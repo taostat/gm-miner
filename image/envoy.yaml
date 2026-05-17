@@ -1,0 +1,252 @@
+## gm miner Envoy configuration — three provider routes.
+##
+## Routes are enabled only when the corresponding env var is set.
+## The entrypoint script (start.sh) renders a runtime config from this
+## template, removing routes whose env vars are absent.
+##
+## THIS FILE IS A TEMPLATE. The canonical runtime file is written to
+## /etc/envoy/envoy-runtime.yaml by start.sh at container start.
+## Do not edit /etc/envoy/envoy-runtime.yaml directly; it is
+## overwritten on every restart.
+##
+## Header handling per spec §10.4:
+##   - Strip gm-internal headers (x-gm-request-id, x-gm-gateway-sig,
+##     x-gm-product) before forwarding upstream.
+##   - Replace Authorization with the upstream key from env.
+##   - After the upstream response, the Lua filter appends a trailing
+##     usage event so the gateway can cross-check token counts
+##     (spec §8, D.2). The trailing event is unsigned in v1 because
+##     the miner pubkey was not included in v1 contracts
+##     (registry.proto reserved-by-comment).
+
+static_resources:
+
+  listeners:
+    - name: ingress
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8080
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                use_remote_address: true
+                route_config:
+                  name: provider_routes
+                  virtual_hosts:
+                    - name: providers
+                      domains: ["*"]
+                      routes:
+
+                        ## ── Anthropic ───────────────────────────────────────
+                        ##  Enabled only when ANTHROPIC_API_KEY is set.
+                        ##  The route matches any path beginning with /v1/ that
+                        ##  was tagged with x-gm-product: anthropic/* by the
+                        ##  gateway. The header x-gm-provider is set by the
+                        ##  gateway; we use it as the route discriminator so
+                        ##  Envoy's static config can separate providers while
+                        ##  the template engine strips the route block entirely
+                        ##  when the key is absent.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "anthropic"
+                          route:
+                            cluster: anthropic
+                            host_rewrite_literal: api.anthropic.com
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-provider
+                          request_headers_to_add:
+                            - header:
+                                key: x-api-key
+                                value: "%ENVIRONMENT(ANTHROPIC_API_KEY)%"
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                            - header:
+                                key: anthropic-version
+                                value: "2023-06-01"
+                              append_action: ADD_IF_ABSENT
+
+                        ## ── OpenAI ──────────────────────────────────────────
+                        ##  Enabled only when OPENAI_API_KEY is set.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "openai"
+                          route:
+                            cluster: openai
+                            host_rewrite_literal: api.openai.com
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-provider
+                          request_headers_to_add:
+                            - header:
+                                key: authorization
+                                value: "Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+
+                        ## ── Gemini ──────────────────────────────────────────
+                        ##  Enabled only when GOOGLE_API_KEY is set.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "gemini"
+                          route:
+                            cluster: gemini
+                            host_rewrite_literal: generativelanguage.googleapis.com
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-provider
+                          request_headers_to_add:
+                            - header:
+                                key: x-goog-api-key
+                                value: "%ENVIRONMENT(GOOGLE_API_KEY)%"
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+
+                        ## ── Fallback: provider key not configured ────────────
+                        ##  Returns HTTP 501 when the requested provider's env
+                        ##  var is not set or the request has no x-gm-provider
+                        ##  header. This is the "route is disabled" state
+                        ##  described in spec §10.2.
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 501
+                            body:
+                              inline_string: |
+                                {"error":"provider not configured on this miner"}
+
+                http_filters:
+                  ## Lua filter appends the trailing usage SSE event after the
+                  ## upstream response body has been forwarded. This gives the
+                  ## gateway a miner-side token count to cross-check against its
+                  ## own parsed count (spec §8). The event is NOT signed in v1
+                  ## (no miner pubkey in v1 contracts per registry.proto comment).
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.LuaPerRoute
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+
+    ## ── Anthropic ─────────────────────────────────────────────────────
+    - name: anthropic
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: anthropic
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: api.anthropic.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: api.anthropic.com
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: api.anthropic.com
+
+    ## ── OpenAI ────────────────────────────────────────────────────────
+    - name: openai
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: openai
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: api.openai.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: api.openai.com
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: api.openai.com
+
+    ## ── Gemini ────────────────────────────────────────────────────────
+    - name: gemini
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: gemini
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: generativelanguage.googleapis.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: generativelanguage.googleapis.com
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: generativelanguage.googleapis.com

@@ -5,14 +5,32 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Phase 0 scaffold for the gm miner capability check service. Phase 1 W4 fills in the per-provider endpoints + Prometheus exporter."
+description = "gm miner capability check service — per-provider /capability/{provider} endpoints and Prometheus exporter."
+
+[[bin]]
+name = "gm-miner-capability"
+path = "src/main.rs"
+
+[lib]
+name = "gm_miner_capability"
+path = "src/lib.rs"
 
 [lints]
 workspace = true
 
 [dependencies]
-tokio = { workspace = true }
-tracing = { workspace = true }
+axum        = "0.7"
+tokio       = { workspace = true }
+tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+reqwest     = { workspace = true }
+clap        = { workspace = true }
+chrono      = { version = "0.4", features = ["serde"] }
+prometheus  = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tower       = { version = "0.4", features = ["util"] }
