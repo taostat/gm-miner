@@ -1,0 +1,18 @@
+[package]
+name = "gm-miner-capability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Phase 0 scaffold for the gm miner capability check service. Phase 1 W4 fills in the per-provider endpoints + Prometheus exporter."
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

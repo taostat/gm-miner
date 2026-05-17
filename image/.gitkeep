@@ -1,0 +1,4 @@
+# Phase 0 placeholder. Phase 1 W4 populates this directory with:
+# - Dockerfile (multi-stage, deterministic-build flags where possible)
+# - envoy.yaml template with three provider routes
+# - bootstrap scripts for dstack-cloud deploy

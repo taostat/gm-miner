@@ -1,0 +1,4 @@
+# Phase 0 placeholder. Phase 1 W4 populates with:
+# - docker-compose.yaml referencing image by digest
+# - app.json template with gcp_config placeholder
+# - operator README documenting dstack-cloud deploy workflow

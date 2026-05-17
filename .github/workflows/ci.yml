@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (lint + build + test)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tooling
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@5cb072d7354962be830356aa6b146f7612846014  # v2.7.5
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Format
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --target ${{ matrix.target }} --all-targets
+
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --all-features
+
+  rust-supply-chain:
+    name: Rust supply chain (cargo deny)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@523d46c8b4755bc8344db2e6893442fed3a0e030  # v2.0.6
+        with:
+          command: check
+          arguments: --all-features
+
+  shell:
+    name: Shell (shellcheck + shfmt)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          if find . -path ./target -prune -o -type f -name '*.sh' -print | head -1 | read -r _; then
+            find . -path ./target -prune -o -type f -name '*.sh' -print0 | xargs -0 shellcheck
+          fi
+
+      - name: Install shfmt
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64 -o /usr/local/bin/shfmt
+          chmod +x /usr/local/bin/shfmt
+
+      - name: shfmt
+        run: |
+          set -euo pipefail
+          if find . -path ./target -prune -o -type f -name '*.sh' -print | head -1 | read -r _; then
+            find . -path ./target -prune -o -type f -name '*.sh' -print0 | xargs -0 shfmt -d -i 2 -ci
+          fi
+
+  actions-lint:
+    name: GitHub Actions (actionlint + zizmor)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.4/scripts/download-actionlint.bash) 1.7.4
+          ./actionlint -color
+
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@f52a838cfabf134edcbaa7c8b3677dde20045018  # v0.1.1

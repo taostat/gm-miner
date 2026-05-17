@@ -1,0 +1,3 @@
+# Phase 0 placeholder. Phase 1 W4 adds:
+# - reproducibility.md (known gaps per Phala's current Docker tooling)
+# - operator runbook for image rollout
