@@ -259,7 +259,14 @@ async fn cmd_login(
     auth_url_override: Option<String>,
     open_browser: bool,
 ) -> Result<()> {
-    let mut cfg = config::load().unwrap_or_default();
+    // `config::load()` already returns Config::default() when the file
+    // is absent (first-time login). A failure here means the file
+    // exists but is unreadable or invalid JSON — surfacing that as a
+    // hard error matches the other commands' behaviour and prevents
+    // a normal re-login from silently wiping an operator's existing
+    // mainnet/testnet tokens.
+    let mut cfg = config::load()
+        .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
 
     if testnet {
         cfg.active_network = Some("testnet".to_string());
@@ -476,7 +483,7 @@ async fn cmd_update_prices(
         );
     }
 
-    let path = format!("/miners/products/{}/{}", provider.as_str(), model);
+    let path = format!("/miners/products/{}/{}/prices", provider.as_str(), model);
     let body = serde_json::json!({ "miner_price": miner_price });
 
     let resp = client.patch(&path, &body).await.context("PATCH prices")?;
