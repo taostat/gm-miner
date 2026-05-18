@@ -19,7 +19,6 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
-allow-wildcards-from-build-deps = false
 
 [sources]
 unknown-registry = "deny"
