@@ -5,19 +5,52 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Phase 0 scaffold for the gm miner CLI. Phase 1 W4 fills in the Taostats OAuth device-code flow, image registration, and product declaration commands."
+description = "gm miner CLI — login, register-image, list-products, declare-product, update-prices, status."
 
-[lints]
-workspace = true
+[lints.clippy]
+# Inherit all workspace lints, then relax the ones that don't apply to a CLI.
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+todo = "deny"
+# CLIs print to stdout/stderr by design — relax these workspace-level denies.
+print_stdout = "allow"
+print_stderr = "allow"
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"
+too_many_arguments = "allow"
 
 [[bin]]
 name = "gm-miner"
 path = "src/main.rs"
 
+[lib]
+name = "gm_miner_cli"
+path = "src/lib.rs"
+
 [dependencies]
-clap = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+clap         = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+reqwest      = { workspace = true }
+chrono       = { version = "0.4", features = ["serde"] }
+dirs         = "5"
+open         = "5"
+
+[dev-dependencies]
+wiremock     = "0.6"
+tokio        = { workspace = true }

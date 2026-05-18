@@ -1,0 +1,14 @@
+{
+  "name": "gm-miner",
+  "version": "1",
+  "gcp_config": {
+    "project": "__FILL_GCP_PROJECT_ID__",
+    "zone": "us-central1-a",
+    "machine_type": "c3-standard-4",
+    "instance_name": "__FILL_APP_NAME__",
+    "bucket": "__FILL_GCS_BUCKET__"
+  },
+  "key_provider": "kms",
+  "kms_url": "https://kms.tdxlab.dstack.org:12001",
+  "gateway_enabled": true
+}
