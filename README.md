@@ -4,9 +4,8 @@ Miner image and CLI for the gm Bittensor subnet.
 
 | Path | Owner | Description |
 |---|---|---|
-| `image/` | W4 | Envoy-based miner image with three provider routes (Anthropic / OpenAI / Gemini). Pinned to digest. |
-| `capability/` | W4 | Rust binary inside the image: per-provider capability check endpoints (free, registry-only) plus a Prometheus exporter. |
-| `cli/` | W4 | `gm-miner` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. |
+| `image/` | W4 | Envoy-only miner image with three provider routes (Anthropic / OpenAI / Gemini). Pinned to digest. The runtime is `envoy` plus its native `/stats/prometheus` exposure — no sidecar service. |
+| `cli/` | W4 | `gm-miner` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. Runs operator-side from a laptop, not inside the TEE. |
 | `dstack/` | W4 | dstack-cloud compose template + `app.json` skeleton for operators. |
 | `docs/` | W4 | Operator-facing docs including reproducibility caveats. |
 

@@ -232,11 +232,6 @@ log "writing ${PROJECT_DIR}/.env"
     [[ -n "${ANTHROPIC_API_KEY:-}" ]] && printf 'ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY}"
     [[ -n "${OPENAI_API_KEY:-}" ]] && printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY}"
     [[ -n "${GOOGLE_API_KEY:-}" ]] && printf 'GOOGLE_API_KEY=%s\n' "${GOOGLE_API_KEY}"
-    # Capability bearer token — generate a random 32-byte hex token if not set.
-    CAPABILITY_BEARER_TOKEN="${CAPABILITY_BEARER_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
-    printf 'CAPABILITY_BEARER_TOKEN=%s\n' "${CAPABILITY_BEARER_TOKEN}"
-    log "CAPABILITY_BEARER_TOKEN generated (save this for registry configuration):"
-    log "  ${CAPABILITY_BEARER_TOKEN}"
   } >"${PROJECT_DIR}/.env"
 )
 
@@ -285,9 +280,11 @@ Next steps:
        gm-miner status
 
   5. The registry will run its control loop within ~10 minutes and
-     mark eligible products as active if attestation passes.
-
-NOTE: The CAPABILITY_BEARER_TOKEN has been printed above. You must
-provide it to the registry operator so the registry can authenticate
-its capability check calls to this miner.
+     mark eligible products as active if attestation passes. The
+     registry verifies each provider by probing envoy directly:
+     GET https://<miner-endpoint>/v1/models with header
+       x-gm-provider: openai
+     (and the equivalent for anthropic / gemini). No bearer token is
+     required — the registry's authentication to the miner is the
+     attestation chain itself.
 EOF

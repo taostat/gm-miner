@@ -21,8 +21,7 @@ compose-hash at boot and binds it to the attestation quote.
 |---|---|---|
 | Envoy base image | Yes | Pinned by `@sha256:…` digest |
 | Rust builder base | Yes | Pinned by `@sha256:…` digest |
-| Rust binary: `gm-miner-capability` | Yes, given same toolchain | `RUSTFLAGS="-C codegen-units=1 -C debuginfo=0"`, `CARGO_INCREMENTAL=0`, `SOURCE_DATE_EPOCH` set |
-| Rust binary: `gm-miner` (CLI) | Yes, given same toolchain | Same flags |
+| Rust binary: `gm-miner` (CLI) | Yes, given same toolchain | `RUSTFLAGS="-C codegen-units=1 -C debuginfo=0"`, `CARGO_INCREMENTAL=0`, `SOURCE_DATE_EPOCH` set |
 | `envoy.yaml` | Yes | Static config, version-controlled |
 | `start.sh` | Yes | Static script, version-controlled |
 

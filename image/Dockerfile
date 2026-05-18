@@ -27,24 +27,21 @@ WORKDIR /build
 
 ## Copy workspace manifests first for layer caching.
 COPY Cargo.toml Cargo.lock ./
-COPY capability/Cargo.toml ./capability/
 COPY cli/Cargo.toml ./cli/
 
 ## Pre-build a dummy workspace to cache dependencies.
-RUN mkdir -p capability/src cli/src \
-  && echo "fn main() {}" > capability/src/main.rs \
+RUN mkdir -p cli/src \
   && echo "fn main() {}" > cli/src/main.rs \
   && cargo build --release --workspace 2>/dev/null || true \
-  && rm -rf capability/src cli/src
+  && rm -rf cli/src
 
 ## Copy real sources.
-COPY capability/ ./capability/
 COPY cli/ ./cli/
 
-## Build both binaries. Touch src to invalidate the dummy build cache.
-RUN touch capability/src/main.rs cli/src/main.rs \
+## Build the CLI. Touch src to invalidate the dummy build cache.
+RUN touch cli/src/main.rs \
   && cargo build --release --workspace \
-  && strip target/release/gm-miner-capability target/release/gm-miner
+  && strip target/release/gm-miner
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
 ## Envoy 1.32.x pinned by digest.
@@ -52,19 +49,17 @@ RUN touch capability/src/main.rs cli/src/main.rs \
 ## Current digest as of 2026-05-17:
 FROM envoyproxy/envoy:v1.32-latest@sha256:6bf0d37dd5e8eac4b37effe89a1aec4760f7f2ce860d1fd6af22147eb87a5058
 
-## Install curl (used by start.sh for the capability-service readiness check)
-## and ca-certificates (already present in envoy base, but explicit for clarity).
-RUN apt-get update -qq \
-  && apt-get install -y --no-install-recommends curl ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+## ca-certificates is already present in the envoy base image; nothing
+## else needs to be installed now that the capability sidecar is gone.
 
 ## Image version — set at build time by the build pipeline.
-## The registry checks this via the capability service's /health response.
 ARG GM_IMAGE_VERSION=dev
 ENV GM_IMAGE_VERSION=${GM_IMAGE_VERSION}
 
-## Copy capability binary and CLI binary from builder.
-COPY --from=builder /build/target/release/gm-miner-capability /usr/local/bin/gm-miner-capability
+## Copy the operator-side CLI binary. The CLI is included in the image
+## for one-shot ops tasks (config dump, key rotation) executed via
+## `docker run --entrypoint gm-miner ...`; the runtime entrypoint
+## itself is envoy alone.
 COPY --from=builder /build/target/release/gm-miner /usr/local/bin/gm-miner
 
 ## Copy Envoy config.
@@ -74,12 +69,12 @@ COPY image/envoy.yaml /etc/envoy/envoy.yaml
 COPY image/start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh
 
-## Envoy proxy port.
+## Envoy data-plane port (upstream request proxying).
 EXPOSE 8080
-## Capability check service (private; not publicly routed).
-EXPOSE 8443
-## Prometheus metrics (public read-only).
-EXPOSE 9090
+## Envoy admin port (Prometheus `/stats/prometheus` and runtime config
+## introspection — bound to localhost via admin block in envoy.yaml,
+## the EXPOSE is informational only).
+EXPOSE 9901
 
 ## Drop to non-root. The envoy base image has the envoy user (uid 100).
 USER envoy

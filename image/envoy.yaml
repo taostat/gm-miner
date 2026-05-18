@@ -1,23 +1,30 @@
 ## gm miner Envoy configuration — three provider routes.
 ##
-## Routes are enabled only when the corresponding env var is set.
-## The entrypoint script (start.sh) renders a runtime config from this
-## template, removing routes whose env vars are absent.
-##
-## THIS FILE IS A TEMPLATE. The canonical runtime file is written to
-## /etc/envoy/envoy-runtime.yaml by start.sh at container start.
-## Do not edit /etc/envoy/envoy-runtime.yaml directly; it is
-## overwritten on every restart.
+## Routes match on the `x-gm-provider` header set by the gateway and
+## are gated on the upstream key being present in the container's
+## environment. Unconfigured providers return 401 from upstream when
+## probed (envoy substitutes an empty key) so the registry can detect
+## "no key set" the same way it detects "key revoked".
 ##
 ## Header handling per spec §10.4:
 ##   - Strip gm-internal headers (x-gm-request-id, x-gm-gateway-sig,
 ##     x-gm-product) before forwarding upstream.
 ##   - Replace Authorization with the upstream key from env.
-##   - After the upstream response, the Lua filter appends a trailing
-##     usage event so the gateway can cross-check token counts
-##     (spec §8, D.2). The trailing event is unsigned in v1 because
-##     the miner pubkey was not included in v1 contracts
-##     (registry.proto reserved-by-comment).
+##
+## Prometheus metrics: envoy's admin interface exposes
+## `/stats/prometheus` on the admin port (bound to localhost). This
+## replaces the deleted capability sidecar's `/metrics` endpoint.
+
+admin:
+  ## Bound to loopback only. The container exposes 9901 as informational
+  ## but a scrape endpoint accessible only from inside the TEE keeps
+  ## the attack surface minimal — the registry probes `:8080` (the
+  ## data plane) with `x-gm-provider` for liveness/capability checks
+  ## instead.
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
 
 static_resources:
 
@@ -138,14 +145,9 @@ static_resources:
                                 {"error":"provider not configured on this miner"}
 
                 http_filters:
-                  ## Lua filter appends the trailing usage SSE event after the
-                  ## upstream response body has been forwarded. This gives the
-                  ## gateway a miner-side token count to cross-check against its
-                  ## own parsed count (spec §8). The event is NOT signed in v1
-                  ## (no miner pubkey in v1 contracts per registry.proto comment).
-                  - name: envoy.filters.http.lua
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.LuaPerRoute
+                  ## v1: only the router filter is needed. The previous
+                  ## Lua trailing-usage filter was dropped along with the
+                  ## gateway-side miner-usage cross-check (gm MVP simplify).
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
