@@ -203,6 +203,7 @@ else
   log "updating gcp_config in existing app.json (preserves app_id/instance_id_seed)"
   GCP_PROJECT_ID="${GCP_PROJECT_ID}" GCP_ZONE="${GCP_ZONE}" \
     MACHINE_TYPE="${MACHINE_TYPE}" APP_NAME="${APP_NAME}" \
+    GCS_BUCKET="${GCS_BUCKET}" \
     python3 - "${PROJECT_DIR}/app.json" <<'PY'
 import json, os, sys
 path = sys.argv[1]
@@ -212,6 +213,11 @@ gcp["project"] = os.environ["GCP_PROJECT_ID"]
 gcp["zone"] = os.environ["GCP_ZONE"]
 gcp["machine_type"] = os.environ["MACHINE_TYPE"]
 gcp["instance_name"] = os.environ["APP_NAME"]
+# Always rewrite bucket: when an operator reuses an app.json across
+# GCP projects (or starts from a file with a stale/empty bucket),
+# leaving the old value here points dstack-cloud deploy at the wrong
+# storage location and the upload fails.
+gcp["bucket"] = os.environ["GCS_BUCKET"]
 with open(path, "w") as f: json.dump(app, f, indent=2)
 PY
 fi

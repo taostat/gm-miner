@@ -19,9 +19,13 @@ use anyhow::{bail, Result};
 const PICO_PER_USD_F64: f64 = 1_000_000_000_000.0_f64;
 
 /// Maximum USD/Mtok accepted by this function.
-/// Chosen to be safely below the u64 ceiling (≈18.446 USD/Mtok) with
-/// no f64 rounding ambiguity at the boundary.
-const MAX_USD_PER_MTOK: f64 = 18.4_f64;
+///
+/// `u64::MAX` picodollars / 10^12 pUSD-per-USD ≈ 18,446,744 USD/Mtok.
+/// Pick a round value comfortably under that ceiling so the f64
+/// boundary is unambiguous and well-priced future SKUs (anything up
+/// to ~$1k per million tokens, well above today's frontier $40/Mtok)
+/// stays inside the safe range.
+const MAX_USD_PER_MTOK: f64 = 1_000_000.0_f64;
 
 /// Parse a human-supplied USD/Mtok string (e.g. "3.00", "0.25", "15")
 /// and return picodollars per million tokens.

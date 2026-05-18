@@ -75,8 +75,10 @@ fn roundtrip_3_usd() {
 
 #[test]
 fn overflow_rejected() {
-    // 19 USD/Mtok would overflow u64 picodollar representation (~18.4 max)
-    assert!(usd_per_mtok_to_pdollars("19").is_err());
+    // 2_000_000 USD/Mtok exceeds the CLI's MAX_USD_PER_MTOK cap of
+    // 1_000_000, which is well below u64::MAX/10^12 (~18.4M) but
+    // comfortably above any realistic frontier model price.
+    assert!(usd_per_mtok_to_pdollars("2000000").is_err());
 }
 
 #[test]

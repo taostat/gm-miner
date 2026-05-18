@@ -217,9 +217,12 @@ async fn main() -> Result<()> {
 fn load_config(testnet: bool, api_url_override: Option<String>) -> Result<Config> {
     let mut cfg = config::load().context("load config")?;
 
-    if testnet {
-        cfg.active_network = Some("testnet".to_string());
-    }
+    // Always reset to the explicit choice on every invocation so the
+    // active network reflects the current flag, not whatever the last
+    // command left in the config. Without this, a single `--testnet`
+    // call sticks across every subsequent command until the operator
+    // hand-edits ~/.gm-miner/config.json.
+    cfg.active_network = Some(if testnet { "testnet" } else { "mainnet" }.to_string());
 
     if let Some(url) = api_url_override {
         cfg.active_entry_mut().api_url = Some(url);
@@ -268,9 +271,9 @@ async fn cmd_login(
     let mut cfg = config::load()
         .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
 
-    if testnet {
-        cfg.active_network = Some("testnet".to_string());
-    }
+    // Reset on every login so a previous testnet session can't sticky-
+    // overwrite mainnet credentials when the operator omits --testnet.
+    cfg.active_network = Some(if testnet { "testnet" } else { "mainnet" }.to_string());
 
     let auth_url = auth_url_override
         .or_else(|| {
