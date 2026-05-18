@@ -1,0 +1,5 @@
+rules:
+  # dtolnay/rust-toolchain uses `stable`/`nightly` tags rather than semver
+  # versions, so zizmor's ref-version-mismatch fires spuriously on every pin.
+  ref-version-mismatch:
+    disable: true
