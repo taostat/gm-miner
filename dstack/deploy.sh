@@ -199,6 +199,20 @@ if [[ ! -f "${PROJECT_DIR}/app.json" ]]; then
     --instance-name "${APP_NAME}" \
     --key-provider kms \
     --gw)
+  # `dstack-cloud new` seeds gcp_config.bucket from the global config
+  # which we initialised to "". Write the deploy-time bucket into the
+  # freshly-scaffolded app.json so dstack-cloud deploy has a valid GCS
+  # upload target on a clean machine too.
+  log "setting gcp_config.bucket on fresh app.json"
+  GCS_BUCKET="${GCS_BUCKET}" \
+    python3 - "${PROJECT_DIR}/app.json" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+with open(path) as f: app = json.load(f)
+gcp = app.setdefault("gcp_config", {})
+gcp["bucket"] = os.environ["GCS_BUCKET"]
+with open(path, "w") as f: json.dump(app, f, indent=2)
+PY
 else
   log "updating gcp_config in existing app.json (preserves app_id/instance_id_seed)"
   GCP_PROJECT_ID="${GCP_PROJECT_ID}" GCP_ZONE="${GCP_ZONE}" \

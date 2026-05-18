@@ -386,16 +386,13 @@ async fn cmd_declare_product(
     model: &str,
     price: MinerPriceBlock,
 ) -> Result<()> {
+    // Serialize via the typed MinerPriceBlock so its skip_serializing_if
+    // attrs kick in and unset cache_* fields are omitted entirely
+    // (rather than sent as JSON null, which the registry rejects).
     let body = serde_json::json!({
         "provider": provider.as_str(),
         "model": model,
-        "miner_price": {
-            "input_per_mtok_pdollars": price.input_per_mtok_pdollars,
-            "output_per_mtok_pdollars": price.output_per_mtok_pdollars,
-            "cache_read_per_mtok_pdollars": price.cache_read_per_mtok_pdollars,
-            "cache_write_5m_per_mtok_pdollars": price.cache_write_5m_per_mtok_pdollars,
-            "cache_write_1h_per_mtok_pdollars": price.cache_write_1h_per_mtok_pdollars,
-        }
+        "miner_price": price,
     });
 
     let resp = client
