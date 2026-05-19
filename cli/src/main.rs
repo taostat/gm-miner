@@ -527,12 +527,20 @@ async fn cmd_deploy(
             )
         })?;
 
-    // Step 2: fetch approved image versions from the registry.
+    // Step 2: auth preflight. `dstack-cloud deploy` is slow and irreversible
+    // for the operator (CVM created, GCS bytes uploaded), so we refuse to
+    // start the deploy unless the registry will accept the eventual
+    // `register-image` call. The preflight is a cheap `GET /miners/me` —
+    // a missing token / 401 fails fast with an actionable message before
+    // any CVM work.
+    client.preflight_auth().await?;
+
+    // Step 3: fetch approved image versions from the registry.
     let registry_url = cfg.api_url();
     println!("Fetching approved image versions from {registry_url} ...");
     let versions = fetch_supported_versions(&registry_url).await?;
 
-    // Step 3: select the target version.
+    // Step 4: select the target version.
     let approved = select_version(&versions, version_pin)?;
     println!(
         "Selected version {}  ({})",
@@ -540,10 +548,10 @@ async fn cmd_deploy(
         format_created_at(&approved.created_at),
     );
 
-    // Step 4: render the compose template with the pinned image ref.
+    // Step 5: render the compose template with the pinned image ref.
     let rendered = render_compose(COMPOSE_TEMPLATE, image_ref)?;
 
-    // Step 5: bootstrap the dstack project if this is a fresh machine
+    // Step 6: bootstrap the dstack project if this is a fresh machine
     // (app.json absent means `dstack-cloud new` has never been run here).
     // Bootstrap also patches gcp_config immediately after `dstack-cloud new`.
     if !dstack.is_bootstrapped() {
@@ -551,19 +559,19 @@ async fn cmd_deploy(
         dstack.bootstrap(app_name, gcp)?;
     }
 
-    // Step 6: deploy via dstack-cloud, polling until hashes appear.
+    // Step 7: deploy via dstack-cloud, polling until hashes appear.
     // On re-deploy the deploy() call also refreshes gcp_config before running
     // `dstack-cloud deploy` so GCP coordinates stay current.
     println!("Deploying via dstack-cloud (boot timeout: {boot_timeout_secs}s) ...");
     let actual = dstack.deploy(&rendered, keys, gcp, boot_timeout_secs)?;
 
-    // Step 7: verify hashes.
+    // Step 8: verify hashes.
     println!("Verifying hashes against registry approval ...");
     verify_hashes(&actual, approved)?;
     println!("  compose_hash  : OK ({})", actual.compose_sha256);
     println!("  os_image_hash : OK ({})", actual.os_image_hash);
 
-    // Step 8: register the image.
+    // Step 9: register the image.
     println!("Registering image with the registry ...");
     cmd_register_image(client, &actual.compose_sha256, &actual.os_image_hash).await
 }
@@ -820,7 +828,10 @@ async fn cmd_update_prices(
 }
 
 async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
-    let resp = client.get("/miners/me").await.context("GET /miners/me")?;
+    let resp = client
+        .get(gm_miner_cli::client::ME_PATH)
+        .await
+        .context("GET /miners/me")?;
 
     let status_code = resp.status();
     if !status_code.is_success() {

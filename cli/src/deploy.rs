@@ -2,18 +2,21 @@
 //!
 //! Steps:
 //!   1. Read provider API keys from config; error early if none set.
-//!   2. Fetch the approved `ImageVersion` list from the registry.
-//!   3. Select the newest supported version (or a pinned one if `--version` given).
-//!   4. Render the bundled `dstack/docker-compose.yaml` template with the
+//!   2. Auth preflight (`GET /miners/me`) — fail fast if the operator
+//!      forgot `gm-miner login` or has a stale token, before any CVM work.
+//!   3. Fetch the approved `ImageVersion` list from the registry.
+//!   4. Select the newest supported version (or a pinned one if `--version` given).
+//!   5. Render the bundled `dstack/docker-compose.yaml` template with the
 //!      digest-pinned image ref from the approved version.
-//!   5. Bootstrap the dstack project if `app.json` is missing (calls
-//!      `dstack-cloud new`).
-//!   6. Submit to dstack-cloud (via the `DstackClient` trait for testability).
-//!   7. Poll `dstack-cloud status --json` until `compose_sha256` and
+//!   6. Bootstrap the dstack project if `app.json` is missing (calls
+//!      `dstack-cloud new` with GCP coordinates, `--key-provider kms`,
+//!      and `--gw` — mirrors `dstack/deploy.sh`).
+//!   7. Submit to dstack-cloud (via the `DstackClient` trait for testability).
+//!   8. Poll `dstack-cloud status --json` until `compose_sha256` and
 //!      `os_image_hash` are populated (up to `boot_timeout_secs` seconds).
-//!   8. **Verify** both match the registry's approved version — refuse and exit 1
+//!   9. **Verify** both match the registry's approved version — refuse and exit 1
 //!      if they don't.
-//!   9. Call `register_image` with the verified hashes.
+//!  10. Call `register_image` with the verified hashes.
 
 use anyhow::{bail, Context, Result};
 use chrono::DateTime;
@@ -113,6 +116,42 @@ pub const POLL_INTERVAL_SECS: u64 = 5;
 /// Default maximum time to wait for hashes to appear after deploy (seconds).
 pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
 
+/// Key-provider passed to `dstack-cloud new`. The miner's trust model
+/// requires KMS — fixed here so an operator cannot accidentally weaken
+/// it from the CLI. Mirrors `dstack/deploy.sh`.
+pub const DSTACK_KEY_PROVIDER: &str = "kms";
+
+/// Build the argument list for `dstack-cloud new`.
+///
+/// `dstack-cloud new` takes the project name as a positional argument
+/// followed by GCP coordinates. Two flags are hardcoded because the
+/// miner's trust model requires them:
+///   - `--key-provider kms` — only KMS produces an attestation chain
+///     the registry can verify.
+///   - `--gw` — gateway must be enabled for the registry to probe envoy
+///     directly (no bearer token; the gateway is the trust boundary).
+///
+/// Extracted from `RealDstackClient::bootstrap` so the wiring can be
+/// asserted without spawning a subprocess.
+#[must_use]
+pub fn build_dstack_new_args(app_name: &str, gcp: &GcpConfig) -> Vec<String> {
+    vec![
+        "new".to_owned(),
+        app_name.to_owned(),
+        "--project".to_owned(),
+        gcp.project.clone(),
+        "--zone".to_owned(),
+        gcp.zone.clone(),
+        "--machine-type".to_owned(),
+        gcp.machine_type.clone(),
+        "--instance-name".to_owned(),
+        gcp.instance_name.clone(),
+        "--key-provider".to_owned(),
+        DSTACK_KEY_PROVIDER.to_owned(),
+        "--gw".to_owned(),
+    ]
+}
+
 // ── Registry image-version types ─────────────────────────────────────────────
 
 /// A single approved (`compose_hash`, `os_image_hash`) entry from the registry.
@@ -149,9 +188,16 @@ pub struct DstackDeployResult {
 /// implementation returns pre-canned values without touching the filesystem.
 pub trait DstackClient {
     /// Bootstrap a new dstack project in the project directory by running
-    /// `dstack-cloud new --name <app_name>`, then patch `app.json` with
-    /// `gcp` so `dstack-cloud deploy` has a valid GCS upload target and
-    /// machine configuration on a fresh machine.
+    /// `dstack-cloud new <app_name> --project ... --zone ... --machine-type ...
+    /// --instance-name ... --key-provider kms --gw`, then patch `app.json`
+    /// with `gcp` so `dstack-cloud deploy` has a valid GCS upload target
+    /// (`bucket` is not a `dstack-cloud new` flag, so it must be patched in
+    /// after the fact).
+    ///
+    /// The KMS key-provider and gateway-enabled flags are baked in: the
+    /// miner's attestation chain requires both, and exposing them as
+    /// configurable would let an operator accidentally weaken the trust
+    /// model. Mirrors `dstack/deploy.sh`.
     ///
     /// Only called when `app.json` is absent (i.e. on a fresh machine with
     /// no prior deploy).
@@ -234,12 +280,26 @@ impl DstackClient for RealDstackClient {
     fn bootstrap(&self, _hint_app_name: &str, gcp: &GcpConfig) -> Result<()> {
         // Use the app name this client was constructed with; the hint is for
         // test stubs that don't store state.
-        std::fs::create_dir_all(&self.project_dir)
-            .with_context(|| format!("create project dir {}", self.project_dir.display()))?;
+        //
+        // `dstack-cloud new <name>` creates `<cwd>/<name>/` containing the
+        // generated `app.json`. To land it at `self.project_dir`, run from
+        // the parent and pass `app_name` as the positional name — mirrors
+        // `dstack/deploy.sh` which does `cd "${DIST_DIR}" && dstack-cloud
+        // new "${APP_NAME}"`.
+        let parent_dir = self.project_dir.parent().unwrap_or_else(|| {
+            // project_dir has no parent only when it is a root (e.g. "/"
+            // or "C:\"). That can't happen with the default `dist/<app>`
+            // layout; fall back to "." so the command can still run and
+            // the operator gets a clean error from dstack-cloud itself.
+            std::path::Path::new(".")
+        });
+        std::fs::create_dir_all(parent_dir)
+            .with_context(|| format!("create parent dir {}", parent_dir.display()))?;
 
+        let args = build_dstack_new_args(&self.app_name, gcp);
         let status = std::process::Command::new("dstack-cloud")
-            .args(["new", "--name", &self.app_name])
-            .current_dir(&self.project_dir)
+            .args(&args)
+            .current_dir(parent_dir)
             .status()
             .context("run dstack-cloud new — is dstack-cloud installed?")?;
 
@@ -250,10 +310,13 @@ impl DstackClient for RealDstackClient {
             );
         }
 
-        // Patch gcp_config immediately after bootstrap: `dstack-cloud new`
-        // seeds bucket/project from the global config, which is often empty
-        // on a fresh machine. Without this, `dstack-cloud deploy` fails to
-        // find the GCS upload target.
+        // Patch gcp_config immediately after bootstrap. `dstack-cloud new`
+        // now seeds project/zone/machine_type/instance_name from the flags
+        // above, but `bucket` is not a `new` flag — it comes from the
+        // global config (often empty on a fresh machine). This call writes
+        // the deploy-time bucket and (idempotently) reaffirms the other
+        // GCP coordinates so a subsequent `dstack-cloud deploy` has a
+        // valid upload target.
         let app_json = self.project_dir.join("app.json");
         patch_app_json(&app_json, gcp)
             .with_context(|| format!("patch gcp_config in {}", app_json.display()))?;
@@ -799,5 +862,74 @@ mod tests {
         }];
         assert!(select_version(&versions, Some(2)).is_err());
         assert!(select_version(&versions, Some(0)).is_err());
+    }
+
+    fn sample_gcp() -> GcpConfig {
+        GcpConfig {
+            project: "my-project".to_owned(),
+            zone: "us-east1-b".to_owned(),
+            machine_type: "c3-standard-8".to_owned(),
+            instance_name: "miner-a".to_owned(),
+            bucket: "gs://my-project-dstack".to_owned(),
+        }
+    }
+
+    /// Trust-correct deploy requires `dstack-cloud new` to be invoked with
+    /// the GCP coordinates from `GcpConfig`, plus the hardcoded
+    /// `--key-provider kms` and `--gw` flags. Anything missing here means
+    /// a fresh-machine deploy would scaffold a project with weaker
+    /// settings than `deploy.sh` produced, and the registry would later
+    /// refuse the resulting attestation.
+    #[test]
+    fn build_dstack_new_args_matches_deploy_sh() {
+        let gcp = sample_gcp();
+        let args = build_dstack_new_args("gm-miner-1", &gcp);
+
+        // Subcommand and positional name in the correct order.
+        assert_eq!(args[0], "new");
+        assert_eq!(args[1], "gm-miner-1");
+
+        // Every required flag pair is present somewhere in the arg list.
+        let pairs = [
+            ("--project", "my-project"),
+            ("--zone", "us-east1-b"),
+            ("--machine-type", "c3-standard-8"),
+            ("--instance-name", "miner-a"),
+            ("--key-provider", "kms"),
+        ];
+        for (flag, value) in pairs {
+            let pos = args.iter().position(|a| a == flag);
+            assert!(pos.is_some(), "flag {flag} missing from {args:?}");
+            let idx = pos.unwrap_or(0);
+            assert_eq!(
+                args[idx + 1],
+                value,
+                "flag {flag} should be followed by {value}, got {:?}",
+                args[idx + 1]
+            );
+        }
+
+        // `--gw` is a boolean flag — present, no value follows.
+        assert!(args.iter().any(|a| a == "--gw"), "missing --gw in {args:?}");
+    }
+
+    /// Trust-critical: `--key-provider kms` is never substitutable from
+    /// the CLI, because anything other than KMS breaks attestation.
+    #[test]
+    fn dstack_key_provider_is_kms() {
+        assert_eq!(DSTACK_KEY_PROVIDER, "kms");
+    }
+
+    /// The positional `name` argument is what dstack-cloud uses as the
+    /// project name in app.json; it must be the `app_name` we pass in,
+    /// not a flag like `--name`.
+    #[test]
+    fn build_dstack_new_args_positional_name() {
+        let args = build_dstack_new_args("custom-app", &sample_gcp());
+        assert_eq!(args[1], "custom-app");
+        assert!(
+            !args.iter().any(|a| a == "--name"),
+            "--name flag must not appear (name is positional in dstack-cloud new)"
+        );
     }
 }
