@@ -36,8 +36,9 @@ struct Cli {
     #[arg(long, global = true)]
     testnet: bool,
 
-    /// Override the registry API URL.
-    #[arg(long, global = true, env = "GM_REGISTRY_URL")]
+    /// Override the registry API URL (flag only; use `GM_REGISTRY_URL` env var for
+    /// per-run overrides that should not be persisted — see `load_config`).
+    #[arg(long, global = true)]
     api_url: Option<String>,
 
     #[command(subcommand)]
@@ -147,7 +148,7 @@ async fn main() -> Result<()> {
         Command::Login {
             no_browser,
             auth_url,
-        } => cmd_login(cli.testnet, auth_url, !no_browser).await,
+        } => cmd_login(cli.testnet, auth_url, cli.api_url, !no_browser).await,
         Command::RegisterImage {
             compose_hash,
             os_image_hash,
@@ -224,7 +225,10 @@ fn load_config(testnet: bool, api_url_override: Option<String>) -> Result<Config
     // hand-edits ~/.gm-miner/config.json.
     cfg.active_network = Some(if testnet { "testnet" } else { "mainnet" }.to_string());
 
-    if let Some(url) = api_url_override {
+    // Explicit --api-url flag wins; fall back to GM_REGISTRY_URL for a
+    // this-run-only override that is never persisted.
+    let effective = api_url_override.or_else(|| std::env::var("GM_REGISTRY_URL").ok());
+    if let Some(url) = effective {
         cfg.active_entry_mut().api_url = Some(url);
     }
 
@@ -260,6 +264,7 @@ fn build_price_block(
 async fn cmd_login(
     testnet: bool,
     auth_url_override: Option<String>,
+    api_url_override: Option<String>,
     open_browser: bool,
 ) -> Result<()> {
     // `config::load()` already returns Config::default() when the file
@@ -289,13 +294,16 @@ async fn cmd_login(
 
     let entry = cfg.active_entry_mut();
     entry.auth_url = Some(auth_url.clone());
-    if entry.api_url.is_none() {
-        entry.api_url = Some(if testnet {
-            "https://api-testnet.gm.taostats.io".to_string()
-        } else {
-            "https://api.gm.taostats.io".to_string()
+    let resolved_api_url = api_url_override
+        .or_else(|| entry.api_url.clone())
+        .unwrap_or_else(|| {
+            if testnet {
+                "https://api-testnet.gm.taostats.io".to_string()
+            } else {
+                "https://api.gm.taostats.io".to_string()
+            }
         });
-    }
+    entry.api_url = Some(resolved_api_url);
     entry.tokens = Some(TokenEntry {
         access_token: Some(token.access_token.clone()),
         refresh_token: token.refresh_token.clone(),
