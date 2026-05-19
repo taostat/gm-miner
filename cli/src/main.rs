@@ -36,8 +36,9 @@ struct Cli {
     #[arg(long, global = true)]
     testnet: bool,
 
-    /// Override the registry API URL.
-    #[arg(long, global = true, env = "GM_REGISTRY_URL")]
+    /// Override the registry API URL (flag only; use `GM_REGISTRY_URL` env var for
+    /// per-run overrides that should not be persisted — see `load_config`).
+    #[arg(long, global = true)]
     api_url: Option<String>,
 
     #[command(subcommand)]
@@ -224,7 +225,10 @@ fn load_config(testnet: bool, api_url_override: Option<String>) -> Result<Config
     // hand-edits ~/.gm-miner/config.json.
     cfg.active_network = Some(if testnet { "testnet" } else { "mainnet" }.to_string());
 
-    if let Some(url) = api_url_override {
+    // Explicit --api-url flag wins; fall back to GM_REGISTRY_URL for a
+    // this-run-only override that is never persisted.
+    let effective = api_url_override.or_else(|| std::env::var("GM_REGISTRY_URL").ok());
+    if let Some(url) = effective {
         cfg.active_entry_mut().api_url = Some(url);
     }
 
