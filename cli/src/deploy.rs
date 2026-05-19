@@ -6,17 +6,25 @@
 //!   3. Select the newest supported version (or a pinned one if `--version` given).
 //!   4. Render the bundled `dstack/docker-compose.yaml` template with the
 //!      digest-pinned image ref from the approved version.
-//!   5. Submit to dstack-cloud (via the `DstackClient` trait for testability).
-//!   6. Read back `compose_sha256` + `os_image_hash` from dstack's response.
-//!   7. **Verify** both match the registry's approved version — refuse and exit 1
+//!   5. Bootstrap the dstack project if `app.json` is missing (calls
+//!      `dstack-cloud new`).
+//!   6. Submit to dstack-cloud (via the `DstackClient` trait for testability).
+//!   7. Poll `dstack-cloud status --json` until `compose_sha256` and
+//!      `os_image_hash` are populated (up to `boot_timeout_secs` seconds).
+//!   8. **Verify** both match the registry's approved version — refuse and exit 1
 //!      if they don't.
-//!   8. Call `register_image` with the verified hashes.
+//!   9. Call `register_image` with the verified hashes.
 
 use anyhow::{bail, Context, Result};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderKeys;
+
+/// Default poll interval when waiting for the CVM to boot (seconds).
+pub const POLL_INTERVAL_SECS: u64 = 5;
+/// Default maximum time to wait for hashes to appear after deploy (seconds).
+pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
 
 // ── Registry image-version types ─────────────────────────────────────────────
 
@@ -49,18 +57,37 @@ pub struct DstackDeployResult {
 
 /// Abstraction over the dstack-cloud CLI, injectable for tests.
 ///
-/// The real implementation shells out to `dstack-cloud deploy` +
-/// `dstack-cloud status --json`. The mock implementation returns
-/// pre-canned values without touching the filesystem.
+/// The real implementation shells out to `dstack-cloud new` (bootstrap),
+/// `dstack-cloud deploy`, and `dstack-cloud status --json`. The mock
+/// implementation returns pre-canned values without touching the filesystem.
 pub trait DstackClient {
+    /// Bootstrap a new dstack project in the project directory by running
+    /// `dstack-cloud new --name <app_name>`. Only called when `app.json` is
+    /// absent (i.e. on a fresh machine with no prior deploy).
+    ///
+    /// # Errors
+    /// Returns an error if `dstack-cloud new` fails.
+    fn bootstrap(&self, app_name: &str) -> Result<()>;
+
+    /// Returns true if the project directory already contains `app.json`,
+    /// meaning the dstack project has already been bootstrapped.
+    fn is_bootstrapped(&self) -> bool;
+
     /// Deploy and return the compose + OS image hashes that dstack-cloud
     /// actually used. `compose_yaml` is the rendered compose file content;
     /// `env_vars` are the operator's provider API keys to pass via dstack's
-    /// encrypted env upload.
+    /// encrypted env upload. `boot_timeout_secs` controls how long to poll
+    /// for hashes before giving up.
     ///
     /// # Errors
-    /// Returns an error if the deploy fails or the hashes cannot be read back.
-    fn deploy(&self, compose_yaml: &str, env_vars: &ProviderKeys) -> Result<DstackDeployResult>;
+    /// Returns an error if the deploy fails or the hashes cannot be read back
+    /// within `boot_timeout_secs`.
+    fn deploy(
+        &self,
+        compose_yaml: &str,
+        env_vars: &ProviderKeys,
+        boot_timeout_secs: u64,
+    ) -> Result<DstackDeployResult>;
 }
 
 // ── Real dstack-cloud implementation ─────────────────────────────────────────
@@ -95,9 +122,41 @@ struct DstackStatus {
 }
 
 impl DstackClient for RealDstackClient {
-    fn deploy(&self, compose_yaml: &str, env_vars: &ProviderKeys) -> Result<DstackDeployResult> {
+    fn is_bootstrapped(&self) -> bool {
+        self.project_dir.join("app.json").exists()
+    }
+
+    fn bootstrap(&self, _hint_app_name: &str) -> Result<()> {
+        // Use the app name this client was constructed with; the hint is for
+        // test stubs that don't store state.
+        std::fs::create_dir_all(&self.project_dir)
+            .with_context(|| format!("create project dir {}", self.project_dir.display()))?;
+
+        let status = std::process::Command::new("dstack-cloud")
+            .args(["new", "--name", &self.app_name])
+            .current_dir(&self.project_dir)
+            .status()
+            .context("run dstack-cloud new — is dstack-cloud installed?")?;
+
+        if !status.success() {
+            bail!(
+                "dstack-cloud new exited with status {}",
+                status.code().unwrap_or(-1)
+            );
+        }
+        Ok(())
+    }
+
+    fn deploy(
+        &self,
+        compose_yaml: &str,
+        env_vars: &ProviderKeys,
+        boot_timeout_secs: u64,
+    ) -> Result<DstackDeployResult> {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write as _;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
 
         fs::create_dir_all(&self.project_dir)
             .with_context(|| format!("create project dir {}", self.project_dir.display()))?;
@@ -107,7 +166,8 @@ impl DstackClient for RealDstackClient {
         fs::write(&compose_path, compose_yaml)
             .with_context(|| format!("write {}", compose_path.display()))?;
 
-        // Write .env (mode 0600) with only the keys that are set.
+        // Write .env atomically at mode 0600 from creation — no window where
+        // the file is world-readable on shared hosts.
         let env_path = self.project_dir.join(".env");
         {
             let mut lines = String::new();
@@ -126,10 +186,26 @@ impl DstackClient for RealDstackClient {
                 lines.push_str(k);
                 lines.push('\n');
             }
-            fs::write(&env_path, &lines)
+
+            #[cfg(unix)]
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&env_path)
+                .with_context(|| format!("open {}", env_path.display()))?;
+
+            #[cfg(not(unix))]
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&env_path)
+                .with_context(|| format!("open {}", env_path.display()))?;
+
+            file.write_all(lines.as_bytes())
                 .with_context(|| format!("write {}", env_path.display()))?;
-            fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod 600 {}", env_path.display()))?;
         }
 
         // Run dstack-cloud deploy.
@@ -146,40 +222,65 @@ impl DstackClient for RealDstackClient {
             );
         }
 
-        // Read back hashes via `dstack-cloud status --json`.
-        let out = std::process::Command::new("dstack-cloud")
-            .args(["status", "--json"])
-            .current_dir(&self.project_dir)
-            .output()
-            .context("run dstack-cloud status --json")?;
+        // Poll `dstack-cloud status --json` until both hashes are populated.
+        // The CVM may take seconds to minutes to boot after deploy returns.
+        self.poll_status(boot_timeout_secs)
+    }
+}
 
-        if !out.status.success() {
-            bail!(
-                "dstack-cloud status --json failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+impl RealDstackClient {
+    /// Poll `dstack-cloud status --json` every [`POLL_INTERVAL_SECS`] seconds
+    /// until both `compose_sha256` and `os_image_hash` are non-empty, or until
+    /// `timeout_secs` elapses.
+    fn poll_status(&self, timeout_secs: u64) -> Result<DstackDeployResult> {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let poll = Duration::from_secs(POLL_INTERVAL_SECS);
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+            let out = std::process::Command::new("dstack-cloud")
+                .args(["status", "--json"])
+                .current_dir(&self.project_dir)
+                .output()
+                .context("run dstack-cloud status --json")?;
+
+            if !out.status.success() {
+                bail!(
+                    "dstack-cloud status --json failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+
+            let ds: DstackStatus = serde_json::from_slice(&out.stdout)
+                .context("parse dstack-cloud status --json output")?;
+
+            if let (Some(compose_sha256), Some(os_image_hash)) =
+                (ds.compose_sha256, ds.os_image_hash)
+            {
+                return Ok(DstackDeployResult {
+                    compose_sha256,
+                    os_image_hash,
+                });
+            }
+
+            // Hashes not yet populated — check deadline before sleeping.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "timed out after {timeout_secs}s waiting for the CVM to boot \
+                     (compose_sha256/os_image_hash never appeared in \
+                     `dstack-cloud status --json`); \
+                     increase --boot-timeout-secs or check the dstack-cloud console"
+                );
+            }
+
+            let sleep = remaining.min(poll);
+            tracing::debug!(attempt, ?sleep, "hashes not yet available; waiting");
+            std::thread::sleep(sleep);
         }
-
-        let ds: DstackStatus = serde_json::from_slice(&out.stdout)
-            .context("parse dstack-cloud status --json output")?;
-
-        let compose_sha256 = ds.compose_sha256.ok_or_else(|| {
-            anyhow::anyhow!(
-                "dstack-cloud status --json did not include compose_sha256; \
-                 try re-running after the instance boots"
-            )
-        })?;
-        let os_image_hash = ds.os_image_hash.ok_or_else(|| {
-            anyhow::anyhow!(
-                "dstack-cloud status --json did not include os_image_hash; \
-                 try re-running after the instance boots"
-            )
-        })?;
-
-        Ok(DstackDeployResult {
-            compose_sha256,
-            os_image_hash,
-        })
     }
 }
 

@@ -26,7 +26,7 @@ use gm_miner_cli::{
     config::{self, Config, ProviderKeys, TokenEntry},
     deploy::{
         fetch_supported_versions, format_created_at, render_compose, select_version, verify_hashes,
-        DstackClient, RealDstackClient, COMPOSE_TEMPLATE,
+        COMPOSE_TEMPLATE, DEFAULT_BOOT_TIMEOUT_SECS,
     },
     picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
@@ -78,6 +78,9 @@ enum Command {
     /// with `gm-miner set-api-keys`), fetches the registry-approved image
     /// version, deploys via dstack-cloud, verifies the actual hashes match the
     /// registry approval, then registers the image automatically.
+    ///
+    /// On a fresh machine (no prior deploy) this automatically runs
+    /// `dstack-cloud new` to scaffold the project before deploying.
     Deploy {
         /// Pinned image reference (registry/repo/name@sha256:...) to embed in
         /// the compose file.  If omitted, you must set `GM_IMAGE_REF` in env.
@@ -96,6 +99,11 @@ enum Command {
         /// Directory for dstack project state (`dist/<app_name>` by default).
         #[arg(long)]
         dist_dir: Option<std::path::PathBuf>,
+
+        /// How long to wait for the CVM to boot and populate hashes in
+        /// `dstack-cloud status --json` (seconds). Default: 300.
+        #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
+        boot_timeout_secs: u64,
     },
 
     /// Authenticate with Taostats (device-code OAuth flow) and store
@@ -209,6 +217,7 @@ async fn main() -> Result<()> {
             version,
             app_name,
             dist_dir,
+            boot_timeout_secs,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             let dist_root = dist_dir.unwrap_or_else(|| {
@@ -216,9 +225,18 @@ async fn main() -> Result<()> {
                 // from the repo root just as they do with deploy.sh).
                 std::path::PathBuf::from("dist")
             });
-            let dstack = RealDstackClient::new(&app_name, &dist_root);
+            let dstack = gm_miner_cli::deploy::RealDstackClient::new(&app_name, &dist_root);
             let mut client = RegistryClient::new(cfg.clone());
-            cmd_deploy(&cfg, &mut client, &dstack, &image_ref, version).await
+            cmd_deploy(
+                &cfg,
+                &mut client,
+                &dstack,
+                &app_name,
+                &image_ref,
+                version,
+                boot_timeout_secs,
+            )
+            .await
         }
         Command::Login {
             no_browser,
@@ -397,9 +415,11 @@ fn cmd_set_api_keys(
 async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
-    dstack: &dyn DstackClient,
+    dstack: &dyn gm_miner_cli::deploy::DstackClient,
+    app_name: &str,
     image_ref: &str,
     version_pin: Option<usize>,
+    boot_timeout_secs: u64,
 ) -> Result<()> {
     // Step 1: ensure provider keys are configured.
     let keys = cfg
@@ -429,17 +449,24 @@ async fn cmd_deploy(
     // Step 4: render the compose template with the pinned image ref.
     let rendered = render_compose(COMPOSE_TEMPLATE, image_ref)?;
 
-    // Step 5: deploy via dstack-cloud.
-    println!("Deploying via dstack-cloud ...");
-    let actual = dstack.deploy(&rendered, keys)?;
+    // Step 5: bootstrap the dstack project if this is a fresh machine
+    // (app.json absent means `dstack-cloud new` has never been run here).
+    if !dstack.is_bootstrapped() {
+        println!("No dstack project found; bootstrapping with `dstack-cloud new` ...");
+        dstack.bootstrap(app_name)?;
+    }
 
-    // Step 6: verify hashes.
+    // Step 6: deploy via dstack-cloud, polling until hashes appear.
+    println!("Deploying via dstack-cloud (boot timeout: {boot_timeout_secs}s) ...");
+    let actual = dstack.deploy(&rendered, keys, boot_timeout_secs)?;
+
+    // Step 7: verify hashes.
     println!("Verifying hashes against registry approval ...");
     verify_hashes(&actual, approved)?;
     println!("  compose_hash  : OK ({})", actual.compose_sha256);
     println!("  os_image_hash : OK ({})", actual.os_image_hash);
 
-    // Step 7: register the image.
+    // Step 8: register the image.
     println!("Registering image with the registry ...");
     cmd_register_image(client, &actual.compose_sha256, &actual.os_image_hash).await
 }

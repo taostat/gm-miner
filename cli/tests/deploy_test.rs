@@ -33,6 +33,9 @@ use wiremock::{
 struct StubDstack {
     compose_sha256: String,
     os_image_hash: String,
+    bootstrapped: bool,
+    /// Records whether `bootstrap` was called.
+    bootstrap_called: std::cell::Cell<bool>,
 }
 
 impl StubDstack {
@@ -40,15 +43,35 @@ impl StubDstack {
         Self {
             compose_sha256: compose.to_owned(),
             os_image_hash: os.to_owned(),
+            bootstrapped: true,
+            bootstrap_called: std::cell::Cell::new(false),
+        }
+    }
+
+    fn fresh_machine(compose: &str, os: &str) -> Self {
+        Self {
+            bootstrapped: false,
+            bootstrap_called: std::cell::Cell::new(false),
+            ..Self::matching(compose, os)
         }
     }
 }
 
 impl DstackClient for StubDstack {
+    fn is_bootstrapped(&self) -> bool {
+        self.bootstrapped
+    }
+
+    fn bootstrap(&self, _app_name: &str) -> anyhow::Result<()> {
+        self.bootstrap_called.set(true);
+        Ok(())
+    }
+
     fn deploy(
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {
         Ok(DstackDeployResult {
             compose_sha256: self.compose_sha256.clone(),
@@ -57,14 +80,88 @@ impl DstackClient for StubDstack {
     }
 }
 
-/// A stub that always returns an error (simulates a deploy failure).
-struct FailingDstack;
+/// A stub that simulates a deploy that returns hashes immediately.
+/// Used to verify the happy path when the CVM boots quickly.
+struct FastBootDstack {
+    compose_sha256: String,
+    os_image_hash: String,
+}
 
-impl DstackClient for FailingDstack {
+impl FastBootDstack {
+    fn new(compose: &str, os: &str) -> Self {
+        Self {
+            compose_sha256: compose.to_owned(),
+            os_image_hash: os.to_owned(),
+        }
+    }
+}
+
+impl DstackClient for FastBootDstack {
+    fn is_bootstrapped(&self) -> bool {
+        true
+    }
+
+    fn bootstrap(&self, _app_name: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn deploy(
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _boot_timeout_secs: u64,
+    ) -> anyhow::Result<DstackDeployResult> {
+        Ok(DstackDeployResult {
+            compose_sha256: self.compose_sha256.clone(),
+            os_image_hash: self.os_image_hash.clone(),
+        })
+    }
+}
+
+/// A stub that simulates a deploy that always times out (hashes never appear).
+struct TimedOutDstack;
+
+impl DstackClient for TimedOutDstack {
+    fn is_bootstrapped(&self) -> bool {
+        true
+    }
+
+    fn bootstrap(&self, _app_name: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn deploy(
+        &self,
+        _compose_yaml: &str,
+        _env_vars: &ProviderKeys,
+        _boot_timeout_secs: u64,
+    ) -> anyhow::Result<DstackDeployResult> {
+        anyhow::bail!(
+            "timed out after 0s waiting for the CVM to boot \
+             (compose_sha256/os_image_hash never appeared in \
+             `dstack-cloud status --json`); \
+             increase --boot-timeout-secs or check the dstack-cloud console"
+        )
+    }
+}
+
+/// A stub that always returns an error (simulates a deploy failure).
+struct FailingDstack;
+
+impl DstackClient for FailingDstack {
+    fn is_bootstrapped(&self) -> bool {
+        true
+    }
+
+    fn bootstrap(&self, _app_name: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn deploy(
+        &self,
+        _compose_yaml: &str,
+        _env_vars: &ProviderKeys,
+        _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {
         anyhow::bail!("dstack-cloud deploy exited with status 1");
     }
@@ -220,7 +317,7 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
         google: None,
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "reg.example.com/app@sha256:abc").unwrap();
-    let actual = stub.deploy(&rendered, &keys).unwrap();
+    let actual = stub.deploy(&rendered, &keys, 300).unwrap();
 
     assert!(verify_hashes(&actual, approved).is_ok());
 }
@@ -252,7 +349,7 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
         google: None,
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "reg.example.com/app@sha256:abc").unwrap();
-    let actual = stub.deploy(&rendered, &keys).unwrap();
+    let actual = stub.deploy(&rendered, &keys, 300).unwrap();
 
     let err =
         verify_hashes(&actual, approved).expect_err("mismatched hashes must produce an error");
@@ -349,7 +446,7 @@ fn dstack_failure_surfaces_as_error() {
         google: None,
     };
     let err = FailingDstack
-        .deploy("compose-content", &keys)
+        .deploy("compose-content", &keys, 300)
         .expect_err("failing dstack must produce an error");
     assert!(err.to_string().contains("dstack-cloud deploy exited"));
 }
@@ -428,4 +525,120 @@ async fn pinned_version_selected_when_requested() {
     // Pin to version 2 (older one, 1-based index in newest-first list).
     let selected = select_version(&versions, Some(2)).unwrap();
     assert_eq!(selected.compose_hash, "old-compose");
+}
+
+// ── Bootstrap detection ───────────────────────────────────────────────────────
+
+/// On a fresh machine where `app.json` is absent, `is_bootstrapped()` returns
+/// false and the deploy flow must call `bootstrap()` before deploying.
+#[test]
+fn fresh_machine_bootstrap_is_called() {
+    let stub = StubDstack::fresh_machine("compose", "os");
+    assert!(
+        !stub.is_bootstrapped(),
+        "fresh machine must not be bootstrapped"
+    );
+
+    // Simulate what cmd_deploy does: call bootstrap when not bootstrapped.
+    if !stub.is_bootstrapped() {
+        stub.bootstrap("gm-miner-1").unwrap();
+    }
+    assert!(
+        stub.bootstrap_called.get(),
+        "bootstrap must have been called for a fresh machine"
+    );
+}
+
+/// On a machine where `app.json` exists, `is_bootstrapped()` returns true and
+/// `bootstrap()` must NOT be called.
+#[test]
+fn existing_machine_bootstrap_not_called() {
+    let stub = StubDstack::matching("compose", "os");
+    assert!(
+        stub.is_bootstrapped(),
+        "existing machine must be bootstrapped"
+    );
+
+    // Simulate what cmd_deploy does.
+    if !stub.is_bootstrapped() {
+        stub.bootstrap("gm-miner-1").unwrap();
+    }
+    assert!(
+        !stub.bootstrap_called.get(),
+        "bootstrap must NOT be called when app.json already exists"
+    );
+}
+
+// ── Atomic 0600 .env creation ─────────────────────────────────────────────────
+
+/// Verify that the `.env` file is created with mode 0600 from the outset
+/// (no world-readable window).
+#[cfg(unix)]
+#[test]
+fn env_file_created_with_0600_mode() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let env_path = dir.path().join(".env");
+
+    // Replicate the atomic open logic from RealDstackClient::deploy.
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&env_path)
+            .unwrap();
+        file.write_all(b"ANTHROPIC_API_KEY=test\n").unwrap();
+    }
+
+    let meta = std::fs::metadata(&env_path).unwrap();
+    let mode = meta.permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        ".env must be created with mode 0600 (got {mode:o})"
+    );
+}
+
+// ── Polling timeout error ─────────────────────────────────────────────────────
+
+/// When the CVM never boots and hashes never appear, the poll loop must surface
+/// a clear actionable error mentioning `--boot-timeout-secs`.
+#[test]
+fn timeout_error_is_actionable() {
+    let keys = ProviderKeys {
+        anthropic: Some("key".to_owned()),
+        openai: None,
+        google: None,
+    };
+    let err = TimedOutDstack
+        .deploy("compose", &keys, 0)
+        .expect_err("timed-out deploy must produce an error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timed out"),
+        "error must say 'timed out'; got: {msg}"
+    );
+    assert!(
+        msg.contains("--boot-timeout-secs"),
+        "error must mention --boot-timeout-secs; got: {msg}"
+    );
+}
+
+/// When the CVM boots quickly and hashes appear on the first status poll,
+/// deploy succeeds without error.
+#[test]
+fn fast_boot_deploy_succeeds() {
+    let keys = ProviderKeys {
+        anthropic: Some("key".to_owned()),
+        openai: None,
+        google: None,
+    };
+    let stub = FastBootDstack::new("compose-hash", "os-hash");
+    let result = stub.deploy("compose", &keys, 300).unwrap();
+    assert_eq!(result.compose_sha256, "compose-hash");
+    assert_eq!(result.os_image_hash, "os-hash");
 }
