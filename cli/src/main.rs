@@ -398,7 +398,23 @@ async fn cmd_deploy_subcommand(
 ) -> Result<()> {
     // --dist-dir is the project directory used verbatim.
     // Default: dist/<app_name> relative to cwd (matches deploy.sh).
-    let project_dir = dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
+    let project_dir = if let Some(dir) = dist_dir {
+        // Validate that the basename of --dist-dir matches --app-name.
+        // `dstack-cloud new <app_name>` always creates `<cwd>/<app_name>/`, so
+        // if the two differ the bootstrapped directory and the one the rest of
+        // the code reads/patches are different paths and the deploy breaks.
+        let basename = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if basename != app_name {
+            bail!(
+                "dist-dir basename must equal app-name; \
+                 got dist-dir={}, app-name={app_name}",
+                dir.display()
+            );
+        }
+        dir
+    } else {
+        std::path::PathBuf::from("dist").join(&app_name)
+    };
 
     let bucket = gcs_bucket.unwrap_or_else(|| GcpConfig::default_bucket(&gcp_project));
     let gcp = GcpConfig {

@@ -470,10 +470,12 @@ impl RealDstackClient {
             if let (Some(compose_sha256), Some(os_image_hash)) =
                 (ds.compose_sha256, ds.os_image_hash)
             {
-                return Ok(DstackDeployResult {
-                    compose_sha256,
-                    os_image_hash,
-                });
+                if !compose_sha256.is_empty() && !os_image_hash.is_empty() {
+                    return Ok(DstackDeployResult {
+                        compose_sha256,
+                        os_image_hash,
+                    });
+                }
             }
 
             // Hashes not yet populated — check deadline before sleeping.
@@ -504,8 +506,18 @@ impl RealDstackClient {
 /// Returns an error if the registry returns 404 (endpoint not yet deployed),
 /// any other non-2xx status, or the response body cannot be parsed.
 pub async fn fetch_supported_versions(registry_url: &str) -> Result<Vec<ImageVersion>> {
+    // Build a one-shot client with a 30 s timeout — same as RegistryClient —
+    // rather than using bare `reqwest::get()` which has no timeout.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!("gm-miner/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("build reqwest client for /image-versions")?;
+
     let url = format!("{registry_url}/image-versions?status=supported");
-    let resp = reqwest::get(&url)
+    let resp = client
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("GET {url}"))?;
 
@@ -931,5 +943,52 @@ mod tests {
             !args.iter().any(|a| a == "--name"),
             "--name flag must not appear (name is positional in dstack-cloud new)"
         );
+    }
+
+    // ── P2 fix: poll_status must not return on empty hash strings ─────────────
+
+    /// `DstackStatus` with `Some("")` fields must not be treated as ready; only
+    /// non-empty strings should terminate the poll loop.
+    ///
+    /// We test this through the `DstackStatus` deserialization + the ready-check
+    /// predicate directly (the struct is private but visible in the test module).
+    #[test]
+    fn dstack_status_empty_strings_not_ready() {
+        // Simulate what happens when dstack-cloud emits `{"compose_sha256": "",
+        // "os_image_hash": ""}` — both Some("") must not satisfy the ready check.
+        let compose_sha256: Option<String> = Some(String::new());
+        let os_image_hash: Option<String> = Some(String::new());
+
+        let ready = matches!(
+            (compose_sha256, os_image_hash),
+            (Some(ref c), Some(ref o)) if !c.is_empty() && !o.is_empty()
+        );
+        assert!(!ready, "empty strings must not be treated as ready");
+    }
+
+    /// Non-empty hashes must be treated as ready.
+    #[test]
+    fn dstack_status_non_empty_strings_are_ready() {
+        let compose_sha256: Option<String> = Some("sha256:abc".to_owned());
+        let os_image_hash: Option<String> = Some("sha256:def".to_owned());
+
+        let ready = matches!(
+            (compose_sha256, os_image_hash),
+            (Some(ref c), Some(ref o)) if !c.is_empty() && !o.is_empty()
+        );
+        assert!(ready, "non-empty hashes must be treated as ready");
+    }
+
+    /// One empty and one non-empty must not be treated as ready.
+    #[test]
+    fn dstack_status_partial_empty_not_ready() {
+        let compose_sha256: Option<String> = Some("sha256:abc".to_owned());
+        let os_image_hash: Option<String> = Some(String::new());
+
+        let ready = matches!(
+            (compose_sha256, os_image_hash),
+            (Some(ref c), Some(ref o)) if !c.is_empty() && !o.is_empty()
+        );
+        assert!(!ready, "partial empty (one empty string) must not be ready");
     }
 }

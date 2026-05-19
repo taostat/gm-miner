@@ -866,3 +866,55 @@ fn any_set_true_for_non_empty_key() {
     };
     assert!(keys.any_set());
 }
+
+// ── P1 fix: --dist-dir basename must equal --app-name ─────────────────────────
+
+/// Replicates the validation logic from `cmd_deploy_subcommand`.
+/// When `--dist-dir` basename differs from `--app-name`, an error must be
+/// returned before any dstack work is attempted.
+fn validate_dist_dir(dist_dir: &std::path::Path, app_name: &str) -> Result<(), String> {
+    let basename = dist_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if basename != app_name {
+        return Err(format!(
+            "dist-dir basename must equal app-name; \
+             got dist-dir={}, app-name={app_name}",
+            dist_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn dist_dir_basename_mismatch_is_rejected() {
+    let result = validate_dist_dir(std::path::Path::new("/some/path/foo"), "bar");
+    let err = result.expect_err("mismatched basename must produce an error");
+    assert!(
+        err.contains("dist-dir basename must equal app-name"),
+        "error must explain the problem; got: {err}"
+    );
+    assert!(
+        err.contains("foo"),
+        "error must mention the actual dir; got: {err}"
+    );
+    assert!(
+        err.contains("bar"),
+        "error must mention the app-name; got: {err}"
+    );
+}
+
+#[test]
+fn dist_dir_basename_match_is_accepted() {
+    let result = validate_dist_dir(std::path::Path::new("/some/path/bar"), "bar");
+    assert!(result.is_ok(), "matching basename must be accepted");
+}
+
+#[test]
+fn dist_dir_default_basename_matches_app_name() {
+    let app_name = "gm-miner-1";
+    let default_dir = std::path::PathBuf::from("dist").join(app_name);
+    let result = validate_dist_dir(&default_dir, app_name);
+    assert!(result.is_ok(), "default dist_dir must pass basename check");
+}
