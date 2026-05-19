@@ -1,6 +1,9 @@
 //! gm-miner CLI.
 //!
 //! Subcommands:
+//!   set-api-keys    — persist provider API keys to ~/.gm-miner/config.json
+//!   deploy          — trust-correct single-shot deploy: fetch approved hashes,
+//!                     deploy via dstack-cloud, verify hashes, register image
 //!   login           — Taostats device-code OAuth flow
 //!   register-image  — register the miner image's compose hash with the registry
 //!   list-products   — show the registry product catalog
@@ -20,7 +23,11 @@ use clap::{Parser, Subcommand};
 use gm_miner_cli::{
     auth,
     client::RegistryClient,
-    config::{self, Config, TokenEntry},
+    config::{self, Config, ProviderKeys, TokenEntry},
+    deploy::{
+        fetch_supported_versions, format_created_at, render_compose, select_version, verify_hashes,
+        DstackClient, RealDstackClient, COMPOSE_TEMPLATE,
+    },
     picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
 };
@@ -47,6 +54,50 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Persist provider API keys to ~/.gm-miner/config.json (mode 0600).
+    ///
+    /// Each flag, if provided, replaces the stored value.  Omitted flags
+    /// leave existing values intact.  Key values are never echoed back.
+    SetApiKeys {
+        /// Anthropic API key (sk-ant-...).
+        #[arg(long)]
+        anthropic: Option<String>,
+
+        /// `OpenAI` API key (sk-...).
+        #[arg(long)]
+        openai: Option<String>,
+
+        /// Google API key.
+        #[arg(long)]
+        google: Option<String>,
+    },
+
+    /// Deploy the miner via dstack-cloud with trust-correct hash verification.
+    ///
+    /// Reads provider API keys from ~/.gm-miner/config.json (set them first
+    /// with `gm-miner set-api-keys`), fetches the registry-approved image
+    /// version, deploys via dstack-cloud, verifies the actual hashes match the
+    /// registry approval, then registers the image automatically.
+    Deploy {
+        /// Pinned image reference (registry/repo/name@sha256:...) to embed in
+        /// the compose file.  If omitted, you must set `GM_IMAGE_REF` in env.
+        #[arg(long, env = "GM_IMAGE_REF")]
+        image_ref: String,
+
+        /// Pin to a specific approved version by index (1 = newest).
+        /// Defaults to the newest supported version.
+        #[arg(long)]
+        version: Option<usize>,
+
+        /// dstack-cloud app name.
+        #[arg(long, default_value = "gm-miner-1")]
+        app_name: String,
+
+        /// Directory for dstack project state (`dist/<app_name>` by default).
+        #[arg(long)]
+        dist_dir: Option<std::path::PathBuf>,
+    },
+
     /// Authenticate with Taostats (device-code OAuth flow) and store
     /// credentials in ~/.gm-miner/config.json.
     Login {
@@ -60,14 +111,17 @@ enum Command {
     },
 
     /// Register this miner's image compose hash + capabilities with the registry.
-    /// Run once after deploying a new image version.
+    ///
+    /// The normal operator flow uses `gm-miner deploy` which verifies and
+    /// registers in one step.  Use this subcommand only for re-registering
+    /// without redeploying (e.g. after a registry resync or for debugging).
     RegisterImage {
         /// Docker compose SHA256 (output of sha256sum docker-compose.yaml).
-        #[arg(long)]
+        #[arg(long, hide = true)]
         compose_hash: String,
 
         /// dstack OS image hash (from dstack-cloud status or the deployment log).
-        #[arg(long)]
+        #[arg(long, hide = true)]
         os_image_hash: String,
     },
 
@@ -145,6 +199,27 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::SetApiKeys {
+            anthropic,
+            openai,
+            google,
+        } => cmd_set_api_keys(anthropic, openai, google),
+        Command::Deploy {
+            image_ref,
+            version,
+            app_name,
+            dist_dir,
+        } => {
+            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let dist_root = dist_dir.unwrap_or_else(|| {
+                // Default: <repo-root>/dist  (relative to cwd; operators run
+                // from the repo root just as they do with deploy.sh).
+                std::path::PathBuf::from("dist")
+            });
+            let dstack = RealDstackClient::new(&app_name, &dist_root);
+            let mut client = RegistryClient::new(cfg.clone());
+            cmd_deploy(&cfg, &mut client, &dstack, &image_ref, version).await
+        }
         Command::Login {
             no_browser,
             auth_url,
@@ -260,6 +335,114 @@ fn build_price_block(
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
+
+fn cmd_set_api_keys(
+    anthropic: Option<String>,
+    openai: Option<String>,
+    google: Option<String>,
+) -> Result<()> {
+    let mut cfg = config::load()
+        .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
+
+    {
+        let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
+        if let Some(k) = anthropic {
+            keys.anthropic = Some(k);
+        }
+        if let Some(k) = openai {
+            keys.openai = Some(k);
+        }
+        if let Some(k) = google {
+            keys.google = Some(k);
+        }
+    }
+
+    // Snapshot which keys are set before saving (only immutable borrow needed).
+    let (has_anthropic, has_openai, has_google) =
+        cfg.provider_keys
+            .as_ref()
+            .map_or((false, false, false), |k| {
+                (
+                    k.anthropic.is_some(),
+                    k.openai.is_some(),
+                    k.google.is_some(),
+                )
+            });
+
+    config::save(&cfg).context("save config")?;
+
+    let mut set_names: Vec<&str> = Vec::new();
+    if has_anthropic {
+        set_names.push("anthropic");
+    }
+    if has_openai {
+        set_names.push("openai");
+    }
+    if has_google {
+        set_names.push("google");
+    }
+
+    // Report which providers are now configured — never print the values.
+    if set_names.is_empty() {
+        println!("No keys stored (pass --anthropic, --openai, or --google to set one).");
+    } else {
+        println!("Provider keys updated.");
+        for name in &set_names {
+            println!("  {name}: set");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_deploy(
+    cfg: &Config,
+    client: &mut RegistryClient,
+    dstack: &dyn DstackClient,
+    image_ref: &str,
+    version_pin: Option<usize>,
+) -> Result<()> {
+    // Step 1: ensure provider keys are configured.
+    let keys = cfg
+        .provider_keys
+        .as_ref()
+        .filter(|k| k.any_set())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no provider keys; run `gm-miner set-api-keys \
+                 --anthropic <key>` (and/or --openai / --google) first"
+            )
+        })?;
+
+    // Step 2: fetch approved image versions from the registry.
+    let registry_url = cfg.api_url();
+    println!("Fetching approved image versions from {registry_url} ...");
+    let versions = fetch_supported_versions(&registry_url).await?;
+
+    // Step 3: select the target version.
+    let approved = select_version(&versions, version_pin)?;
+    println!(
+        "Selected version {}  ({})",
+        approved.notes.as_deref().unwrap_or("<no notes>"),
+        format_created_at(&approved.created_at),
+    );
+
+    // Step 4: render the compose template with the pinned image ref.
+    let rendered = render_compose(COMPOSE_TEMPLATE, image_ref)?;
+
+    // Step 5: deploy via dstack-cloud.
+    println!("Deploying via dstack-cloud ...");
+    let actual = dstack.deploy(&rendered, keys)?;
+
+    // Step 6: verify hashes.
+    println!("Verifying hashes against registry approval ...");
+    verify_hashes(&actual, approved)?;
+    println!("  compose_hash  : OK ({})", actual.compose_sha256);
+    println!("  os_image_hash : OK ({})", actual.os_image_hash);
+
+    // Step 7: register the image.
+    println!("Registering image with the registry ...");
+    cmd_register_image(client, &actual.compose_sha256, &actual.os_image_hash).await
+}
 
 async fn cmd_login(
     testnet: bool,

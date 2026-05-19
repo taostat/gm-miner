@@ -54,3 +54,4 @@ open         = "5"
 [dev-dependencies]
 wiremock     = "0.6"
 tokio        = { workspace = true }
+tempfile     = "3"
