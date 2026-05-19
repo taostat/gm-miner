@@ -21,6 +21,93 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderKeys;
 
+// ── GCP configuration ─────────────────────────────────────────────────────────
+
+/// GCP-specific fields written into `app.json` after `dstack-cloud new`.
+///
+/// The deploy.sh script patches `gcp_config` in app.json between bootstrap
+/// and deploy so that `dstack-cloud deploy` has a valid GCS upload target and
+/// can provision the correct machine type/zone on fresh machines.
+///
+/// Fields mirror those used by the reference `dstack/deploy.sh`:
+/// - `project` — GCP project ID
+/// - `zone` — GCP zone (e.g. `us-central1-a`)
+/// - `machine_type` — Compute Engine machine type (e.g. `c3-standard-4`)
+/// - `instance_name` — Compute Engine instance name (matches the app name)
+/// - `bucket` — GCS bucket URI for dstack image upload (e.g. `gs://<project>-dstack`)
+#[derive(Debug, Clone)]
+pub struct GcpConfig {
+    pub project: String,
+    pub zone: String,
+    pub machine_type: String,
+    pub instance_name: String,
+    pub bucket: String,
+}
+
+impl GcpConfig {
+    /// Derive a GCS bucket name from the GCP project ID using the same
+    /// convention as `deploy.sh`: `gs://<project>-dstack`.
+    #[must_use]
+    pub fn default_bucket(project: &str) -> String {
+        format!("gs://{project}-dstack")
+    }
+}
+
+/// Patch `gcp_config` fields in the `app.json` file written by `dstack-cloud new`.
+///
+/// `dstack-cloud new` seeds `gcp_config.bucket` (and other fields) from the
+/// global `~/.config/dstack-cloud/config.json`, which is often empty or
+/// stale on a fresh machine.  This function writes the deploy-time values so
+/// `dstack-cloud deploy` has a valid upload target.
+///
+/// Matches the python patch in `dstack/deploy.sh` (both fresh and re-deploy
+/// paths): always writes `project`, `zone`, `machine_type`, `instance_name`,
+/// and `bucket`.
+///
+/// # Errors
+/// Returns an error if the file cannot be read, parsed, or written.
+pub fn patch_app_json(app_json_path: &std::path::Path, gcp: &GcpConfig) -> Result<()> {
+    let raw = std::fs::read_to_string(app_json_path)
+        .with_context(|| format!("read {}", app_json_path.display()))?;
+
+    let mut app: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", app_json_path.display()))?;
+
+    let gcp_obj = app
+        .as_object_mut()
+        .context("app.json root is not an object")?
+        .entry("gcp_config")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    let map = gcp_obj
+        .as_object_mut()
+        .context("app.json gcp_config is not an object")?;
+
+    map.insert(
+        "project".into(),
+        serde_json::Value::String(gcp.project.clone()),
+    );
+    map.insert("zone".into(), serde_json::Value::String(gcp.zone.clone()));
+    map.insert(
+        "machine_type".into(),
+        serde_json::Value::String(gcp.machine_type.clone()),
+    );
+    map.insert(
+        "instance_name".into(),
+        serde_json::Value::String(gcp.instance_name.clone()),
+    );
+    map.insert(
+        "bucket".into(),
+        serde_json::Value::String(gcp.bucket.clone()),
+    );
+
+    let patched = serde_json::to_string_pretty(&app).context("re-serialize app.json")?;
+    std::fs::write(app_json_path, patched)
+        .with_context(|| format!("write {}", app_json_path.display()))?;
+
+    Ok(())
+}
+
 /// Default poll interval when waiting for the CVM to boot (seconds).
 pub const POLL_INTERVAL_SECS: u64 = 5;
 /// Default maximum time to wait for hashes to appear after deploy (seconds).
@@ -62,12 +149,27 @@ pub struct DstackDeployResult {
 /// implementation returns pre-canned values without touching the filesystem.
 pub trait DstackClient {
     /// Bootstrap a new dstack project in the project directory by running
-    /// `dstack-cloud new --name <app_name>`. Only called when `app.json` is
-    /// absent (i.e. on a fresh machine with no prior deploy).
+    /// `dstack-cloud new --name <app_name>`, then patch `app.json` with
+    /// `gcp` so `dstack-cloud deploy` has a valid GCS upload target and
+    /// machine configuration on a fresh machine.
+    ///
+    /// Only called when `app.json` is absent (i.e. on a fresh machine with
+    /// no prior deploy).
     ///
     /// # Errors
-    /// Returns an error if `dstack-cloud new` fails.
-    fn bootstrap(&self, app_name: &str) -> Result<()>;
+    /// Returns an error if `dstack-cloud new` fails or `app.json` cannot
+    /// be patched.
+    fn bootstrap(&self, app_name: &str, gcp: &GcpConfig) -> Result<()>;
+
+    /// Patch `gcp_config` fields in an existing `app.json` (re-deploy path).
+    ///
+    /// Called when the project is already bootstrapped to keep GCP coordinates
+    /// current (project, zone, `machine_type`, bucket) without clobbering the
+    /// `app_id` / `instance_id_seed` that dstack uses to identify the CVM.
+    ///
+    /// # Errors
+    /// Returns an error if `app.json` cannot be read or written.
+    fn refresh_gcp_config(&self, gcp: &GcpConfig) -> Result<()>;
 
     /// Returns true if the project directory already contains `app.json`,
     /// meaning the dstack project has already been bootstrapped.
@@ -76,7 +178,9 @@ pub trait DstackClient {
     /// Deploy and return the compose + OS image hashes that dstack-cloud
     /// actually used. `compose_yaml` is the rendered compose file content;
     /// `env_vars` are the operator's provider API keys to pass via dstack's
-    /// encrypted env upload. `boot_timeout_secs` controls how long to poll
+    /// encrypted env upload. `gcp` is used to refresh `gcp_config` in
+    /// `app.json` before calling `dstack-cloud deploy` (both fresh and
+    /// re-deploy paths). `boot_timeout_secs` controls how long to poll
     /// for hashes before giving up.
     ///
     /// # Errors
@@ -86,6 +190,7 @@ pub trait DstackClient {
         &self,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
+        gcp: &GcpConfig,
         boot_timeout_secs: u64,
     ) -> Result<DstackDeployResult>;
 }
@@ -126,7 +231,7 @@ impl DstackClient for RealDstackClient {
         self.project_dir.join("app.json").exists()
     }
 
-    fn bootstrap(&self, _hint_app_name: &str) -> Result<()> {
+    fn bootstrap(&self, _hint_app_name: &str, gcp: &GcpConfig) -> Result<()> {
         // Use the app name this client was constructed with; the hint is for
         // test stubs that don't store state.
         std::fs::create_dir_all(&self.project_dir)
@@ -144,30 +249,53 @@ impl DstackClient for RealDstackClient {
                 status.code().unwrap_or(-1)
             );
         }
+
+        // Patch gcp_config immediately after bootstrap: `dstack-cloud new`
+        // seeds bucket/project from the global config, which is often empty
+        // on a fresh machine. Without this, `dstack-cloud deploy` fails to
+        // find the GCS upload target.
+        let app_json = self.project_dir.join("app.json");
+        patch_app_json(&app_json, gcp)
+            .with_context(|| format!("patch gcp_config in {}", app_json.display()))?;
+
         Ok(())
+    }
+
+    fn refresh_gcp_config(&self, gcp: &GcpConfig) -> Result<()> {
+        let app_json = self.project_dir.join("app.json");
+        patch_app_json(&app_json, gcp)
+            .with_context(|| format!("refresh gcp_config in {}", app_json.display()))
     }
 
     fn deploy(
         &self,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
+        gcp: &GcpConfig,
         boot_timeout_secs: u64,
     ) -> Result<DstackDeployResult> {
         use std::fs;
         use std::io::Write as _;
         #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         fs::create_dir_all(&self.project_dir)
             .with_context(|| format!("create project dir {}", self.project_dir.display()))?;
+
+        // Refresh gcp_config on every deploy (both fresh and re-deploy paths).
+        // On a fresh machine this runs after bootstrap has already written the
+        // file; on re-deploy it keeps project/zone/bucket current without
+        // touching app_id / instance_id_seed.
+        self.refresh_gcp_config(gcp)?;
 
         // Write the rendered compose file.
         let compose_path = self.project_dir.join("docker-compose.yaml");
         fs::write(&compose_path, compose_yaml)
             .with_context(|| format!("write {}", compose_path.display()))?;
 
-        // Write .env atomically at mode 0600 from creation — no window where
-        // the file is world-readable on shared hosts.
+        // Write .env via a temp-file-then-rename so the target file is always
+        // at mode 0600 from the moment it exists — no window where a partially-
+        // written or broader-permission file is present on disk.
         let env_path = self.project_dir.join(".env");
         {
             let mut lines = String::new();
@@ -187,25 +315,44 @@ impl DstackClient for RealDstackClient {
                 lines.push('\n');
             }
 
+            // Write to a sibling temp file first, then atomically rename over
+            // the target. The temp file is created at 0600 from the start, so
+            // the target is never visible with broader permissions during
+            // an overwrite.
+            let tmp_path = self.project_dir.join(".env.tmp");
+
             #[cfg(unix)]
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&env_path)
-                .with_context(|| format!("open {}", env_path.display()))?;
+            {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .with_context(|| format!("open {}", tmp_path.display()))?;
+                file.write_all(lines.as_bytes())
+                    .with_context(|| format!("write {}", tmp_path.display()))?;
+                // Explicit set_permissions ensures 0600 even if umask is
+                // permissive and the file somehow already existed.
+                fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("chmod 600 {}", tmp_path.display()))?;
+            }
 
             #[cfg(not(unix))]
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&env_path)
-                .with_context(|| format!("open {}", env_path.display()))?;
+            {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp_path)
+                    .with_context(|| format!("open {}", tmp_path.display()))?;
+                file.write_all(lines.as_bytes())
+                    .with_context(|| format!("write {}", tmp_path.display()))?;
+            }
 
-            file.write_all(lines.as_bytes())
-                .with_context(|| format!("write {}", env_path.display()))?;
+            fs::rename(&tmp_path, &env_path).with_context(|| {
+                format!("rename {} -> {}", tmp_path.display(), env_path.display())
+            })?;
         }
 
         // Run dstack-cloud deploy.

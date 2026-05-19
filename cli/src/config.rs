@@ -58,10 +58,15 @@ pub struct ProviderKeys {
 }
 
 impl ProviderKeys {
-    /// Returns true if at least one key is set.
+    /// Returns true if at least one key is set to a non-empty, non-whitespace value.
+    ///
+    /// `Some("")` and `Some("  ")` are treated as not set so that accidental
+    /// empty-string assignments (e.g. from an unset shell variable) don't
+    /// silently pass the deploy preflight check.
     #[must_use]
     pub fn any_set(&self) -> bool {
-        self.anthropic.is_some() || self.openai.is_some() || self.google.is_some()
+        let non_empty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+        non_empty(&self.anthropic) || non_empty(&self.openai) || non_empty(&self.google)
     }
 }
 

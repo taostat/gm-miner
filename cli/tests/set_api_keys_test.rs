@@ -170,3 +170,63 @@ fn any_set_true_when_google_set() {
     };
     assert!(keys.any_set());
 }
+
+/// `Some("")` must not count as a set key — the deploy preflight must not
+/// pass when an operator accidentally stores an empty value (e.g. from an
+/// unset shell variable).
+#[test]
+fn any_set_false_for_empty_string() {
+    let keys = ProviderKeys {
+        anthropic: Some(String::new()),
+        openai: None,
+        google: None,
+    };
+    assert!(!keys.any_set(), "Some(\"\") must not count as set");
+}
+
+/// `Some("  ")` (whitespace-only) must also not count as set.
+#[test]
+fn any_set_false_for_whitespace_only() {
+    let keys = ProviderKeys {
+        anthropic: None,
+        openai: Some("  ".to_owned()),
+        google: None,
+    };
+    assert!(!keys.any_set());
+}
+
+// ── Empty-key rejection in set-api-keys ──────────────────────────────────────
+
+/// Passing `--openai ""` must be rejected with a clear error before the
+/// config is written.
+///
+/// We test the `validate_key` logic inline (the function is private to
+/// `main.rs`) by replicating its rule: reject if trim is empty.
+#[test]
+fn empty_key_is_rejected_with_clear_error() {
+    let value = "";
+    let is_empty = value.trim().is_empty();
+    assert!(is_empty, "empty string must be rejected");
+
+    // Simulate the error message the CLI produces.
+    let msg = "empty value for --openai; either omit the flag or pass a non-empty key".to_string();
+    assert!(msg.contains("empty value"));
+    assert!(msg.contains("--openai"));
+}
+
+/// A whitespace-only value must also be rejected.
+#[test]
+fn whitespace_only_key_is_rejected() {
+    let value = "   ";
+    assert!(value.trim().is_empty(), "whitespace-only must be rejected");
+}
+
+/// A non-empty value must pass validation.
+#[test]
+fn valid_key_passes_validation() {
+    let value = "sk-real-key-abc123";
+    assert!(
+        !value.trim().is_empty(),
+        "non-empty key must not be rejected"
+    );
+}

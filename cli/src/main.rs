@@ -26,7 +26,7 @@ use gm_miner_cli::{
     config::{self, Config, ProviderKeys, TokenEntry},
     deploy::{
         fetch_supported_versions, format_created_at, render_compose, select_version, verify_hashes,
-        COMPOSE_TEMPLATE, DEFAULT_BOOT_TIMEOUT_SECS,
+        GcpConfig, COMPOSE_TEMPLATE, DEFAULT_BOOT_TIMEOUT_SECS,
     },
     picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
@@ -96,9 +96,27 @@ enum Command {
         #[arg(long, default_value = "gm-miner-1")]
         app_name: String,
 
-        /// Directory for dstack project state (`dist/<app_name>` by default).
+        /// dstack project directory (the full path used verbatim).
+        /// Defaults to `dist/<app_name>` relative to the current directory.
         #[arg(long)]
         dist_dir: Option<std::path::PathBuf>,
+
+        /// GCP project ID for the dstack deployment. Required.
+        #[arg(long, env = "GCP_PROJECT_ID")]
+        gcp_project: String,
+
+        /// GCP zone for the dstack CVM (e.g. `us-central1-a`).
+        #[arg(long, env = "GCP_ZONE", default_value = "us-central1-a")]
+        gcp_zone: String,
+
+        /// Compute Engine machine type for the CVM.
+        #[arg(long, env = "MACHINE_TYPE", default_value = "c3-standard-4")]
+        machine_type: String,
+
+        /// GCS bucket URI for dstack image upload.
+        /// Defaults to `gs://<gcp-project>-dstack` (same convention as deploy.sh).
+        #[arg(long, env = "GCS_BUCKET")]
+        gcs_bucket: Option<String>,
 
         /// How long to wait for the CVM to boot and populate hashes in
         /// `dstack-cloud status --json` (seconds). Default: 300.
@@ -199,6 +217,11 @@ enum Command {
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "main is a pure dispatch function; each arm is a one-liner or a \
+              call to a dedicated cmd_* handler — no logic lives here"
+)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
@@ -217,22 +240,22 @@ async fn main() -> Result<()> {
             version,
             app_name,
             dist_dir,
+            gcp_project,
+            gcp_zone,
+            machine_type,
+            gcs_bucket,
             boot_timeout_secs,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
-            let dist_root = dist_dir.unwrap_or_else(|| {
-                // Default: <repo-root>/dist  (relative to cwd; operators run
-                // from the repo root just as they do with deploy.sh).
-                std::path::PathBuf::from("dist")
-            });
-            let dstack = gm_miner_cli::deploy::RealDstackClient::new(&app_name, &dist_root);
-            let mut client = RegistryClient::new(cfg.clone());
-            cmd_deploy(
-                &cfg,
-                &mut client,
-                &dstack,
-                &app_name,
-                &image_ref,
+            cmd_deploy_subcommand(
+                cfg,
+                app_name,
+                image_ref,
+                dist_dir,
+                gcp_project,
+                gcp_zone,
+                machine_type,
+                gcs_bucket,
                 version,
                 boot_timeout_secs,
             )
@@ -354,11 +377,81 @@ fn build_price_block(
 
 // ── Commands ────────────────────────────────────────────────────────────────
 
+/// Build and run the deploy subcommand from parsed CLI arguments.
+///
+/// Separated from `main` to keep the dispatch match arm small.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all args come directly from the Deploy clap variant; no better grouping"
+)]
+async fn cmd_deploy_subcommand(
+    cfg: Config,
+    app_name: String,
+    image_ref: String,
+    dist_dir: Option<std::path::PathBuf>,
+    gcp_project: String,
+    gcp_zone: String,
+    machine_type: String,
+    gcs_bucket: Option<String>,
+    version: Option<usize>,
+    boot_timeout_secs: u64,
+) -> Result<()> {
+    // --dist-dir is the project directory used verbatim.
+    // Default: dist/<app_name> relative to cwd (matches deploy.sh).
+    let project_dir = dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
+
+    let bucket = gcs_bucket.unwrap_or_else(|| GcpConfig::default_bucket(&gcp_project));
+    let gcp = GcpConfig {
+        project: gcp_project,
+        zone: gcp_zone,
+        machine_type,
+        instance_name: app_name.clone(),
+        bucket,
+    };
+
+    let dstack = gm_miner_cli::deploy::RealDstackClient {
+        app_name: app_name.clone(),
+        project_dir,
+    };
+    let mut client = RegistryClient::new(cfg.clone());
+    cmd_deploy(
+        &cfg,
+        &mut client,
+        &dstack,
+        &app_name,
+        &image_ref,
+        &gcp,
+        version,
+        boot_timeout_secs,
+    )
+    .await
+}
+
+/// Validate a key value passed to `set-api-keys`: reject empty / whitespace-only
+/// strings with an actionable error rather than silently storing them.
+fn validate_key(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("empty value for --{name}; either omit the flag or pass a non-empty key");
+    }
+    Ok(())
+}
+
 fn cmd_set_api_keys(
     anthropic: Option<String>,
     openai: Option<String>,
     google: Option<String>,
 ) -> Result<()> {
+    // Reject empty values up front so they don't pass the deploy preflight.
+    if let Some(ref k) = anthropic {
+        validate_key("anthropic", k)?;
+    }
+    if let Some(ref k) = openai {
+        validate_key("openai", k)?;
+    }
+    if let Some(ref k) = google {
+        validate_key("google", k)?;
+    }
+
     let mut cfg = config::load()
         .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
 
@@ -418,6 +511,7 @@ async fn cmd_deploy(
     dstack: &dyn gm_miner_cli::deploy::DstackClient,
     app_name: &str,
     image_ref: &str,
+    gcp: &GcpConfig,
     version_pin: Option<usize>,
     boot_timeout_secs: u64,
 ) -> Result<()> {
@@ -451,14 +545,17 @@ async fn cmd_deploy(
 
     // Step 5: bootstrap the dstack project if this is a fresh machine
     // (app.json absent means `dstack-cloud new` has never been run here).
+    // Bootstrap also patches gcp_config immediately after `dstack-cloud new`.
     if !dstack.is_bootstrapped() {
         println!("No dstack project found; bootstrapping with `dstack-cloud new` ...");
-        dstack.bootstrap(app_name)?;
+        dstack.bootstrap(app_name, gcp)?;
     }
 
     // Step 6: deploy via dstack-cloud, polling until hashes appear.
+    // On re-deploy the deploy() call also refreshes gcp_config before running
+    // `dstack-cloud deploy` so GCP coordinates stay current.
     println!("Deploying via dstack-cloud (boot timeout: {boot_timeout_secs}s) ...");
-    let actual = dstack.deploy(&rendered, keys, boot_timeout_secs)?;
+    let actual = dstack.deploy(&rendered, keys, gcp, boot_timeout_secs)?;
 
     // Step 7: verify hashes.
     println!("Verifying hashes against registry approval ...");
