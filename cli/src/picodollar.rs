@@ -97,11 +97,11 @@ pub fn usd_per_mtok_to_pdollars(input: &str) -> Result<u64> {
         );
     }
 
-    // Concatenate integer + 12 fractional digits and parse as a u64.
-    // `trim_start_matches('0')` keeps the parse fast for long strings and
-    // a fully-zero value parses correctly as the empty-string fallback.
-    let mut digits = String::with_capacity(int_part.len() + PICO_DECIMALS);
-    digits.push_str(int_part.trim_start_matches('0'));
+    // Concatenate the leading-zero-trimmed integer digits + 12 fractional
+    // digits and parse as a u64. A fully-zero value trims to the empty
+    // string and is handled by the fallback below.
+    let mut digits = String::with_capacity(int_digits.len() + PICO_DECIMALS);
+    digits.push_str(int_digits);
     digits.push_str(&frac);
     let digits = digits.trim_start_matches('0');
     if digits.is_empty() {
