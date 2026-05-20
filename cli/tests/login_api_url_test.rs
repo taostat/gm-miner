@@ -40,9 +40,9 @@ fn resolve_api_url(cfg: &Config, override_url: Option<&str>, testnet: bool) -> S
         })
         .unwrap_or_else(|| {
             if testnet {
-                "https://api-testnet.gm.taostats.io".to_string()
+                "https://test-gm-registry.taostats.io".to_string()
             } else {
-                "https://api.gm.taostats.io".to_string()
+                "https://gm-registry.taostats.io".to_string()
             }
         })
 }
@@ -65,14 +65,14 @@ fn absent_override_keeps_stored_value() {
 fn absent_override_and_no_stored_value_uses_mainnet_default() {
     let cfg = Config::default();
     let resolved = resolve_api_url(&cfg, None, false);
-    assert_eq!(resolved, "https://api.gm.taostats.io");
+    assert_eq!(resolved, "https://gm-registry.taostats.io");
 }
 
 #[test]
 fn absent_override_and_no_stored_value_uses_testnet_default() {
     let cfg = Config::default();
     let resolved = resolve_api_url(&cfg, None, true);
-    assert_eq!(resolved, "https://api-testnet.gm.taostats.io");
+    assert_eq!(resolved, "https://test-gm-registry.taostats.io");
 }
 
 // ── Persistence contract ─────────────────────────────────────────────────────
