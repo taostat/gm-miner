@@ -25,8 +25,8 @@ use gm_miner_cli::{
     client::RegistryClient,
     config::{self, Config, ProviderKeys, TokenEntry},
     deploy::{
-        fetch_supported_versions, format_created_at, render_compose, select_version, verify_hashes,
-        DstackClient, GcpConfig, COMPOSE_TEMPLATE, DEFAULT_BOOT_TIMEOUT_SECS,
+        fetch_supported_versions, format_created_at, prepare_deploy_target, select_version,
+        verify_hashes, DstackClient, GcpConfig, ImageProvisioner, DEFAULT_BOOT_TIMEOUT_SECS,
     },
     picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
@@ -413,6 +413,16 @@ fn build_price_block(
     })
 }
 
+/// Extract a human-readable error detail from a registry JSON error body.
+///
+/// Returns the `detail` string field if present, otherwise the whole body
+/// re-serialized. Avoids leaking a `'static str` on every error path.
+fn error_detail(json: &serde_json::Value) -> String {
+    json.get("detail")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| json.to_string(), str::to_owned)
+}
+
 // ── Commands ────────────────────────────────────────────────────────────────
 
 /// Parsed `gm-miner deploy` arguments, grouped so the dispatch match arm
@@ -490,7 +500,8 @@ async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
     cmd_deploy(&cfg, &mut client, &dstack, &args, &gcp).await
 }
 
-/// Provision GCP infrastructure and obtain the digest-pinned image ref.
+/// Real [`ImageProvisioner`]: provisions GCP infrastructure and obtains the
+/// digest-pinned image ref via `gcloud` / `docker`.
 ///
 /// When `args.image_ref` is supplied only `gcloud` is preflighted; the
 /// Artifact Registry setup and Docker steps are skipped entirely (the
@@ -501,44 +512,54 @@ async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
 /// both `gcloud` and `docker`, `gcloud` project / services / bucket /
 /// Artifact-Registry setup, Docker auth, image build + push, and digest
 /// resolution.
-fn provision_and_build_image(args: &DeployArgs, gcp: &GcpConfig) -> Result<String> {
-    use gm_miner_cli::gcp as gcp_provision;
+struct GcpImageProvisioner<'a> {
+    args: &'a DeployArgs,
+    gcp: &'a GcpConfig,
+}
 
-    // Configure the GCP project + service APIs regardless of whether we
-    // build locally — `dstack-cloud deploy` needs compute / storage /
-    // confidentialcomputing enabled and the GCS bucket present.
-    println!("Provisioning GCP project {} ...", args.gcp_project);
-    if let Some(pre_built) = &args.image_ref {
-        // Pre-built image: only gcloud is needed (no Docker, no AR repo).
-        gcp_provision::preflight_gcloud()?;
+impl ImageProvisioner for GcpImageProvisioner<'_> {
+    fn provision(&self) -> Result<String> {
+        use gm_miner_cli::gcp as gcp_provision;
+
+        let args = self.args;
+        let gcp = self.gcp;
+
+        // Configure the GCP project + service APIs regardless of whether we
+        // build locally — `dstack-cloud deploy` needs compute / storage /
+        // confidentialcomputing enabled and the GCS bucket present.
+        println!("Provisioning GCP project {} ...", args.gcp_project);
+        if let Some(pre_built) = &args.image_ref {
+            // Pre-built image: only gcloud is needed (no Docker, no AR repo).
+            gcp_provision::preflight_gcloud()?;
+            gcp_provision::configure_project(&args.gcp_project)?;
+            gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
+            println!("Using pre-built image ref (skipping local build): {pre_built}");
+            return Ok(pre_built.clone());
+        }
+
+        // Local-build path: preflight both gcloud and docker, set up AR.
+        gcp_provision::preflight_tools()?;
         gcp_provision::configure_project(&args.gcp_project)?;
         gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
-        println!("Using pre-built image ref (skipping local build): {pre_built}");
-        return Ok(pre_built.clone());
+        gcp_provision::ensure_artifact_registry(&args.ar_repo, &args.gcp_region)?;
+
+        let repo_root = args
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let coords = gcp_provision::ImageCoordinates::derive(
+            &args.gcp_region,
+            &args.gcp_project,
+            &args.ar_repo,
+            &args.app_name,
+            &args.image_tag,
+        );
+        gcp_provision::configure_docker_auth(&coords.ar_host)?;
+
+        let image_version = git_short_sha(&repo_root);
+        println!("Building and pushing the miner image ...");
+        gcp_provision::build_and_push_image(&coords, &args.app_name, &image_version, &repo_root)
     }
-
-    // Local-build path: preflight both gcloud and docker, set up AR.
-    gcp_provision::preflight_tools()?;
-    gcp_provision::configure_project(&args.gcp_project)?;
-    gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
-    gcp_provision::ensure_artifact_registry(&args.ar_repo, &args.gcp_region)?;
-
-    let repo_root = args
-        .repo_root
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let coords = gcp_provision::ImageCoordinates::derive(
-        &args.gcp_region,
-        &args.gcp_project,
-        &args.ar_repo,
-        &args.app_name,
-        &args.image_tag,
-    );
-    gcp_provision::configure_docker_auth(&coords.ar_host)?;
-
-    let image_version = git_short_sha(&repo_root);
-    println!("Building and pushing the miner image ...");
-    gcp_provision::build_and_push_image(&coords, &args.app_name, &image_version, &repo_root)
 }
 
 /// Resolve the short git commit SHA of `repo_root` for the image version,
@@ -673,37 +694,14 @@ async fn cmd_deploy(
         format_created_at(&approved.created_at),
     );
 
-    // Step 5: provision GCP infrastructure (project, services, bucket,
-    // Artifact Registry) and obtain the digest-pinned image ref — either
-    // by building + pushing the miner image locally or by using a
-    // pre-built `--image-ref`. Mirrors the infra half of deploy.sh.
-    let image_ref = provision_and_build_image(args, gcp)?;
-
-    // Step 6: render the compose template with the pinned image ref.
-    let rendered = render_compose(COMPOSE_TEMPLATE, &image_ref)?;
-
-    // Step 7: bootstrap the dstack project if this is a fresh machine
-    // (app.json absent means `dstack-cloud new` has never been run here).
-    // Bootstrap also patches gcp_config immediately after `dstack-cloud new`.
-    if dstack.is_bootstrapped() {
-        // Re-deploy path: an app.json is already on disk. Validate its
-        // trust-critical fields (key_provider / gateway_enabled / kms_url)
-        // before treating it as the deploy target — it could be stale or
-        // tampered with. A freshly scaffolded project skips this because
-        // `dstack-cloud new` writes a trust-correct file by construction.
-        println!("Validating trust fields of the existing app.json ...");
-        dstack.validate_existing_trust()?;
-    } else {
-        println!("No dstack project found; bootstrapping with `dstack-cloud new` ...");
-        gm_miner_cli::deploy::ensure_dstack_global_config()?;
-        dstack.bootstrap(&args.app_name, gcp)?;
-        // Validate the freshly-scaffolded app.json. `dstack-cloud new` reads
-        // KMS/gateway URLs from ~/.config/dstack-cloud/config.json; if that
-        // global config is stale or tampered, the scaffolded file may already
-        // point at the wrong KMS URL. Treat it exactly like a re-deploy.
-        println!("Validating trust fields of the fresh app.json ...");
-        dstack.validate_existing_trust()?;
-    }
+    // Steps 5-7: prepare the deploy target. The dstack project is
+    // bootstrapped (or its existing app.json trust-validated) *before* the
+    // multi-minute image build+push, so a fresh-machine bootstrap failure is
+    // hit cheaply instead of after a wasted build. `prepare_deploy_target`
+    // then provisions GCP + the image (via `GcpImageProvisioner`, which owns
+    // the build-vs-prebuilt branch) and renders the compose template.
+    let provisioner = GcpImageProvisioner { args, gcp };
+    let rendered = prepare_deploy_target(dstack, &provisioner, &args.app_name, gcp)?;
 
     // Step 8: pull the dstack-cloud OS image referenced by the deploy.
     let os_image_url = args
@@ -819,12 +817,7 @@ async fn cmd_register_image(
     let json: serde_json::Value = resp.json().await.context("parse register response")?;
 
     if !status.is_success() {
-        bail!(
-            "register-image failed ({status}): {}",
-            json.get("detail")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| json.to_string().leak())
-        );
+        bail!("register-image failed ({status}): {}", error_detail(&json));
     }
 
     println!("Image registered.");
@@ -891,12 +884,7 @@ async fn cmd_declare_product(
         .context("parse declare-product response")?;
 
     if !status.is_success() {
-        bail!(
-            "declare-product failed ({status}): {}",
-            json.get("detail")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| json.to_string().leak())
-        );
+        bail!("declare-product failed ({status}): {}", error_detail(&json));
     }
 
     let input_usd =
@@ -976,12 +964,7 @@ async fn cmd_update_prices(
     let json: serde_json::Value = resp.json().await.context("parse update-prices response")?;
 
     if !status.is_success() {
-        bail!(
-            "update-prices failed ({status}): {}",
-            json.get("detail")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| json.to_string().leak())
-        );
+        bail!("update-prices failed ({status}): {}", error_detail(&json));
     }
 
     println!("Prices updated for {provider}/{model}.");

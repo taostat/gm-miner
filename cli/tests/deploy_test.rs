@@ -16,10 +16,12 @@
 use gm_miner_cli::{
     config::{Config, ProviderKeys},
     deploy::{
-        fetch_supported_versions, patch_app_json, render_compose, select_version, verify_hashes,
-        DstackClient, DstackDeployResult, GcpConfig, ImageVersion, COMPOSE_TEMPLATE,
+        fetch_supported_versions, patch_app_json, prepare_deploy_target, render_compose,
+        select_version, verify_hashes, DstackClient, DstackDeployResult, GcpConfig,
+        ImageProvisioner, ImageVersion, COMPOSE_TEMPLATE,
     },
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use wiremock::{
     matchers::{method, path, query_param},
@@ -1118,52 +1120,203 @@ fn image_ref_deploy_does_not_require_docker_ar() {
     assert_eq!(result.os_image_hash, "os-hash");
 }
 
-/// Verify that the `--image-ref` routing logic (guards in
-/// `provision_and_build_image`) correctly selects the gcloud-only
-/// preflight path.  We test this structurally: when `image_ref` is
-/// `Some`, the build-path code that calls `ensure_artifact_registry` and
-/// `configure_docker_auth` must be unreachable.
-#[test]
-fn image_ref_some_skips_ar_and_docker_auth_steps() {
-    // Simulate the branch that provision_and_build_image takes.
-    let image_ref: Option<&str> = Some("us-central1-docker.pkg.dev/proj/repo/app@sha256:abc");
+// ── Integration: real `prepare_deploy_target` orchestration ──────────────────
+//
+// These tests drive the real `prepare_deploy_target` function — the
+// network-free core of `cmd_deploy` — rather than re-implementing its branch
+// logic inline. The subprocess/IO boundaries (`DstackClient`,
+// `ImageProvisioner`) are mocked the way the other stubs in this file are.
 
-    let mut ar_setup_called = false;
-    let mut docker_auth_called = false;
+/// A `DstackClient` + `ImageProvisioner` recorder that appends a tag to a
+/// shared call log every time one of its methods runs. Used to assert the
+/// real orchestration's ordering: trust validation must precede image build.
+struct CallLog(RefCell<Vec<&'static str>>);
 
-    if image_ref.is_none() {
-        // These steps only run on the local-build path.
-        ar_setup_called = true;
-        docker_auth_called = true;
+impl CallLog {
+    fn new() -> Self {
+        Self(RefCell::new(Vec::new()))
     }
 
-    assert!(
-        !ar_setup_called,
-        "ensure_artifact_registry must not run on the --image-ref path"
+    fn push(&self, tag: &'static str) {
+        self.0.borrow_mut().push(tag);
+    }
+
+    fn entries(&self) -> Vec<&'static str> {
+        self.0.borrow().clone()
+    }
+}
+
+/// A `DstackClient` that records bootstrap / trust-validation calls into a
+/// shared `CallLog`. `bootstrapped` controls which branch the orchestration
+/// takes; `validate_result` lets a test inject a trust-validation failure.
+struct RecordingDstack<'a> {
+    log: &'a CallLog,
+    bootstrapped: bool,
+    validate_fails: bool,
+}
+
+impl DstackClient for RecordingDstack<'_> {
+    fn is_bootstrapped(&self) -> bool {
+        self.bootstrapped
+    }
+
+    fn bootstrap(&self, _app_name: &str, _gcp: &GcpConfig) -> anyhow::Result<()> {
+        self.log.push("bootstrap");
+        Ok(())
+    }
+
+    fn refresh_gcp_config(&self, _gcp: &GcpConfig) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn validate_existing_trust(&self) -> anyhow::Result<()> {
+        self.log.push("validate_trust");
+        if self.validate_fails {
+            anyhow::bail!("app.json has key_provider=<missing> — refusing to deploy");
+        }
+        Ok(())
+    }
+
+    fn deploy(
+        &self,
+        _compose_yaml: &str,
+        _env_vars: &ProviderKeys,
+        _gcp: &GcpConfig,
+        _boot_timeout_secs: u64,
+    ) -> anyhow::Result<DstackDeployResult> {
+        unreachable!("deploy is not exercised by prepare_deploy_target")
+    }
+}
+
+/// An `ImageProvisioner` that records the provisioning call and returns a
+/// pinned image ref (or fails, to model a build failure).
+struct RecordingProvisioner<'a> {
+    log: &'a CallLog,
+    fails: bool,
+}
+
+impl ImageProvisioner for RecordingProvisioner<'_> {
+    fn provision(&self) -> anyhow::Result<String> {
+        self.log.push("provision");
+        if self.fails {
+            anyhow::bail!("image build+push failed");
+        }
+        Ok("us-central1-docker.pkg.dev/proj/repo/app@sha256:abc".to_owned())
+    }
+}
+
+/// Re-deploy path: `prepare_deploy_target` must trust-validate the existing
+/// `app.json` *before* provisioning the image, then render the compose file.
+#[test]
+fn prepare_deploy_target_validates_trust_before_build_on_redeploy() {
+    let log = CallLog::new();
+    let dstack = RecordingDstack {
+        log: &log,
+        bootstrapped: true,
+        validate_fails: false,
+    };
+    let provisioner = RecordingProvisioner {
+        log: &log,
+        fails: false,
+    };
+
+    let rendered = prepare_deploy_target(&dstack, &provisioner, "gm-miner-1", &test_gcp())
+        .expect("orchestration must succeed");
+
+    assert_eq!(
+        log.entries(),
+        ["validate_trust", "provision"],
+        "trust validation must run before the image build"
     );
     assert!(
-        !docker_auth_called,
-        "configure_docker_auth must not run on the --image-ref path"
+        rendered.contains("sha256:abc"),
+        "rendered compose must embed the pinned image ref"
+    );
+    assert!(
+        !rendered.contains("${GM_IMAGE_REF"),
+        "the ${{GM_IMAGE_REF}} placeholder must be substituted"
     );
 }
 
-/// Without `--image-ref`, the local-build path must invoke AR setup and
-/// Docker auth (the opposite guard).
+/// Fresh-machine path: `prepare_deploy_target` must bootstrap, then
+/// trust-validate the freshly-scaffolded `app.json`, and only then build
+/// the image.
 #[test]
-fn no_image_ref_enters_build_path_for_ar_and_docker() {
-    let image_ref: Option<&str> = None;
+fn prepare_deploy_target_bootstraps_then_validates_before_build() {
+    let log = CallLog::new();
+    let dstack = RecordingDstack {
+        log: &log,
+        bootstrapped: false,
+        validate_fails: false,
+    };
+    let provisioner = RecordingProvisioner {
+        log: &log,
+        fails: false,
+    };
 
-    let mut ar_setup_called = false;
-    let mut docker_auth_called = false;
+    prepare_deploy_target(&dstack, &provisioner, "gm-miner-1", &test_gcp())
+        .expect("fresh-machine orchestration must succeed");
 
-    if image_ref.is_none() {
-        ar_setup_called = true;
-        docker_auth_called = true;
+    assert_eq!(
+        log.entries(),
+        ["bootstrap", "validate_trust", "provision"],
+        "bootstrap + trust validation must both precede the image build"
+    );
+}
+
+/// A trust-validation failure on the existing `app.json` must abort the
+/// orchestration *before* the multi-minute image build runs.
+#[test]
+fn prepare_deploy_target_trust_failure_skips_build() {
+    let log = CallLog::new();
+    let dstack = RecordingDstack {
+        log: &log,
+        bootstrapped: true,
+        validate_fails: true,
+    };
+    let provisioner = RecordingProvisioner {
+        log: &log,
+        fails: false,
+    };
+
+    let err = prepare_deploy_target(&dstack, &provisioner, "gm-miner-1", &test_gcp())
+        .expect_err("trust failure must abort the deploy");
+    assert!(
+        err.to_string().contains("refusing to deploy"),
+        "error must surface the trust failure; got: {err}"
+    );
+    assert_eq!(
+        log.entries(),
+        ["validate_trust"],
+        "image build must not run after a trust-validation failure"
+    );
+}
+
+/// The build-vs-prebuilt branch lives in the `ImageProvisioner`; whichever
+/// ref it returns must end up pinned in the rendered compose. A pre-built
+/// `--image-ref` therefore reaches `render_compose` exactly as a freshly
+/// built ref does — no Docker/AR work happens inside `prepare_deploy_target`.
+#[test]
+fn prepare_deploy_target_embeds_provisioner_ref() {
+    /// A provisioner that returns a fixed, pre-built-style digest ref.
+    struct PrebuiltProvisioner;
+    impl ImageProvisioner for PrebuiltProvisioner {
+        fn provision(&self) -> anyhow::Result<String> {
+            Ok("registry.example.com/prebuilt/miner@sha256:deadbeef".to_owned())
+        }
     }
 
-    assert!(ar_setup_called, "AR setup must run on the local-build path");
+    let log = CallLog::new();
+    let dstack = RecordingDstack {
+        log: &log,
+        bootstrapped: true,
+        validate_fails: false,
+    };
+
+    let rendered = prepare_deploy_target(&dstack, &PrebuiltProvisioner, "gm-miner-1", &test_gcp())
+        .expect("prebuilt-ref orchestration must succeed");
     assert!(
-        docker_auth_called,
-        "Docker auth must run on the local-build path"
+        rendered.contains("sha256:deadbeef"),
+        "the provisioner's ref must be pinned into the compose file"
     );
 }

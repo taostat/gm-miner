@@ -10,17 +10,17 @@
 //!      forgot `gm-miner login` or has a stale token, before any CVM work.
 //!   3. Fetch the approved `ImageVersion` list from the registry.
 //!   4. Select the newest supported version (or a pinned one if `--version` given).
-//!   5. Provision GCP (`crate::gcp`): preflight host tools, set the project,
-//!      enable service APIs, describe-or-create the GCS bucket + Artifact
-//!      Registry repo, then build + push the miner image (or accept a
-//!      pre-built `--image-ref`) and resolve the digest-pinned ref.
-//!   6. Render the bundled `dstack/docker-compose.yaml` template with the
-//!      digest-pinned image ref.
-//!   7. Bootstrap the dstack project if `app.json` is missing (writes the
-//!      dstack-cloud global config, then calls `dstack-cloud new` with GCP
-//!      coordinates, `--key-provider kms`, and `--gw`). If `app.json` already
-//!      exists, validate its trust-critical fields instead
-//!      ([`validate_app_json_trust`]).
+//!   5. Prepare the deploy target ([`prepare_deploy_target`]): bootstrap the
+//!      dstack project if `app.json` is missing (writes the dstack-cloud
+//!      global config, then calls `dstack-cloud new` with GCP coordinates,
+//!      `--key-provider kms`, and `--gw`) — or, if `app.json` already exists,
+//!      validate its trust-critical fields ([`validate_app_json_trust`]).
+//!      This runs *before* the build so a fresh-machine bootstrap failure is
+//!      hit cheaply. Then provision GCP (`crate::gcp`): preflight host tools,
+//!      set the project, enable service APIs, describe-or-create the GCS
+//!      bucket + Artifact Registry repo, build + push the miner image (or
+//!      accept a pre-built `--image-ref`), and render the bundled
+//!      `dstack/docker-compose.yaml` template with the digest-pinned ref.
 //!   8. Pull the dstack-cloud OS image (`crate::gcp::pull_os_image`).
 //!   9. Submit to dstack-cloud (via the `DstackClient` trait for testability).
 //!  10. Poll `dstack-cloud status --json` until `compose_sha256` and
@@ -192,8 +192,10 @@ pub fn validate_app_json_trust(app_json_path: &std::path::Path) -> Result<bool> 
     }
 
     // kms_url — fill in if missing; reject a different non-empty value.
+    // A trailing slash is cosmetic for an origin URL, so compare on the
+    // slash-trimmed form rather than rejecting `…:12001/` as a foreign
+    // authority.
     match obj.get("kms_url").and_then(serde_json::Value::as_str) {
-        Some(TRUSTED_KMS_URL) => {}
         None | Some("") => {
             tracing::warn!(
                 kms_url = TRUSTED_KMS_URL,
@@ -205,6 +207,7 @@ pub fn validate_app_json_trust(app_json_path: &std::path::Path) -> Result<bool> 
             );
             corrected = true;
         }
+        Some(value) if value.trim_end_matches('/') == TRUSTED_KMS_URL.trim_end_matches('/') => {}
         Some(other) => bail!(
             "app.json has kms_url={other:?} but the miner trusts {TRUSTED_KMS_URL:?} \
              — refusing to deploy against a different key authority. Delete app.json \
@@ -415,6 +418,77 @@ pub trait DstackClient {
         gcp: &GcpConfig,
         boot_timeout_secs: u64,
     ) -> Result<DstackDeployResult>;
+}
+
+// ── Image provisioning abstraction ────────────────────────────────────────────
+
+/// Abstraction over the GCP-provisioning + image-build step, injectable so
+/// the deploy orchestration can be exercised without a real `gcloud` /
+/// `docker` toolchain.
+///
+/// The real implementation (in `crate::gcp`, wired by `main`) either builds
+/// and pushes the miner image to Artifact Registry, or — when the operator
+/// supplied `--image-ref` — skips the build and returns the pre-built ref.
+pub trait ImageProvisioner {
+    /// Provision GCP infrastructure and return the digest-pinned image ref
+    /// to embed in the compose template.
+    ///
+    /// # Errors
+    /// Returns an error if GCP provisioning or the image build/push fails.
+    fn provision(&self) -> Result<String>;
+}
+
+/// Prepare the dstack deploy target: bootstrap (or trust-validate) the
+/// project, then provision the miner image, then render the compose file.
+///
+/// This is the network-free core of the deploy orchestration, extracted so
+/// it can be integration-tested against real code rather than a re-implemented
+/// copy of the branch logic.
+///
+/// **Ordering.** The dstack project is bootstrapped (`dstack-cloud new` +
+/// global-config seed) — or its existing `app.json` trust-validated — *before*
+/// the image is built and pushed. A bootstrap failure on a fresh machine is
+/// cheap to hit and would otherwise waste a multi-minute Docker build+push
+/// that nothing downstream can use. The build does not consume any bootstrap
+/// output and the bootstrap does not consume the built image, so the two
+/// steps are independent and the cheap-fails-first order is safe.
+///
+/// Returns the rendered `docker-compose.yaml` content (image ref pinned).
+///
+/// # Errors
+/// Returns an error if the global-config seed, bootstrap, trust validation,
+/// image provisioning, or compose rendering fails.
+pub fn prepare_deploy_target(
+    dstack: &dyn DstackClient,
+    provisioner: &dyn ImageProvisioner,
+    app_name: &str,
+    gcp: &GcpConfig,
+) -> Result<String> {
+    // Bootstrap / trust-validate first — a fresh-machine bootstrap failure is
+    // cheap and must not be reached only after a multi-minute build+push.
+    if dstack.is_bootstrapped() {
+        // Re-deploy path: validate the trust-critical fields of the existing
+        // app.json before treating it as the deploy target.
+        println!("Validating trust fields of the existing app.json ...");
+        dstack.validate_existing_trust()?;
+    } else {
+        println!("No dstack project found; bootstrapping with `dstack-cloud new` ...");
+        ensure_dstack_global_config()?;
+        dstack.bootstrap(app_name, gcp)?;
+        // `dstack-cloud new` reads KMS/gateway URLs from the global config; if
+        // that file is stale or tampered the scaffolded app.json may already
+        // point at the wrong KMS URL, so validate it like a re-deploy.
+        println!("Validating trust fields of the fresh app.json ...");
+        dstack.validate_existing_trust()?;
+    }
+
+    // Only now provision GCP + build/push the image (or accept a pre-built
+    // ref). The build-vs-prebuilt branch lives entirely inside the
+    // `ImageProvisioner`.
+    let image_ref = provisioner.provision()?;
+
+    // Render the compose template with the digest-pinned ref.
+    render_compose(COMPOSE_TEMPLATE, &image_ref)
 }
 
 // ── Real dstack-cloud implementation ─────────────────────────────────────────
@@ -1286,6 +1360,22 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("re-read");
         let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
         assert_eq!(v["kms_url"], TRUSTED_KMS_URL);
+    }
+
+    /// A `kms_url` that differs only by a trailing slash is the same
+    /// authority and must pass without correction.
+    #[test]
+    fn trust_validation_accepts_kms_url_trailing_slash() {
+        let (_dir, path) = temp_app_json(
+            r#"{"key_provider":"kms","gateway_enabled":true,
+                "kms_url":"https://kms.tdxlab.dstack.org:12001/"}"#,
+        );
+        let corrected =
+            validate_app_json_trust(&path).expect("trailing-slash kms_url must be accepted");
+        assert!(
+            !corrected,
+            "a trailing-slash-only difference must not be treated as a correction"
+        );
     }
 
     /// A *different* non-empty `kms_url` is rejected hard — it points the
