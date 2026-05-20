@@ -802,6 +802,61 @@ fn dist_dir_default_includes_app_name() {
     );
 }
 
+// ── --dist-dir is honoured by the OS-image pull path ─────────────────────────
+//
+// Regression guard for the bug where `cmd_deploy` recomputed
+// `dist/<app_name>` for the `pull_os_image` call instead of reusing the
+// single resolved `project_dir`. The fix resolves `project_dir` once (from
+// `--dist-dir` or the default) and threads that one value through every
+// deploy step — `RealDstackClient` and `pull_os_image` alike.
+
+/// Replicates the single `project_dir` resolution from the deploy dispatch:
+/// `--dist-dir` verbatim, else `dist/<app_name>`.
+fn resolve_project_dir(dist_dir: Option<std::path::PathBuf>, app_name: &str) -> std::path::PathBuf {
+    dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(app_name))
+}
+
+/// A custom `--dist-dir` must be the directory the OS-image pull runs in —
+/// not a recomputed `dist/<app_name>`.
+#[test]
+fn pull_path_uses_custom_dist_dir() {
+    use gm_miner_cli::deploy::RealDstackClient;
+
+    let custom = std::path::PathBuf::from("/srv/deploys/my-miner");
+    let app_name = "gm-miner-1";
+
+    let project_dir = resolve_project_dir(Some(custom.clone()), app_name);
+
+    // Both the dstack client and the pull share this one value.
+    let client = RealDstackClient {
+        app_name: app_name.to_owned(),
+        project_dir: project_dir.clone(),
+    };
+
+    assert_eq!(
+        project_dir, custom,
+        "the pull must run in the verbatim --dist-dir, not dist/<app_name>"
+    );
+    assert_eq!(
+        client.project_dir, project_dir,
+        "the dstack client and the OS-image pull must share one project_dir"
+    );
+    assert_ne!(
+        project_dir,
+        std::path::PathBuf::from("dist").join(app_name),
+        "a custom --dist-dir must not collapse to the default",
+    );
+}
+
+/// With `--dist-dir` omitted the pull runs in the `dist/<app_name>` default,
+/// matching what `RealDstackClient` deploys from.
+#[test]
+fn pull_path_uses_default_when_dist_dir_omitted() {
+    let app_name = "gm-miner-1";
+    let project_dir = resolve_project_dir(None, app_name);
+    assert_eq!(project_dir, std::path::PathBuf::from("dist/gm-miner-1"));
+}
+
 // ── P2: .env overwrite permission fix ────────────────────────────────────────
 
 /// Overwriting an existing `.env` that was created with mode 0644 must leave

@@ -110,10 +110,31 @@ impl RegistryClient {
     /// failure: the eventual `register-image` call would catch those with
     /// more context, so we let them through.
     ///
+    /// Before the network probe this also checks the stored
+    /// `token_expires_at`: a `deploy` runs many minutes of CVM work before
+    /// its trailing `register-image` call, so a token that is valid now but
+    /// expires mid-deploy must be caught up front rather than after all the
+    /// irreversible CVM work.
+    ///
     /// # Errors
-    /// Returns an error only for the two auth failure modes above. The
-    /// caller does not need to inspect the response body.
+    /// Returns an error for a missing token, a stored token that is expired
+    /// or about to expire, or a 401 from the registry. The caller does not
+    /// need to inspect the response body.
     pub async fn preflight_auth(&mut self) -> Result<()> {
+        // Fail fast on a token that is expired or expires within the deploy
+        // window — before any registry round-trip or CVM work.
+        if self
+            .config
+            .active_tokens()
+            .is_some_and(crate::config::TokenEntry::is_expired_or_near)
+        {
+            bail!(
+                "authentication token has expired (or expires within \
+                 {}s) — run `gm-miner login` again before deploying",
+                crate::config::TOKEN_EXPIRY_MARGIN_SECS
+            );
+        }
+
         let _resp = self
             .get(ME_PATH)
             .await

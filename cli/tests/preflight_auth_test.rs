@@ -29,6 +29,12 @@ use wiremock::{
 };
 
 fn config_with(api_url: &str, token: Option<&str>) -> Config {
+    config_with_expiry(api_url, token, None)
+}
+
+/// Like [`config_with`] but also sets `token_expires_at` (an RFC3339
+/// string) on the stored token entry.
+fn config_with_expiry(api_url: &str, token: Option<&str>, expires_at: Option<String>) -> Config {
     let mut networks = HashMap::new();
     networks.insert(
         "mainnet".to_owned(),
@@ -37,7 +43,7 @@ fn config_with(api_url: &str, token: Option<&str>) -> Config {
             tokens: token.map(|t| TokenEntry {
                 access_token: Some(t.to_owned()),
                 refresh_token: None,
-                token_expires_at: None,
+                token_expires_at: expires_at,
             }),
             ..Default::default()
         },
@@ -140,4 +146,94 @@ async fn preflight_passes_on_404() {
         .preflight_auth()
         .await
         .expect("404 (miner not registered) must not block deploy");
+}
+
+// ── Token-expiry preflight ───────────────────────────────────────────────────
+//
+// A `gm-miner deploy` does many minutes of CVM work before its trailing
+// `register-image` call. A token that is valid at preflight but expires
+// mid-deploy must be caught up front, not after the irreversible CVM work.
+
+/// A stored token whose `token_expires_at` is already in the past must be
+/// rejected by the preflight without any HTTP round-trip.
+#[tokio::test]
+async fn preflight_errors_when_token_already_expired() {
+    let past = "2000-01-01T00:00:00Z".to_owned();
+    // No mock server: if the preflight made an HTTP call it would fail with
+    // a connection error, not the expiry error we assert on below.
+    let cfg = config_with_expiry("http://127.0.0.1:1", Some("expired-token"), Some(past));
+    let mut client = RegistryClient::new(cfg);
+
+    let err = client
+        .preflight_auth()
+        .await
+        .expect_err("an expired token must fail the preflight");
+    let chain = full_chain(&err);
+    assert!(
+        chain.contains("expired") && chain.to_lowercase().contains("login"),
+        "error must say the token expired and direct to `gm-miner login`; got: {chain}"
+    );
+}
+
+/// A token that is technically still valid but expires within the deploy
+/// margin must also be rejected — it would lapse mid-deploy.
+#[tokio::test]
+async fn preflight_errors_when_token_near_expiry() {
+    // 60s from now — inside the 300s margin.
+    let soon = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+    let cfg = config_with_expiry("http://127.0.0.1:1", Some("soon-token"), Some(soon));
+    let mut client = RegistryClient::new(cfg);
+
+    let err = client
+        .preflight_auth()
+        .await
+        .expect_err("a near-expiry token must fail the preflight");
+    let chain = full_chain(&err);
+    assert!(
+        chain.contains("expired") || chain.to_lowercase().contains("login"),
+        "error must direct the operator to re-login; got: {chain}"
+    );
+}
+
+/// An unparseable `token_expires_at` is treated as expired — better to
+/// force a re-login than to trust a corrupt timestamp.
+#[tokio::test]
+async fn preflight_errors_on_corrupt_expiry_timestamp() {
+    let cfg = config_with_expiry(
+        "http://127.0.0.1:1",
+        Some("token"),
+        Some("not-a-timestamp".to_owned()),
+    );
+    let mut client = RegistryClient::new(cfg);
+
+    let err = client
+        .preflight_auth()
+        .await
+        .expect_err("a corrupt expiry must fail the preflight");
+    let chain = full_chain(&err);
+    assert!(
+        chain.to_lowercase().contains("login"),
+        "error must direct the operator to re-login; got: {chain}"
+    );
+}
+
+/// A token whose `token_expires_at` is comfortably in the future must pass
+/// the expiry check and proceed to the normal HTTP probe.
+#[tokio::test]
+async fn preflight_passes_when_token_not_near_expiry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/miners/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    let later = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+    let cfg = config_with_expiry(&server.uri(), Some("fresh-token"), Some(later));
+    let mut client = RegistryClient::new(cfg);
+
+    client
+        .preflight_auth()
+        .await
+        .expect("a token valid well past the deploy window must pass");
 }
