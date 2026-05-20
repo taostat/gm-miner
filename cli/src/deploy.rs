@@ -1,22 +1,33 @@
 //! `gm-miner deploy` — single-shot trust-correct deploy flow.
 //!
-//! Steps:
+//! This module and `crate::gcp` together replace the former
+//! `dstack/deploy.sh`: the whole operator deploy pipeline is now the
+//! `gm-miner deploy` subcommand.
+//!
+//! Steps (orchestrated from `main::cmd_deploy`):
 //!   1. Read provider API keys from config; error early if none set.
 //!   2. Auth preflight (`GET /miners/me`) — fail fast if the operator
 //!      forgot `gm-miner login` or has a stale token, before any CVM work.
 //!   3. Fetch the approved `ImageVersion` list from the registry.
 //!   4. Select the newest supported version (or a pinned one if `--version` given).
-//!   5. Render the bundled `dstack/docker-compose.yaml` template with the
-//!      digest-pinned image ref from the approved version.
-//!   6. Bootstrap the dstack project if `app.json` is missing (calls
-//!      `dstack-cloud new` with GCP coordinates, `--key-provider kms`,
-//!      and `--gw` — mirrors `dstack/deploy.sh`).
-//!   7. Submit to dstack-cloud (via the `DstackClient` trait for testability).
-//!   8. Poll `dstack-cloud status --json` until `compose_sha256` and
+//!   5. Provision GCP (`crate::gcp`): preflight host tools, set the project,
+//!      enable service APIs, describe-or-create the GCS bucket + Artifact
+//!      Registry repo, then build + push the miner image (or accept a
+//!      pre-built `--image-ref`) and resolve the digest-pinned ref.
+//!   6. Render the bundled `dstack/docker-compose.yaml` template with the
+//!      digest-pinned image ref.
+//!   7. Bootstrap the dstack project if `app.json` is missing (writes the
+//!      dstack-cloud global config, then calls `dstack-cloud new` with GCP
+//!      coordinates, `--key-provider kms`, and `--gw`). If `app.json` already
+//!      exists, validate its trust-critical fields instead
+//!      ([`validate_app_json_trust`]).
+//!   8. Pull the dstack-cloud OS image (`crate::gcp::pull_os_image`).
+//!   9. Submit to dstack-cloud (via the `DstackClient` trait for testability).
+//!  10. Poll `dstack-cloud status --json` until `compose_sha256` and
 //!      `os_image_hash` are populated (up to `boot_timeout_secs` seconds).
-//!   9. **Verify** both match the registry's approved version — refuse and exit 1
+//!  11. **Verify** both match the registry's approved version — refuse and exit 1
 //!      if they don't.
-//!  10. Call `register_image` with the verified hashes.
+//!  12. Call `register_image` with the verified hashes.
 
 use anyhow::{bail, Context, Result};
 use chrono::DateTime;
@@ -111,6 +122,105 @@ pub fn patch_app_json(app_json_path: &std::path::Path, gcp: &GcpConfig) -> Resul
     Ok(())
 }
 
+// ── app.json trust validation ─────────────────────────────────────────────────
+
+/// The KMS URL the miner's trust model is anchored to. An `app.json` whose
+/// `kms_url` differs points the CVM at a different key authority and breaks
+/// the registry's attestation chain. Mirrors the global config written by
+/// `deploy.sh`.
+pub const TRUSTED_KMS_URL: &str = "https://kms.tdxlab.dstack.org:12001";
+
+/// Validate the trust-critical fields of an existing `app.json` and correct
+/// them in place if they are wrong.
+///
+/// `dstack-cloud new` writes a fresh, trust-correct `app.json`, but the
+/// deploy path also accepts an `app.json` that already exists on disk — it
+/// could be stale (from an older toolchain) or tampered with. Before that
+/// file is trusted as the deploy target, three fields are checked:
+///
+/// - `key_provider` must be `kms` — only KMS produces an attestation chain
+///   the registry can verify. Anything else (e.g. `local`) is rejected hard;
+///   silently re-writing it could mask a tampered file, so this fails loudly.
+/// - `gateway_enabled` must be `true` — the gateway is the trust boundary
+///   the registry probes envoy through. A missing or `false` value is
+///   corrected in place (the subcommand knows the right value).
+/// - `kms_url` must equal [`TRUSTED_KMS_URL`] — a missing value is filled in;
+///   a *different* non-empty value is rejected hard (it points the CVM at
+///   another key authority).
+///
+/// Returns `true` if the file was modified (corrected) and needs no further
+/// action, `false` if it was already trust-correct.
+///
+/// # Errors
+/// Returns an error if the file cannot be read/parsed/written, or if a
+/// trust-critical field holds an actively wrong value that must not be
+/// silently overwritten.
+pub fn validate_app_json_trust(app_json_path: &std::path::Path) -> Result<bool> {
+    let raw = std::fs::read_to_string(app_json_path)
+        .with_context(|| format!("read {}", app_json_path.display()))?;
+    let mut app: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", app_json_path.display()))?;
+    let obj = app
+        .as_object_mut()
+        .context("app.json root is not an object")?;
+
+    let mut corrected = false;
+
+    // key_provider — reject anything that is not exactly "kms".
+    match obj.get("key_provider").and_then(serde_json::Value::as_str) {
+        Some(DSTACK_KEY_PROVIDER) => {}
+        other => bail!(
+            "app.json has key_provider={} — refusing to deploy. The miner's \
+             attestation chain requires `kms`; delete app.json to re-scaffold \
+             a trust-correct project, or fix it by hand.",
+            other.map_or_else(|| "<missing>".to_owned(), |s| format!("{s:?}"))
+        ),
+    }
+
+    // gateway_enabled — must be true; correct a missing/false value in place.
+    if obj
+        .get("gateway_enabled")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        tracing::warn!(
+            "app.json gateway_enabled was not true; correcting it — the registry \
+             probes envoy through the gateway, so it must be enabled"
+        );
+        obj.insert("gateway_enabled".to_owned(), serde_json::Value::Bool(true));
+        corrected = true;
+    }
+
+    // kms_url — fill in if missing; reject a different non-empty value.
+    match obj.get("kms_url").and_then(serde_json::Value::as_str) {
+        Some(TRUSTED_KMS_URL) => {}
+        None | Some("") => {
+            tracing::warn!(
+                kms_url = TRUSTED_KMS_URL,
+                "app.json kms_url was empty; setting it"
+            );
+            obj.insert(
+                "kms_url".to_owned(),
+                serde_json::Value::String(TRUSTED_KMS_URL.to_owned()),
+            );
+            corrected = true;
+        }
+        Some(other) => bail!(
+            "app.json has kms_url={other:?} but the miner trusts {TRUSTED_KMS_URL:?} \
+             — refusing to deploy against a different key authority. Delete app.json \
+             to re-scaffold, or fix it by hand if the change is intentional."
+        ),
+    }
+
+    if corrected {
+        let patched = serde_json::to_string_pretty(&app).context("re-serialize app.json")?;
+        std::fs::write(app_json_path, patched)
+            .with_context(|| format!("write {}", app_json_path.display()))?;
+    }
+
+    Ok(corrected)
+}
+
 /// Default poll interval when waiting for the CVM to boot (seconds).
 pub const POLL_INTERVAL_SECS: u64 = 5;
 /// Default maximum time to wait for hashes to appear after deploy (seconds).
@@ -150,6 +260,58 @@ pub fn build_dstack_new_args(app_name: &str, gcp: &GcpConfig) -> Vec<String> {
         DSTACK_KEY_PROVIDER.to_owned(),
         "--gw".to_owned(),
     ]
+}
+
+// ── dstack-cloud global config ────────────────────────────────────────────────
+
+/// The dstack-cloud global config JSON, written to
+/// `~/.config/dstack-cloud/config.json` if absent.
+///
+/// `dstack-cloud new` reads KMS/gateway service URLs from this file. On a
+/// fresh machine the file does not exist; `deploy.sh` seeds it before
+/// calling `dstack-cloud new`. The `gcp` / `image_search_paths` blocks are
+/// left at their defaults — the per-project `app.json` carries the
+/// deploy-time GCP coordinates.
+const DSTACK_GLOBAL_CONFIG: &str = r#"{
+  "services": {
+    "kms_urls": ["https://kms.tdxlab.dstack.org:12001"],
+    "gateway_urls": ["https://gateway.tdxlab.dstack.org:12002"],
+    "pccs_url": ""
+  },
+  "image_search_paths": ["~/.dstack/images"],
+  "gcp": {
+    "project": "",
+    "zone": "us-central1-a",
+    "bucket": ""
+  }
+}
+"#;
+
+/// Ensure the dstack-cloud global config exists, creating it from the
+/// trusted default if absent. Mirrors `ensure_dstack_cloud_global_config`
+/// in `deploy.sh`.
+///
+/// # Errors
+/// Returns an error if the directory or file cannot be created.
+pub fn ensure_dstack_global_config() -> Result<()> {
+    let Some(home) = dirs::home_dir() else {
+        bail!("could not resolve the home directory for the dstack-cloud config");
+    };
+    let cfg = home
+        .join(".config")
+        .join("dstack-cloud")
+        .join("config.json");
+    if cfg.exists() {
+        return Ok(());
+    }
+    let dir = cfg
+        .parent()
+        .context("dstack-cloud config path has no parent")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    tracing::info!(path = %cfg.display(), "writing dstack-cloud global config");
+    std::fs::write(&cfg, DSTACK_GLOBAL_CONFIG)
+        .with_context(|| format!("write {}", cfg.display()))?;
+    Ok(())
 }
 
 // ── Registry image-version types ─────────────────────────────────────────────
@@ -220,6 +382,20 @@ pub trait DstackClient {
     /// Returns true if the project directory already contains `app.json`,
     /// meaning the dstack project has already been bootstrapped.
     fn is_bootstrapped(&self) -> bool;
+
+    /// Validate the trust-critical fields of an already-existing `app.json`
+    /// (re-deploy path) and correct them in place where safe.
+    ///
+    /// Called only when [`Self::is_bootstrapped`] is true. A freshly
+    /// `dstack-cloud new`-scaffolded project is trust-correct by
+    /// construction, but a file that was already on disk could be stale or
+    /// tampered with; this check refuses to deploy against a weakened one.
+    /// See [`validate_app_json_trust`].
+    ///
+    /// # Errors
+    /// Returns an error if `app.json` cannot be read/written or holds an
+    /// actively wrong trust-critical value.
+    fn validate_existing_trust(&self) -> Result<()>;
 
     /// Deploy and return the compose + OS image hashes that dstack-cloud
     /// actually used. `compose_yaml` is the rendered compose file content;
@@ -328,6 +504,19 @@ impl DstackClient for RealDstackClient {
         let app_json = self.project_dir.join("app.json");
         patch_app_json(&app_json, gcp)
             .with_context(|| format!("refresh gcp_config in {}", app_json.display()))
+    }
+
+    fn validate_existing_trust(&self) -> Result<()> {
+        let app_json = self.project_dir.join("app.json");
+        let corrected = validate_app_json_trust(&app_json)
+            .with_context(|| format!("validate trust fields in {}", app_json.display()))?;
+        if corrected {
+            tracing::info!(
+                path = %app_json.display(),
+                "corrected trust-critical fields in existing app.json"
+            );
+        }
+        Ok(())
     }
 
     fn deploy(
@@ -1003,5 +1192,115 @@ mod tests {
             (Some(ref c), Some(ref o)) if !c.is_empty() && !o.is_empty()
         );
         assert!(!ready, "partial empty (one empty string) must not be ready");
+    }
+
+    // ── app.json trust-field validation ───────────────────────────────────────
+
+    /// Write `content` to a fresh temp `app.json` and return (dir, path).
+    /// The dir handle must be kept alive to keep the file on disk.
+    fn temp_app_json(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("app.json");
+        std::fs::write(&path, content).expect("write app.json");
+        (dir, path)
+    }
+
+    /// A trust-correct app.json passes unchanged (returns `false` — no
+    /// correction needed).
+    #[test]
+    fn trust_validation_passes_correct_app_json() {
+        let (_dir, path) = temp_app_json(
+            r#"{"key_provider":"kms","gateway_enabled":true,
+                "kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
+        );
+        let corrected = validate_app_json_trust(&path).expect("valid app.json must pass");
+        assert!(!corrected, "trust-correct file must not be modified");
+    }
+
+    /// A `key_provider` other than `kms` is rejected hard — never silently
+    /// rewritten, because that could mask a tampered file.
+    #[test]
+    fn trust_validation_rejects_non_kms_key_provider() {
+        let (_dir, path) = temp_app_json(
+            r#"{"key_provider":"local","gateway_enabled":true,
+                "kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
+        );
+        let err = validate_app_json_trust(&path).expect_err("non-kms must be rejected");
+        assert!(err.to_string().contains("key_provider"));
+        assert!(err.to_string().contains("kms"));
+    }
+
+    /// A missing `key_provider` is also rejected (no value to trust).
+    #[test]
+    fn trust_validation_rejects_missing_key_provider() {
+        let (_dir, path) = temp_app_json(
+            r#"{"gateway_enabled":true,"kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
+        );
+        let err =
+            validate_app_json_trust(&path).expect_err("missing key_provider must be rejected");
+        assert!(err.to_string().contains("key_provider"));
+    }
+
+    /// `gateway_enabled:false` is corrected in place to `true`.
+    #[test]
+    fn trust_validation_corrects_gateway_disabled() {
+        let (_dir, path) = temp_app_json(
+            r#"{"key_provider":"kms","gateway_enabled":false,
+                "kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
+        );
+        let corrected = validate_app_json_trust(&path).expect("must correct, not fail");
+        assert!(
+            corrected,
+            "gateway_enabled:false must be reported as corrected"
+        );
+
+        let raw = std::fs::read_to_string(&path).expect("re-read");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(v["gateway_enabled"], serde_json::Value::Bool(true));
+    }
+
+    /// A missing `gateway_enabled` is filled in as `true`.
+    #[test]
+    fn trust_validation_fills_missing_gateway_enabled() {
+        let (_dir, path) = temp_app_json(
+            r#"{"key_provider":"kms","kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
+        );
+        let corrected = validate_app_json_trust(&path).expect("must correct");
+        assert!(corrected);
+        let raw = std::fs::read_to_string(&path).expect("re-read");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(v["gateway_enabled"], serde_json::Value::Bool(true));
+    }
+
+    /// A missing `kms_url` is filled in with the trusted URL.
+    #[test]
+    fn trust_validation_fills_missing_kms_url() {
+        let (_dir, path) = temp_app_json(r#"{"key_provider":"kms","gateway_enabled":true}"#);
+        let corrected = validate_app_json_trust(&path).expect("must correct");
+        assert!(corrected);
+        let raw = std::fs::read_to_string(&path).expect("re-read");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(v["kms_url"], TRUSTED_KMS_URL);
+    }
+
+    /// A *different* non-empty `kms_url` is rejected hard — it points the
+    /// CVM at another key authority and must not be silently overwritten.
+    #[test]
+    fn trust_validation_rejects_different_kms_url() {
+        let (_dir, path) = temp_app_json(
+            r#"{"key_provider":"kms","gateway_enabled":true,
+                "kms_url":"https://evil.example.com:12001"}"#,
+        );
+        let err = validate_app_json_trust(&path).expect_err("foreign kms_url must be rejected");
+        assert!(err.to_string().contains("kms_url"));
+        assert!(err.to_string().contains(TRUSTED_KMS_URL));
+    }
+
+    /// The trusted KMS URL constant matches the URL the app.json template
+    /// and the dstack-cloud global config use.
+    #[test]
+    fn trusted_kms_url_is_tdxlab() {
+        assert_eq!(TRUSTED_KMS_URL, "https://kms.tdxlab.dstack.org:12001");
+        assert!(DSTACK_GLOBAL_CONFIG.contains(TRUSTED_KMS_URL));
     }
 }

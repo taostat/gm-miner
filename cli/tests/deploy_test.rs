@@ -83,6 +83,10 @@ impl DstackClient for StubDstack {
         Ok(())
     }
 
+    fn validate_existing_trust(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn deploy(
         &self,
         _compose_yaml: &str,
@@ -126,6 +130,10 @@ impl DstackClient for FastBootDstack {
         Ok(())
     }
 
+    fn validate_existing_trust(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn deploy(
         &self,
         _compose_yaml: &str,
@@ -153,6 +161,10 @@ impl DstackClient for TimedOutDstack {
     }
 
     fn refresh_gcp_config(&self, _gcp: &GcpConfig) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn validate_existing_trust(&self) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -185,6 +197,10 @@ impl DstackClient for FailingDstack {
     }
 
     fn refresh_gcp_config(&self, _gcp: &GcpConfig) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn validate_existing_trust(&self) -> anyhow::Result<()> {
         Ok(())
     }
 

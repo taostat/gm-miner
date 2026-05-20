@@ -82,10 +82,14 @@ enum Command {
     /// On a fresh machine (no prior deploy) this automatically runs
     /// `dstack-cloud new` to scaffold the project before deploying.
     Deploy {
-        /// Pinned image reference (registry/repo/name@sha256:...) to embed in
-        /// the compose file.  If omitted, you must set `GM_IMAGE_REF` in env.
+        /// Pre-built digest-pinned image reference (registry/repo/name@sha256:...).
+        ///
+        /// When set (or `GM_IMAGE_REF` is in env), the local image build is
+        /// skipped and this ref is embedded in the compose file directly.
+        /// When omitted, the miner image is built and pushed to Artifact
+        /// Registry and the resulting digest is pinned automatically.
         #[arg(long, env = "GM_IMAGE_REF")]
-        image_ref: String,
+        image_ref: Option<String>,
 
         /// Pin to a specific approved version by index (1 = newest).
         /// Defaults to the newest supported version.
@@ -105,9 +109,13 @@ enum Command {
         #[arg(long, env = "GCP_PROJECT_ID")]
         gcp_project: String,
 
-        /// GCP zone for the dstack CVM (e.g. `us-central1-a`).
-        #[arg(long, env = "GCP_ZONE", default_value = "us-central1-a")]
-        gcp_zone: String,
+        /// GCP region for the GCS bucket / Artifact Registry repo.
+        #[arg(long, env = "GCP_REGION", default_value = "us-central1")]
+        gcp_region: String,
+
+        /// GCP zone for the dstack CVM. Defaults to `<gcp-region>-a`.
+        #[arg(long, env = "GCP_ZONE")]
+        gcp_zone: Option<String>,
 
         /// Compute Engine machine type for the CVM.
         #[arg(long, env = "MACHINE_TYPE", default_value = "c3-standard-4")]
@@ -117,6 +125,24 @@ enum Command {
         /// Defaults to `gs://<gcp-project>-dstack` (same convention as deploy.sh).
         #[arg(long, env = "GCS_BUCKET")]
         gcs_bucket: Option<String>,
+
+        /// Artifact Registry repository name for the miner image.
+        #[arg(long, env = "AR_REPO", default_value = "gm-miner")]
+        ar_repo: String,
+
+        /// Image tag applied to the build before digest resolution.
+        #[arg(long, env = "IMAGE_TAG", default_value = "v0.1.0")]
+        image_tag: String,
+
+        /// dstack-cloud OS image URL pulled before deploy. Defaults to the
+        /// pinned Phala meta-dstack-cloud release used by deploy.sh.
+        #[arg(long, env = "DSTACK_OS_IMAGE_URL")]
+        os_image_url: Option<String>,
+
+        /// Repository root used as the Docker build context. Defaults to
+        /// the current directory.
+        #[arg(long)]
+        repo_root: Option<std::path::PathBuf>,
 
         /// How long to wait for the CVM to boot and populate hashes in
         /// `dstack-cloud status --json` (seconds). Default: 300.
@@ -241,23 +267,35 @@ async fn main() -> Result<()> {
             app_name,
             dist_dir,
             gcp_project,
+            gcp_region,
             gcp_zone,
             machine_type,
             gcs_bucket,
+            ar_repo,
+            image_tag,
+            os_image_url,
+            repo_root,
             boot_timeout_secs,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             cmd_deploy_subcommand(
                 cfg,
-                app_name,
-                image_ref,
-                dist_dir,
-                gcp_project,
-                gcp_zone,
-                machine_type,
-                gcs_bucket,
-                version,
-                boot_timeout_secs,
+                DeployArgs {
+                    app_name,
+                    image_ref,
+                    dist_dir,
+                    gcp_project,
+                    gcp_region,
+                    gcp_zone,
+                    machine_type,
+                    gcs_bucket,
+                    ar_repo,
+                    image_tag,
+                    os_image_url,
+                    repo_root,
+                    version,
+                    boot_timeout_secs,
+                },
             )
             .await
         }
@@ -377,33 +415,38 @@ fn build_price_block(
 
 // ── Commands ────────────────────────────────────────────────────────────────
 
+/// Parsed `gm-miner deploy` arguments, grouped so the dispatch match arm
+/// and the subcommand entry point do not need a long positional list.
+struct DeployArgs {
+    app_name: String,
+    image_ref: Option<String>,
+    dist_dir: Option<std::path::PathBuf>,
+    gcp_project: String,
+    gcp_region: String,
+    gcp_zone: Option<String>,
+    machine_type: String,
+    gcs_bucket: Option<String>,
+    ar_repo: String,
+    image_tag: String,
+    os_image_url: Option<String>,
+    repo_root: Option<std::path::PathBuf>,
+    version: Option<usize>,
+    boot_timeout_secs: u64,
+}
+
 /// Build and run the deploy subcommand from parsed CLI arguments.
 ///
 /// Separated from `main` to keep the dispatch match arm small.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "all args come directly from the Deploy clap variant; no better grouping"
-)]
-async fn cmd_deploy_subcommand(
-    cfg: Config,
-    app_name: String,
-    image_ref: String,
-    dist_dir: Option<std::path::PathBuf>,
-    gcp_project: String,
-    gcp_zone: String,
-    machine_type: String,
-    gcs_bucket: Option<String>,
-    version: Option<usize>,
-    boot_timeout_secs: u64,
-) -> Result<()> {
+async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
     // --dist-dir is the project directory used verbatim.
     // Default: dist/<app_name> relative to cwd (matches deploy.sh).
-    let project_dir = dist_dir
+    let project_dir = args
+        .dist_dir
         .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
+        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&args.app_name));
 
     let dstack = gm_miner_cli::deploy::RealDstackClient {
-        app_name: app_name.clone(),
+        app_name: args.app_name.clone(),
         project_dir: project_dir.clone(),
     };
 
@@ -412,40 +455,97 @@ async fn cmd_deploy_subcommand(
     // differs the bootstrapped directory and the one we read/patch diverge.
     // An already-bootstrapped project (valid `app.json`) is deployed in place
     // via `current_dir`, so any path is fine; don't reject custom dist dirs.
-    if dist_dir.is_some() && !dstack.is_bootstrapped() {
+    if args.dist_dir.is_some() && !dstack.is_bootstrapped() {
         let basename = project_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        if basename != app_name {
+        if basename != args.app_name {
             bail!(
                 "dist-dir basename must equal app-name when bootstrapping a fresh \
                  project; got dist-dir={}, app-name={app_name}",
-                project_dir.display()
+                project_dir.display(),
+                app_name = args.app_name
             );
         }
     }
 
-    let bucket = gcs_bucket.unwrap_or_else(|| GcpConfig::default_bucket(&gcp_project));
+    // zone defaults to `<region>-a`, mirroring deploy.sh.
+    let zone = args
+        .gcp_zone
+        .clone()
+        .unwrap_or_else(|| format!("{}-a", args.gcp_region));
+    let bucket = args
+        .gcs_bucket
+        .clone()
+        .unwrap_or_else(|| GcpConfig::default_bucket(&args.gcp_project));
     let gcp = GcpConfig {
-        project: gcp_project,
-        zone: gcp_zone,
-        machine_type,
-        instance_name: app_name.clone(),
+        project: args.gcp_project.clone(),
+        zone,
+        machine_type: args.machine_type.clone(),
+        instance_name: args.app_name.clone(),
         bucket,
     };
     let mut client = RegistryClient::new(cfg.clone());
-    cmd_deploy(
-        &cfg,
-        &mut client,
-        &dstack,
-        &app_name,
-        &image_ref,
-        &gcp,
-        version,
-        boot_timeout_secs,
-    )
-    .await
+    cmd_deploy(&cfg, &mut client, &dstack, &args, &gcp).await
+}
+
+/// Provision GCP infrastructure and obtain the digest-pinned image ref.
+///
+/// When `args.image_ref` is supplied the local build is skipped and that
+/// pre-built ref is returned verbatim. Otherwise this runs the full
+/// `deploy.sh` infrastructure flow: tool preflight, `gcloud` project /
+/// services / bucket / Artifact-Registry setup, Docker auth, the image
+/// build + push, and digest resolution.
+fn provision_and_build_image(args: &DeployArgs, gcp: &GcpConfig) -> Result<String> {
+    use gm_miner_cli::gcp as gcp_provision;
+
+    // Always preflight the host tools the deploy needs.
+    gcp_provision::preflight_tools()?;
+
+    // Configure the GCP project + service APIs regardless of whether we
+    // build locally — `dstack-cloud deploy` needs compute / storage /
+    // confidentialcomputing enabled and the GCS bucket present.
+    println!("Provisioning GCP project {} ...", args.gcp_project);
+    gcp_provision::configure_project(&args.gcp_project)?;
+    gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
+    gcp_provision::ensure_artifact_registry(&args.ar_repo, &args.gcp_region)?;
+
+    if let Some(pre_built) = &args.image_ref {
+        println!("Using pre-built image ref (skipping local build): {pre_built}");
+        return Ok(pre_built.clone());
+    }
+
+    let repo_root = args
+        .repo_root
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let coords = gcp_provision::ImageCoordinates::derive(
+        &args.gcp_region,
+        &args.gcp_project,
+        &args.ar_repo,
+        &args.app_name,
+        &args.image_tag,
+    );
+    gcp_provision::configure_docker_auth(&coords.ar_host)?;
+
+    let image_version = git_short_sha(&repo_root);
+    println!("Building and pushing the miner image ...");
+    gcp_provision::build_and_push_image(&coords, &args.app_name, &image_version, &repo_root)
+}
+
+/// Resolve the short git commit SHA of `repo_root` for the image version,
+/// falling back to `"unknown"` (matches deploy.sh's `GM_IMAGE_VERSION`).
+fn git_short_sha(repo_root: &std::path::Path) -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Validate a key value passed to `set-api-keys`: reject empty / whitespace-only
@@ -530,11 +630,8 @@ async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
     dstack: &dyn gm_miner_cli::deploy::DstackClient,
-    app_name: &str,
-    image_ref: &str,
+    args: &DeployArgs,
     gcp: &GcpConfig,
-    version_pin: Option<usize>,
-    boot_timeout_secs: u64,
 ) -> Result<()> {
     // Step 1: ensure provider keys are configured.
     let keys = cfg
@@ -562,37 +659,67 @@ async fn cmd_deploy(
     let versions = fetch_supported_versions(&registry_url).await?;
 
     // Step 4: select the target version.
-    let approved = select_version(&versions, version_pin)?;
+    let approved = select_version(&versions, args.version)?;
     println!(
         "Selected version {}  ({})",
         approved.notes.as_deref().unwrap_or("<no notes>"),
         format_created_at(&approved.created_at),
     );
 
-    // Step 5: render the compose template with the pinned image ref.
-    let rendered = render_compose(COMPOSE_TEMPLATE, image_ref)?;
+    // Step 5: provision GCP infrastructure (project, services, bucket,
+    // Artifact Registry) and obtain the digest-pinned image ref — either
+    // by building + pushing the miner image locally or by using a
+    // pre-built `--image-ref`. Mirrors the infra half of deploy.sh.
+    let image_ref = provision_and_build_image(args, gcp)?;
 
-    // Step 6: bootstrap the dstack project if this is a fresh machine
+    // Step 6: render the compose template with the pinned image ref.
+    let rendered = render_compose(COMPOSE_TEMPLATE, &image_ref)?;
+
+    // Step 7: bootstrap the dstack project if this is a fresh machine
     // (app.json absent means `dstack-cloud new` has never been run here).
     // Bootstrap also patches gcp_config immediately after `dstack-cloud new`.
-    if !dstack.is_bootstrapped() {
+    if dstack.is_bootstrapped() {
+        // Re-deploy path: an app.json is already on disk. Validate its
+        // trust-critical fields (key_provider / gateway_enabled / kms_url)
+        // before treating it as the deploy target — it could be stale or
+        // tampered with. A freshly scaffolded project skips this because
+        // `dstack-cloud new` writes a trust-correct file by construction.
+        println!("Validating trust fields of the existing app.json ...");
+        dstack.validate_existing_trust()?;
+    } else {
         println!("No dstack project found; bootstrapping with `dstack-cloud new` ...");
-        dstack.bootstrap(app_name, gcp)?;
+        gm_miner_cli::deploy::ensure_dstack_global_config()?;
+        dstack.bootstrap(&args.app_name, gcp)?;
     }
 
-    // Step 7: deploy via dstack-cloud, polling until hashes appear.
+    // Step 8: pull the dstack-cloud OS image referenced by the deploy.
+    let os_image_url = args
+        .os_image_url
+        .clone()
+        .unwrap_or_else(|| gm_miner_cli::gcp::DEFAULT_DSTACK_OS_IMAGE_URL.to_owned());
+    let project_dir = args
+        .dist_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&args.app_name));
+    println!("Pulling the dstack-cloud OS image ...");
+    gm_miner_cli::gcp::pull_os_image(&os_image_url, &project_dir)?;
+
+    // Step 9: deploy via dstack-cloud, polling until hashes appear.
     // On re-deploy the deploy() call also refreshes gcp_config before running
     // `dstack-cloud deploy` so GCP coordinates stay current.
-    println!("Deploying via dstack-cloud (boot timeout: {boot_timeout_secs}s) ...");
-    let actual = dstack.deploy(&rendered, keys, gcp, boot_timeout_secs)?;
+    println!(
+        "Deploying via dstack-cloud (boot timeout: {}s) ...",
+        args.boot_timeout_secs
+    );
+    let actual = dstack.deploy(&rendered, keys, gcp, args.boot_timeout_secs)?;
 
-    // Step 8: verify hashes.
+    // Step 10: verify hashes.
     println!("Verifying hashes against registry approval ...");
     verify_hashes(&actual, approved)?;
     println!("  compose_hash  : OK ({})", actual.compose_sha256);
     println!("  os_image_hash : OK ({})", actual.os_image_hash);
 
-    // Step 9: register the image.
+    // Step 11: register the image.
     println!("Registering image with the registry ...");
     cmd_register_image(client, &actual.compose_sha256, &actual.os_image_hash).await
 }
