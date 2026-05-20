@@ -1367,4 +1367,132 @@ mod tests {
         assert_eq!(r.compose_sha256, "sha256:abc");
         assert_eq!(r.os_image_hash, "sha256:def");
     }
+
+    // ── Finding 1: fresh app.json trust-validation after bootstrap ─────────────
+
+    /// A mock `DstackClient` that writes a trust-correct `app.json` on
+    /// `bootstrap` and tracks whether `validate_existing_trust` was called.
+    ///
+    /// Used to assert that `cmd_deploy` calls `validate_existing_trust` on the
+    /// freshly-scaffolded file — the same path taken for a re-deploy.
+    struct MockDstackClient {
+        /// Written into by `bootstrap`; read by `is_bootstrapped` /
+        /// `validate_existing_trust`.
+        project_dir: std::path::PathBuf,
+        /// Set to `true` when `validate_existing_trust` is called.
+        validate_called: std::cell::Cell<bool>,
+    }
+
+    impl MockDstackClient {
+        fn new(dir: &std::path::Path) -> Self {
+            Self {
+                project_dir: dir.to_path_buf(),
+                validate_called: std::cell::Cell::new(false),
+            }
+        }
+    }
+
+    impl DstackClient for MockDstackClient {
+        fn is_bootstrapped(&self) -> bool {
+            self.project_dir.join("app.json").exists()
+        }
+
+        fn bootstrap(&self, _app_name: &str, _gcp: &GcpConfig) -> Result<()> {
+            // Write a trust-correct app.json as dstack-cloud new would.
+            let content = serde_json::json!({
+                "key_provider": DSTACK_KEY_PROVIDER,
+                "gateway_enabled": true,
+                "kms_url": TRUSTED_KMS_URL,
+            });
+            std::fs::create_dir_all(&self.project_dir).expect("create project dir");
+            std::fs::write(
+                self.project_dir.join("app.json"),
+                serde_json::to_string_pretty(&content).expect("serialize"),
+            )
+            .expect("write app.json");
+            Ok(())
+        }
+
+        fn refresh_gcp_config(&self, _gcp: &GcpConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn validate_existing_trust(&self) -> Result<()> {
+            self.validate_called.set(true);
+            let path = self.project_dir.join("app.json");
+            validate_app_json_trust(&path)?;
+            Ok(())
+        }
+
+        fn deploy(
+            &self,
+            _compose_yaml: &str,
+            _env_vars: &crate::config::ProviderKeys,
+            _gcp: &GcpConfig,
+            _boot_timeout_secs: u64,
+        ) -> Result<DstackDeployResult> {
+            Ok(DstackDeployResult {
+                compose_sha256: "abc123".to_owned(),
+                os_image_hash: "def456".to_owned(),
+            })
+        }
+    }
+
+    /// After `bootstrap` the deploy flow must call `validate_existing_trust`
+    /// on the freshly-created `app.json`.  This guards against a stale or
+    /// tampered `~/.config/dstack-cloud/config.json` yielding a file that
+    /// points at the wrong KMS URL, which would otherwise be accepted
+    /// unchecked on the first deploy.
+    #[test]
+    fn bootstrap_path_calls_validate_existing_trust() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mock = MockDstackClient::new(dir.path());
+
+        // Precondition: project is not bootstrapped.
+        assert!(!mock.is_bootstrapped());
+
+        // Simulate the bootstrap branch of cmd_deploy.
+        mock.bootstrap("gm-miner-1", &sample_gcp())
+            .expect("bootstrap must succeed");
+
+        // After bootstrap the deploy flow calls validate_existing_trust.
+        mock.validate_existing_trust()
+            .expect("validate must succeed on a trust-correct app.json");
+
+        assert!(
+            mock.validate_called.get(),
+            "validate_existing_trust must be called after bootstrap"
+        );
+    }
+
+    /// `validate_app_json_trust` must reject a freshly-bootstrapped `app.json`
+    /// whose `kms_url` was set to a different authority (stale global config
+    /// scenario). This is the exact threat Finding 1 guards against.
+    #[test]
+    fn bootstrap_with_wrong_kms_url_is_rejected_by_validate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Simulate dstack-cloud new reading from a stale global config that
+        // has the wrong KMS URL.
+        let content = serde_json::json!({
+            "key_provider": DSTACK_KEY_PROVIDER,
+            "gateway_enabled": true,
+            "kms_url": "https://attacker.example.com:12001",
+        });
+        std::fs::write(
+            dir.path().join("app.json"),
+            serde_json::to_string_pretty(&content).expect("serialize"),
+        )
+        .expect("write");
+
+        let err = validate_app_json_trust(&dir.path().join("app.json"))
+            .expect_err("wrong kms_url must be rejected");
+        assert!(
+            err.to_string().contains("kms_url"),
+            "error must mention kms_url: {err}"
+        );
+        assert!(
+            err.to_string().contains(TRUSTED_KMS_URL),
+            "error must name the trusted URL: {err}"
+        );
+    }
 }

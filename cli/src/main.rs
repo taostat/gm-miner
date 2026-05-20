@@ -697,6 +697,12 @@ async fn cmd_deploy(
         println!("No dstack project found; bootstrapping with `dstack-cloud new` ...");
         gm_miner_cli::deploy::ensure_dstack_global_config()?;
         dstack.bootstrap(&args.app_name, gcp)?;
+        // Validate the freshly-scaffolded app.json. `dstack-cloud new` reads
+        // KMS/gateway URLs from ~/.config/dstack-cloud/config.json; if that
+        // global config is stale or tampered, the scaffolded file may already
+        // point at the wrong KMS URL. Treat it exactly like a re-deploy.
+        println!("Validating trust fields of the fresh app.json ...");
+        dstack.validate_existing_trust()?;
     }
 
     // Step 8: pull the dstack-cloud OS image referenced by the deploy.
