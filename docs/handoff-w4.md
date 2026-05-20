@@ -24,10 +24,12 @@ A `200` means the provider's key is configured and the upstream is reachable; a 
 
 ### CLI (`cli/`)
 
-Clap 4.5 binary `gm-miner` with six subcommands:
+Clap 4.5 binary `gm-miner` with eight subcommands:
 
 | Subcommand | Action |
 |---|---|
+| `set-api-keys` | persists provider API keys to `~/.gm-miner/config.json` (mode 0600) |
+| `deploy` | full trust-correct deploy: provisions GCP, builds/pushes the image, scaffolds/validates the dstack-cloud project, deploys, verifies hashes against the registry, registers the image |
 | `login` | OAuth 2.0 device-code flow via Taostats auth; saves tokens to `~/.gm-miner/config.json` |
 | `register-image` | `POST /miners/register` with compose_hash + os_image_hash |
 | `list-products` | `GET /products`; prints provider/model/status table |
@@ -43,8 +45,10 @@ Tests: 12 tests in `cli/tests/picodollar_test.rs` covering conversion, boundary 
 
 ### dstack compose template (`dstack/`)
 
-- `dstack/docker-compose.yaml` — template with `${GM_IMAGE_REF:?...}` substituted by `deploy.sh`; passes the three optional provider API keys as env vars.
-- `dstack/deploy.sh` — full deploy pipeline: builds/pushes multi-arch image to GCR, resolves digest, creates or updates the dstack-cloud project, writes `.env` (encrypted by dstack KMS at deploy time), runs `dstack-cloud deploy`.
+- `dstack/docker-compose.yaml` — template with `${GM_IMAGE_REF:?...}` substituted by `gm-miner deploy`; passes the three optional provider API keys as env vars.
+- `dstack/app.json.template` — reference shape for the trust-correct `app.json` (`key_provider: kms`, `gateway_enabled: true`, the trusted `kms_url`).
+
+The full deploy pipeline lives in the `gm-miner deploy` subcommand (`cli/src/deploy.rs` + `cli/src/gcp.rs`): it preflights host tools, provisions the GCP project / service APIs / GCS bucket / Artifact Registry repo, builds and pushes the image, resolves the digest, scaffolds or validates the dstack-cloud project, pulls the OS image, writes `.env` (encrypted by dstack KMS at deploy time), runs `dstack-cloud deploy`, verifies the resulting hashes against the registry approval, and registers the image. It replaces the former `dstack/deploy.sh`.
 
 ### Docs (`docs/`)
 
@@ -62,15 +66,15 @@ Tests: 12 tests in `cli/tests/picodollar_test.rs` covering conversion, boundary 
 
 ```
 cargo clippy --all-targets --all-features -- -D warnings   # clean
-cargo test                                                  # 27 tests pass
-shellcheck image/start.sh dstack/deploy.sh                 # clean
-shfmt -d image/start.sh dstack/deploy.sh                   # clean
+cargo test                                                  # all tests pass
+shellcheck image/start.sh                                   # clean
+shfmt -d image/start.sh                                     # clean
 ```
 
 ## What W5 needs from W4
 
 1. **Miner endpoint URL** — `https://<miner-ip>:8080`. The IP/hostname comes from `dstack-cloud status` after deploy. The registry probes upstream availability + key validity by issuing `GET /v1/models` (anthropic / openai) or `GET /v1beta/models` (gemini) with the `x-gm-provider` header.
-2. **`compose_hash`** — SHA-256 of `docker-compose.yaml` printed by `deploy.sh`. Pass to `gm-miner register-image --compose-hash <hash>`.
+2. **`compose_hash`** — SHA-256 of `docker-compose.yaml`, verified against the registry approval and registered automatically by `gm-miner deploy` (or read from `dstack-cloud status` for a manual `gm-miner register-image`).
 
 ## What is NOT done (Phase 2 scope)
 
