@@ -253,6 +253,21 @@ pub fn preflight_tools() -> Result<()> {
     Ok(())
 }
 
+/// Preflight only `gcloud` — for the `--image-ref` path where the local
+/// build is skipped and Docker is not required.
+///
+/// # Errors
+/// Returns an error if `gcloud` is not on `PATH`.
+pub fn preflight_gcloud() -> Result<()> {
+    if !tool_on_path("gcloud") {
+        bail!(
+            "missing required host tool for `gm-miner deploy`:\n  \
+             - gcloud: install: https://cloud.google.com/sdk/docs/install"
+        );
+    }
+    Ok(())
+}
+
 /// Run `gcloud <args...>`, failing with an actionable error on non-zero exit.
 fn run_gcloud(args: &[String]) -> Result<()> {
     let status = std::process::Command::new("gcloud")

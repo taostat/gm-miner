@@ -492,29 +492,36 @@ async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
 
 /// Provision GCP infrastructure and obtain the digest-pinned image ref.
 ///
-/// When `args.image_ref` is supplied the local build is skipped and that
-/// pre-built ref is returned verbatim. Otherwise this runs the full
-/// `deploy.sh` infrastructure flow: tool preflight, `gcloud` project /
-/// services / bucket / Artifact-Registry setup, Docker auth, the image
-/// build + push, and digest resolution.
+/// When `args.image_ref` is supplied only `gcloud` is preflighted; the
+/// Artifact Registry setup and Docker steps are skipped entirely (the
+/// operator may have no Docker daemon on the host). The non-build GCP
+/// steps (project config, services, bucket) still run.
+///
+/// Without `--image-ref` this runs the full build flow: preflight for
+/// both `gcloud` and `docker`, `gcloud` project / services / bucket /
+/// Artifact-Registry setup, Docker auth, image build + push, and digest
+/// resolution.
 fn provision_and_build_image(args: &DeployArgs, gcp: &GcpConfig) -> Result<String> {
     use gm_miner_cli::gcp as gcp_provision;
-
-    // Always preflight the host tools the deploy needs.
-    gcp_provision::preflight_tools()?;
 
     // Configure the GCP project + service APIs regardless of whether we
     // build locally — `dstack-cloud deploy` needs compute / storage /
     // confidentialcomputing enabled and the GCS bucket present.
     println!("Provisioning GCP project {} ...", args.gcp_project);
-    gcp_provision::configure_project(&args.gcp_project)?;
-    gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
-    gcp_provision::ensure_artifact_registry(&args.ar_repo, &args.gcp_region)?;
-
     if let Some(pre_built) = &args.image_ref {
+        // Pre-built image: only gcloud is needed (no Docker, no AR repo).
+        gcp_provision::preflight_gcloud()?;
+        gcp_provision::configure_project(&args.gcp_project)?;
+        gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
         println!("Using pre-built image ref (skipping local build): {pre_built}");
         return Ok(pre_built.clone());
     }
+
+    // Local-build path: preflight both gcloud and docker, set up AR.
+    gcp_provision::preflight_tools()?;
+    gcp_provision::configure_project(&args.gcp_project)?;
+    gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
+    gcp_provision::ensure_artifact_registry(&args.ar_repo, &args.gcp_region)?;
 
     let repo_root = args
         .repo_root
