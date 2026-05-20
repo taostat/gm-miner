@@ -20,3 +20,11 @@ rules:
   template-injection:
     ignore:
       - release.yml
+
+  # release.yml's `container:` is a dist-generated matrix expression
+  # (`${{ matrix.container && matrix.container.image || null }}`); the
+  # image, when used, is selected by dist. The unpinned-images finding
+  # is inherent to dist's output and reappears on any regeneration.
+  unpinned-images:
+    ignore:
+      - release.yml
