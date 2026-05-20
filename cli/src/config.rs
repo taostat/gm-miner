@@ -154,7 +154,13 @@ impl Config {
         self.networks
             .get(self.active_network())
             .and_then(|n| n.auth_url.clone())
-            .unwrap_or_else(|| "https://auth.taostats.io".to_string())
+            .unwrap_or_else(|| {
+                if self.active_network() == "testnet" {
+                    "https://test-auth.taostats.io".to_string()
+                } else {
+                    "https://auth.taostats.io".to_string()
+                }
+            })
     }
 
     /// Registry API URL for the active network.
@@ -163,7 +169,13 @@ impl Config {
         self.networks
             .get(self.active_network())
             .and_then(|n| n.api_url.clone())
-            .unwrap_or_else(|| "https://api.gm.taostats.io".to_string())
+            .unwrap_or_else(|| {
+                if self.active_network() == "testnet" {
+                    "https://test-gm-registry.taostats.io".to_string()
+                } else {
+                    "https://gm-registry.taostats.io".to_string()
+                }
+            })
     }
 
     /// OAuth client ID.

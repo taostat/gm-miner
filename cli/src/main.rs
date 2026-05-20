@@ -18,6 +18,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::IsTerminal as _;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use gm_miner_cli::{
@@ -253,6 +255,10 @@ async fn main() -> Result<()> {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
         .init();
 
+    if std::env::args().len() == 1 && std::io::stdout().is_terminal() {
+        println!("{BANNER}");
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -385,6 +391,27 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+// ── Banner ───────────────────────────────────────────────────────────────────
+
+const BANNER: &str = r"
+         .     .     .
+      .  * .  . * .  * .
+   .   *   \  |  /   *   .
+     .   ---( gm )---   .
+   .   *   /  |  \   *   .
+      .  * .  . * .  * .
+         .     .     .
+
+   ,----------------------------------.
+   |                                  |
+   |   gm fren  (n'-')n               |
+   |                                  |
+   |   another day, another block.    |
+   |   now go get that alpha.         |
+   |                                  |
+   '----------------------------------'
+";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -798,29 +825,14 @@ async fn cmd_login(
     // overwrite mainnet credentials when the operator omits --testnet.
     cfg.active_network = Some(if testnet { "testnet" } else { "mainnet" }.to_string());
 
-    let auth_url = auth_url_override
-        .or_else(|| {
-            cfg.networks
-                .get(cfg.active_network())
-                .and_then(|n| n.auth_url.clone())
-        })
-        .unwrap_or_else(|| "https://auth.taostats.io".to_string());
-
+    let auth_url = auth_url_override.unwrap_or_else(|| cfg.auth_url());
+    let resolved_api_url = api_url_override.unwrap_or_else(|| cfg.api_url());
     let client_id = cfg.client_id();
 
     let token = auth::device_login(&auth_url, &client_id, &["miner"], open_browser).await?;
 
     let entry = cfg.active_entry_mut();
     entry.auth_url = Some(auth_url.clone());
-    let resolved_api_url = api_url_override
-        .or_else(|| entry.api_url.clone())
-        .unwrap_or_else(|| {
-            if testnet {
-                "https://api-testnet.gm.taostats.io".to_string()
-            } else {
-                "https://api.gm.taostats.io".to_string()
-            }
-        });
     entry.api_url = Some(resolved_api_url);
     entry.tokens = Some(TokenEntry {
         access_token: Some(token.access_token.clone()),
