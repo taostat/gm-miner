@@ -444,11 +444,18 @@ pub fn build_and_push_image(
 #[must_use]
 pub fn os_image_cache_path(image_url: &str) -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
-    // Extract the filename from the URL (last `/`-delimited segment).
-    let filename = image_url.rsplit('/').next().filter(|s| !s.is_empty())?;
-    // Strip .tar.gz (or just .gz if someone passes a .gz-only URL).
+    // Extract the filename from the URL (last `/`-delimited segment),
+    // ignoring any query string or fragment a release URL may carry.
+    let filename = image_url
+        .rsplit('/')
+        .next()
+        .map(|seg| seg.split(['?', '#']).next().unwrap_or(seg))
+        .filter(|s| !s.is_empty())?;
+    // Strip the archive extension. `.tar.gz` / `.tgz` are the dstack-cloud
+    // release forms; `.gz` covers a bare `.gz`-only URL.
     let dir_name = filename
         .strip_suffix(".tar.gz")
+        .or_else(|| filename.strip_suffix(".tgz"))
         .or_else(|| filename.strip_suffix(".gz"))
         .unwrap_or(filename);
     Some(home.join(".dstack").join("images").join(dir_name))
@@ -594,6 +601,22 @@ mod tests {
         let path = os_image_cache_path(url).expect("must resolve");
         let name = path.file_name().unwrap().to_string_lossy();
         assert_eq!(name, "plain-image");
+    }
+
+    #[test]
+    fn os_image_cache_path_strips_tgz_suffix() {
+        let url = "https://example.com/releases/image-3.0.tgz";
+        let path = os_image_cache_path(url).expect("must resolve");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(name, "image-3.0");
+    }
+
+    #[test]
+    fn os_image_cache_path_ignores_query_string() {
+        let url = "https://example.com/releases/image-4.0.tar.gz?token=abc#frag";
+        let path = os_image_cache_path(url).expect("must resolve");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(name, "image-4.0");
     }
 
     /// `pull_os_image` must skip the `dstack-cloud pull` subprocess when the
