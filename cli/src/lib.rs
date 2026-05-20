@@ -3,5 +3,7 @@
 pub mod auth;
 pub mod client;
 pub mod config;
+pub mod deploy;
+pub mod gcp;
 pub mod picodollar;
 pub mod types;

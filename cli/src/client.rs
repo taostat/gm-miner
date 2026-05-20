@@ -8,6 +8,12 @@ use serde_json::Value;
 
 use crate::config::Config;
 
+/// Cheapest authenticated endpoint on the registry — used by the deploy
+/// command's auth preflight. Returns the caller's current miner block
+/// (or 404 if the miner has never registered). Exposed as a constant so
+/// the preflight and `gm-miner status` agree on the URL.
+pub const ME_PATH: &str = "/miners/me";
+
 pub struct RegistryClient {
     pub config: Config,
     client: Client,
@@ -94,6 +100,25 @@ impl RegistryClient {
             bail!("authentication expired — run `gm-miner login` again");
         }
         Ok(resp)
+    }
+
+    /// Cheap authenticated probe used by `gm-miner deploy` before any
+    /// expensive CVM work. A missing access token surfaces as "not logged
+    /// in" and a 401 response surfaces as "authentication expired" — both
+    /// from `get` itself. Any non-auth error (e.g. registry 404 because
+    /// the miner has never registered, or a 5xx) is *not* a preflight
+    /// failure: the eventual `register-image` call would catch those with
+    /// more context, so we let them through.
+    ///
+    /// # Errors
+    /// Returns an error only for the two auth failure modes above. The
+    /// caller does not need to inspect the response body.
+    pub async fn preflight_auth(&mut self) -> Result<()> {
+        let _resp = self
+            .get(ME_PATH)
+            .await
+            .context("authentication preflight (GET /miners/me)")?;
+        Ok(())
     }
 
     /// Issue an authenticated PATCH request with a JSON body.

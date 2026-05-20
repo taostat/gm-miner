@@ -42,6 +42,34 @@ pub struct NetworkEntry {
     pub tokens: Option<TokenEntry>,
 }
 
+/// Provider API keys persisted by `gm-miner set-api-keys`.
+///
+/// Values are stored in `~/.gm-miner/config.json` (mode 0600).
+/// Missing fields mean "not configured" — the deploy command treats
+/// a completely absent `provider_keys` section the same as all-None.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProviderKeys {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub google: Option<String>,
+}
+
+impl ProviderKeys {
+    /// Returns true if at least one key is set to a non-empty, non-whitespace value.
+    ///
+    /// `Some("")` and `Some("  ")` are treated as not set so that accidental
+    /// empty-string assignments (e.g. from an unset shell variable) don't
+    /// silently pass the deploy preflight check.
+    #[must_use]
+    pub fn any_set(&self) -> bool {
+        let non_empty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+        non_empty(&self.anthropic) || non_empty(&self.openai) || non_empty(&self.google)
+    }
+}
+
 /// Root config structure.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -49,6 +77,9 @@ pub struct Config {
     pub networks: std::collections::HashMap<String, NetworkEntry>,
     /// Which network is currently active.
     pub active_network: Option<String>,
+    /// Provider API keys set by `gm-miner set-api-keys`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_keys: Option<ProviderKeys>,
 }
 
 impl Config {

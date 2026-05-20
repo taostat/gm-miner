@@ -1,13 +1,13 @@
 ## gm miner dstack compose template.
 ##
-## Usage: deploy.sh renders this file, substituting GM_IMAGE_REF with
-## the digest-pinned image reference. The rendered output is written to
-## dist/<app-name>/docker-compose.yaml and deployed via dstack-cloud.
+## Usage: `gm-miner deploy` renders this file, substituting GM_IMAGE_REF
+## with the digest-pinned image reference. The rendered output is written
+## to dist/<app-name>/docker-compose.yaml and deployed via dstack-cloud.
 ##
 ## Provider keys (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY)
 ## are NOT rendered into this file — dstack encrypts them via KMS from
-## the .env file written by deploy.sh. Set only the keys you have; an
-## unset key makes the upstream return 401, which the registry surfaces
+## the .env file written by `gm-miner deploy`. Set only the keys you have;
+## an unset key makes the upstream return 401, which the registry surfaces
 ## as a "key not configured" capability failure.
 ##
 ## The runtime is envoy + its native /stats/prometheus exposure — no
@@ -16,7 +16,7 @@
 
 services:
   gm-miner:
-    image: ${GM_IMAGE_REF:?GM_IMAGE_REF must be set (deploy.sh renders this with the pinned image digest)}
+    image: ${GM_IMAGE_REF:?GM_IMAGE_REF must be set (gm-miner deploy renders this with the pinned image digest)}
     ports:
       ## Envoy data plane — receives gateway inference traffic AND the
       ## registry's `x-gm-provider` capability probes.

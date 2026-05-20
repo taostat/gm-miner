@@ -25,6 +25,7 @@ fn mainnet_config_with_api_url(url: &str) -> Config {
     Config {
         networks,
         active_network: Some("mainnet".to_string()),
+        provider_keys: None,
     }
 }
 

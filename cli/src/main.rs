@@ -1,6 +1,9 @@
 //! gm-miner CLI.
 //!
 //! Subcommands:
+//!   set-api-keys    — persist provider API keys to ~/.gm-miner/config.json
+//!   deploy          — trust-correct single-shot deploy: fetch approved hashes,
+//!                     deploy via dstack-cloud, verify hashes, register image
 //!   login           — Taostats device-code OAuth flow
 //!   register-image  — register the miner image's compose hash with the registry
 //!   list-products   — show the registry product catalog
@@ -20,7 +23,11 @@ use clap::{Parser, Subcommand};
 use gm_miner_cli::{
     auth,
     client::RegistryClient,
-    config::{self, Config, TokenEntry},
+    config::{self, Config, ProviderKeys, TokenEntry},
+    deploy::{
+        fetch_supported_versions, format_created_at, prepare_deploy_target, select_version,
+        verify_hashes, DstackClient, GcpConfig, ImageProvisioner, DEFAULT_BOOT_TIMEOUT_SECS,
+    },
     picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
 };
@@ -47,6 +54,102 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Persist provider API keys to ~/.gm-miner/config.json (mode 0600).
+    ///
+    /// Each flag, if provided, replaces the stored value.  Omitted flags
+    /// leave existing values intact.  Key values are never echoed back.
+    SetApiKeys {
+        /// Anthropic API key (sk-ant-...).
+        #[arg(long)]
+        anthropic: Option<String>,
+
+        /// `OpenAI` API key (sk-...).
+        #[arg(long)]
+        openai: Option<String>,
+
+        /// Google API key.
+        #[arg(long)]
+        google: Option<String>,
+    },
+
+    /// Deploy the miner via dstack-cloud with trust-correct hash verification.
+    ///
+    /// Reads provider API keys from ~/.gm-miner/config.json (set them first
+    /// with `gm-miner set-api-keys`), fetches the registry-approved image
+    /// version, deploys via dstack-cloud, verifies the actual hashes match the
+    /// registry approval, then registers the image automatically.
+    ///
+    /// On a fresh machine (no prior deploy) this automatically runs
+    /// `dstack-cloud new` to scaffold the project before deploying.
+    Deploy {
+        /// Pre-built digest-pinned image reference (registry/repo/name@sha256:...).
+        ///
+        /// When set (or `GM_IMAGE_REF` is in env), the local image build is
+        /// skipped and this ref is embedded in the compose file directly.
+        /// When omitted, the miner image is built and pushed to Artifact
+        /// Registry and the resulting digest is pinned automatically.
+        #[arg(long, env = "GM_IMAGE_REF")]
+        image_ref: Option<String>,
+
+        /// Pin to a specific approved version by index (1 = newest).
+        /// Defaults to the newest supported version.
+        #[arg(long)]
+        version: Option<usize>,
+
+        /// dstack-cloud app name.
+        #[arg(long, default_value = "gm-miner-1")]
+        app_name: String,
+
+        /// dstack project directory (the full path used verbatim).
+        /// Defaults to `dist/<app_name>` relative to the current directory.
+        #[arg(long)]
+        dist_dir: Option<std::path::PathBuf>,
+
+        /// GCP project ID for the dstack deployment. Required.
+        #[arg(long, env = "GCP_PROJECT_ID")]
+        gcp_project: String,
+
+        /// GCP region for the GCS bucket / Artifact Registry repo.
+        #[arg(long, env = "GCP_REGION", default_value = "us-central1")]
+        gcp_region: String,
+
+        /// GCP zone for the dstack CVM. Defaults to `<gcp-region>-a`.
+        #[arg(long, env = "GCP_ZONE")]
+        gcp_zone: Option<String>,
+
+        /// Compute Engine machine type for the CVM.
+        #[arg(long, env = "MACHINE_TYPE", default_value = "c3-standard-4")]
+        machine_type: String,
+
+        /// GCS bucket URI for dstack image upload.
+        /// Defaults to `gs://<gcp-project>-dstack` (same convention as deploy.sh).
+        #[arg(long, env = "GCS_BUCKET")]
+        gcs_bucket: Option<String>,
+
+        /// Artifact Registry repository name for the miner image.
+        #[arg(long, env = "AR_REPO", default_value = "gm-miner")]
+        ar_repo: String,
+
+        /// Image tag applied to the build before digest resolution.
+        #[arg(long, env = "IMAGE_TAG", default_value = "v0.1.0")]
+        image_tag: String,
+
+        /// dstack-cloud OS image URL pulled before deploy. Defaults to the
+        /// pinned Phala meta-dstack-cloud release used by deploy.sh.
+        #[arg(long, env = "DSTACK_OS_IMAGE_URL")]
+        os_image_url: Option<String>,
+
+        /// Repository root used as the Docker build context. Defaults to
+        /// the current directory.
+        #[arg(long)]
+        repo_root: Option<std::path::PathBuf>,
+
+        /// How long to wait for the CVM to boot and populate hashes in
+        /// `dstack-cloud status --json` (seconds). Default: 300.
+        #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
+        boot_timeout_secs: u64,
+    },
+
     /// Authenticate with Taostats (device-code OAuth flow) and store
     /// credentials in ~/.gm-miner/config.json.
     Login {
@@ -60,14 +163,17 @@ enum Command {
     },
 
     /// Register this miner's image compose hash + capabilities with the registry.
-    /// Run once after deploying a new image version.
+    ///
+    /// The normal operator flow uses `gm-miner deploy` which verifies and
+    /// registers in one step.  Use this subcommand only for re-registering
+    /// without redeploying (e.g. after a registry resync or for debugging).
     RegisterImage {
         /// Docker compose SHA256 (output of sha256sum docker-compose.yaml).
-        #[arg(long)]
+        #[arg(long, hide = true)]
         compose_hash: String,
 
         /// dstack OS image hash (from dstack-cloud status or the deployment log).
-        #[arg(long)]
+        #[arg(long, hide = true)]
         os_image_hash: String,
     },
 
@@ -137,6 +243,11 @@ enum Command {
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "main is a pure dispatch function; each arm is a one-liner or a \
+              call to a dedicated cmd_* handler — no logic lives here"
+)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
@@ -145,6 +256,49 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::SetApiKeys {
+            anthropic,
+            openai,
+            google,
+        } => cmd_set_api_keys(anthropic, openai, google),
+        Command::Deploy {
+            image_ref,
+            version,
+            app_name,
+            dist_dir,
+            gcp_project,
+            gcp_region,
+            gcp_zone,
+            machine_type,
+            gcs_bucket,
+            ar_repo,
+            image_tag,
+            os_image_url,
+            repo_root,
+            boot_timeout_secs,
+        } => {
+            let cfg = load_config(cli.testnet, cli.api_url)?;
+            cmd_deploy_subcommand(
+                cfg,
+                DeployArgs {
+                    app_name,
+                    image_ref,
+                    dist_dir,
+                    gcp_project,
+                    gcp_region,
+                    gcp_zone,
+                    machine_type,
+                    gcs_bucket,
+                    ar_repo,
+                    image_tag,
+                    os_image_url,
+                    repo_root,
+                    version,
+                    boot_timeout_secs,
+                },
+            )
+            .await
+        }
         Command::Login {
             no_browser,
             auth_url,
@@ -259,7 +413,327 @@ fn build_price_block(
     })
 }
 
+/// Extract a human-readable error detail from a registry JSON error body.
+///
+/// Returns the `detail` string field if present, otherwise the whole body
+/// re-serialized. Avoids leaking a `'static str` on every error path.
+fn error_detail(json: &serde_json::Value) -> String {
+    json.get("detail")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| json.to_string(), str::to_owned)
+}
+
 // ── Commands ────────────────────────────────────────────────────────────────
+
+/// Parsed `gm-miner deploy` arguments, grouped so the dispatch match arm
+/// and the subcommand entry point do not need a long positional list.
+struct DeployArgs {
+    app_name: String,
+    image_ref: Option<String>,
+    dist_dir: Option<std::path::PathBuf>,
+    gcp_project: String,
+    gcp_region: String,
+    gcp_zone: Option<String>,
+    machine_type: String,
+    gcs_bucket: Option<String>,
+    ar_repo: String,
+    image_tag: String,
+    os_image_url: Option<String>,
+    repo_root: Option<std::path::PathBuf>,
+    version: Option<usize>,
+    boot_timeout_secs: u64,
+}
+
+/// Build and run the deploy subcommand from parsed CLI arguments.
+///
+/// Separated from `main` to keep the dispatch match arm small.
+async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
+    // --dist-dir is the project directory used verbatim.
+    // Default: dist/<app_name> relative to cwd (matches deploy.sh).
+    let project_dir = args
+        .dist_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&args.app_name));
+
+    let dstack = gm_miner_cli::deploy::RealDstackClient {
+        app_name: args.app_name.clone(),
+        project_dir: project_dir.clone(),
+    };
+
+    // The basename check only matters when this directory still needs
+    // `dstack-cloud new`, which creates `<cwd>/<app_name>/` — if the basename
+    // differs the bootstrapped directory and the one we read/patch diverge.
+    // An already-bootstrapped project (valid `app.json`) is deployed in place
+    // via `current_dir`, so any path is fine; don't reject custom dist dirs.
+    if args.dist_dir.is_some() && !dstack.is_bootstrapped() {
+        let basename = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if basename != args.app_name {
+            bail!(
+                "dist-dir basename must equal app-name when bootstrapping a fresh \
+                 project; got dist-dir={}, app-name={app_name}",
+                project_dir.display(),
+                app_name = args.app_name
+            );
+        }
+    }
+
+    // zone defaults to `<region>-a`, mirroring deploy.sh.
+    let zone = args
+        .gcp_zone
+        .clone()
+        .unwrap_or_else(|| format!("{}-a", args.gcp_region));
+    let bucket = args
+        .gcs_bucket
+        .clone()
+        .unwrap_or_else(|| GcpConfig::default_bucket(&args.gcp_project));
+    let gcp = GcpConfig {
+        project: args.gcp_project.clone(),
+        zone,
+        machine_type: args.machine_type.clone(),
+        instance_name: args.app_name.clone(),
+        bucket,
+    };
+    let mut client = RegistryClient::new(cfg.clone());
+    cmd_deploy(&cfg, &mut client, &dstack, &args, &gcp).await
+}
+
+/// Real [`ImageProvisioner`]: provisions GCP infrastructure and obtains the
+/// digest-pinned image ref via `gcloud` / `docker`.
+///
+/// When `args.image_ref` is supplied only `gcloud` is preflighted; the
+/// Artifact Registry setup and Docker steps are skipped entirely (the
+/// operator may have no Docker daemon on the host). The non-build GCP
+/// steps (project config, services, bucket) still run.
+///
+/// Without `--image-ref` this runs the full build flow: preflight for
+/// both `gcloud` and `docker`, `gcloud` project / services / bucket /
+/// Artifact-Registry setup, Docker auth, image build + push, and digest
+/// resolution.
+struct GcpImageProvisioner<'a> {
+    args: &'a DeployArgs,
+    gcp: &'a GcpConfig,
+}
+
+impl ImageProvisioner for GcpImageProvisioner<'_> {
+    fn provision(&self) -> Result<String> {
+        use gm_miner_cli::gcp as gcp_provision;
+
+        let args = self.args;
+        let gcp = self.gcp;
+
+        // Configure the GCP project + service APIs regardless of whether we
+        // build locally — `dstack-cloud deploy` needs compute / storage /
+        // confidentialcomputing enabled and the GCS bucket present.
+        println!("Provisioning GCP project {} ...", args.gcp_project);
+        if let Some(pre_built) = &args.image_ref {
+            // Pre-built image: only gcloud is needed (no Docker, no AR repo).
+            gcp_provision::preflight_gcloud()?;
+            gcp_provision::configure_project(&args.gcp_project)?;
+            gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
+            println!("Using pre-built image ref (skipping local build): {pre_built}");
+            return Ok(pre_built.clone());
+        }
+
+        // Local-build path: preflight both gcloud and docker, set up AR.
+        gcp_provision::preflight_tools()?;
+        gcp_provision::configure_project(&args.gcp_project)?;
+        gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
+        gcp_provision::ensure_artifact_registry(&args.ar_repo, &args.gcp_region)?;
+
+        let repo_root = args
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let coords = gcp_provision::ImageCoordinates::derive(
+            &args.gcp_region,
+            &args.gcp_project,
+            &args.ar_repo,
+            &args.app_name,
+            &args.image_tag,
+        );
+        gcp_provision::configure_docker_auth(&coords.ar_host)?;
+
+        let image_version = git_short_sha(&repo_root);
+        println!("Building and pushing the miner image ...");
+        gcp_provision::build_and_push_image(&coords, &args.app_name, &image_version, &repo_root)
+    }
+}
+
+/// Resolve the short git commit SHA of `repo_root` for the image version,
+/// falling back to `"unknown"` (matches deploy.sh's `GM_IMAGE_VERSION`).
+fn git_short_sha(repo_root: &std::path::Path) -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Validate a key value passed to `set-api-keys`: reject empty / whitespace-only
+/// strings with an actionable error rather than silently storing them.
+fn validate_key(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("empty value for --{name}; either omit the flag or pass a non-empty key");
+    }
+    Ok(())
+}
+
+fn cmd_set_api_keys(
+    anthropic: Option<String>,
+    openai: Option<String>,
+    google: Option<String>,
+) -> Result<()> {
+    // Reject empty values up front so they don't pass the deploy preflight.
+    if let Some(ref k) = anthropic {
+        validate_key("anthropic", k)?;
+    }
+    if let Some(ref k) = openai {
+        validate_key("openai", k)?;
+    }
+    if let Some(ref k) = google {
+        validate_key("google", k)?;
+    }
+
+    let mut cfg = config::load()
+        .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
+
+    {
+        let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
+        if let Some(k) = anthropic {
+            keys.anthropic = Some(k);
+        }
+        if let Some(k) = openai {
+            keys.openai = Some(k);
+        }
+        if let Some(k) = google {
+            keys.google = Some(k);
+        }
+    }
+
+    // Snapshot which keys are set before saving (only immutable borrow needed).
+    let (has_anthropic, has_openai, has_google) =
+        cfg.provider_keys
+            .as_ref()
+            .map_or((false, false, false), |k| {
+                (
+                    k.anthropic.is_some(),
+                    k.openai.is_some(),
+                    k.google.is_some(),
+                )
+            });
+
+    config::save(&cfg).context("save config")?;
+
+    let mut set_names: Vec<&str> = Vec::new();
+    if has_anthropic {
+        set_names.push("anthropic");
+    }
+    if has_openai {
+        set_names.push("openai");
+    }
+    if has_google {
+        set_names.push("google");
+    }
+
+    // Report which providers are now configured — never print the values.
+    if set_names.is_empty() {
+        println!("No keys stored (pass --anthropic, --openai, or --google to set one).");
+    } else {
+        println!("Provider keys updated.");
+        for name in &set_names {
+            println!("  {name}: set");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_deploy(
+    cfg: &Config,
+    client: &mut RegistryClient,
+    dstack: &dyn gm_miner_cli::deploy::DstackClient,
+    args: &DeployArgs,
+    gcp: &GcpConfig,
+) -> Result<()> {
+    // Step 1: ensure provider keys are configured.
+    let keys = cfg
+        .provider_keys
+        .as_ref()
+        .filter(|k| k.any_set())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no provider keys; run `gm-miner set-api-keys \
+                 --anthropic <key>` (and/or --openai / --google) first"
+            )
+        })?;
+
+    // Step 2: auth preflight. `dstack-cloud deploy` is slow and irreversible
+    // for the operator (CVM created, GCS bytes uploaded), so we refuse to
+    // start the deploy unless the registry will accept the eventual
+    // `register-image` call. The preflight is a cheap `GET /miners/me` —
+    // a missing token / 401 fails fast with an actionable message before
+    // any CVM work.
+    client.preflight_auth().await?;
+
+    // Step 3: fetch approved image versions from the registry.
+    let registry_url = cfg.api_url();
+    println!("Fetching approved image versions from {registry_url} ...");
+    let versions = fetch_supported_versions(&registry_url).await?;
+
+    // Step 4: select the target version.
+    let approved = select_version(&versions, args.version)?;
+    println!(
+        "Selected version {}  ({})",
+        approved.notes.as_deref().unwrap_or("<no notes>"),
+        format_created_at(&approved.created_at),
+    );
+
+    // Steps 5-7: prepare the deploy target. The dstack project is
+    // bootstrapped (or its existing app.json trust-validated) *before* the
+    // multi-minute image build+push, so a fresh-machine bootstrap failure is
+    // hit cheaply instead of after a wasted build. `prepare_deploy_target`
+    // then provisions GCP + the image (via `GcpImageProvisioner`, which owns
+    // the build-vs-prebuilt branch) and renders the compose template.
+    let provisioner = GcpImageProvisioner { args, gcp };
+    let rendered = prepare_deploy_target(dstack, &provisioner, &args.app_name, gcp)?;
+
+    // Step 8: pull the dstack-cloud OS image referenced by the deploy.
+    let os_image_url = args
+        .os_image_url
+        .clone()
+        .unwrap_or_else(|| gm_miner_cli::gcp::DEFAULT_DSTACK_OS_IMAGE_URL.to_owned());
+    let project_dir = args
+        .dist_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&args.app_name));
+    println!("Pulling the dstack-cloud OS image ...");
+    gm_miner_cli::gcp::pull_os_image(&os_image_url, &project_dir)?;
+
+    // Step 9: deploy via dstack-cloud, polling until hashes appear.
+    // On re-deploy the deploy() call also refreshes gcp_config before running
+    // `dstack-cloud deploy` so GCP coordinates stay current.
+    println!(
+        "Deploying via dstack-cloud (boot timeout: {}s) ...",
+        args.boot_timeout_secs
+    );
+    let actual = dstack.deploy(&rendered, keys, gcp, args.boot_timeout_secs)?;
+
+    // Step 10: verify hashes.
+    println!("Verifying hashes against registry approval ...");
+    verify_hashes(&actual, approved)?;
+    println!("  compose_hash  : OK ({})", actual.compose_sha256);
+    println!("  os_image_hash : OK ({})", actual.os_image_hash);
+
+    // Step 11: register the image.
+    println!("Registering image with the registry ...");
+    cmd_register_image(client, &actual.compose_sha256, &actual.os_image_hash).await
+}
 
 async fn cmd_login(
     testnet: bool,
@@ -343,12 +817,7 @@ async fn cmd_register_image(
     let json: serde_json::Value = resp.json().await.context("parse register response")?;
 
     if !status.is_success() {
-        bail!(
-            "register-image failed ({status}): {}",
-            json.get("detail")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| json.to_string().leak())
-        );
+        bail!("register-image failed ({status}): {}", error_detail(&json));
     }
 
     println!("Image registered.");
@@ -415,12 +884,7 @@ async fn cmd_declare_product(
         .context("parse declare-product response")?;
 
     if !status.is_success() {
-        bail!(
-            "declare-product failed ({status}): {}",
-            json.get("detail")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| json.to_string().leak())
-        );
+        bail!("declare-product failed ({status}): {}", error_detail(&json));
     }
 
     let input_usd =
@@ -500,12 +964,7 @@ async fn cmd_update_prices(
     let json: serde_json::Value = resp.json().await.context("parse update-prices response")?;
 
     if !status.is_success() {
-        bail!(
-            "update-prices failed ({status}): {}",
-            json.get("detail")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| json.to_string().leak())
-        );
+        bail!("update-prices failed ({status}): {}", error_detail(&json));
     }
 
     println!("Prices updated for {provider}/{model}.");
@@ -513,7 +972,10 @@ async fn cmd_update_prices(
 }
 
 async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
-    let resp = client.get("/miners/me").await.context("GET /miners/me")?;
+    let resp = client
+        .get(gm_miner_cli::client::ME_PATH)
+        .await
+        .context("GET /miners/me")?;
 
     let status_code = resp.status();
     if !status_code.is_success() {
