@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
 description = "gm miner CLI — login, register-image, list-products, declare-product, update-prices, status."
 
 [lints.clippy]
@@ -28,6 +29,12 @@ mem_forget = "deny"
 module_name_repetitions = "allow"
 similar_names = "allow"
 too_many_arguments = "allow"
+
+# The workspace sets `publish = false` (this CLI is never published to
+# crates.io). That flag also hides the crate from `dist`, so opt the binary
+# back in explicitly for release builds.
+[package.metadata.dist]
+dist = true
 
 [[bin]]
 name = "gm-miner"

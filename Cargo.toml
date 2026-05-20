@@ -8,6 +8,7 @@ edition = "2021"
 rust-version = "1.83"
 license = "Apache-2.0"
 publish = false
+repository = "https://github.com/taostat/gm-miner"
 
 [workspace.dependencies]
 tokio = { version = "1.42", features = ["full"] }
@@ -38,3 +39,8 @@ exit = "deny"
 mem_forget = "deny"
 module_name_repetitions = "allow"
 similar_names = "allow"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
