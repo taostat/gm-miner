@@ -5,7 +5,8 @@
 //!   deploy          — trust-correct single-shot deploy: fetch approved hashes,
 //!                     deploy via dstack-cloud, verify hashes, register image
 //!   login           — Taostats device-code OAuth flow
-//!   register-image  — register the miner image's compose hash with the registry
+//!   register-image  — re-register the deployed miner's image hashes
+//!                     (auto-discovered from dstack-cloud status)
 //!   list-products   — show the registry product catalog
 //!   declare-product — register a miner-product offer with prices in USD/Mtok
 //!   update-prices   — update prices on an existing offer
@@ -169,14 +170,19 @@ enum Command {
     /// The normal operator flow uses `gm-miner deploy` which verifies and
     /// registers in one step.  Use this subcommand only for re-registering
     /// without redeploying (e.g. after a registry resync or for debugging).
+    ///
+    /// The compose + OS image hashes are read automatically from the deployed
+    /// miner via `dstack-cloud status --json`; the dstack app must already be
+    /// deployed (`gm-miner deploy`).
     RegisterImage {
-        /// Docker compose SHA256 (output of sha256sum docker-compose.yaml).
-        #[arg(long, hide = true)]
-        compose_hash: String,
+        /// dstack-cloud app name (must match the one used by `gm-miner deploy`).
+        #[arg(long, default_value = "gm-miner-1")]
+        app_name: String,
 
-        /// dstack OS image hash (from dstack-cloud status or the deployment log).
-        #[arg(long, hide = true)]
-        os_image_hash: String,
+        /// dstack project directory (the full path used verbatim).
+        /// Defaults to `dist/<app_name>` relative to the current directory.
+        #[arg(long)]
+        dist_dir: Option<std::path::PathBuf>,
     },
 
     /// List all products in the registry catalog.
@@ -314,10 +320,7 @@ async fn main() -> Result<()> {
             no_browser,
             auth_url,
         } => cmd_login(cli.testnet, auth_url, cli.api_url, !no_browser).await,
-        Command::RegisterImage {
-            compose_hash,
-            os_image_hash,
-        } => {
+        Command::RegisterImage { app_name, dist_dir } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             // Re-send the network's persisted node secret so a standalone
             // re-registration keeps the registry's stored copy in sync
@@ -327,14 +330,13 @@ async fn main() -> Result<()> {
             let node_secret = cfg
                 .active_network_entry()
                 .and_then(|n| n.node_secret.clone());
+            // --dist-dir is used verbatim; default `dist/<app_name>` matches
+            // the convention `gm-miner deploy` uses, so re-registration reads
+            // the same dstack project the deploy wrote.
+            let project_dir =
+                dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
             let mut client = RegistryClient::new(cfg);
-            cmd_register_image(
-                &mut client,
-                &compose_hash,
-                &os_image_hash,
-                node_secret.as_deref(),
-            )
-            .await
+            cmd_register_image(&mut client, &app_name, &project_dir, node_secret.as_deref()).await
         }
         Command::ListProducts => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
@@ -783,9 +785,11 @@ async fn cmd_deploy(
     println!("  os_image_hash : OK ({})", verified.os_image_hash);
 
     // Step 11: register the image, carrying the node secret so the
-    // registry stores it and serves it to the gateway.
+    // registry stores it and serves it to the gateway. The hashes are
+    // already verified against the registry approval, so POST directly
+    // rather than re-reading dstack status.
     println!("Registering image with the registry ...");
-    cmd_register_image(
+    post_register_image(
         client,
         &verified.compose_sha256,
         &verified.os_image_hash,
@@ -852,7 +856,52 @@ async fn cmd_login(
     Ok(())
 }
 
+/// `gm-miner register-image` — re-register the deployed miner's image with
+/// the registry without a full redeploy.
+///
+/// Auto-discovers the deployed `compose_hash` + `os_image_hash` by reading
+/// `dstack-cloud status --json` for the dstack app at `project_dir` (the
+/// same status read `gm-miner deploy` performs), then POSTs them — and the
+/// persisted node secret — to `/miners/register`.
+///
+/// Fails with an actionable error if the dstack app is not deployed or its
+/// hashes are not yet populated.
 async fn cmd_register_image(
+    client: &mut RegistryClient,
+    app_name: &str,
+    project_dir: &std::path::Path,
+    node_secret: Option<&str>,
+) -> Result<()> {
+    let dstack = gm_miner_cli::deploy::RealDstackClient {
+        app_name: app_name.to_owned(),
+        project_dir: project_dir.to_path_buf(),
+    };
+    let hashes = dstack
+        .current_hashes()
+        .context("read deployed miner hashes from dstack-cloud status")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no deployed miner found for app '{app_name}' \
+                 (no compose/os-image hashes in `dstack-cloud status --json` \
+                 for {dir}); deploy first with `gm-miner deploy`",
+                dir = project_dir.display()
+            )
+        })?;
+
+    post_register_image(
+        client,
+        &hashes.compose_sha256,
+        &hashes.os_image_hash,
+        node_secret,
+    )
+    .await
+}
+
+/// POST verified compose + OS image hashes to `/miners/register`.
+///
+/// Shared by `cmd_register_image` (auto-discovered hashes) and `cmd_deploy`
+/// (hashes already verified against the registry approval).
+async fn post_register_image(
     client: &mut RegistryClient,
     compose_hash: &str,
     os_image_hash: &str,

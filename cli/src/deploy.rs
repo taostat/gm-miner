@@ -526,6 +526,69 @@ struct DstackStatus {
     os_image_hash: Option<String>,
 }
 
+/// Parse a `dstack-cloud status --json` invocation result into the deployed
+/// hashes.
+///
+/// `succeeded` is the command's exit status; `stdout` is its raw stdout. The
+/// single status-parsing code path shared by [`RealDstackClient::poll_status`]
+/// (deploy) and [`RealDstackClient::current_hashes`] (`register-image`).
+///
+/// Returns `Ok(Some(..))` only when the command succeeded and both hashes are
+/// present and non-empty; `Ok(None)` when the command exited non-zero (control
+/// plane not ready) or when either hash is still absent/empty.
+///
+/// # Errors
+/// Returns an error if `succeeded` is true but `stdout` is not valid
+/// `status --json` JSON.
+pub fn parse_dstack_status(succeeded: bool, stdout: &[u8]) -> Result<Option<DstackDeployResult>> {
+    if !succeeded {
+        return Ok(None);
+    }
+
+    let ds: DstackStatus =
+        serde_json::from_slice(stdout).context("parse dstack-cloud status --json output")?;
+
+    match (ds.compose_sha256, ds.os_image_hash) {
+        (Some(compose_sha256), Some(os_image_hash))
+            if !compose_sha256.is_empty() && !os_image_hash.is_empty() =>
+        {
+            Ok(Some(DstackDeployResult {
+                compose_sha256,
+                os_image_hash,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Run `dstack-cloud status --json` once in `project_dir` and parse the
+/// deployed `compose_sha256` + `os_image_hash` via [`parse_dstack_status`].
+///
+/// Returns `Ok(None)` when the command exited non-zero (control plane not
+/// ready) or when either hash is still absent/empty.
+///
+/// # Errors
+/// Returns an error only if `dstack-cloud` cannot be spawned, or it exits
+/// successfully but emits output that is not valid `status --json` JSON.
+fn read_dstack_status(project_dir: &std::path::Path) -> Result<Option<DstackDeployResult>> {
+    let out = std::process::Command::new("dstack-cloud")
+        .args(["status", "--json"])
+        .current_dir(project_dir)
+        .output()
+        .context("run dstack-cloud status --json — is dstack-cloud installed?")?;
+
+    if !out.status.success() {
+        // A non-zero exit is expected before the control plane is ready —
+        // surface it as "not available yet" so callers can retry or report.
+        tracing::info!(
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "dstack-cloud status --json not ready yet (non-zero exit)"
+        );
+    }
+
+    parse_dstack_status(out.status.success(), &out.stdout)
+}
+
 impl DstackClient for RealDstackClient {
     fn is_bootstrapped(&self) -> bool {
         self.project_dir.join("app.json").exists()
@@ -712,6 +775,20 @@ impl DstackClient for RealDstackClient {
 }
 
 impl RealDstackClient {
+    /// Read the hashes of the currently-deployed miner from
+    /// `dstack-cloud status --json` (single, non-polling read).
+    ///
+    /// Returns `Ok(None)` when the dstack app is not deployed yet or the CVM
+    /// has not populated its hashes — the `register-image` flow turns that
+    /// into an actionable "deploy first" error.
+    ///
+    /// # Errors
+    /// Returns an error if `dstack-cloud` cannot be spawned or emits
+    /// unparseable `status --json` output.
+    pub fn current_hashes(&self) -> Result<Option<DstackDeployResult>> {
+        read_dstack_status(&self.project_dir)
+    }
+
     /// Poll `dstack-cloud status --json` every [`POLL_INTERVAL_SECS`] seconds
     /// until both `compose_sha256` and `os_image_hash` are non-empty, or until
     /// `timeout_secs` elapses.
@@ -724,36 +801,8 @@ impl RealDstackClient {
 
         loop {
             attempt += 1;
-            let out = std::process::Command::new("dstack-cloud")
-                .args(["status", "--json"])
-                .current_dir(&self.project_dir)
-                .output()
-                .context("run dstack-cloud status --json")?;
-
-            if out.status.success() {
-                let ds: DstackStatus = serde_json::from_slice(&out.stdout)
-                    .context("parse dstack-cloud status --json output")?;
-
-                if let (Some(compose_sha256), Some(os_image_hash)) =
-                    (ds.compose_sha256, ds.os_image_hash)
-                {
-                    if !compose_sha256.is_empty() && !os_image_hash.is_empty() {
-                        return Ok(DstackDeployResult {
-                            compose_sha256,
-                            os_image_hash,
-                        });
-                    }
-                }
-            } else {
-                // A non-zero exit is expected on a fresh deployment before the
-                // control plane is ready — treat it as "not yet available"
-                // rather than a hard failure (mirrors the old deploy.sh
-                // behaviour which tolerated early status failures).
-                tracing::info!(
-                    attempt,
-                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                    "dstack-cloud status --json not ready yet (non-zero exit); will retry"
-                );
+            if let Some(result) = read_dstack_status(&self.project_dir)? {
+                return Ok(result);
             }
 
             // Hashes not yet populated (or status not ready) — check deadline before sleeping.
