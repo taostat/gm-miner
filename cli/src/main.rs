@@ -28,7 +28,7 @@ use gm_miner_cli::{
         fetch_supported_versions, format_created_at, prepare_deploy_target, select_version,
         verify_hashes, DstackClient, GcpConfig, ImageProvisioner, DEFAULT_BOOT_TIMEOUT_SECS,
     },
-    picodollar,
+    node_secret, picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
 };
 
@@ -313,8 +313,22 @@ async fn main() -> Result<()> {
             os_image_hash,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
+            // Re-send the network's persisted node secret so a standalone
+            // re-registration keeps the registry's stored copy in sync
+            // with what the deployed envoy enforces. Absent (a miner
+            // predating node-secret auth) means the registry leaves any
+            // stored secret untouched.
+            let node_secret = cfg
+                .active_network_entry()
+                .and_then(|n| n.node_secret.clone());
             let mut client = RegistryClient::new(cfg);
-            cmd_register_image(&mut client, &compose_hash, &os_image_hash).await
+            cmd_register_image(
+                &mut client,
+                &compose_hash,
+                &os_image_hash,
+                node_secret.as_deref(),
+            )
+            .await
         }
         Command::ListProducts => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
@@ -678,6 +692,13 @@ async fn cmd_deploy(
             )
         })?;
 
+    // Step 1b: resolve the node secret for the network this deploy
+    // targets. Generated once per network and persisted to the CLI
+    // config so the value baked into the container's env, what envoy
+    // enforces, and what the registry stores all stay in lockstep across
+    // re-deploys (Mechanism 1 of attestation-and-identity.md).
+    let node_secret = resolve_node_secret(cfg.active_network())?;
+
     // Step 2: auth preflight. `dstack-cloud deploy` is slow and irreversible
     // for the operator (CVM created, GCS bytes uploaded), so we refuse to
     // start the deploy unless the registry will accept the eventual
@@ -725,7 +746,7 @@ async fn cmd_deploy(
         "Deploying via dstack-cloud (boot timeout: {}s) ...",
         args.boot_timeout_secs
     );
-    let actual = dstack.deploy(&rendered, keys, gcp, args.boot_timeout_secs)?;
+    let actual = dstack.deploy(&rendered, keys, &node_secret, gcp, args.boot_timeout_secs)?;
 
     // Step 10: verify hashes.
     println!("Verifying hashes against registry approval ...");
@@ -733,9 +754,27 @@ async fn cmd_deploy(
     println!("  compose_hash  : OK ({})", actual.compose_sha256);
     println!("  os_image_hash : OK ({})", actual.os_image_hash);
 
-    // Step 11: register the image.
+    // Step 11: register the image, carrying the node secret so the
+    // registry stores it and serves it to the gateway.
     println!("Registering image with the registry ...");
-    cmd_register_image(client, &actual.compose_sha256, &actual.os_image_hash).await
+    cmd_register_image(
+        client,
+        &actual.compose_sha256,
+        &actual.os_image_hash,
+        Some(&node_secret),
+    )
+    .await
+}
+
+/// Resolve the miner's node secret for `network`: reuse the value
+/// persisted in the CLI config, or generate a fresh one and persist it
+/// on the first deploy.
+fn resolve_node_secret(network: &str) -> Result<String> {
+    let (secret, freshly_generated) = node_secret::resolve_persisted(network)?;
+    if freshly_generated {
+        println!("Generated a node secret and saved it to the gm-miner config.");
+    }
+    Ok(secret)
 }
 
 async fn cmd_login(
@@ -805,11 +844,18 @@ async fn cmd_register_image(
     client: &mut RegistryClient,
     compose_hash: &str,
     os_image_hash: &str,
+    node_secret: Option<&str>,
 ) -> Result<()> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "compose_hash": compose_hash,
         "os_image_hash": os_image_hash,
     });
+    // Include the node secret so the registry stores it and serves it to
+    // the gateway (Mechanism 1 of attestation-and-identity.md). Omitted
+    // when the miner has no secret — a miner predating node-secret auth.
+    if let Some(secret) = node_secret {
+        body["node_secret"] = serde_json::Value::String(secret.to_owned());
+    }
 
     let resp = client
         .post("/miners/register", &body)

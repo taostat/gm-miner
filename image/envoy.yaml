@@ -6,9 +6,19 @@
 ## probed (envoy substitutes an empty key) so the registry can detect
 ## "no key set" the same way it detects "key revoked".
 ##
+## Inbound auth (Mechanism 1 of attestation-and-identity.md): a Lua
+## filter checks the `x-gm-node-key` header against the node secret
+## before any route runs. `start.sh` renders the secret into this
+## config from the `GM_NODE_SECRET` env var at container start (see the
+## filter's own comment). Requests without the correct secret are
+## rejected with 401. When `GM_NODE_SECRET` is unset the check is
+## skipped (a miner predating node-secret auth) — the data plane is
+## then open, the pre-Mechanism-1 behaviour. The gateway and the
+## registry's control-loop probes both set this header.
+##
 ## Header handling per spec §10.4:
 ##   - Strip gm-internal headers (x-gm-request-id, x-gm-gateway-sig,
-##     x-gm-product) before forwarding upstream.
+##     x-gm-product, x-gm-node-key) before forwarding upstream.
 ##   - Replace Authorization with the upstream key from env.
 ##
 ## Prometheus metrics: envoy's admin interface exposes
@@ -72,6 +82,7 @@ static_resources:
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
+                            - x-gm-node-key
                             - x-gm-provider
                           request_headers_to_add:
                             - header:
@@ -100,6 +111,7 @@ static_resources:
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
+                            - x-gm-node-key
                             - x-gm-provider
                           request_headers_to_add:
                             - header:
@@ -124,6 +136,7 @@ static_resources:
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
+                            - x-gm-node-key
                             - x-gm-provider
                           request_headers_to_add:
                             - header:
@@ -145,9 +158,41 @@ static_resources:
                                 {"error":"provider not configured on this miner"}
 
                 http_filters:
-                  ## v1: only the router filter is needed. The previous
-                  ## Lua trailing-usage filter was dropped along with the
-                  ## gateway-side miner-usage cross-check (gm MVP simplify).
+                  ## ── Inbound node-secret auth ────────────────────────
+                  ##  Mechanism 1 of attestation-and-identity.md. The Lua
+                  ##  filter compares the `x-gm-node-key` request header
+                  ##  against the expected secret and rejects a mismatch
+                  ##  with 401 before any route runs.
+                  ##
+                  ##  `start.sh` substitutes the `__GM_NODE_SECRET__`
+                  ##  placeholder below with the value of the
+                  ##  `GM_NODE_SECRET` env var at container start, then
+                  ##  execs envoy against the rendered config. The secret
+                  ##  is a config literal at runtime — the filter does not
+                  ##  depend on Lua reading the process environment, which
+                  ##  Envoy's Lua sandbox does not document as supported.
+                  ##  When `GM_NODE_SECRET` is unset `start.sh` substitutes
+                  ##  an empty string and the filter skips the check, so a
+                  ##  miner predating node-secret auth still serves.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          local expected = "__GM_NODE_SECRET__"
+                          function envoy_on_request(handle)
+                            if expected == "" then
+                              return
+                            end
+                            local presented = handle:headers():get("x-gm-node-key")
+                            if presented ~= expected then
+                              handle:respond(
+                                {[":status"] = "401",
+                                 ["content-type"] = "application/json"},
+                                "{\"error\":\"missing or invalid x-gm-node-key\"}")
+                            end
+                          end
+                  ## The router filter terminates the chain.
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

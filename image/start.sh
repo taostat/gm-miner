@@ -37,6 +37,37 @@ if [[ "${HAS_KEY}" -eq 0 ]]; then
   exit 1
 fi
 
+# ── Render the node secret into the envoy config ──────────────────────
+# Envoy's inbound Lua filter enforces x-gm-node-key against a config
+# literal — Envoy's Lua sandbox does not document os.getenv support, so
+# the secret is substituted in here rather than read at Lua runtime. An
+# unset GM_NODE_SECRET renders an empty literal, which the filter treats
+# as "skip the check" (a miner predating node-secret auth).
+#
+# The substitution is a literal token replace (awk index/substr, not
+# gsub) so a secret containing regex- or replacement-special characters
+# is handled verbatim. The rendered config goes to a writable path; the
+# baked-in /etc/envoy/envoy.yaml stays untouched.
+RENDERED_CONFIG=/tmp/envoy.rendered.yaml
+GM_NODE_SECRET="${GM_NODE_SECRET:-}" awk '
+  BEGIN { token = "__GM_NODE_SECRET__"; secret = ENVIRON["GM_NODE_SECRET"] }
+  {
+    out = ""
+    rest = $0
+    while ((pos = index(rest, token)) > 0) {
+      out = out substr(rest, 1, pos - 1) secret
+      rest = substr(rest, pos + length(token))
+    }
+    print out rest
+  }
+' /etc/envoy/envoy.yaml >"${RENDERED_CONFIG}"
+
+if [[ -n "${GM_NODE_SECRET:-}" ]]; then
+  log "GM_NODE_SECRET set — envoy enforces x-gm-node-key on inbound requests"
+else
+  log "warning: GM_NODE_SECRET unset — inbound data plane is unauthenticated"
+fi
+
 GM_IMAGE_VERSION="${GM_IMAGE_VERSION:-unknown}"
 log "image version: ${GM_IMAGE_VERSION}"
 
@@ -45,6 +76,6 @@ log "image version: ${GM_IMAGE_VERSION}"
 # directly and the container exits when envoy does.
 log "starting envoy"
 exec envoy \
-  -c /etc/envoy/envoy.yaml \
+  -c "${RENDERED_CONFIG}" \
   --log-level warn \
   --drain-time-s 10

@@ -403,10 +403,13 @@ pub trait DstackClient {
     /// Deploy and return the compose + OS image hashes that dstack-cloud
     /// actually used. `compose_yaml` is the rendered compose file content;
     /// `env_vars` are the operator's provider API keys to pass via dstack's
-    /// encrypted env upload. `gcp` is used to refresh `gcp_config` in
-    /// `app.json` before calling `dstack-cloud deploy` (both fresh and
-    /// re-deploy paths). `boot_timeout_secs` controls how long to poll
-    /// for hashes before giving up.
+    /// encrypted env upload. `node_secret` is the miner's node secret
+    /// (Mechanism 1 of `docs/plans/attestation-and-identity.md`), written
+    /// into the same encrypted `.env` as `GM_NODE_SECRET`. `gcp` is used
+    /// to refresh `gcp_config` in `app.json` before calling
+    /// `dstack-cloud deploy` (both fresh and re-deploy paths).
+    /// `boot_timeout_secs` controls how long to poll for hashes before
+    /// giving up.
     ///
     /// # Errors
     /// Returns an error if the deploy fails or the hashes cannot be read back
@@ -415,6 +418,7 @@ pub trait DstackClient {
         &self,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
+        node_secret: &str,
         gcp: &GcpConfig,
         boot_timeout_secs: u64,
     ) -> Result<DstackDeployResult>;
@@ -597,6 +601,7 @@ impl DstackClient for RealDstackClient {
         &self,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
+        node_secret: &str,
         gcp: &GcpConfig,
         boot_timeout_secs: u64,
     ) -> Result<DstackDeployResult> {
@@ -640,6 +645,11 @@ impl DstackClient for RealDstackClient {
                 lines.push_str(k);
                 lines.push('\n');
             }
+            // The node secret envoy enforces as the x-gm-node-key header.
+            // Always written: `cmd_deploy` resolves it before this call.
+            lines.push_str("GM_NODE_SECRET=");
+            lines.push_str(node_secret);
+            lines.push('\n');
 
             // Write to a sibling temp file first, then atomically rename over
             // the target. The temp file is created at 0600 from the start, so
@@ -1518,6 +1528,7 @@ mod tests {
             &self,
             _compose_yaml: &str,
             _env_vars: &crate::config::ProviderKeys,
+            _node_secret: &str,
             _gcp: &GcpConfig,
             _boot_timeout_secs: u64,
         ) -> Result<DstackDeployResult> {

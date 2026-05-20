@@ -67,6 +67,16 @@ pub struct NetworkEntry {
     pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenEntry>,
+    /// The miner's node secret for this network (Mechanism 1 of
+    /// `docs/plans/attestation-and-identity.md`). Scoped per network so
+    /// a mainnet and a testnet deployment from the same config get
+    /// distinct `x-gm-node-key` values — a secret leaked or rotated for
+    /// one node never authenticates the other. Generated once on the
+    /// first `gm-miner deploy` for the network and reused thereafter so
+    /// the value baked into the container's env, what envoy enforces,
+    /// and what the registry stores all stay in lockstep.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_secret: Option<String>,
 }
 
 /// Provider API keys persisted by `gm-miner set-api-keys`.
@@ -128,6 +138,12 @@ impl Config {
         self.networks
             .get(self.active_network())
             .and_then(|n| n.tokens.as_ref())
+    }
+
+    /// The active network's entry, if one has been created.
+    #[must_use]
+    pub fn active_network_entry(&self) -> Option<&NetworkEntry> {
+        self.networks.get(self.active_network())
     }
 
     /// Auth URL for the active network.
