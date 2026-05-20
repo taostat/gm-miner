@@ -540,10 +540,23 @@ pub async fn fetch_supported_versions(registry_url: &str) -> Result<Vec<ImageVer
 
     let mut versions = body.versions;
 
-    // Sort newest-first by created_at (RFC 3339 strings sort lexicographically).
-    versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    // Sort newest-first by the parsed `created_at` instant. Raw RFC 3339
+    // strings only sort correctly when every offset is `Z`; an entry like
+    // `2025-05-01T00:30:00+01:00` would otherwise sort after an older `Z`
+    // timestamp. Unparseable timestamps sort last so they are never picked
+    // as the default newest version.
+    versions.sort_by_key(|v| std::cmp::Reverse(created_at_key(v)));
 
     Ok(versions)
+}
+
+/// Sort key for ordering `ImageVersion`s by `created_at`, newest-first.
+///
+/// Returns the parsed UTC instant, or `DateTime::<Utc>::MIN_UTC` when the
+/// timestamp cannot be parsed so malformed entries sort as oldest.
+fn created_at_key(v: &ImageVersion) -> chrono::DateTime<chrono::Utc> {
+    DateTime::parse_from_rfc3339(&v.created_at)
+        .map_or(chrono::DateTime::<chrono::Utc>::MIN_UTC, |dt| dt.to_utc())
 }
 
 /// Select a version from the list, optionally pinned to a specific index

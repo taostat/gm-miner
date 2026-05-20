@@ -26,7 +26,7 @@ use gm_miner_cli::{
     config::{self, Config, ProviderKeys, TokenEntry},
     deploy::{
         fetch_supported_versions, format_created_at, render_compose, select_version, verify_hashes,
-        GcpConfig, COMPOSE_TEMPLATE, DEFAULT_BOOT_TIMEOUT_SECS,
+        DstackClient, GcpConfig, COMPOSE_TEMPLATE, DEFAULT_BOOT_TIMEOUT_SECS,
     },
     picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
@@ -398,23 +398,33 @@ async fn cmd_deploy_subcommand(
 ) -> Result<()> {
     // --dist-dir is the project directory used verbatim.
     // Default: dist/<app_name> relative to cwd (matches deploy.sh).
-    let project_dir = if let Some(dir) = dist_dir {
-        // Validate that the basename of --dist-dir matches --app-name.
-        // `dstack-cloud new <app_name>` always creates `<cwd>/<app_name>/`, so
-        // if the two differ the bootstrapped directory and the one the rest of
-        // the code reads/patches are different paths and the deploy breaks.
-        let basename = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let project_dir = dist_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
+
+    let dstack = gm_miner_cli::deploy::RealDstackClient {
+        app_name: app_name.clone(),
+        project_dir: project_dir.clone(),
+    };
+
+    // The basename check only matters when this directory still needs
+    // `dstack-cloud new`, which creates `<cwd>/<app_name>/` — if the basename
+    // differs the bootstrapped directory and the one we read/patch diverge.
+    // An already-bootstrapped project (valid `app.json`) is deployed in place
+    // via `current_dir`, so any path is fine; don't reject custom dist dirs.
+    if dist_dir.is_some() && !dstack.is_bootstrapped() {
+        let basename = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if basename != app_name {
             bail!(
-                "dist-dir basename must equal app-name; \
-                 got dist-dir={}, app-name={app_name}",
-                dir.display()
+                "dist-dir basename must equal app-name when bootstrapping a fresh \
+                 project; got dist-dir={}, app-name={app_name}",
+                project_dir.display()
             );
         }
-        dir
-    } else {
-        std::path::PathBuf::from("dist").join(&app_name)
-    };
+    }
 
     let bucket = gcs_bucket.unwrap_or_else(|| GcpConfig::default_bucket(&gcp_project));
     let gcp = GcpConfig {
@@ -423,11 +433,6 @@ async fn cmd_deploy_subcommand(
         machine_type,
         instance_name: app_name.clone(),
         bucket,
-    };
-
-    let dstack = gm_miner_cli::deploy::RealDstackClient {
-        app_name: app_name.clone(),
-        project_dir,
     };
     let mut client = RegistryClient::new(cfg.clone());
     cmd_deploy(
