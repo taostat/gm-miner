@@ -25,10 +25,12 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Per-network token set.
+///
+/// No `refresh_token`: token refresh is deferred (issue #65). An expired
+/// access token surfaces as a 401 and the operator re-runs `gm-miner login`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TokenEntry {
     pub access_token: Option<String>,
-    pub refresh_token: Option<String>,
     pub token_expires_at: Option<String>,
 }
 

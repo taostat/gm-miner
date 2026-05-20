@@ -926,18 +926,43 @@ fn replace_image_ref_placeholder(text: &str, replacement: &str) -> String {
 
 // ── Hash verification ─────────────────────────────────────────────────────────
 
+/// Normalize a hash to the registry's canonical form: lowercase, with any
+/// `sha256:` prefix stripped. dstack-cloud may report a hash uppercased or
+/// `sha256:`-prefixed; the registry's `POST /miners/register` only accepts
+/// `^[0-9a-f]{64}$`, so the hash must be normalized before it is both
+/// verified and sent onward.
+#[must_use]
+pub fn normalize_hash(hash: &str) -> String {
+    let lowered = hash.to_lowercase();
+    match lowered.strip_prefix("sha256:") {
+        Some(stripped) => stripped.to_owned(),
+        None => lowered,
+    }
+}
+
 /// Verify that the actual hashes from dstack-cloud match the registry-approved
-/// version.
+/// version, returning the normalized actual hashes.
+///
+/// Both sides are normalized (lowercased, `sha256:` prefix stripped) before
+/// comparison. The returned [`DstackDeployResult`] holds the normalized
+/// values so the loud verification check and the subsequent registration
+/// operate on the exact same hash.
 ///
 /// # Errors
 /// Returns a loud, actionable error if either hash does not match.
-pub fn verify_hashes(actual: &DstackDeployResult, approved: &ImageVersion) -> Result<()> {
-    let compose_match =
-        actual.compose_sha256.to_lowercase() == approved.compose_hash.to_lowercase();
-    let os_match = actual.os_image_hash.to_lowercase() == approved.os_image_hash.to_lowercase();
+pub fn verify_hashes(
+    actual: &DstackDeployResult,
+    approved: &ImageVersion,
+) -> Result<DstackDeployResult> {
+    let normalized = DstackDeployResult {
+        compose_sha256: normalize_hash(&actual.compose_sha256),
+        os_image_hash: normalize_hash(&actual.os_image_hash),
+    };
+    let compose_match = normalized.compose_sha256 == normalize_hash(&approved.compose_hash);
+    let os_match = normalized.os_image_hash == normalize_hash(&approved.os_image_hash);
 
     if compose_match && os_match {
-        return Ok(());
+        return Ok(normalized);
     }
 
     let mut msg = String::from("HASH MISMATCH — deployment is suspect; refusing to register.\n\n");
@@ -1031,7 +1056,9 @@ mod tests {
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
         };
-        assert!(verify_hashes(&actual, &approved).is_ok());
+        let verified = verify_hashes(&actual, &approved).expect("hashes should match");
+        assert_eq!(verified.compose_sha256, "abc123");
+        assert_eq!(verified.os_image_hash, "def456");
     }
 
     #[test]
@@ -1047,7 +1074,39 @@ mod tests {
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
         };
-        assert!(verify_hashes(&actual, &approved).is_ok());
+        let verified = verify_hashes(&actual, &approved).expect("hashes should match");
+        assert_eq!(verified.compose_sha256, "abc123");
+        assert_eq!(verified.os_image_hash, "def456");
+    }
+
+    #[test]
+    fn verify_hashes_strips_sha256_prefix() {
+        // dstack-cloud may report a `sha256:`-prefixed or uppercased hash;
+        // the registry only accepts bare lowercase hex. The returned hashes
+        // must be normalized so registration uses the value that was
+        // actually verified.
+        let actual = DstackDeployResult {
+            compose_sha256: "sha256:ABC123".to_string(),
+            os_image_hash: "SHA256:DEF456".to_string(),
+        };
+        let approved = ImageVersion {
+            compose_hash: "abc123".to_string(),
+            os_image_hash: "def456".to_string(),
+            status: "supported".to_string(),
+            notes: None,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        let verified = verify_hashes(&actual, &approved).expect("hashes should match");
+        assert_eq!(verified.compose_sha256, "abc123");
+        assert_eq!(verified.os_image_hash, "def456");
+    }
+
+    #[test]
+    fn normalize_hash_lowercases_and_strips_prefix() {
+        assert_eq!(normalize_hash("ABCDEF"), "abcdef");
+        assert_eq!(normalize_hash("sha256:ABCDEF"), "abcdef");
+        assert_eq!(normalize_hash("SHA256:abcdef"), "abcdef");
+        assert_eq!(normalize_hash("abcdef"), "abcdef");
     }
 
     #[test]

@@ -7,7 +7,11 @@
 //!   1. `POST /v1/device/code` → `device_code` + `user_code` + `verification_uri`
 //!   2. Display URL + code; optionally open browser.
 //!   3. Poll `POST /v1/oauth/token` until authorized or expired.
-//!   4. Store `access_token` + `refresh_token` in `~/.gm-miner/config.json`.
+//!   4. Store `access_token` in `~/.gm-miner/config.json`.
+//!
+//! Token refresh is deferred (issue #65): the token endpoint's
+//! `refresh_token` is ignored, and an expired access token is handled by
+//! re-running `gm-miner login`.
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -16,10 +20,12 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Token endpoint response.
+///
+/// The token endpoint also returns a `refresh_token`; it is intentionally
+/// not deserialized because token refresh is deferred (issue #65).
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
-    pub refresh_token: Option<String>,
     pub expires_in: Option<u64>,
     pub token_type: Option<String>,
 }
