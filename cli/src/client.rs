@@ -1,6 +1,8 @@
-//! Registry API client with JWT bearer auth and auto-refresh.
+//! Registry API client with JWT bearer auth.
 //!
-//! Mirrors the pattern in blockmachine's client.py.
+//! Mirrors the pattern in blockmachine's client.py. Token refresh is not
+//! implemented (deferred — issue #65); an expired token surfaces as a 401
+//! and the operator re-runs `gm-miner login`.
 
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Response, StatusCode};

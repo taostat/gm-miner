@@ -748,19 +748,21 @@ async fn cmd_deploy(
     );
     let actual = dstack.deploy(&rendered, keys, &node_secret, gcp, args.boot_timeout_secs)?;
 
-    // Step 10: verify hashes.
+    // Step 10: verify hashes. The returned hashes are normalized
+    // (lowercased, `sha256:` prefix stripped) so the loud check and the
+    // registration in step 11 agree on the exact value.
     println!("Verifying hashes against registry approval ...");
-    verify_hashes(&actual, approved)?;
-    println!("  compose_hash  : OK ({})", actual.compose_sha256);
-    println!("  os_image_hash : OK ({})", actual.os_image_hash);
+    let verified = verify_hashes(&actual, approved)?;
+    println!("  compose_hash  : OK ({})", verified.compose_sha256);
+    println!("  os_image_hash : OK ({})", verified.os_image_hash);
 
     // Step 11: register the image, carrying the node secret so the
     // registry stores it and serves it to the gateway.
     println!("Registering image with the registry ...");
     cmd_register_image(
         client,
-        &actual.compose_sha256,
-        &actual.os_image_hash,
+        &verified.compose_sha256,
+        &verified.os_image_hash,
         Some(&node_secret),
     )
     .await
@@ -822,7 +824,6 @@ async fn cmd_login(
     entry.api_url = Some(resolved_api_url);
     entry.tokens = Some(TokenEntry {
         access_token: Some(token.access_token.clone()),
-        refresh_token: token.refresh_token.clone(),
         token_expires_at: token.expires_in.map(|s| {
             #[expect(
                 clippy::cast_possible_wrap,

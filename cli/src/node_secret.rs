@@ -7,6 +7,8 @@
 //! `gm-miner deploy` and persisted in the CLI config so re-deploys reuse
 //! the same value.
 
+use std::fmt::Write as _;
+
 use anyhow::{Context, Result};
 
 use crate::config;
@@ -28,10 +30,8 @@ pub fn generate() -> Result<String> {
     let bytes = os_random_bytes()?;
     let mut hex = String::with_capacity(SECRET_BYTES * 2);
     for byte in bytes {
-        // `write!` to a String is infallible; format the byte as two
-        // lowercase hex digits.
-        hex.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-        hex.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+        // `write!` to a String never fails, so the result is discarded.
+        let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
 }

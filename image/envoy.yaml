@@ -144,11 +144,14 @@ static_resources:
                                 value: "%ENVIRONMENT(GOOGLE_API_KEY)%"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
 
-                        ## ── Fallback: provider key not configured ────────────
-                        ##  Returns HTTP 501 when the requested provider's env
-                        ##  var is not set or the request has no x-gm-provider
-                        ##  header. This is the "route is disabled" state
-                        ##  described in spec §10.2.
+                        ## ── Fallback: no provider matched ─────────────────────
+                        ##  Catch-all for requests whose `x-gm-provider` header
+                        ##  is absent or names a provider with no route above.
+                        ##  Returns HTTP 501. A request that *does* match a
+                        ##  provider route whose API key env var is unset is
+                        ##  routed upstream instead and fails there with 401
+                        ##  (see start.sh). This is the "route is disabled"
+                        ##  state described in spec §10.2.
                         - match:
                             prefix: "/"
                           direct_response:

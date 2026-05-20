@@ -62,25 +62,6 @@ pub struct Product {
     pub provider: String,
     pub model: String,
     pub status: String,
-    #[serde(default)]
-    pub retail_price: Option<serde_json::Value>,
-}
-
-/// Response from POST /miners/register.
-#[derive(Debug, Deserialize)]
-pub struct RegisterImageResponse {
-    pub miner_id: String,
-    pub status: String,
-}
-
-/// Response from POST /miners/products.
-#[derive(Debug, Deserialize)]
-pub struct DeclareProductResponse {
-    pub miner_hotkey: String,
-    pub provider: String,
-    pub model: String,
-    pub miner_price: MinerPriceBlock,
-    pub status: String,
 }
 
 /// Response from GET /miners/me (status endpoint).
@@ -100,6 +81,5 @@ pub struct ProductOfferStatus {
     pub model: String,
     pub is_offered: bool,
     pub is_eligible: bool,
-    pub capability_check_passed_at: Option<String>,
     pub miner_price: Option<MinerPriceBlock>,
 }
