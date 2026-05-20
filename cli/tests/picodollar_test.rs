@@ -87,3 +87,73 @@ fn display_precision() {
     let s = pdollars_to_usd_per_mtok(10_000_000_000);
     assert_eq!(s, "0.010000");
 }
+
+// ── Exact decimal-string conversion (no f64 precision loss) ──────────────────
+
+/// A price with all twelve fractional digits distinct exercises the full
+/// picodollar resolution. An f64 multiply silently corrupts the low digits;
+/// the exact string conversion must reproduce every one.
+#[test]
+fn full_twelve_digit_fraction_is_exact() {
+    assert_eq!(
+        usd_per_mtok_to_pdollars("0.123456789012").unwrap(),
+        123_456_789_012
+    );
+}
+
+/// A sub-cent price with a long fraction must keep every picodollar.
+/// `0.000000000007` = 7 picodollars — below f64's reliable resolution at
+/// the magnitudes here once multiplied.
+#[test]
+fn single_picodollar_sub_cent_price_is_exact() {
+    assert_eq!(usd_per_mtok_to_pdollars("0.000000000007").unwrap(), 7);
+}
+
+/// A price with more than twelve fractional digits truncates the excess
+/// (finer than a picodollar) rather than rounding or erroring.
+#[test]
+fn fraction_finer_than_picodollar_is_truncated() {
+    assert_eq!(
+        usd_per_mtok_to_pdollars("0.1234567890129").unwrap(),
+        123_456_789_012
+    );
+}
+
+/// A many-digit integer-and-fraction price must convert with no rounding.
+#[test]
+fn many_digit_price_is_exact() {
+    // $123.456789012345/Mtok → 123_456_789_012_345 pUSD (fraction truncated
+    // to 12 digits: "456789012345").
+    assert_eq!(
+        usd_per_mtok_to_pdollars("123.456789012345").unwrap(),
+        123_456_789_012_345
+    );
+}
+
+/// The cap boundary: exactly the maximum accepted dollar value converts,
+/// one whole dollar above it is rejected.
+#[test]
+fn cap_boundary_is_exact() {
+    // 1_000_000 USD/Mtok is the cap → 1e18 pUSD.
+    assert_eq!(
+        usd_per_mtok_to_pdollars("1000000").unwrap(),
+        1_000_000_000_000_000_000
+    );
+    assert!(usd_per_mtok_to_pdollars("1000001").is_err());
+}
+
+/// Scientific notation and other f64-isms must be rejected — only plain
+/// decimal strings are accepted now that there is no f64 parse.
+#[test]
+fn scientific_notation_rejected() {
+    assert!(usd_per_mtok_to_pdollars("3e5").is_err());
+    assert!(usd_per_mtok_to_pdollars("inf").is_err());
+    assert!(usd_per_mtok_to_pdollars("NaN").is_err());
+    assert!(usd_per_mtok_to_pdollars("3.0.0").is_err());
+}
+
+/// A plain "." with no digits on either side is not a number.
+#[test]
+fn bare_dot_rejected() {
+    assert!(usd_per_mtok_to_pdollars(".").is_err());
+}
