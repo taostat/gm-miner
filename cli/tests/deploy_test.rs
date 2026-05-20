@@ -93,6 +93,7 @@ impl DstackClient for StubDstack {
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _node_secret: &str,
         _gcp: &GcpConfig,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {
@@ -140,6 +141,7 @@ impl DstackClient for FastBootDstack {
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _node_secret: &str,
         _gcp: &GcpConfig,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {
@@ -174,6 +176,7 @@ impl DstackClient for TimedOutDstack {
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _node_secret: &str,
         _gcp: &GcpConfig,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {
@@ -210,6 +213,7 @@ impl DstackClient for FailingDstack {
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _node_secret: &str,
         _gcp: &GcpConfig,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {
@@ -367,7 +371,9 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
         google: None,
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "reg.example.com/app@sha256:abc").unwrap();
-    let actual = stub.deploy(&rendered, &keys, &test_gcp(), 300).unwrap();
+    let actual = stub
+        .deploy(&rendered, &keys, "test-node-secret-1234", &test_gcp(), 300)
+        .unwrap();
 
     assert!(verify_hashes(&actual, approved).is_ok());
 }
@@ -399,7 +405,9 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
         google: None,
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "reg.example.com/app@sha256:abc").unwrap();
-    let actual = stub.deploy(&rendered, &keys, &test_gcp(), 300).unwrap();
+    let actual = stub
+        .deploy(&rendered, &keys, "test-node-secret-1234", &test_gcp(), 300)
+        .unwrap();
 
     let err =
         verify_hashes(&actual, approved).expect_err("mismatched hashes must produce an error");
@@ -496,7 +504,13 @@ fn dstack_failure_surfaces_as_error() {
         google: None,
     };
     let err = FailingDstack
-        .deploy("compose-content", &keys, &test_gcp(), 300)
+        .deploy(
+            "compose-content",
+            &keys,
+            "test-node-secret-1234",
+            &test_gcp(),
+            300,
+        )
         .expect_err("failing dstack must produce an error");
     assert!(err.to_string().contains("dstack-cloud deploy exited"));
 }
@@ -665,7 +679,7 @@ fn timeout_error_is_actionable() {
         google: None,
     };
     let err = TimedOutDstack
-        .deploy("compose", &keys, &test_gcp(), 0)
+        .deploy("compose", &keys, "test-node-secret-1234", &test_gcp(), 0)
         .expect_err("timed-out deploy must produce an error");
     let msg = err.to_string();
     assert!(
@@ -688,7 +702,9 @@ fn fast_boot_deploy_succeeds() {
         google: None,
     };
     let stub = FastBootDstack::new("compose-hash", "os-hash");
-    let result = stub.deploy("compose", &keys, &test_gcp(), 300).unwrap();
+    let result = stub
+        .deploy("compose", &keys, "test-node-secret-1234", &test_gcp(), 300)
+        .unwrap();
     assert_eq!(result.compose_sha256, "compose-hash");
     assert_eq!(result.os_image_hash, "os-hash");
 }
@@ -1036,6 +1052,7 @@ impl DstackClient for TransientFailDstack {
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _node_secret: &str,
         _gcp: &GcpConfig,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {
@@ -1093,6 +1110,7 @@ impl DstackClient for SpyDstack {
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _node_secret: &str,
         _gcp: &GcpConfig,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {
@@ -1124,7 +1142,9 @@ fn transient_status_failure_does_not_abort_deploy() {
         google: None,
     };
     // Zero failures → succeeds immediately, mirroring the post-fix steady state.
-    let result = stub.deploy("compose", &keys, &test_gcp(), 300).unwrap();
+    let result = stub
+        .deploy("compose", &keys, "test-node-secret-1234", &test_gcp(), 300)
+        .unwrap();
     assert_eq!(result.compose_sha256, "compose-hash");
     assert_eq!(result.os_image_hash, "os-hash");
 }
@@ -1141,7 +1161,7 @@ fn status_always_failing_surfaces_error() {
     };
     // One failure → stub returns an error, modelling the non-zero exit path.
     let err = stub
-        .deploy("compose", &keys, &test_gcp(), 0)
+        .deploy("compose", &keys, "test-node-secret-1234", &test_gcp(), 0)
         .expect_err("transient failure must surface as error");
     assert!(
         err.to_string().contains("not ready"),
@@ -1166,7 +1186,9 @@ fn image_ref_deploy_does_not_require_docker_ar() {
         openai: None,
         google: None,
     };
-    let result = spy.deploy("compose", &keys, &test_gcp(), 300).unwrap();
+    let result = spy
+        .deploy("compose", &keys, "test-node-secret-1234", &test_gcp(), 300)
+        .unwrap();
     assert!(
         spy.deploy_called.get(),
         "deploy must have been called for the --image-ref path"
@@ -1236,6 +1258,7 @@ impl DstackClient for RecordingDstack<'_> {
         &self,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
+        _node_secret: &str,
         _gcp: &GcpConfig,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DstackDeployResult> {

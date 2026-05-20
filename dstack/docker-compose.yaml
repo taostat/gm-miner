@@ -10,6 +10,13 @@
 ## an unset key makes the upstream return 401, which the registry surfaces
 ## as a "key not configured" capability failure.
 ##
+## GM_NODE_SECRET is the node secret (Mechanism 1 of
+## attestation-and-identity.md): `gm-miner deploy` generates it, writes
+## it into the same dstack-KMS-encrypted .env, and registers it with the
+## registry. Envoy's inbound Lua filter enforces it as the `x-gm-node-key`
+## header. It is declared here so it is part of the attestation-measured
+## compose hash.
+##
 ## The runtime is envoy + its native /stats/prometheus exposure — no
 ## sidecar service, no extra ports. The registry probes :8080 with the
 ## `x-gm-provider` header to validate auth and list models.
@@ -27,4 +34,6 @@ services:
       - ANTHROPIC_API_KEY
       - OPENAI_API_KEY
       - GOOGLE_API_KEY
+      ## Node secret — enforced by envoy's inbound x-gm-node-key check.
+      - GM_NODE_SECRET
     restart: unless-stopped

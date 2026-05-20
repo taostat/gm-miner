@@ -22,6 +22,8 @@ The miner runtime is **envoy + native prometheus exposure only** — no sidecar 
 
 A `200` means the provider's key is configured and the upstream is reachable; a `401` means the key is missing or revoked; a `5xx` or timeout means the upstream is unreachable. The registry parses the upstream's native model-list response shape per provider rather than the canonical wrapper the old capability sidecar exposed.
 
+> **Update (miner node secret, WS-1).** Envoy now runs an inbound auth filter: once the miner has a node secret, the probe must also carry it as `x-gm-node-key` or Envoy returns `401` before routing. The registry control loop sets this header from the miner's stored secret. A miner with no node secret keeps the open data plane described above. See `gm/docs/plans/attestation-and-identity.md` (Mechanism 1).
+
 ### CLI (`cli/`)
 
 Clap 4.5 binary `gm-miner` with eight subcommands:
