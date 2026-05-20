@@ -278,12 +278,17 @@ async fn main() -> Result<()> {
             boot_timeout_secs,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
+            // --dist-dir is the project directory used verbatim. Default:
+            // dist/<app_name> relative to cwd (matches deploy.sh). Resolve it
+            // once here so every deploy step shares the same path.
+            let project_dir =
+                dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
             cmd_deploy_subcommand(
                 cfg,
                 DeployArgs {
                     app_name,
                     image_ref,
-                    dist_dir,
+                    project_dir,
                     gcp_project,
                     gcp_region,
                     gcp_zone,
@@ -430,7 +435,11 @@ fn error_detail(json: &serde_json::Value) -> String {
 struct DeployArgs {
     app_name: String,
     image_ref: Option<String>,
-    dist_dir: Option<std::path::PathBuf>,
+    /// The resolved dstack project directory used verbatim by every step
+    /// (`RealDstackClient`, `pull_os_image`, ...). Set once in
+    /// `cmd_deploy_subcommand` from `--dist-dir` or the `dist/<app_name>`
+    /// default, so no later step recomputes — and diverges from — it.
+    project_dir: std::path::PathBuf,
     gcp_project: String,
     gcp_region: String,
     gcp_zone: Option<String>,
@@ -448,16 +457,9 @@ struct DeployArgs {
 ///
 /// Separated from `main` to keep the dispatch match arm small.
 async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
-    // --dist-dir is the project directory used verbatim.
-    // Default: dist/<app_name> relative to cwd (matches deploy.sh).
-    let project_dir = args
-        .dist_dir
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&args.app_name));
-
     let dstack = gm_miner_cli::deploy::RealDstackClient {
         app_name: args.app_name.clone(),
-        project_dir: project_dir.clone(),
+        project_dir: args.project_dir.clone(),
     };
 
     // The basename check only matters when this directory still needs
@@ -465,8 +467,11 @@ async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
     // differs the bootstrapped directory and the one we read/patch diverge.
     // An already-bootstrapped project (valid `app.json`) is deployed in place
     // via `current_dir`, so any path is fine; don't reject custom dist dirs.
-    if args.dist_dir.is_some() && !dstack.is_bootstrapped() {
-        let basename = project_dir
+    // The default `dist/<app_name>` always satisfies this, so the check only
+    // bites a custom `--dist-dir` whose basename differs from `--app-name`.
+    if !dstack.is_bootstrapped() {
+        let basename = args
+            .project_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
@@ -474,7 +479,7 @@ async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
             bail!(
                 "dist-dir basename must equal app-name when bootstrapping a fresh \
                  project; got dist-dir={}, app-name={app_name}",
-                project_dir.display(),
+                args.project_dir.display(),
                 app_name = args.app_name
             );
         }
@@ -704,16 +709,14 @@ async fn cmd_deploy(
     let rendered = prepare_deploy_target(dstack, &provisioner, &args.app_name, gcp)?;
 
     // Step 8: pull the dstack-cloud OS image referenced by the deploy.
+    // Use the single resolved `project_dir` (honours `--dist-dir`) so the
+    // pull runs in the same directory `RealDstackClient` deploys from.
     let os_image_url = args
         .os_image_url
         .clone()
         .unwrap_or_else(|| gm_miner_cli::gcp::DEFAULT_DSTACK_OS_IMAGE_URL.to_owned());
-    let project_dir = args
-        .dist_dir
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&args.app_name));
     println!("Pulling the dstack-cloud OS image ...");
-    gm_miner_cli::gcp::pull_os_image(&os_image_url, &project_dir)?;
+    gm_miner_cli::gcp::pull_os_image(&os_image_url, &args.project_dir)?;
 
     // Step 9: deploy via dstack-cloud, polling until hashes appear.
     // On re-deploy the deploy() call also refreshes gcp_config before running
@@ -887,10 +890,19 @@ async fn cmd_declare_product(
         bail!("declare-product failed ({status}): {}", error_detail(&json));
     }
 
-    let input_usd =
-        picodollar::pdollars_to_usd_per_mtok(price.input_per_mtok_pdollars.parse().unwrap_or(0));
-    let output_usd =
-        picodollar::pdollars_to_usd_per_mtok(price.output_per_mtok_pdollars.parse().unwrap_or(0));
+    // The price strings were produced by `usd_per_mtok_to_pdollars` so they
+    // are valid u64s; surface any parse failure instead of silently showing
+    // "$0.000000/Mtok", which would mask a bug rather than report it.
+    let input_pico: u64 = price
+        .input_per_mtok_pdollars
+        .parse()
+        .with_context(|| format!("parse input price '{}'", price.input_per_mtok_pdollars))?;
+    let output_pico: u64 = price
+        .output_per_mtok_pdollars
+        .parse()
+        .with_context(|| format!("parse output price '{}'", price.output_per_mtok_pdollars))?;
+    let input_usd = picodollar::pdollars_to_usd_per_mtok(input_pico);
+    let output_usd = picodollar::pdollars_to_usd_per_mtok(output_pico);
 
     println!("Product declared.");
     println!("  Provider : {provider}");
