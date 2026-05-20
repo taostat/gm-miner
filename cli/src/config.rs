@@ -32,6 +32,33 @@ pub struct TokenEntry {
     pub token_expires_at: Option<String>,
 }
 
+/// Margin treated as "about to expire": a token within this window of its
+/// stated expiry is rejected up front. A `gm-miner deploy` does many
+/// minutes of CVM work before its trailing `register-image` call, so a
+/// token that is merely "still valid right now" is not good enough.
+pub const TOKEN_EXPIRY_MARGIN_SECS: i64 = 300;
+
+impl TokenEntry {
+    /// Returns true if `token_expires_at` is set and is in the past, or
+    /// within [`TOKEN_EXPIRY_MARGIN_SECS`] of now.
+    ///
+    /// A token with no `token_expires_at` is treated as not-expired here:
+    /// the registry's 401 handling remains the backstop for that case.
+    #[must_use]
+    pub fn is_expired_or_near(&self) -> bool {
+        let Some(raw) = self.token_expires_at.as_deref() else {
+            return false;
+        };
+        let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(raw) else {
+            // An unparseable timestamp is treated as expired — better to
+            // force a re-login than to trust a corrupt value.
+            return true;
+        };
+        let cutoff = chrono::Utc::now() + chrono::Duration::seconds(TOKEN_EXPIRY_MARGIN_SECS);
+        expiry.with_timezone(&chrono::Utc) <= cutoff
+    }
+}
+
 /// Per-network configuration.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetworkEntry {
