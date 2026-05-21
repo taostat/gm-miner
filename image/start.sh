@@ -110,7 +110,7 @@ envoy \
   --drain-time-s 10 &
 ENVOY_PID=$!
 
-# shellcheck disable=SC2329  # invoked indirectly via the trap below.
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
 shutdown() {
   log "received signal — shutting down"
   kill -TERM "${ENVOY_PID}" "${ATTESTD_PID}" 2>/dev/null || true
