@@ -6,9 +6,54 @@
 
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Response, StatusCode};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::Config;
+
+/// Auth configuration returned by `GET /auth/config`.
+///
+/// The CLI fetches this before running the device-code flow so all OAuth
+/// endpoints and the client identity come from the registry at runtime rather
+/// than being baked into the binary.
+#[derive(Debug, Deserialize)]
+pub struct AuthConfig {
+    pub device_code_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+}
+
+/// Fetch OAuth configuration from the registry.
+///
+/// Unauthenticated `GET {api_url}/auth/config`. Called by `gm-miner login`
+/// before the device-code flow starts.
+///
+/// # Errors
+/// Returns an error if the request fails or the response cannot be parsed.
+pub async fn get_auth_config(api_url: &str) -> Result<AuthConfig> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build http client")?;
+
+    let url = format!("{api_url}/auth/config");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("GET /auth/config failed ({status}): {body}");
+    }
+
+    resp.json::<AuthConfig>()
+        .await
+        .context("parse /auth/config response")
+}
 
 /// Cheapest authenticated endpoint on the registry — used by the deploy
 /// command's auth preflight. Returns the caller's current miner block

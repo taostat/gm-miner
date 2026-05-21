@@ -1,15 +1,20 @@
-//! OAuth 2.0 device-code flow via the gm registry proxy.
+//! OAuth 2.0 device-code flow against the Taostats auth-gateway.
 //!
 //! Flow:
-//!   1. `POST {api_url}/auth/device/code` (no body) → `device_code` + `user_code` + `verification_uri`
-//!   2. Display URL + code; optionally open browser.
-//!   3. Poll `POST {api_url}/auth/device/token` with `{"device_code": "..."}` until authorized or
-//!      expired.
-//!   4. Store `access_token` in `~/.gm-miner/config.json`.
+//!   1. `POST {device_code_url}` with JSON `{"client_id": ..., "scopes": [...]}`
+//!      → `device_code`, `user_code`, `verification_uri`, `interval`, `expires_in`.
+//!   2. Display the verification URL + code; optionally open the browser.
+//!   3. Poll `POST {token_url}` (form-encoded) with `client_id`, `device_code`,
+//!      `grant_type=urn:ietf:params:oauth:grant-type:device_code` until the user
+//!      authorizes or the code expires.
+//!   4. Return the token bundle to the caller for persistence.
 //!
-//! The registry server-side injects the correct OAuth `client_id` and subnet-scoped scope, so the
-//! CLI does not need to know either. Token refresh is deferred (issue #65): an expired access token
-//! is handled by re-running `gm-miner login`.
+//! The auth-gateway URLs, client ID, and scopes are fetched from the registry
+//! at `GET /auth/config` immediately before this function is called — nothing
+//! auth-related is baked into the binary.
+//!
+//! Token refresh is deferred (issue #65): an expired access token is handled
+//! by re-running `gm-miner login`.
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -17,10 +22,10 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-/// Token endpoint response.
+/// Token bundle returned by the auth-gateway on a successful device-code flow.
 ///
-/// The token endpoint also returns a `refresh_token`; it is intentionally
-/// not deserialized because token refresh is deferred (issue #65).
+/// `refresh_token` is not modelled here because token refresh is deferred
+/// (issue #65). An expired access token is handled by re-running `gm-miner login`.
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -28,7 +33,7 @@ pub struct TokenResponse {
     pub token_type: Option<String>,
 }
 
-/// Device code endpoint response.
+/// Device authorization endpoint response.
 #[derive(Debug, Deserialize)]
 struct DeviceCodeResponse {
     device_code: String,
@@ -47,29 +52,58 @@ fn default_expires_in() -> u64 {
     900
 }
 
-/// Run the device-code flow against the registry proxy. Returns the token response on success.
+/// Build an HTTP client with no idle connection pooling.
 ///
-/// Prints instructions to stdout. Optionally opens the browser if `open_browser` is true.
+/// `pool_max_idle_per_host(0)` ensures every request opens a fresh TCP
+/// connection. Without this the keep-alive connection used for the device-code
+/// POST is closed server-side between polls, and the next POST fails with
+/// "connection closed before message completed" — reqwest does not retry POSTs
+/// automatically.
+fn no_pool_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("build http client")
+}
+
+/// Run the device-code flow against the Taostats auth-gateway.
+///
+/// `device_code_url`, `token_url`, `client_id`, and `scopes` come from
+/// `GET {registry}/auth/config` and are passed in by the caller.
+///
+/// Prints instructions to stdout. Optionally opens the browser when
+/// `open_browser` is `true`.
 ///
 /// # Errors
-/// Returns an error if the HTTP request fails, the response cannot be parsed,
+/// Returns an error if any HTTP request fails, the response cannot be parsed,
 /// the device code flow times out, or the user denies access.
-pub async fn device_login(api_url: &str, open_browser: bool) -> Result<TokenResponse> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("build http client")?;
+pub async fn device_login(
+    device_code_url: &str,
+    token_url: &str,
+    client_id: &str,
+    scopes: &[String],
+    open_browser: bool,
+) -> Result<TokenResponse> {
+    let client = no_pool_client()?;
 
-    // Step 1: request device code. No body — the registry injects client_id and scope.
+    // Step 1: request a device code.
+    // The auth-gateway requires the `scopes` array; a singular `scope` string
+    // is silently ignored.
     let resp = client
-        .post(format!("{api_url}/auth/device/code"))
+        .post(device_code_url)
+        .json(&serde_json::json!({
+            "client_id": client_id,
+            "scopes": scopes,
+        }))
         .send()
         .await
-        .context("POST /auth/device/code")?;
+        .with_context(|| format!("POST {device_code_url}"))?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("device code request failed: {body}");
+        bail!("device code request failed ({status}): {body}");
     }
 
     let dc: DeviceCodeResponse = resp.json().await.context("parse device code response")?;
@@ -90,10 +124,10 @@ pub async fn device_login(api_url: &str, open_browser: bool) -> Result<TokenResp
         }
     }
 
-    // Step 2: poll until authorized.
+    // Step 2: poll until the user authorizes or the code expires.
     poll_for_token(
-        &client,
-        api_url,
+        token_url,
+        client_id,
         &dc.device_code,
         dc.interval,
         dc.expires_in,
@@ -102,8 +136,8 @@ pub async fn device_login(api_url: &str, open_browser: bool) -> Result<TokenResp
 }
 
 async fn poll_for_token(
-    client: &Client,
-    api_url: &str,
+    token_url: &str,
+    client_id: &str,
     device_code: &str,
     initial_interval: u64,
     expires_in: u64,
@@ -121,14 +155,22 @@ async fn poll_for_token(
             bail!("login timed out — please try again");
         }
 
+        // Build a fresh client per poll — `pool_max_idle_per_host(0)` on the
+        // shared client already prevents keep-alive reuse, but an explicit
+        // fresh client makes the intent unmistakable.
+        let client = no_pool_client()?;
+
+        // OAuth token endpoints are form-encoded per RFC 8628 §3.4.
         let resp = client
-            .post(format!("{api_url}/auth/device/token"))
-            .json(&serde_json::json!({
-                "device_code": device_code,
-            }))
+            .post(token_url)
+            .form(&[
+                ("client_id", client_id),
+                ("device_code", device_code),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
             .send()
             .await
-            .context("POST /auth/device/token")?;
+            .with_context(|| format!("POST {token_url}"))?;
 
         let status = resp.status();
 
@@ -138,7 +180,7 @@ async fn poll_for_token(
             return Ok(token);
         }
 
-        // Parse OAuth error.
+        // Parse the OAuth error code from the 400 body.
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let error = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
 
