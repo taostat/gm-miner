@@ -1,33 +1,34 @@
 //! `gm-miner deploy` — single-shot trust-correct deploy flow.
 //!
-//! This module and `crate::gcp` together replace the former
-//! `dstack/deploy.sh`: the whole operator deploy pipeline is now the
-//! `gm-miner deploy` subcommand.
+//! This module and `crate::image` together are the whole operator deploy
+//! pipeline: the `gm-miner deploy` subcommand builds the miner image,
+//! submits the compose stack to Phala Cloud, verifies the resulting CVM's
+//! measured hashes against the registry allow-list, and registers the
+//! image.
+//!
+//! Phala Cloud owns the confidential VM, the KMS, and `app_id`
+//! authorization. The trust check therefore rests entirely on verifying
+//! the deployed CVM's compose hash and OS image hash against the
+//! registry's approved `ImageVersion` list — there is no client-side KMS
+//! trust-pinning to do.
 //!
 //! Steps (orchestrated from `main::cmd_deploy`):
 //!   1. Read provider API keys from config; error early if none set.
 //!   2. Auth preflight (`GET /miners/me`) — fail fast if the operator
 //!      forgot `gm-miner login` or has a stale token, before any CVM work.
 //!   3. Fetch the approved `ImageVersion` list from the registry.
-//!   4. Select the newest supported version (or a pinned one if `--version` given).
-//!   5. Prepare the deploy target ([`prepare_deploy_target`]): bootstrap the
-//!      dstack project if `app.json` is missing (writes the dstack-cloud
-//!      global config, then calls `dstack-cloud new` with GCP coordinates,
-//!      `--key-provider kms`, and `--gw`) — or, if `app.json` already exists,
-//!      validate its trust-critical fields ([`validate_app_json_trust`]).
-//!      This runs *before* the build so a fresh-machine bootstrap failure is
-//!      hit cheaply. Then provision GCP (`crate::gcp`): preflight host tools,
-//!      set the project, enable service APIs, describe-or-create the GCS
-//!      bucket + Artifact Registry repo, build + push the miner image (or
-//!      accept a pre-built `--image-ref`), and render the bundled
-//!      `dstack/docker-compose.yaml` template with the digest-pinned ref.
-//!   8. Pull the dstack-cloud OS image (`crate::gcp::pull_os_image`).
-//!   9. Submit to dstack-cloud (via the `DstackClient` trait for testability).
-//!  10. Poll `dstack-cloud status --json` until `compose_sha256` and
-//!      `os_image_hash` are populated (up to `boot_timeout_secs` seconds).
-//!  11. **Verify** both match the registry's approved version — refuse and exit 1
-//!      if they don't.
-//!  12. Call `register_image` with the verified hashes.
+//!   4. Select the newest supported version (or a pinned one if `--version`
+//!      given).
+//!   5. Prepare the deploy target ([`prepare_deploy_target`]): build and
+//!      push the miner image to a public registry (or accept a pre-built
+//!      `--image-ref`), then render the bundled `dstack/docker-compose.yaml`
+//!      template with the digest-pinned ref.
+//!   6. Submit the compose stack to Phala Cloud (via the [`PhalaClient`]
+//!      trait for testability), wait for the CVM to boot, and read back
+//!      the measured `compose_hash` + `os_image_hash`.
+//!   7. **Verify** both match the registry's approved version — refuse and
+//!      exit 1 if they don't.
+//!   8. Call `register_image` with the verified hashes.
 
 use anyhow::{bail, Context, Result};
 use chrono::DateTime;
@@ -35,287 +36,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderKeys;
 
-// ── GCP configuration ─────────────────────────────────────────────────────────
-
-/// GCP-specific fields written into `app.json` after `dstack-cloud new`.
-///
-/// The deploy.sh script patches `gcp_config` in app.json between bootstrap
-/// and deploy so that `dstack-cloud deploy` has a valid GCS upload target and
-/// can provision the correct machine type/zone on fresh machines.
-///
-/// Fields mirror those used by the reference `dstack/deploy.sh`:
-/// - `project` — GCP project ID
-/// - `zone` — GCP zone (e.g. `us-central1-a`)
-/// - `machine_type` — Compute Engine machine type (e.g. `c3-standard-4`)
-/// - `instance_name` — Compute Engine instance name (matches the app name)
-/// - `bucket` — GCS bucket URI for dstack image upload (e.g. `gs://<project>-dstack`)
-#[derive(Debug, Clone)]
-pub struct GcpConfig {
-    pub project: String,
-    pub zone: String,
-    pub machine_type: String,
-    pub instance_name: String,
-    pub bucket: String,
-}
-
-impl GcpConfig {
-    /// Derive a GCS bucket name from the GCP project ID using the same
-    /// convention as `deploy.sh`: `gs://<project>-dstack`.
-    #[must_use]
-    pub fn default_bucket(project: &str) -> String {
-        format!("gs://{project}-dstack")
-    }
-}
-
-/// Patch `gcp_config` fields in the `app.json` file written by `dstack-cloud new`.
-///
-/// `dstack-cloud new` seeds `gcp_config.bucket` (and other fields) from the
-/// global `~/.config/dstack-cloud/config.json`, which is often empty or
-/// stale on a fresh machine.  This function writes the deploy-time values so
-/// `dstack-cloud deploy` has a valid upload target.
-///
-/// Matches the python patch in `dstack/deploy.sh` (both fresh and re-deploy
-/// paths): always writes `project`, `zone`, `machine_type`, `instance_name`,
-/// and `bucket`.
-///
-/// # Errors
-/// Returns an error if the file cannot be read, parsed, or written.
-pub fn patch_app_json(app_json_path: &std::path::Path, gcp: &GcpConfig) -> Result<()> {
-    let raw = std::fs::read_to_string(app_json_path)
-        .with_context(|| format!("read {}", app_json_path.display()))?;
-
-    let mut app: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", app_json_path.display()))?;
-
-    let gcp_obj = app
-        .as_object_mut()
-        .context("app.json root is not an object")?
-        .entry("gcp_config")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    let map = gcp_obj
-        .as_object_mut()
-        .context("app.json gcp_config is not an object")?;
-
-    map.insert(
-        "project".into(),
-        serde_json::Value::String(gcp.project.clone()),
-    );
-    map.insert("zone".into(), serde_json::Value::String(gcp.zone.clone()));
-    map.insert(
-        "machine_type".into(),
-        serde_json::Value::String(gcp.machine_type.clone()),
-    );
-    map.insert(
-        "instance_name".into(),
-        serde_json::Value::String(gcp.instance_name.clone()),
-    );
-    map.insert(
-        "bucket".into(),
-        serde_json::Value::String(gcp.bucket.clone()),
-    );
-
-    let patched = serde_json::to_string_pretty(&app).context("re-serialize app.json")?;
-    std::fs::write(app_json_path, patched)
-        .with_context(|| format!("write {}", app_json_path.display()))?;
-
-    Ok(())
-}
-
-// ── app.json trust validation ─────────────────────────────────────────────────
-
-/// The KMS URL the miner's trust model is anchored to. An `app.json` whose
-/// `kms_url` differs points the CVM at a different key authority and breaks
-/// the registry's attestation chain. Mirrors the global config written by
-/// `deploy.sh`.
-pub const TRUSTED_KMS_URL: &str = "https://kms.tdxlab.dstack.org:12001";
-
-/// Validate the trust-critical fields of an existing `app.json` and correct
-/// them in place if they are wrong.
-///
-/// `dstack-cloud new` writes a fresh, trust-correct `app.json`, but the
-/// deploy path also accepts an `app.json` that already exists on disk — it
-/// could be stale (from an older toolchain) or tampered with. Before that
-/// file is trusted as the deploy target, three fields are checked:
-///
-/// - `key_provider` must be `kms` — only KMS produces an attestation chain
-///   the registry can verify. Anything else (e.g. `local`) is rejected hard;
-///   silently re-writing it could mask a tampered file, so this fails loudly.
-/// - `gateway_enabled` must be `true` — the gateway is the trust boundary
-///   the registry probes envoy through. A missing or `false` value is
-///   corrected in place (the subcommand knows the right value).
-/// - `kms_url` must equal [`TRUSTED_KMS_URL`] — a missing value is filled in;
-///   a *different* non-empty value is rejected hard (it points the CVM at
-///   another key authority).
-///
-/// Returns `true` if the file was modified (corrected) and needs no further
-/// action, `false` if it was already trust-correct.
-///
-/// # Errors
-/// Returns an error if the file cannot be read/parsed/written, or if a
-/// trust-critical field holds an actively wrong value that must not be
-/// silently overwritten.
-pub fn validate_app_json_trust(app_json_path: &std::path::Path) -> Result<bool> {
-    let raw = std::fs::read_to_string(app_json_path)
-        .with_context(|| format!("read {}", app_json_path.display()))?;
-    let mut app: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", app_json_path.display()))?;
-    let obj = app
-        .as_object_mut()
-        .context("app.json root is not an object")?;
-
-    let mut corrected = false;
-
-    // key_provider — reject anything that is not exactly "kms".
-    match obj.get("key_provider").and_then(serde_json::Value::as_str) {
-        Some(DSTACK_KEY_PROVIDER) => {}
-        other => bail!(
-            "app.json has key_provider={} — refusing to deploy. The miner's \
-             attestation chain requires `kms`; delete app.json to re-scaffold \
-             a trust-correct project, or fix it by hand.",
-            other.map_or_else(|| "<missing>".to_owned(), |s| format!("{s:?}"))
-        ),
-    }
-
-    // gateway_enabled — must be true; correct a missing/false value in place.
-    if obj
-        .get("gateway_enabled")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
-        tracing::warn!(
-            "app.json gateway_enabled was not true; correcting it — the registry \
-             probes envoy through the gateway, so it must be enabled"
-        );
-        obj.insert("gateway_enabled".to_owned(), serde_json::Value::Bool(true));
-        corrected = true;
-    }
-
-    // kms_url — fill in if missing; reject a different non-empty value.
-    // A trailing slash is cosmetic for an origin URL, so compare on the
-    // slash-trimmed form rather than rejecting `…:12001/` as a foreign
-    // authority.
-    match obj.get("kms_url").and_then(serde_json::Value::as_str) {
-        None | Some("") => {
-            tracing::warn!(
-                kms_url = TRUSTED_KMS_URL,
-                "app.json kms_url was empty; setting it"
-            );
-            obj.insert(
-                "kms_url".to_owned(),
-                serde_json::Value::String(TRUSTED_KMS_URL.to_owned()),
-            );
-            corrected = true;
-        }
-        Some(value) if value.trim_end_matches('/') == TRUSTED_KMS_URL.trim_end_matches('/') => {}
-        Some(other) => bail!(
-            "app.json has kms_url={other:?} but the miner trusts {TRUSTED_KMS_URL:?} \
-             — refusing to deploy against a different key authority. Delete app.json \
-             to re-scaffold, or fix it by hand if the change is intentional."
-        ),
-    }
-
-    if corrected {
-        let patched = serde_json::to_string_pretty(&app).context("re-serialize app.json")?;
-        std::fs::write(app_json_path, patched)
-            .with_context(|| format!("write {}", app_json_path.display()))?;
-    }
-
-    Ok(corrected)
-}
-
 /// Default poll interval when waiting for the CVM to boot (seconds).
 pub const POLL_INTERVAL_SECS: u64 = 5;
 /// Default maximum time to wait for hashes to appear after deploy (seconds).
 pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
-
-/// Key-provider passed to `dstack-cloud new`. The miner's trust model
-/// requires KMS — fixed here so an operator cannot accidentally weaken
-/// it from the CLI. Mirrors `dstack/deploy.sh`.
-pub const DSTACK_KEY_PROVIDER: &str = "kms";
-
-/// Build the argument list for `dstack-cloud new`.
-///
-/// `dstack-cloud new` takes the project name as a positional argument
-/// followed by GCP coordinates. Two flags are hardcoded because the
-/// miner's trust model requires them:
-///   - `--key-provider kms` — only KMS produces an attestation chain
-///     the registry can verify.
-///   - `--gw` — gateway must be enabled for the registry to probe envoy
-///     directly (no bearer token; the gateway is the trust boundary).
-///
-/// Extracted from `RealDstackClient::bootstrap` so the wiring can be
-/// asserted without spawning a subprocess.
-#[must_use]
-pub fn build_dstack_new_args(app_name: &str, gcp: &GcpConfig) -> Vec<String> {
-    vec![
-        "new".to_owned(),
-        app_name.to_owned(),
-        "--project".to_owned(),
-        gcp.project.clone(),
-        "--zone".to_owned(),
-        gcp.zone.clone(),
-        "--machine-type".to_owned(),
-        gcp.machine_type.clone(),
-        "--instance-name".to_owned(),
-        gcp.instance_name.clone(),
-        "--key-provider".to_owned(),
-        DSTACK_KEY_PROVIDER.to_owned(),
-        "--gw".to_owned(),
-    ]
-}
-
-// ── dstack-cloud global config ────────────────────────────────────────────────
-
-/// The dstack-cloud global config JSON, written to
-/// `~/.config/dstack-cloud/config.json` if absent.
-///
-/// `dstack-cloud new` reads KMS/gateway service URLs from this file. On a
-/// fresh machine the file does not exist; `deploy.sh` seeds it before
-/// calling `dstack-cloud new`. The `gcp` / `image_search_paths` blocks are
-/// left at their defaults — the per-project `app.json` carries the
-/// deploy-time GCP coordinates.
-const DSTACK_GLOBAL_CONFIG: &str = r#"{
-  "services": {
-    "kms_urls": ["https://kms.tdxlab.dstack.org:12001"],
-    "gateway_urls": ["https://gateway.tdxlab.dstack.org:12002"],
-    "pccs_url": ""
-  },
-  "image_search_paths": ["~/.dstack/images"],
-  "gcp": {
-    "project": "",
-    "zone": "us-central1-a",
-    "bucket": ""
-  }
-}
-"#;
-
-/// Ensure the dstack-cloud global config exists, creating it from the
-/// trusted default if absent. Mirrors `ensure_dstack_cloud_global_config`
-/// in `deploy.sh`.
-///
-/// # Errors
-/// Returns an error if the directory or file cannot be created.
-pub fn ensure_dstack_global_config() -> Result<()> {
-    let Some(home) = dirs::home_dir() else {
-        bail!("could not resolve the home directory for the dstack-cloud config");
-    };
-    let cfg = home
-        .join(".config")
-        .join("dstack-cloud")
-        .join("config.json");
-    if cfg.exists() {
-        return Ok(());
-    }
-    let dir = cfg
-        .parent()
-        .context("dstack-cloud config path has no parent")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    tracing::info!(path = %cfg.display(), "writing dstack-cloud global config");
-    std::fs::write(&cfg, DSTACK_GLOBAL_CONFIG)
-        .with_context(|| format!("write {}", cfg.display()))?;
-    Ok(())
-}
 
 // ── Registry image-version types ─────────────────────────────────────────────
 
@@ -335,220 +59,182 @@ pub struct ImageVersionsResponse {
     pub versions: Vec<ImageVersion>,
 }
 
-// ── dstack abstraction ────────────────────────────────────────────────────────
+// ── Phala Cloud deploy abstraction ────────────────────────────────────────────
 
-/// Result returned after a successful dstack-cloud deploy + status poll.
+/// Result returned after a successful Phala Cloud deploy + status poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DstackDeployResult {
-    /// SHA-256 of the rendered `docker-compose.yaml` as computed by dstack-cloud.
+    /// Canonical compose hash measured by the CVM (RTMR3-derived). Read
+    /// from `phala cvms get <app-id> --json`.
     pub compose_sha256: String,
-    /// OS image hash reported by dstack-cloud.
+    /// OS image hash reported for the CVM.
     pub os_image_hash: String,
 }
 
-/// Abstraction over the dstack-cloud CLI, injectable for tests.
+/// Abstraction over the `phala` CLI, injectable for tests.
 ///
-/// The real implementation shells out to `dstack-cloud new` (bootstrap),
-/// `dstack-cloud deploy`, and `dstack-cloud status --json`. The mock
-/// implementation returns pre-canned values without touching the filesystem.
-pub trait DstackClient {
-    /// Bootstrap a new dstack project in the project directory by running
-    /// `dstack-cloud new <app_name> --project ... --zone ... --machine-type ...
-    /// --instance-name ... --key-provider kms --gw`, then patch `app.json`
-    /// with `gcp` so `dstack-cloud deploy` has a valid GCS upload target
-    /// (`bucket` is not a `dstack-cloud new` flag, so it must be patched in
-    /// after the fact).
+/// The real implementation ([`RealPhalaClient`]) shells out to
+/// `phala deploy` and `phala cvms get`. Tests inject a stub that returns
+/// pre-canned values without touching the filesystem or a subprocess.
+pub trait PhalaClient {
+    /// Deploy the compose stack to Phala Cloud and return the compose + OS
+    /// image hashes the platform measured for the resulting CVM.
     ///
-    /// The KMS key-provider and gateway-enabled flags are baked in: the
-    /// miner's attestation chain requires both, and exposing them as
-    /// configurable would let an operator accidentally weaken the trust
-    /// model. Mirrors `dstack/deploy.sh`.
-    ///
-    /// Only called when `app.json` is absent (i.e. on a fresh machine with
-    /// no prior deploy).
+    /// `compose_yaml` is the rendered compose file content; `env_vars` are
+    /// the operator's provider API keys, encrypted client-side to the CVM
+    /// key by `phala deploy`. `node_secret` is the miner's node secret
+    /// (Mechanism 1 of `docs/plans/attestation-and-identity.md`), passed in
+    /// the same encrypted env as `GM_NODE_SECRET`. `boot_timeout_secs`
+    /// controls how long to poll for the measured hashes before giving up.
     ///
     /// # Errors
-    /// Returns an error if `dstack-cloud new` fails or `app.json` cannot
-    /// be patched.
-    fn bootstrap(&self, app_name: &str, gcp: &GcpConfig) -> Result<()>;
-
-    /// Patch `gcp_config` fields in an existing `app.json` (re-deploy path).
-    ///
-    /// Called when the project is already bootstrapped to keep GCP coordinates
-    /// current (project, zone, `machine_type`, bucket) without clobbering the
-    /// `app_id` / `instance_id_seed` that dstack uses to identify the CVM.
-    ///
-    /// # Errors
-    /// Returns an error if `app.json` cannot be read or written.
-    fn refresh_gcp_config(&self, gcp: &GcpConfig) -> Result<()>;
-
-    /// Returns true if the project directory already contains `app.json`,
-    /// meaning the dstack project has already been bootstrapped.
-    fn is_bootstrapped(&self) -> bool;
-
-    /// Validate the trust-critical fields of an already-existing `app.json`
-    /// (re-deploy path) and correct them in place where safe.
-    ///
-    /// Called only when [`Self::is_bootstrapped`] is true. A freshly
-    /// `dstack-cloud new`-scaffolded project is trust-correct by
-    /// construction, but a file that was already on disk could be stale or
-    /// tampered with; this check refuses to deploy against a weakened one.
-    /// See [`validate_app_json_trust`].
-    ///
-    /// # Errors
-    /// Returns an error if `app.json` cannot be read/written or holds an
-    /// actively wrong trust-critical value.
-    fn validate_existing_trust(&self) -> Result<()>;
-
-    /// Deploy and return the compose + OS image hashes that dstack-cloud
-    /// actually used. `compose_yaml` is the rendered compose file content;
-    /// `env_vars` are the operator's provider API keys to pass via dstack's
-    /// encrypted env upload. `node_secret` is the miner's node secret
-    /// (Mechanism 1 of `docs/plans/attestation-and-identity.md`), written
-    /// into the same encrypted `.env` as `GM_NODE_SECRET`. `gcp` is used
-    /// to refresh `gcp_config` in `app.json` before calling
-    /// `dstack-cloud deploy` (both fresh and re-deploy paths).
-    /// `boot_timeout_secs` controls how long to poll for hashes before
-    /// giving up.
-    ///
-    /// # Errors
-    /// Returns an error if the deploy fails or the hashes cannot be read back
-    /// within `boot_timeout_secs`.
+    /// Returns an error if the deploy fails or the hashes cannot be read
+    /// back within `boot_timeout_secs`.
     fn deploy(
         &self,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
         node_secret: &str,
-        gcp: &GcpConfig,
         boot_timeout_secs: u64,
     ) -> Result<DstackDeployResult>;
 }
 
 // ── Image provisioning abstraction ────────────────────────────────────────────
 
-/// Abstraction over the GCP-provisioning + image-build step, injectable so
-/// the deploy orchestration can be exercised without a real `gcloud` /
-/// `docker` toolchain.
+/// Abstraction over the image-build step, injectable so the deploy
+/// orchestration can be exercised without a real `docker` toolchain.
 ///
-/// The real implementation (in `crate::gcp`, wired by `main`) either builds
-/// and pushes the miner image to Artifact Registry, or — when the operator
-/// supplied `--image-ref` — skips the build and returns the pre-built ref.
+/// The real implementation (in `crate::image`, wired by `main`) either
+/// builds and pushes the miner image to a public registry, or — when the
+/// operator supplied `--image-ref` — skips the build and returns the
+/// pre-built ref.
 pub trait ImageProvisioner {
-    /// Provision GCP infrastructure and return the digest-pinned image ref
-    /// to embed in the compose template.
+    /// Build the miner image and return the digest-pinned image ref to
+    /// embed in the compose template.
     ///
     /// # Errors
-    /// Returns an error if GCP provisioning or the image build/push fails.
+    /// Returns an error if the image build/push fails.
     fn provision(&self) -> Result<String>;
 }
 
-/// Prepare the dstack deploy target: bootstrap (or trust-validate) the
-/// project, then provision the miner image, then render the compose file.
+/// Prepare the deploy target: provision the miner image, then render the
+/// compose file with the digest-pinned ref.
 ///
 /// This is the network-free core of the deploy orchestration, extracted so
-/// it can be integration-tested against real code rather than a re-implemented
-/// copy of the branch logic.
-///
-/// **Ordering.** The dstack project is bootstrapped (`dstack-cloud new` +
-/// global-config seed) — or its existing `app.json` trust-validated — *before*
-/// the image is built and pushed. A bootstrap failure on a fresh machine is
-/// cheap to hit and would otherwise waste a multi-minute Docker build+push
-/// that nothing downstream can use. The build does not consume any bootstrap
-/// output and the bootstrap does not consume the built image, so the two
-/// steps are independent and the cheap-fails-first order is safe.
+/// it can be integration-tested against real code rather than a
+/// re-implemented copy of the branch logic.
 ///
 /// Returns the rendered `docker-compose.yaml` content (image ref pinned).
 ///
 /// # Errors
-/// Returns an error if the global-config seed, bootstrap, trust validation,
-/// image provisioning, or compose rendering fails.
-pub fn prepare_deploy_target(
-    dstack: &dyn DstackClient,
-    provisioner: &dyn ImageProvisioner,
-    app_name: &str,
-    gcp: &GcpConfig,
-) -> Result<String> {
-    // Bootstrap / trust-validate first — a fresh-machine bootstrap failure is
-    // cheap and must not be reached only after a multi-minute build+push.
-    if dstack.is_bootstrapped() {
-        // Re-deploy path: validate the trust-critical fields of the existing
-        // app.json before treating it as the deploy target.
-        println!("Validating trust fields of the existing app.json ...");
-        dstack.validate_existing_trust()?;
-    } else {
-        println!("No dstack project found; bootstrapping with `dstack-cloud new` ...");
-        ensure_dstack_global_config()?;
-        dstack.bootstrap(app_name, gcp)?;
-        // `dstack-cloud new` reads KMS/gateway URLs from the global config; if
-        // that file is stale or tampered the scaffolded app.json may already
-        // point at the wrong KMS URL, so validate it like a re-deploy.
-        println!("Validating trust fields of the fresh app.json ...");
-        dstack.validate_existing_trust()?;
-    }
-
-    // Only now provision GCP + build/push the image (or accept a pre-built
-    // ref). The build-vs-prebuilt branch lives entirely inside the
-    // `ImageProvisioner`.
+/// Returns an error if image provisioning or compose rendering fails.
+pub fn prepare_deploy_target(provisioner: &dyn ImageProvisioner) -> Result<String> {
+    // Build/push the image (or accept a pre-built ref). The
+    // build-vs-prebuilt branch lives entirely inside the `ImageProvisioner`.
     let image_ref = provisioner.provision()?;
 
     // Render the compose template with the digest-pinned ref.
     render_compose(COMPOSE_TEMPLATE, &image_ref)
 }
 
-// ── Real dstack-cloud implementation ─────────────────────────────────────────
+// ── Real `phala` CLI implementation ───────────────────────────────────────────
 
-/// Shells out to `dstack-cloud deploy` and parses the resulting
-/// `dstack-cloud status --json` to obtain both hashes.
-pub struct RealDstackClient {
-    /// App name used by dstack-cloud (defaults to `gm-miner-1`).
+/// Shells out to `phala deploy` and parses the resulting
+/// `phala cvms get <app-id> --json` to obtain both hashes.
+pub struct RealPhalaClient {
+    /// CVM name passed to `phala deploy --name`.
     pub app_name: String,
-    /// Directory for dstack project state (`dist/<app_name>`).
+    /// Directory used to stage the rendered compose file and env file.
     pub project_dir: std::path::PathBuf,
+    /// Instance type for the CVM (`phala deploy --instance-type`).
+    pub instance_type: String,
+    /// Disk size for the CVM (`phala deploy --disk-size`).
+    pub disk_size: String,
 }
 
-impl RealDstackClient {
-    /// Create a client that manages state in `<dist_root>/<app_name>`.
+impl RealPhalaClient {
+    /// Create a client that stages compose/env files in `project_dir`.
     #[must_use]
-    pub fn new(app_name: impl Into<String>, dist_root: &std::path::Path) -> Self {
-        let name = app_name.into();
-        let project_dir = dist_root.join(&name);
+    pub fn new(
+        app_name: impl Into<String>,
+        project_dir: std::path::PathBuf,
+        instance_type: impl Into<String>,
+        disk_size: impl Into<String>,
+    ) -> Self {
         Self {
-            app_name: name,
+            app_name: app_name.into(),
             project_dir,
+            instance_type: instance_type.into(),
+            disk_size: disk_size.into(),
         }
     }
 }
 
-/// Output of `dstack-cloud status --json`.
+/// JSON emitted by `phala deploy --json` on a successful new-CVM deploy.
 #[derive(Debug, Deserialize)]
-struct DstackStatus {
-    compose_sha256: Option<String>,
+struct PhalaDeployOutput {
+    success: bool,
+    app_id: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// The CVM detail document returned by `phala cvms get <app-id> --json`.
+///
+/// Field path is the verified shape of the Phala Cloud CVM-detail schema:
+/// the canonical compose hash is the top-level `compose_hash`, and the OS
+/// image hash is nested under `os.os_image_hash`. Both are read here; the
+/// registry allow-list is keyed on exactly these two values.
+#[derive(Debug, Deserialize)]
+struct PhalaCvmDetail {
+    compose_hash: Option<String>,
+    os: Option<PhalaCvmOs>,
+}
+
+/// The `os` sub-object of [`PhalaCvmDetail`].
+#[derive(Debug, Deserialize)]
+struct PhalaCvmOs {
     os_image_hash: Option<String>,
 }
 
-/// Parse a `dstack-cloud status --json` invocation result into the deployed
-/// hashes.
+/// JSON-path documentation for the measured hashes, kept as a constant so
+/// the dependency on the Phala Cloud CVM-detail schema is greppable and
+/// easy to update if the API changes.
 ///
-/// `succeeded` is the command's exit status; `stdout` is its raw stdout. The
-/// single status-parsing code path shared by [`RealDstackClient::poll_status`]
-/// (deploy) and [`RealDstackClient::current_hashes`] (`register-image`).
+/// Verified against the `phala` CLI source (`@phala/phala-cli`, the
+/// `cvms get` response schema for API version `2026-01-21`): the CVM
+/// detail document carries the canonical compose hash at the top-level
+/// `compose_hash` field and the OS image hash at `os.os_image_hash`.
+pub const PHALA_COMPOSE_HASH_FIELD: &str = "compose_hash";
+/// See [`PHALA_COMPOSE_HASH_FIELD`]; the OS image hash field path.
+pub const PHALA_OS_IMAGE_HASH_FIELD: &str = "os.os_image_hash";
+
+/// Parse the measured hashes out of `phala cvms get <app-id> --json` output.
 ///
-/// Returns `Ok(Some(..))` only when the command succeeded and both hashes are
-/// present and non-empty; `Ok(None)` when the command exited non-zero (control
-/// plane not ready) or when either hash is still absent/empty.
+/// `succeeded` is the command's exit status; `stdout` is its raw stdout.
+///
+/// Returns `Ok(Some(..))` only when the command succeeded and both hashes
+/// are present and non-empty; `Ok(None)` when the command exited non-zero
+/// (the CVM is not ready yet) or when either hash is still absent/empty.
 ///
 /// # Errors
 /// Returns an error if `succeeded` is true but `stdout` is not valid
-/// `status --json` JSON.
-pub fn parse_dstack_status(succeeded: bool, stdout: &[u8]) -> Result<Option<DstackDeployResult>> {
+/// `cvms get --json` JSON.
+pub fn parse_phala_cvm_detail(
+    succeeded: bool,
+    stdout: &[u8],
+) -> Result<Option<DstackDeployResult>> {
     if !succeeded {
         return Ok(None);
     }
 
-    let ds: DstackStatus =
-        serde_json::from_slice(stdout).context("parse dstack-cloud status --json output")?;
+    let detail: PhalaCvmDetail =
+        serde_json::from_slice(stdout).context("parse phala cvms get --json output")?;
 
-    match (ds.compose_sha256, ds.os_image_hash) {
+    let compose = detail.compose_hash;
+    let os_image = detail.os.and_then(|o| o.os_image_hash);
+
+    match (compose, os_image) {
         (Some(compose_sha256), Some(os_image_hash))
             if !compose_sha256.is_empty() && !os_image_hash.is_empty() =>
         {
@@ -561,266 +247,250 @@ pub fn parse_dstack_status(succeeded: bool, stdout: &[u8]) -> Result<Option<Dsta
     }
 }
 
-/// Run `dstack-cloud status --json` once in `project_dir` and parse the
-/// deployed `compose_sha256` + `os_image_hash` via [`parse_dstack_status`].
+/// Build the argument list for `phala deploy`.
 ///
-/// Returns `Ok(None)` when the command exited non-zero (control plane not
+/// `phala deploy` submits a Docker Compose stack to Phala Cloud, which
+/// provisions the `TEEPod`, runs the KMS, encrypts the env file client-side
+/// to the CVM key, and assigns the `app_id`. The flags pin the CVM name,
+/// instance type, disk size, compose file, and env file, and request JSON
+/// output plus `--wait` so the call returns only once the CVM is up.
+///
+/// Extracted from [`RealPhalaClient::deploy`] so the wiring can be asserted
+/// without spawning a subprocess.
+#[must_use]
+pub fn build_phala_deploy_args(
+    app_name: &str,
+    instance_type: &str,
+    disk_size: &str,
+    compose_path: &str,
+    env_path: &str,
+) -> Vec<String> {
+    vec![
+        "deploy".to_owned(),
+        "--name".to_owned(),
+        app_name.to_owned(),
+        "--instance-type".to_owned(),
+        instance_type.to_owned(),
+        "--disk-size".to_owned(),
+        disk_size.to_owned(),
+        "--compose".to_owned(),
+        compose_path.to_owned(),
+        "--env".to_owned(),
+        env_path.to_owned(),
+        "--wait".to_owned(),
+        "--json".to_owned(),
+    ]
+}
+
+/// Run `phala cvms get <app-id> --json` once and parse the measured
+/// `compose_hash` + `os.os_image_hash` via [`parse_phala_cvm_detail`].
+///
+/// Returns `Ok(None)` when the command exited non-zero (the CVM is not
 /// ready) or when either hash is still absent/empty.
 ///
 /// # Errors
-/// Returns an error only if `dstack-cloud` cannot be spawned, or it exits
-/// successfully but emits output that is not valid `status --json` JSON.
-fn read_dstack_status(project_dir: &std::path::Path) -> Result<Option<DstackDeployResult>> {
-    let out = std::process::Command::new("dstack-cloud")
-        .args(["status", "--json"])
-        .current_dir(project_dir)
+/// Returns an error only if `phala` cannot be spawned, or it exits
+/// successfully but emits output that is not valid `cvms get --json` JSON.
+fn read_phala_cvm_detail(app_id: &str) -> Result<Option<DstackDeployResult>> {
+    let out = std::process::Command::new("phala")
+        .args(["cvms", "get", app_id, "--json"])
         .output()
-        .context("run dstack-cloud status --json — is dstack-cloud installed?")?;
+        .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
 
     if !out.status.success() {
-        // A non-zero exit is expected before the control plane is ready —
-        // surface it as "not available yet" so callers can retry or report.
         tracing::info!(
             stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            "dstack-cloud status --json not ready yet (non-zero exit)"
+            "phala cvms get --json not ready yet (non-zero exit)"
         );
     }
 
-    parse_dstack_status(out.status.success(), &out.stdout)
+    parse_phala_cvm_detail(out.status.success(), &out.stdout)
 }
 
-impl DstackClient for RealDstackClient {
-    fn is_bootstrapped(&self) -> bool {
-        self.project_dir.join("app.json").exists()
-    }
-
-    fn bootstrap(&self, _hint_app_name: &str, gcp: &GcpConfig) -> Result<()> {
-        // Use the app name this client was constructed with; the hint is for
-        // test stubs that don't store state.
-        //
-        // `dstack-cloud new <name>` creates `<cwd>/<name>/` containing the
-        // generated `app.json`. To land it at `self.project_dir`, run from
-        // the parent and pass `app_name` as the positional name — mirrors
-        // `dstack/deploy.sh` which does `cd "${DIST_DIR}" && dstack-cloud
-        // new "${APP_NAME}"`.
-        let parent_dir = self.project_dir.parent().unwrap_or_else(|| {
-            // project_dir has no parent only when it is a root (e.g. "/"
-            // or "C:\"). That can't happen with the default `dist/<app>`
-            // layout; fall back to "." so the command can still run and
-            // the operator gets a clean error from dstack-cloud itself.
-            std::path::Path::new(".")
-        });
-        std::fs::create_dir_all(parent_dir)
-            .with_context(|| format!("create parent dir {}", parent_dir.display()))?;
-
-        let args = build_dstack_new_args(&self.app_name, gcp);
-        let status = std::process::Command::new("dstack-cloud")
-            .args(&args)
-            .current_dir(parent_dir)
-            .status()
-            .context("run dstack-cloud new — is dstack-cloud installed?")?;
-
-        if !status.success() {
-            bail!(
-                "dstack-cloud new exited with status {}",
-                status.code().unwrap_or(-1)
-            );
-        }
-
-        // Patch gcp_config immediately after bootstrap. `dstack-cloud new`
-        // now seeds project/zone/machine_type/instance_name from the flags
-        // above, but `bucket` is not a `new` flag — it comes from the
-        // global config (often empty on a fresh machine). This call writes
-        // the deploy-time bucket and (idempotently) reaffirms the other
-        // GCP coordinates so a subsequent `dstack-cloud deploy` has a
-        // valid upload target.
-        let app_json = self.project_dir.join("app.json");
-        patch_app_json(&app_json, gcp)
-            .with_context(|| format!("patch gcp_config in {}", app_json.display()))?;
-
-        Ok(())
-    }
-
-    fn refresh_gcp_config(&self, gcp: &GcpConfig) -> Result<()> {
-        let app_json = self.project_dir.join("app.json");
-        patch_app_json(&app_json, gcp)
-            .with_context(|| format!("refresh gcp_config in {}", app_json.display()))
-    }
-
-    fn validate_existing_trust(&self) -> Result<()> {
-        let app_json = self.project_dir.join("app.json");
-        let corrected = validate_app_json_trust(&app_json)
-            .with_context(|| format!("validate trust fields in {}", app_json.display()))?;
-        if corrected {
-            tracing::info!(
-                path = %app_json.display(),
-                "corrected trust-critical fields in existing app.json"
-            );
-        }
-        Ok(())
-    }
-
+impl PhalaClient for RealPhalaClient {
     fn deploy(
         &self,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
         node_secret: &str,
-        gcp: &GcpConfig,
         boot_timeout_secs: u64,
     ) -> Result<DstackDeployResult> {
         use std::fs;
-        use std::io::Write as _;
-        #[cfg(unix)]
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         fs::create_dir_all(&self.project_dir)
             .with_context(|| format!("create project dir {}", self.project_dir.display()))?;
-
-        // Refresh gcp_config on every deploy (both fresh and re-deploy paths).
-        // On a fresh machine this runs after bootstrap has already written the
-        // file; on re-deploy it keeps project/zone/bucket current without
-        // touching app_id / instance_id_seed.
-        self.refresh_gcp_config(gcp)?;
 
         // Write the rendered compose file.
         let compose_path = self.project_dir.join("docker-compose.yaml");
         fs::write(&compose_path, compose_yaml)
             .with_context(|| format!("write {}", compose_path.display()))?;
 
-        // Write .env via a temp-file-then-rename so the target file is always
-        // at mode 0600 from the moment it exists — no window where a partially-
-        // written or broader-permission file is present on disk.
+        // Write the env file at mode 0600 so the secrets are never visible
+        // with broader permissions. `phala deploy` reads this file and
+        // encrypts its contents client-side to the CVM key.
         let env_path = self.project_dir.join(".env");
-        {
-            let mut lines = String::new();
-            if let Some(k) = &env_vars.anthropic {
-                lines.push_str("ANTHROPIC_API_KEY=");
-                lines.push_str(k);
-                lines.push('\n');
-            }
-            if let Some(k) = &env_vars.openai {
-                lines.push_str("OPENAI_API_KEY=");
-                lines.push_str(k);
-                lines.push('\n');
-            }
-            if let Some(k) = &env_vars.google {
-                lines.push_str("GOOGLE_API_KEY=");
-                lines.push_str(k);
-                lines.push('\n');
-            }
-            // The node secret envoy enforces as the x-gm-node-key header.
-            // Always written: `cmd_deploy` resolves it before this call.
-            lines.push_str("GM_NODE_SECRET=");
-            lines.push_str(node_secret);
-            lines.push('\n');
+        write_env_file(&env_path, env_vars, node_secret)?;
 
-            // Write to a sibling temp file first, then atomically rename over
-            // the target. The temp file is created at 0600 from the start, so
-            // the target is never visible with broader permissions during
-            // an overwrite.
-            let tmp_path = self.project_dir.join(".env.tmp");
+        let compose_arg = compose_path.to_string_lossy().into_owned();
+        let env_arg = env_path.to_string_lossy().into_owned();
+        let args = build_phala_deploy_args(
+            &self.app_name,
+            &self.instance_type,
+            &self.disk_size,
+            &compose_arg,
+            &env_arg,
+        );
 
-            #[cfg(unix)]
-            {
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp_path)
-                    .with_context(|| format!("open {}", tmp_path.display()))?;
-                file.write_all(lines.as_bytes())
-                    .with_context(|| format!("write {}", tmp_path.display()))?;
-                // Explicit set_permissions ensures 0600 even if umask is
-                // permissive and the file somehow already existed.
-                fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-                    .with_context(|| format!("chmod 600 {}", tmp_path.display()))?;
-            }
-
-            #[cfg(not(unix))]
-            {
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&tmp_path)
-                    .with_context(|| format!("open {}", tmp_path.display()))?;
-                file.write_all(lines.as_bytes())
-                    .with_context(|| format!("write {}", tmp_path.display()))?;
-            }
-
-            fs::rename(&tmp_path, &env_path).with_context(|| {
-                format!("rename {} -> {}", tmp_path.display(), env_path.display())
-            })?;
-        }
-
-        // Run dstack-cloud deploy.
-        let status = std::process::Command::new("dstack-cloud")
-            .arg("deploy")
-            .current_dir(&self.project_dir)
-            .status()
-            .context("run dstack-cloud deploy — is dstack-cloud installed?")?;
-
-        if !status.success() {
+        let out = std::process::Command::new("phala")
+            .args(&args)
+            .output()
+            .context("run phala deploy — is the phala CLI installed? (npm i -g phala)")?;
+        if !out.status.success() {
             bail!(
-                "dstack-cloud deploy exited with status {}",
-                status.code().unwrap_or(-1)
+                "phala deploy exited with status {}: {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
             );
         }
 
-        // Poll `dstack-cloud status --json` until both hashes are populated.
-        // The CVM may take seconds to minutes to boot after deploy returns.
-        self.poll_status(boot_timeout_secs)
+        let app_id = parse_phala_deploy_output(&out.stdout)?;
+        println!("Phala Cloud assigned app_id {app_id}; waiting for the CVM to report hashes ...");
+
+        // Poll `phala cvms get` until both measured hashes are populated.
+        // `phala deploy --wait` returns once the CVM is up, but the
+        // platform may take a few more seconds to publish the measured
+        // hashes in the CVM detail document.
+        poll_phala_cvm_detail(&app_id, boot_timeout_secs)
     }
 }
 
-impl RealDstackClient {
-    /// Read the hashes of the currently-deployed miner from
-    /// `dstack-cloud status --json` (single, non-polling read).
-    ///
-    /// Returns `Ok(None)` when the dstack app is not deployed yet or the CVM
-    /// has not populated its hashes — the `register-image` flow turns that
-    /// into an actionable "deploy first" error.
-    ///
-    /// # Errors
-    /// Returns an error if `dstack-cloud` cannot be spawned or emits
-    /// unparseable `status --json` output.
-    pub fn current_hashes(&self) -> Result<Option<DstackDeployResult>> {
-        read_dstack_status(&self.project_dir)
-    }
+/// Poll `phala cvms get <app-id> --json` every [`POLL_INTERVAL_SECS`]
+/// seconds until both `compose_hash` and `os.os_image_hash` are non-empty,
+/// or until `timeout_secs` elapses.
+///
+/// # Errors
+/// Returns an error if `phala` cannot be spawned, emits unparseable JSON,
+/// or the hashes never appear before `timeout_secs` elapses.
+fn poll_phala_cvm_detail(app_id: &str, timeout_secs: u64) -> Result<DstackDeployResult> {
+    use std::time::{Duration, Instant};
 
-    /// Poll `dstack-cloud status --json` every [`POLL_INTERVAL_SECS`] seconds
-    /// until both `compose_sha256` and `os_image_hash` are non-empty, or until
-    /// `timeout_secs` elapses.
-    fn poll_status(&self, timeout_secs: u64) -> Result<DstackDeployResult> {
-        use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let poll = Duration::from_secs(POLL_INTERVAL_SECS);
+    let mut attempt: u32 = 0;
 
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        let poll = Duration::from_secs(POLL_INTERVAL_SECS);
-        let mut attempt: u32 = 0;
-
-        loop {
-            attempt += 1;
-            if let Some(result) = read_dstack_status(&self.project_dir)? {
-                return Ok(result);
-            }
-
-            // Hashes not yet populated (or status not ready) — check deadline before sleeping.
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!(
-                    "timed out after {timeout_secs}s waiting for the CVM to boot \
-                     (compose_sha256/os_image_hash never appeared in \
-                     `dstack-cloud status --json`); \
-                     increase --boot-timeout-secs or check the dstack-cloud console"
-                );
-            }
-
-            let sleep = remaining.min(poll);
-            tracing::debug!(attempt, ?sleep, "hashes not yet available; waiting");
-            std::thread::sleep(sleep);
+    loop {
+        attempt += 1;
+        if let Some(result) = read_phala_cvm_detail(app_id)? {
+            return Ok(result);
         }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "timed out after {timeout_secs}s waiting for the CVM to report \
+                 hashes (compose_hash/os_image_hash never appeared in \
+                 `phala cvms get {app_id} --json`); \
+                 increase --boot-timeout-secs or check the Phala Cloud dashboard"
+            );
+        }
+
+        let sleep = remaining.min(poll);
+        tracing::debug!(attempt, ?sleep, "hashes not yet available; waiting");
+        std::thread::sleep(sleep);
     }
+}
+
+/// Parse `phala deploy --json` output into the assigned `app_id`.
+///
+/// # Errors
+/// Returns an error if the output is not valid JSON, reports a failed
+/// deploy, or carries no `app_id`.
+fn parse_phala_deploy_output(stdout: &[u8]) -> Result<String> {
+    let parsed: PhalaDeployOutput =
+        serde_json::from_slice(stdout).context("parse phala deploy --json output")?;
+    if !parsed.success {
+        bail!(
+            "phala deploy reported failure: {}",
+            parsed.error.as_deref().unwrap_or("<no error detail>")
+        );
+    }
+    parsed
+        .app_id
+        .filter(|id| !id.is_empty())
+        .context("phala deploy succeeded but returned no app_id")
+}
+
+/// Write the provider keys + node secret to `env_path` at mode 0600.
+///
+/// Uses a temp-file-then-rename so the target file is always at mode 0600
+/// from the moment it exists — no window where a partially-written or
+/// broader-permission file is present on disk.
+fn write_env_file(
+    env_path: &std::path::Path,
+    env_vars: &ProviderKeys,
+    node_secret: &str,
+) -> Result<()> {
+    use std::fs;
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let mut lines = String::new();
+    if let Some(k) = &env_vars.anthropic {
+        lines.push_str("ANTHROPIC_API_KEY=");
+        lines.push_str(k);
+        lines.push('\n');
+    }
+    if let Some(k) = &env_vars.openai {
+        lines.push_str("OPENAI_API_KEY=");
+        lines.push_str(k);
+        lines.push('\n');
+    }
+    if let Some(k) = &env_vars.google {
+        lines.push_str("GOOGLE_API_KEY=");
+        lines.push_str(k);
+        lines.push('\n');
+    }
+    // The node secret envoy enforces as the x-gm-node-key header. Always
+    // written: `cmd_deploy` resolves it before this call.
+    lines.push_str("GM_NODE_SECRET=");
+    lines.push_str(node_secret);
+    lines.push('\n');
+
+    let parent = env_path
+        .parent()
+        .context("env file path has no parent directory")?;
+    let tmp_path = parent.join(".env.tmp");
+
+    #[cfg(unix)]
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| format!("open {}", tmp_path.display()))?;
+        file.write_all(lines.as_bytes())
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {}", tmp_path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .with_context(|| format!("open {}", tmp_path.display()))?;
+        file.write_all(lines.as_bytes())
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+    }
+
+    fs::rename(&tmp_path, env_path)
+        .with_context(|| format!("rename {} -> {}", tmp_path.display(), env_path.display()))
 }
 
 // ── Registry image-version fetch ─────────────────────────────────────────────
@@ -912,12 +582,6 @@ pub fn select_version(versions: &[ImageVersion], pin: Option<usize>) -> Result<&
 /// Render the compose template, substituting `${GM_IMAGE_REF...}` with
 /// the supplied pinned image reference.
 ///
-/// Mirrors the `sed` invocation in `deploy.sh`:
-///
-/// ```text
-/// sed "s|\${GM_IMAGE_REF[^}]*}|${PINNED_REF}|g" ...
-/// ```
-///
 /// # Errors
 /// Returns an error if the substitution did not change the template (i.e.
 /// the placeholder was not found).
@@ -936,11 +600,7 @@ pub fn render_compose(template: &str, pinned_image_ref: &str) -> Result<String> 
 }
 
 /// Replace every `${GM_IMAGE_REF...}` shell-variable expression in `text`
-/// with `replacement`. Equivalent to the sed expression in `deploy.sh`:
-///
-/// ```text
-/// sed "s|\${GM_IMAGE_REF[^}]*}|${PINNED_REF}|g"
-/// ```
+/// with `replacement`.
 fn replace_image_ref_placeholder(text: &str, replacement: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
@@ -976,7 +636,7 @@ fn replace_image_ref_placeholder(text: &str, replacement: &str) -> String {
 // ── Hash verification ─────────────────────────────────────────────────────────
 
 /// Normalize a hash to the registry's canonical form: lowercase, with any
-/// `sha256:` prefix stripped. dstack-cloud may report a hash uppercased or
+/// `sha256:` prefix stripped. Phala Cloud may report a hash uppercased or
 /// `sha256:`-prefixed; the registry's `POST /miners/register` only accepts
 /// `^[0-9a-f]{64}$`, so the hash must be normalized before it is both
 /// verified and sent onward.
@@ -989,8 +649,8 @@ pub fn normalize_hash(hash: &str) -> String {
     }
 }
 
-/// Verify that the actual hashes from dstack-cloud match the registry-approved
-/// version, returning the normalized actual hashes.
+/// Verify that the actual hashes from Phala Cloud match the
+/// registry-approved version, returning the normalized actual hashes.
 ///
 /// Both sides are normalized (lowercased, `sha256:` prefix stripped) before
 /// comparison. The returned [`DstackDeployResult`] holds the normalized
@@ -1019,14 +679,14 @@ pub fn verify_hashes(
     if !compose_match {
         msg.push_str("  compose_hash\n    expected (registry): ");
         msg.push_str(&approved.compose_hash);
-        msg.push_str("\n    actual (dstack):     ");
+        msg.push_str("\n    actual (phala):      ");
         msg.push_str(&actual.compose_sha256);
         msg.push_str("\n\n");
     }
     if !os_match {
         msg.push_str("  os_image_hash\n    expected (registry): ");
         msg.push_str(&approved.os_image_hash);
-        msg.push_str("\n    actual (dstack):     ");
+        msg.push_str("\n    actual (phala):      ");
         msg.push_str(&actual.os_image_hash);
         msg.push_str("\n\n");
     }
@@ -1049,9 +709,36 @@ pub fn format_created_at(ts: &str) -> String {
     )
 }
 
+// ── `phala` CLI preflight ─────────────────────────────────────────────────────
+
+/// Preflight that the `phala` CLI is on `PATH`.
+///
+/// `phala` is the runtime dependency of `gm-miner deploy`: it submits the
+/// compose stack to Phala Cloud and reports the measured CVM hashes. A
+/// missing CLI is caught here with an actionable install hint before any
+/// image build runs.
+///
+/// # Errors
+/// Returns an error if `phala` is not on `PATH`.
+pub fn preflight_phala_cli() -> Result<()> {
+    let on_path = std::process::Command::new("phala")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !on_path {
+        bail!(
+            "the `phala` CLI is required for `gm-miner deploy` but was not found on PATH.\n  \
+             install it with: npm i -g phala"
+        );
+    }
+    Ok(())
+}
+
 // ── Bundled compose template ──────────────────────────────────────────────────
 
-/// The dstack compose template, bundled at compile time from
+/// The compose template, bundled at compile time from
 /// `dstack/docker-compose.yaml` relative to the workspace root.
 pub const COMPOSE_TEMPLATE: &str = include_str!("../../dstack/docker-compose.yaml");
 
@@ -1077,12 +764,22 @@ pub struct ImageVersionOut {
 mod tests {
     use super::*;
 
+    fn approved(compose: &str, os: &str) -> ImageVersion {
+        ImageVersion {
+            compose_hash: compose.to_owned(),
+            os_image_hash: os.to_owned(),
+            status: "supported".to_owned(),
+            notes: None,
+            created_at: "2025-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
     #[test]
     fn placeholder_replaced_once() {
         let template = "image: ${GM_IMAGE_REF:?GM_IMAGE_REF must be set}\n  ports:\n";
         let rendered =
-            render_compose(template, "reg.example.com/app@sha256:abc123").expect("should render");
-        assert!(rendered.contains("reg.example.com/app@sha256:abc123"));
+            render_compose(template, "ghcr.io/o/app@sha256:abc123").expect("should render");
+        assert!(rendered.contains("ghcr.io/o/app@sha256:abc123"));
         assert!(!rendered.contains("GM_IMAGE_REF"));
     }
 
@@ -1098,14 +795,8 @@ mod tests {
             compose_sha256: "abc123".to_string(),
             os_image_hash: "def456".to_string(),
         };
-        let approved = ImageVersion {
-            compose_hash: "abc123".to_string(),
-            os_image_hash: "def456".to_string(),
-            status: "supported".to_string(),
-            notes: None,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        };
-        let verified = verify_hashes(&actual, &approved).expect("hashes should match");
+        let verified =
+            verify_hashes(&actual, &approved("abc123", "def456")).expect("hashes should match");
         assert_eq!(verified.compose_sha256, "abc123");
         assert_eq!(verified.os_image_hash, "def456");
     }
@@ -1116,21 +807,15 @@ mod tests {
             compose_sha256: "ABC123".to_string(),
             os_image_hash: "DEF456".to_string(),
         };
-        let approved = ImageVersion {
-            compose_hash: "abc123".to_string(),
-            os_image_hash: "def456".to_string(),
-            status: "supported".to_string(),
-            notes: None,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        };
-        let verified = verify_hashes(&actual, &approved).expect("hashes should match");
+        let verified =
+            verify_hashes(&actual, &approved("abc123", "def456")).expect("hashes should match");
         assert_eq!(verified.compose_sha256, "abc123");
         assert_eq!(verified.os_image_hash, "def456");
     }
 
     #[test]
     fn verify_hashes_strips_sha256_prefix() {
-        // dstack-cloud may report a `sha256:`-prefixed or uppercased hash;
+        // Phala Cloud may report a `sha256:`-prefixed or uppercased hash;
         // the registry only accepts bare lowercase hex. The returned hashes
         // must be normalized so registration uses the value that was
         // actually verified.
@@ -1138,14 +823,8 @@ mod tests {
             compose_sha256: "sha256:ABC123".to_string(),
             os_image_hash: "SHA256:DEF456".to_string(),
         };
-        let approved = ImageVersion {
-            compose_hash: "abc123".to_string(),
-            os_image_hash: "def456".to_string(),
-            status: "supported".to_string(),
-            notes: None,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        };
-        let verified = verify_hashes(&actual, &approved).expect("hashes should match");
+        let verified =
+            verify_hashes(&actual, &approved("abc123", "def456")).expect("hashes should match");
         assert_eq!(verified.compose_sha256, "abc123");
         assert_eq!(verified.os_image_hash, "def456");
     }
@@ -1164,14 +843,7 @@ mod tests {
             compose_sha256: "WRONG".to_string(),
             os_image_hash: "def456".to_string(),
         };
-        let approved = ImageVersion {
-            compose_hash: "abc123".to_string(),
-            os_image_hash: "def456".to_string(),
-            status: "supported".to_string(),
-            notes: None,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        };
-        let err = verify_hashes(&actual, &approved).unwrap_err();
+        let err = verify_hashes(&actual, &approved("abc123", "def456")).unwrap_err();
         assert!(err.to_string().contains("compose_hash"));
         assert!(err.to_string().contains("HASH MISMATCH"));
     }
@@ -1182,14 +854,7 @@ mod tests {
             compose_sha256: "abc123".to_string(),
             os_image_hash: "WRONG".to_string(),
         };
-        let approved = ImageVersion {
-            compose_hash: "abc123".to_string(),
-            os_image_hash: "def456".to_string(),
-            status: "supported".to_string(),
-            notes: None,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        };
-        let err = verify_hashes(&actual, &approved).unwrap_err();
+        let err = verify_hashes(&actual, &approved("abc123", "def456")).unwrap_err();
         assert!(err.to_string().contains("os_image_hash"));
         assert!(err.to_string().contains("HASH MISMATCH"));
     }
@@ -1200,14 +865,7 @@ mod tests {
             compose_sha256: "W1".to_string(),
             os_image_hash: "W2".to_string(),
         };
-        let approved = ImageVersion {
-            compose_hash: "abc123".to_string(),
-            os_image_hash: "def456".to_string(),
-            status: "supported".to_string(),
-            notes: None,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        };
-        let err = verify_hashes(&actual, &approved).unwrap_err();
+        let err = verify_hashes(&actual, &approved("abc123", "def456")).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("compose_hash"));
         assert!(msg.contains("os_image_hash"));
@@ -1217,18 +875,12 @@ mod tests {
     fn select_version_latest_when_no_pin() {
         let versions = vec![
             ImageVersion {
-                compose_hash: "new".to_string(),
-                os_image_hash: "new".to_string(),
-                status: "supported".to_string(),
-                notes: None,
                 created_at: "2025-03-01T00:00:00Z".to_string(),
+                ..approved("new", "new")
             },
             ImageVersion {
-                compose_hash: "old".to_string(),
-                os_image_hash: "old".to_string(),
-                status: "supported".to_string(),
-                notes: None,
                 created_at: "2025-01-01T00:00:00Z".to_string(),
+                ..approved("old", "old")
             },
         ];
         let selected = select_version(&versions, None).expect("should select");
@@ -1239,18 +891,12 @@ mod tests {
     fn select_version_pinned() {
         let versions = vec![
             ImageVersion {
-                compose_hash: "new".to_string(),
-                os_image_hash: "new".to_string(),
-                status: "supported".to_string(),
-                notes: None,
                 created_at: "2025-03-01T00:00:00Z".to_string(),
+                ..approved("new", "new")
             },
             ImageVersion {
-                compose_hash: "old".to_string(),
-                os_image_hash: "old".to_string(),
-                status: "supported".to_string(),
-                notes: None,
                 created_at: "2025-01-01T00:00:00Z".to_string(),
+                ..approved("old", "old")
             },
         ];
         let selected = select_version(&versions, Some(2)).expect("should select");
@@ -1264,49 +910,33 @@ mod tests {
 
     #[test]
     fn select_version_out_of_range_errors() {
-        let versions = vec![ImageVersion {
-            compose_hash: "x".to_string(),
-            os_image_hash: "x".to_string(),
-            status: "supported".to_string(),
-            notes: None,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        }];
+        let versions = vec![approved("x", "x")];
         assert!(select_version(&versions, Some(2)).is_err());
         assert!(select_version(&versions, Some(0)).is_err());
     }
 
-    fn sample_gcp() -> GcpConfig {
-        GcpConfig {
-            project: "my-project".to_owned(),
-            zone: "us-east1-b".to_owned(),
-            machine_type: "c3-standard-8".to_owned(),
-            instance_name: "miner-a".to_owned(),
-            bucket: "gs://my-project-dstack".to_owned(),
-        }
-    }
+    // ── phala deploy argument wiring ──────────────────────────────────────────
 
-    /// Trust-correct deploy requires `dstack-cloud new` to be invoked with
-    /// the GCP coordinates from `GcpConfig`, plus the hardcoded
-    /// `--key-provider kms` and `--gw` flags. Anything missing here means
-    /// a fresh-machine deploy would scaffold a project with weaker
-    /// settings than `deploy.sh` produced, and the registry would later
-    /// refuse the resulting attestation.
+    /// `phala deploy` must be invoked with the compose file, env file,
+    /// instance type, disk size, `--wait`, and `--json` — the env file is
+    /// what carries the (client-side-encrypted) provider keys, and `--json`
+    /// is required so the deploy output can be parsed for `app_id`.
     #[test]
-    fn build_dstack_new_args_matches_deploy_sh() {
-        let gcp = sample_gcp();
-        let args = build_dstack_new_args("gm-miner-1", &gcp);
-
-        // Subcommand and positional name in the correct order.
-        assert_eq!(args[0], "new");
-        assert_eq!(args[1], "gm-miner-1");
-
-        // Every required flag pair is present somewhere in the arg list.
+    fn build_phala_deploy_args_wires_every_flag() {
+        let args = build_phala_deploy_args(
+            "gm-miner-1",
+            "tdx.medium",
+            "40G",
+            "/tmp/dist/docker-compose.yaml",
+            "/tmp/dist/.env",
+        );
+        assert_eq!(args[0], "deploy");
         let pairs = [
-            ("--project", "my-project"),
-            ("--zone", "us-east1-b"),
-            ("--machine-type", "c3-standard-8"),
-            ("--instance-name", "miner-a"),
-            ("--key-provider", "kms"),
+            ("--name", "gm-miner-1"),
+            ("--instance-type", "tdx.medium"),
+            ("--disk-size", "40G"),
+            ("--compose", "/tmp/dist/docker-compose.yaml"),
+            ("--env", "/tmp/dist/.env"),
         ];
         for (flag, value) in pairs {
             let pos = args.iter().position(|a| a == flag);
@@ -1315,393 +945,140 @@ mod tests {
             assert_eq!(
                 args[idx + 1],
                 value,
-                "flag {flag} should be followed by {value}, got {:?}",
-                args[idx + 1]
+                "flag {flag} should be followed by {value}"
             );
         }
-
-        // `--gw` is a boolean flag — present, no value follows.
-        assert!(args.iter().any(|a| a == "--gw"), "missing --gw in {args:?}");
-    }
-
-    /// Trust-critical: `--key-provider kms` is never substitutable from
-    /// the CLI, because anything other than KMS breaks attestation.
-    #[test]
-    fn dstack_key_provider_is_kms() {
-        assert_eq!(DSTACK_KEY_PROVIDER, "kms");
-    }
-
-    /// The positional `name` argument is what dstack-cloud uses as the
-    /// project name in app.json; it must be the `app_name` we pass in,
-    /// not a flag like `--name`.
-    #[test]
-    fn build_dstack_new_args_positional_name() {
-        let args = build_dstack_new_args("custom-app", &sample_gcp());
-        assert_eq!(args[1], "custom-app");
         assert!(
-            !args.iter().any(|a| a == "--name"),
-            "--name flag must not appear (name is positional in dstack-cloud new)"
+            args.iter().any(|a| a == "--wait"),
+            "missing --wait in {args:?}"
         );
-    }
-
-    // ── P2 fix: poll_status must not return on empty hash strings ─────────────
-
-    /// `DstackStatus` with `Some("")` fields must not be treated as ready; only
-    /// non-empty strings should terminate the poll loop.
-    ///
-    /// We test this through the `DstackStatus` deserialization + the ready-check
-    /// predicate directly (the struct is private but visible in the test module).
-    #[test]
-    fn dstack_status_empty_strings_not_ready() {
-        // Simulate what happens when dstack-cloud emits `{"compose_sha256": "",
-        // "os_image_hash": ""}` — both Some("") must not satisfy the ready check.
-        let compose_sha256: Option<String> = Some(String::new());
-        let os_image_hash: Option<String> = Some(String::new());
-
-        let ready = matches!(
-            (compose_sha256, os_image_hash),
-            (Some(ref c), Some(ref o)) if !c.is_empty() && !o.is_empty()
-        );
-        assert!(!ready, "empty strings must not be treated as ready");
-    }
-
-    /// Non-empty hashes must be treated as ready.
-    #[test]
-    fn dstack_status_non_empty_strings_are_ready() {
-        let compose_sha256: Option<String> = Some("sha256:abc".to_owned());
-        let os_image_hash: Option<String> = Some("sha256:def".to_owned());
-
-        let ready = matches!(
-            (compose_sha256, os_image_hash),
-            (Some(ref c), Some(ref o)) if !c.is_empty() && !o.is_empty()
-        );
-        assert!(ready, "non-empty hashes must be treated as ready");
-    }
-
-    /// One empty and one non-empty must not be treated as ready.
-    #[test]
-    fn dstack_status_partial_empty_not_ready() {
-        let compose_sha256: Option<String> = Some("sha256:abc".to_owned());
-        let os_image_hash: Option<String> = Some(String::new());
-
-        let ready = matches!(
-            (compose_sha256, os_image_hash),
-            (Some(ref c), Some(ref o)) if !c.is_empty() && !o.is_empty()
-        );
-        assert!(!ready, "partial empty (one empty string) must not be ready");
-    }
-
-    // ── app.json trust-field validation ───────────────────────────────────────
-
-    /// Write `content` to a fresh temp `app.json` and return (dir, path).
-    /// The dir handle must be kept alive to keep the file on disk.
-    fn temp_app_json(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("app.json");
-        std::fs::write(&path, content).expect("write app.json");
-        (dir, path)
-    }
-
-    /// A trust-correct app.json passes unchanged (returns `false` — no
-    /// correction needed).
-    #[test]
-    fn trust_validation_passes_correct_app_json() {
-        let (_dir, path) = temp_app_json(
-            r#"{"key_provider":"kms","gateway_enabled":true,
-                "kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
-        );
-        let corrected = validate_app_json_trust(&path).expect("valid app.json must pass");
-        assert!(!corrected, "trust-correct file must not be modified");
-    }
-
-    /// A `key_provider` other than `kms` is rejected hard — never silently
-    /// rewritten, because that could mask a tampered file.
-    #[test]
-    fn trust_validation_rejects_non_kms_key_provider() {
-        let (_dir, path) = temp_app_json(
-            r#"{"key_provider":"local","gateway_enabled":true,
-                "kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
-        );
-        let err = validate_app_json_trust(&path).expect_err("non-kms must be rejected");
-        assert!(err.to_string().contains("key_provider"));
-        assert!(err.to_string().contains("kms"));
-    }
-
-    /// A missing `key_provider` is also rejected (no value to trust).
-    #[test]
-    fn trust_validation_rejects_missing_key_provider() {
-        let (_dir, path) = temp_app_json(
-            r#"{"gateway_enabled":true,"kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
-        );
-        let err =
-            validate_app_json_trust(&path).expect_err("missing key_provider must be rejected");
-        assert!(err.to_string().contains("key_provider"));
-    }
-
-    /// `gateway_enabled:false` is corrected in place to `true`.
-    #[test]
-    fn trust_validation_corrects_gateway_disabled() {
-        let (_dir, path) = temp_app_json(
-            r#"{"key_provider":"kms","gateway_enabled":false,
-                "kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
-        );
-        let corrected = validate_app_json_trust(&path).expect("must correct, not fail");
         assert!(
-            corrected,
-            "gateway_enabled:false must be reported as corrected"
-        );
-
-        let raw = std::fs::read_to_string(&path).expect("re-read");
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
-        assert_eq!(v["gateway_enabled"], serde_json::Value::Bool(true));
-    }
-
-    /// A missing `gateway_enabled` is filled in as `true`.
-    #[test]
-    fn trust_validation_fills_missing_gateway_enabled() {
-        let (_dir, path) = temp_app_json(
-            r#"{"key_provider":"kms","kms_url":"https://kms.tdxlab.dstack.org:12001"}"#,
-        );
-        let corrected = validate_app_json_trust(&path).expect("must correct");
-        assert!(corrected);
-        let raw = std::fs::read_to_string(&path).expect("re-read");
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
-        assert_eq!(v["gateway_enabled"], serde_json::Value::Bool(true));
-    }
-
-    /// A missing `kms_url` is filled in with the trusted URL.
-    #[test]
-    fn trust_validation_fills_missing_kms_url() {
-        let (_dir, path) = temp_app_json(r#"{"key_provider":"kms","gateway_enabled":true}"#);
-        let corrected = validate_app_json_trust(&path).expect("must correct");
-        assert!(corrected);
-        let raw = std::fs::read_to_string(&path).expect("re-read");
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
-        assert_eq!(v["kms_url"], TRUSTED_KMS_URL);
-    }
-
-    /// A `kms_url` that differs only by a trailing slash is the same
-    /// authority and must pass without correction.
-    #[test]
-    fn trust_validation_accepts_kms_url_trailing_slash() {
-        let (_dir, path) = temp_app_json(
-            r#"{"key_provider":"kms","gateway_enabled":true,
-                "kms_url":"https://kms.tdxlab.dstack.org:12001/"}"#,
-        );
-        let corrected =
-            validate_app_json_trust(&path).expect("trailing-slash kms_url must be accepted");
-        assert!(
-            !corrected,
-            "a trailing-slash-only difference must not be treated as a correction"
+            args.iter().any(|a| a == "--json"),
+            "missing --json in {args:?}"
         );
     }
 
-    /// A *different* non-empty `kms_url` is rejected hard — it points the
-    /// CVM at another key authority and must not be silently overwritten.
+    // ── phala deploy output parsing ───────────────────────────────────────────
+
     #[test]
-    fn trust_validation_rejects_different_kms_url() {
-        let (_dir, path) = temp_app_json(
-            r#"{"key_provider":"kms","gateway_enabled":true,
-                "kms_url":"https://evil.example.com:12001"}"#,
-        );
-        let err = validate_app_json_trust(&path).expect_err("foreign kms_url must be rejected");
-        assert!(err.to_string().contains("kms_url"));
-        assert!(err.to_string().contains(TRUSTED_KMS_URL));
+    fn parse_phala_deploy_output_extracts_app_id() {
+        let stdout = br#"{"success":true,"vm_uuid":"u","name":"n","app_id":"app_abc123"}"#;
+        let app_id = parse_phala_deploy_output(stdout).expect("must parse");
+        assert_eq!(app_id, "app_abc123");
     }
 
-    /// The trusted KMS URL constant matches the URL the app.json template
-    /// and the dstack-cloud global config use.
     #[test]
-    fn trusted_kms_url_is_tdxlab() {
-        assert_eq!(TRUSTED_KMS_URL, "https://kms.tdxlab.dstack.org:12001");
-        assert!(DSTACK_GLOBAL_CONFIG.contains(TRUSTED_KMS_URL));
+    fn parse_phala_deploy_output_rejects_failure() {
+        let stdout = br#"{"success":false,"error":"quota exceeded"}"#;
+        let err = parse_phala_deploy_output(stdout).expect_err("failure must error");
+        assert!(err.to_string().contains("quota exceeded"));
     }
 
-    // ── P1 fix: poll_status treats non-zero exit as "not ready" ──────────────
-
-    /// A non-zero exit from `dstack-cloud status --json` must be treated as
-    /// "not ready yet", not a hard failure. Verify that the success-path
-    /// ready-check is only evaluated when the process exits zero — i.e. the
-    /// non-zero branch does not attempt to parse stdout as JSON.
-    ///
-    /// This directly reflects the control-flow change in `poll_status`: a
-    /// non-zero exit now falls through to the deadline / sleep path instead
-    /// of bailing.
     #[test]
-    fn poll_status_non_zero_exit_falls_through_to_deadline() {
-        // Replicate the branching logic from poll_status to confirm the
-        // non-zero branch does not try to parse output as a DstackStatus.
-        let exit_success = false; // simulates a non-zero exit code
-        let stdout_bytes: &[u8] = b""; // stdout is garbage/empty on failure
+    fn parse_phala_deploy_output_rejects_missing_app_id() {
+        let stdout = br#"{"success":true}"#;
+        let err = parse_phala_deploy_output(stdout).expect_err("missing app_id must error");
+        assert!(err.to_string().contains("app_id"));
+    }
 
-        let mut ready_checked = false;
+    // ── phala cvms get detail parsing ─────────────────────────────────────────
 
-        if exit_success {
-            // This block must NOT run when exit is non-zero.
-            let ds_result: Result<DstackStatus, _> = serde_json::from_slice(stdout_bytes);
-            if ds_result.is_ok() {
-                ready_checked = true;
+    /// The verified field path: top-level `compose_hash` and nested
+    /// `os.os_image_hash` in the `phala cvms get --json` document.
+    #[test]
+    fn parse_phala_cvm_detail_reads_compose_and_os_hash() {
+        let stdout = br#"{
+            "app_id":"app_abc",
+            "compose_hash":"sha256:aaa",
+            "os":{"name":"dstack-0.5.3","os_image_hash":"sha256:bbb"}
+        }"#;
+        let result = parse_phala_cvm_detail(true, stdout)
+            .expect("must parse")
+            .expect("both hashes present");
+        assert_eq!(result.compose_sha256, "sha256:aaa");
+        assert_eq!(result.os_image_hash, "sha256:bbb");
+    }
+
+    /// A non-zero `phala cvms get` exit means the CVM is not ready yet —
+    /// the parser must return `Ok(None)`, never an error.
+    #[test]
+    fn parse_phala_cvm_detail_non_zero_exit_is_none() {
+        let result =
+            parse_phala_cvm_detail(false, b"garbage").expect("non-zero exit must not error");
+        assert!(result.is_none(), "non-zero exit must yield None");
+    }
+
+    /// A detail document with the hashes still absent must yield `None` so
+    /// the poll loop keeps waiting.
+    #[test]
+    fn parse_phala_cvm_detail_missing_hashes_is_none() {
+        let stdout = br#"{"app_id":"app_abc","status":"starting"}"#;
+        let result = parse_phala_cvm_detail(true, stdout).expect("must parse");
+        assert!(result.is_none(), "missing hashes must yield None");
+    }
+
+    /// Empty-string hashes must not be treated as ready.
+    #[test]
+    fn parse_phala_cvm_detail_empty_hashes_is_none() {
+        let stdout = br#"{"compose_hash":"","os":{"os_image_hash":""}}"#;
+        let result = parse_phala_cvm_detail(true, stdout).expect("must parse");
+        assert!(result.is_none(), "empty hashes must yield None");
+    }
+
+    /// A `compose_hash` present but `os` block absent must yield `None`.
+    #[test]
+    fn parse_phala_cvm_detail_partial_is_none() {
+        let stdout = br#"{"compose_hash":"sha256:aaa"}"#;
+        let result = parse_phala_cvm_detail(true, stdout).expect("must parse");
+        assert!(result.is_none(), "partial detail must yield None");
+    }
+
+    #[test]
+    fn parse_phala_cvm_detail_invalid_json_errors() {
+        assert!(parse_phala_cvm_detail(true, b"not json").is_err());
+    }
+
+    /// The documented field-path constants must match the `phala cvms get`
+    /// CVM-detail schema this module parses.
+    #[test]
+    fn hash_field_path_constants_are_documented() {
+        assert_eq!(PHALA_COMPOSE_HASH_FIELD, "compose_hash");
+        assert_eq!(PHALA_OS_IMAGE_HASH_FIELD, "os.os_image_hash");
+    }
+
+    // ── prepare_deploy_target ─────────────────────────────────────────────────
+
+    /// `prepare_deploy_target` provisions the image and pins the returned
+    /// ref into the rendered compose file.
+    #[test]
+    fn prepare_deploy_target_embeds_provisioner_ref() {
+        struct StubProvisioner;
+        impl ImageProvisioner for StubProvisioner {
+            fn provision(&self) -> Result<String> {
+                Ok("ghcr.io/taostat/gm-miner@sha256:deadbeef".to_owned())
             }
         }
-        // Non-zero exit → ready_checked remains false → poll continues.
+        let rendered = prepare_deploy_target(&StubProvisioner).expect("orchestration must succeed");
         assert!(
-            !ready_checked,
-            "non-zero exit must not trigger the ready-check path"
+            rendered.contains("sha256:deadbeef"),
+            "the provisioner's ref must be pinned into the compose file"
+        );
+        assert!(
+            !rendered.contains("${GM_IMAGE_REF"),
+            "the ${{GM_IMAGE_REF}} placeholder must be substituted"
         );
     }
 
-    /// A zero exit with non-empty hashes must be treated as ready (success path
-    /// still works correctly after the control-flow restructure).
+    /// An image-build failure must propagate out of `prepare_deploy_target`.
     #[test]
-    fn poll_status_zero_exit_with_hashes_is_ready() {
-        let exit_success = true;
-        let stdout_bytes = br#"{"compose_sha256":"sha256:abc","os_image_hash":"sha256:def"}"#;
-
-        let mut result: Option<DstackDeployResult> = None;
-
-        if exit_success {
-            let ds: DstackStatus = serde_json::from_slice(stdout_bytes).expect("parse");
-            if let (Some(c), Some(o)) = (ds.compose_sha256, ds.os_image_hash) {
-                if !c.is_empty() && !o.is_empty() {
-                    result = Some(DstackDeployResult {
-                        compose_sha256: c,
-                        os_image_hash: o,
-                    });
-                }
+    fn prepare_deploy_target_propagates_build_failure() {
+        struct FailingProvisioner;
+        impl ImageProvisioner for FailingProvisioner {
+            fn provision(&self) -> Result<String> {
+                bail!("image build+push failed")
             }
         }
-
-        let r = result.expect("zero exit with non-empty hashes must be ready");
-        assert_eq!(r.compose_sha256, "sha256:abc");
-        assert_eq!(r.os_image_hash, "sha256:def");
-    }
-
-    // ── Finding 1: fresh app.json trust-validation after bootstrap ─────────────
-
-    /// A mock `DstackClient` that writes a trust-correct `app.json` on
-    /// `bootstrap` and tracks whether `validate_existing_trust` was called.
-    ///
-    /// Used to assert that `cmd_deploy` calls `validate_existing_trust` on the
-    /// freshly-scaffolded file — the same path taken for a re-deploy.
-    struct MockDstackClient {
-        /// Written into by `bootstrap`; read by `is_bootstrapped` /
-        /// `validate_existing_trust`.
-        project_dir: std::path::PathBuf,
-        /// Set to `true` when `validate_existing_trust` is called.
-        validate_called: std::cell::Cell<bool>,
-    }
-
-    impl MockDstackClient {
-        fn new(dir: &std::path::Path) -> Self {
-            Self {
-                project_dir: dir.to_path_buf(),
-                validate_called: std::cell::Cell::new(false),
-            }
-        }
-    }
-
-    impl DstackClient for MockDstackClient {
-        fn is_bootstrapped(&self) -> bool {
-            self.project_dir.join("app.json").exists()
-        }
-
-        fn bootstrap(&self, _app_name: &str, _gcp: &GcpConfig) -> Result<()> {
-            // Write a trust-correct app.json as dstack-cloud new would.
-            let content = serde_json::json!({
-                "key_provider": DSTACK_KEY_PROVIDER,
-                "gateway_enabled": true,
-                "kms_url": TRUSTED_KMS_URL,
-            });
-            std::fs::create_dir_all(&self.project_dir).expect("create project dir");
-            std::fs::write(
-                self.project_dir.join("app.json"),
-                serde_json::to_string_pretty(&content).expect("serialize"),
-            )
-            .expect("write app.json");
-            Ok(())
-        }
-
-        fn refresh_gcp_config(&self, _gcp: &GcpConfig) -> Result<()> {
-            Ok(())
-        }
-
-        fn validate_existing_trust(&self) -> Result<()> {
-            self.validate_called.set(true);
-            let path = self.project_dir.join("app.json");
-            validate_app_json_trust(&path)?;
-            Ok(())
-        }
-
-        fn deploy(
-            &self,
-            _compose_yaml: &str,
-            _env_vars: &crate::config::ProviderKeys,
-            _node_secret: &str,
-            _gcp: &GcpConfig,
-            _boot_timeout_secs: u64,
-        ) -> Result<DstackDeployResult> {
-            Ok(DstackDeployResult {
-                compose_sha256: "abc123".to_owned(),
-                os_image_hash: "def456".to_owned(),
-            })
-        }
-    }
-
-    /// After `bootstrap` the deploy flow must call `validate_existing_trust`
-    /// on the freshly-created `app.json`.  This guards against a stale or
-    /// tampered `~/.config/dstack-cloud/config.json` yielding a file that
-    /// points at the wrong KMS URL, which would otherwise be accepted
-    /// unchecked on the first deploy.
-    #[test]
-    fn bootstrap_path_calls_validate_existing_trust() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mock = MockDstackClient::new(dir.path());
-
-        // Precondition: project is not bootstrapped.
-        assert!(!mock.is_bootstrapped());
-
-        // Simulate the bootstrap branch of cmd_deploy.
-        mock.bootstrap("gm-miner-1", &sample_gcp())
-            .expect("bootstrap must succeed");
-
-        // After bootstrap the deploy flow calls validate_existing_trust.
-        mock.validate_existing_trust()
-            .expect("validate must succeed on a trust-correct app.json");
-
-        assert!(
-            mock.validate_called.get(),
-            "validate_existing_trust must be called after bootstrap"
-        );
-    }
-
-    /// `validate_app_json_trust` must reject a freshly-bootstrapped `app.json`
-    /// whose `kms_url` was set to a different authority (stale global config
-    /// scenario). This is the exact threat Finding 1 guards against.
-    #[test]
-    fn bootstrap_with_wrong_kms_url_is_rejected_by_validate() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // Simulate dstack-cloud new reading from a stale global config that
-        // has the wrong KMS URL.
-        let content = serde_json::json!({
-            "key_provider": DSTACK_KEY_PROVIDER,
-            "gateway_enabled": true,
-            "kms_url": "https://attacker.example.com:12001",
-        });
-        std::fs::write(
-            dir.path().join("app.json"),
-            serde_json::to_string_pretty(&content).expect("serialize"),
-        )
-        .expect("write");
-
-        let err = validate_app_json_trust(&dir.path().join("app.json"))
-            .expect_err("wrong kms_url must be rejected");
-        assert!(
-            err.to_string().contains("kms_url"),
-            "error must mention kms_url: {err}"
-        );
-        assert!(
-            err.to_string().contains(TRUSTED_KMS_URL),
-            "error must name the trusted URL: {err}"
-        );
+        let err = prepare_deploy_target(&FailingProvisioner).expect_err("build failure must abort");
+        assert!(err.to_string().contains("image build+push failed"));
     }
 }

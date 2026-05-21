@@ -1,18 +1,18 @@
-## gm miner dstack compose template.
+## gm miner compose template.
 ##
 ## Usage: `gm-miner deploy` renders this file, substituting GM_IMAGE_REF
-## with the digest-pinned image reference. The rendered output is written
-## to dist/<app-name>/docker-compose.yaml and deployed via dstack-cloud.
+## with the digest-pinned image reference, then submits it to Phala Cloud
+## via `phala deploy`. Phala Cloud provisions the TDX CVM and runs the KMS.
 ##
 ## Provider keys (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY)
-## are NOT rendered into this file — dstack encrypts them via KMS from
-## the .env file written by `gm-miner deploy`. Set only the keys you have;
-## an unset key makes the upstream return 401, which the registry surfaces
-## as a "key not configured" capability failure.
+## are NOT rendered into this file — `phala deploy` encrypts them client-
+## side to the CVM key from the .env file written by `gm-miner deploy`.
+## Set only the keys you have; an unset key makes the upstream return 401,
+## which the registry surfaces as a "key not configured" capability failure.
 ##
 ## GM_NODE_SECRET is the node secret (Mechanism 1 of
 ## attestation-and-identity.md): `gm-miner deploy` generates it, writes
-## it into the same dstack-KMS-encrypted .env, and registers it with the
+## it into the same Phala-Cloud-encrypted .env, and registers it with the
 ## registry. Envoy's inbound Lua filter enforces it as the `x-gm-node-key`
 ## header. It is declared here so it is part of the attestation-measured
 ## compose hash.
@@ -29,8 +29,8 @@ services:
       ## registry's `x-gm-provider` capability probes.
       - "8080:8080"
     environment:
-      ## Provider API keys — encrypted by dstack-KMS at deploy time.
-      ## Set only the keys you own.
+      ## Provider API keys — encrypted client-side to the CVM key by
+      ## `phala deploy`. Set only the keys you own.
       - ANTHROPIC_API_KEY
       - OPENAI_API_KEY
       - GOOGLE_API_KEY

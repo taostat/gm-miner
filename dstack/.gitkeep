@@ -1,4 +1,3 @@
-# Phase 0 placeholder. Phase 1 W4 populates with:
-# - docker-compose.yaml referencing image by digest
-# - app.json template with gcp_config placeholder
-# - operator README documenting dstack-cloud deploy workflow
+# Compose template for the miner workload.
+# - docker-compose.yaml: references the miner image by digest;
+#   `gm-miner deploy` renders ${GM_IMAGE_REF} and submits it to Phala Cloud.
