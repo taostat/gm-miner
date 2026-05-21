@@ -64,9 +64,7 @@ impl TokenEntry {
 /// Per-network configuration.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetworkEntry {
-    pub auth_url: Option<String>,
     pub api_url: Option<String>,
-    pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenEntry>,
     /// The miner's node secret for this network (Mechanism 1 of
@@ -148,21 +146,6 @@ impl Config {
         self.networks.get(self.active_network())
     }
 
-    /// Auth URL for the active network.
-    #[must_use]
-    pub fn auth_url(&self) -> String {
-        self.networks
-            .get(self.active_network())
-            .and_then(|n| n.auth_url.clone())
-            .unwrap_or_else(|| {
-                if self.active_network() == "testnet" {
-                    "https://test-auth.taostats.io".to_string()
-                } else {
-                    "https://auth.taostats.io".to_string()
-                }
-            })
-    }
-
     /// Registry API URL for the active network.
     #[must_use]
     pub fn api_url(&self) -> String {
@@ -176,15 +159,6 @@ impl Config {
                     "https://gm-registry.taostats.io".to_string()
                 }
             })
-    }
-
-    /// OAuth client ID.
-    #[must_use]
-    pub fn client_id(&self) -> String {
-        self.networks
-            .get(self.active_network())
-            .and_then(|n| n.client_id.clone())
-            .unwrap_or_else(|| "gm-miner".to_string())
     }
 }
 
