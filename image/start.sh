@@ -143,6 +143,14 @@ fi
 kill -TERM "${ATTESTD_PID}" "${ENVOY_PID}" 2>/dev/null || true
 wait 2>/dev/null || true
 
-# Propagate a non-zero status when either process failed so the
-# container runtime's restart policy fires.
-exit "${FIRST_EXIT_STATUS}"
+# Always exit non-zero so the container runtime's `restart:
+# unless-stopped` policy recreates the stack. A supervised process
+# exiting *at all* — even with a clean status 0 (a graceful or
+# self-initiated shutdown) — leaves the miner missing one of its two
+# required services, which is a failure. The exit code is only a
+# diagnostic detail: surface it when it is non-zero, otherwise exit 1
+# so a status-0 child exit is still treated as a container failure.
+if [[ "${FIRST_EXIT_STATUS}" -ne 0 ]]; then
+  exit "${FIRST_EXIT_STATUS}"
+fi
+exit 1
