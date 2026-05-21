@@ -17,16 +17,25 @@
 ## header. It is declared here so it is part of the attestation-measured
 ## compose hash.
 ##
-## The runtime is envoy + its native /stats/prometheus exposure — no
-## sidecar service, no extra ports. The registry probes :8080 with the
-## `x-gm-provider` header to validate auth and list models.
+## The runtime is two co-located processes inside one container: envoy
+## (the data plane on :8080) and gm-miner-attestd (the TEE attestation
+## server). The registry probes :8080 — `x-gm-provider` for capability,
+## and `GET /attestation/info` which envoy routes to attestd.
+##
+## dstack guest-agent socket: attestd calls the dstack guest agent's
+## get_key (the TEE-bound attestation keypair) and get_quote / info
+## endpoints over /var/run/dstack.sock. dstack exposes the socket on
+## the CVM host but does not auto-mount it into app containers, so the
+## bind mount below is required — without it attestd exits at startup
+## and the container is restarted in a crash loop.
 
 services:
   gm-miner:
     image: ${GM_IMAGE_REF:?GM_IMAGE_REF must be set (gm-miner deploy renders this with the pinned image digest)}
     ports:
-      ## Envoy data plane — receives gateway inference traffic AND the
-      ## registry's `x-gm-provider` capability probes.
+      ## Envoy data plane — receives gateway inference traffic, the
+      ## registry's `x-gm-provider` capability probes, and the
+      ## registry's `GET /attestation/info` attestation probes.
       - "8080:8080"
     environment:
       ## Provider API keys — encrypted client-side to the CVM key by
@@ -36,4 +45,11 @@ services:
       - GOOGLE_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
+    volumes:
+      ## dstack guest-agent socket. The attestation server calls
+      ## get_key (TEE-bound keypair), get_quote (fresh TDX quote), and
+      ## info() (CVM measurements) over this socket. dstack does not
+      ## auto-mount it into app containers — without this bind mount
+      ## attestd crash-loops on "Failed to connect to unix stream".
+      - /var/run/dstack.sock:/var/run/dstack.sock
     restart: unless-stopped

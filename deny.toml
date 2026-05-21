@@ -1,6 +1,13 @@
 [advisories]
 yanked = "deny"
-ignore = []
+# `paste` is unmaintained but has no known vulnerability. It enters the
+# tree transitively via dstack-sdk -> alloy -> alloy-primitives, which
+# the miner's attestation server (attestd) depends on for the dstack
+# guest-agent client. There is no fix to adopt until alloy drops the
+# dependency upstream; the gm gateway repo carries the same ignore.
+ignore = [
+    "RUSTSEC-2024-0436",  # paste crate unmaintained (transitive via dstack-sdk)
+]
 
 [licenses]
 allow = [

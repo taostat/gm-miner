@@ -58,6 +58,29 @@ static_resources:
                       domains: ["*"]
                       routes:
 
+                        ## ── Attestation surface ─────────────────────────────
+                        ##  GET /attestation/info is the miner's TEE
+                        ##  attestation endpoint — the registry's control
+                        ##  loop probes it once per cycle to verify the
+                        ##  miner runs an approved image inside a real TDX
+                        ##  CVM. It is served by the co-located
+                        ##  `gm-miner-attestd` process (see start.sh), not
+                        ##  by an upstream provider, so this route is
+                        ##  matched first and forwarded to the loopback
+                        ##  attestd cluster.
+                        ##
+                        ##  The endpoint is public by contract
+                        ##  (gm/docs/contracts/gateway-attestation-info.md):
+                        ##  the registry probes it WITHOUT the
+                        ##  x-gm-node-key header, and auditors curl it
+                        ##  directly. The inbound Lua filter below skips
+                        ##  the node-secret check for this exact path.
+                        - match:
+                            path: "/attestation/info"
+                          route:
+                            cluster: attestd
+                            timeout: 10s
+
                         ## ── Anthropic ───────────────────────────────────────
                         ##  Enabled only when ANTHROPIC_API_KEY is set.
                         ##  The route matches any path beginning with /v1/ that
@@ -187,6 +210,20 @@ static_resources:
                             if expected == "" then
                               return
                             end
+                            -- The attestation surface is public by
+                            -- contract: the registry's control loop
+                            -- probes GET /attestation/info WITHOUT the
+                            -- node secret, and auditors curl it. Skip
+                            -- the inbound node-secret check for that
+                            -- path; every other path on the data plane
+                            -- still requires x-gm-node-key. The :path
+                            -- pseudo-header carries the query string
+                            -- (?nonce=...), so strip it before matching.
+                            local path = handle:headers():get(":path") or ""
+                            local bare = path:match("^[^?]*")
+                            if bare == "/attestation/info" then
+                              return
+                            end
                             local presented = handle:headers():get("x-gm-node-key")
                             if presented ~= expected then
                               handle:respond(
@@ -201,6 +238,25 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
   clusters:
+
+    ## ── Attestation server ────────────────────────────────────────────
+    ##  The co-located `gm-miner-attestd` process. It binds loopback only
+    ##  (127.0.0.1:8081 — see start.sh / GM_ATTESTD_BIND_ADDR); envoy is
+    ##  the only thing that reaches it. Plaintext HTTP/1.1 over loopback
+    ##  inside the TEE — no TLS, no SNI: the hop never leaves the
+    ##  container's network namespace.
+    - name: attestd
+      type: STATIC
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: attestd
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8081
 
     ## ── Anthropic ─────────────────────────────────────────────────────
     - name: anthropic
