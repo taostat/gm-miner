@@ -14,9 +14,9 @@
 ##     code layout. Fully reproducible Docker is post-v1 per Phala docs.
 
 ## ── Stage 1: Rust builder ──────────────────────────────────────────────
-## Pinned to rust:1.83-slim-bookworm digest at time of writing.
-## Update the pin via: docker manifest inspect rust:1.83-slim-bookworm
-FROM rust:1.83-slim-bookworm@sha256:540c902e99c384163b688bbd8b5b8520e94e7731b27f7bd0eaa56ae1960627ab AS builder
+## Pinned to rust:1.87-slim-bookworm digest at time of writing.
+## Update the pin via: docker buildx imagetools inspect rust:1.87-slim-bookworm
+FROM rust:1.87-slim-bookworm@sha256:437507c3e719e4f968033b88d851ffa9f5aceeb2dcc2482cc6cb7647811a55eb AS builder
 
 ## Reproducibility: fixed build timestamp, single codegen unit.
 ENV SOURCE_DATE_EPOCH=1700000000

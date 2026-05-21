@@ -5,7 +5,7 @@ members = ["cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 license = "Apache-2.0"
 publish = false
 repository = "https://github.com/taostat/gm-miner"
