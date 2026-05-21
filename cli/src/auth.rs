@@ -13,8 +13,9 @@
 //! at `GET /auth/config` immediately before this function is called — nothing
 //! auth-related is baked into the binary.
 //!
-//! Token refresh is deferred (issue #65): an expired access token is handled
-//! by re-running `gm-miner login`.
+//! When an access token expires, [`refresh_token`] mints a fresh one from the
+//! stored `refresh_token` without a browser round-trip. The full device flow
+//! is only re-run when no refresh token is stored or the refresh is rejected.
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -22,15 +23,20 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-/// Token bundle returned by the auth-gateway on a successful device-code flow.
+use crate::config::TokenEntry;
+
+/// Token bundle returned by the auth-gateway on a successful device-code flow
+/// or refresh-token grant.
 ///
-/// `refresh_token` is not modelled here because token refresh is deferred
-/// (issue #65). An expired access token is handled by re-running `gm-miner login`.
+/// `refresh_token` is `Option` because not every OAuth response carries one:
+/// a server that does not rotate refresh tokens omits it from a refresh
+/// response, in which case the caller keeps the existing stored value.
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub expires_in: Option<u64>,
     pub token_type: Option<String>,
+    pub refresh_token: Option<String>,
 }
 
 /// Device authorization endpoint response.
@@ -205,5 +211,114 @@ async fn poll_for_token(
                 bail!("token endpoint error: {error} ({status})");
             }
         }
+    }
+}
+
+/// Outcome of a refresh-token attempt against the auth-gateway.
+///
+/// A rejected refresh (the token was revoked, expired, or the client is not
+/// permitted the `refresh_token` grant) is [`RefreshOutcome::Rejected`] rather
+/// than an `Err`: the caller's correct response is to fall back to the full
+/// device flow, not to abort. An `Err` is reserved for transport failures
+/// where retrying the device flow would be no more likely to succeed.
+#[derive(Debug)]
+pub enum RefreshOutcome {
+    /// The refresh succeeded; the new token bundle is ready to persist.
+    Refreshed(TokenResponse),
+    /// The auth-gateway rejected the refresh token — fall back to device login.
+    Rejected,
+}
+
+/// Exchange a stored `refresh_token` for a fresh access token.
+///
+/// POSTs the standard OAuth `refresh_token` grant (RFC 6749 §6) to `token_url`
+/// — form-encoded `grant_type`, `refresh_token`, `client_id`. On `200` the new
+/// [`TokenResponse`] is returned; the auth-gateway rotates the refresh token,
+/// so the response's `refresh_token` (when present) supersedes the stored one.
+///
+/// A `4xx` response means the refresh token is no longer usable: the result is
+/// [`RefreshOutcome::Rejected`] so the caller can fall back to the device flow.
+///
+/// # Errors
+/// Returns an error only for transport-level failures (the request could not
+/// be sent or the success body could not be parsed) — not for an auth-gateway
+/// rejection, which is reported as [`RefreshOutcome::Rejected`].
+pub async fn refresh_token(
+    token_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<RefreshOutcome> {
+    let client = no_pool_client()?;
+
+    let resp = client
+        .post(token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("POST {token_url}"))?;
+
+    let status = resp.status();
+
+    if status.is_success() {
+        let token: TokenResponse = resp.json().await.context("parse refresh token response")?;
+        return Ok(RefreshOutcome::Refreshed(token));
+    }
+
+    // A 4xx is the auth-gateway declining the refresh token (invalid_grant,
+    // unsupported_grant_type, …). That is a recoverable state — the caller
+    // re-runs the device flow. A 5xx is treated the same way: the device
+    // flow is the only remaining path to a valid token.
+    if status.is_client_error() || status.is_server_error() {
+        let body = resp.text().await.unwrap_or_default();
+        debug!("refresh token rejected ({status}): {body}");
+        return Ok(RefreshOutcome::Rejected);
+    }
+
+    // Any other status (1xx/3xx) is unexpected for an OAuth token endpoint.
+    bail!("unexpected status from token endpoint: {status}");
+}
+
+impl TokenResponse {
+    /// Convert an auth-gateway token response into a persistable [`TokenEntry`].
+    ///
+    /// `token_expires_at` is derived from `expires_in` (seconds-from-now) and
+    /// stored as an RFC3339 string so the CLI can detect expiry without
+    /// re-decoding the JWT. A response with no `refresh_token` yields an entry
+    /// with `refresh_token: None` — callers that already hold a refresh token
+    /// should use [`TokenResponse::to_entry_keeping`] instead.
+    #[must_use]
+    pub fn to_entry(&self) -> TokenEntry {
+        TokenEntry {
+            access_token: Some(self.access_token.clone()),
+            token_expires_at: self.expires_in.map(|s| {
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "expires_in is a small positive number of seconds"
+                )]
+                let expiry = chrono::Utc::now() + chrono::Duration::seconds(s as i64);
+                expiry.to_rfc3339()
+            }),
+            refresh_token: self.refresh_token.clone(),
+        }
+    }
+
+    /// Like [`TokenResponse::to_entry`], but falls back to `previous_refresh`
+    /// when the response itself carries no `refresh_token`.
+    ///
+    /// OAuth servers may or may not rotate the refresh token on a refresh
+    /// grant. When the response omits one, the previously stored token is
+    /// still valid and must be kept — otherwise the next refresh would have
+    /// nothing to present.
+    #[must_use]
+    pub fn to_entry_keeping(&self, previous_refresh: Option<String>) -> TokenEntry {
+        let mut entry = self.to_entry();
+        if entry.refresh_token.is_none() {
+            entry.refresh_token = previous_refresh;
+        }
+        entry
     }
 }
