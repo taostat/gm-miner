@@ -298,16 +298,7 @@ impl RealPhalaClient {
     }
 }
 
-/// JSON emitted by `phala deploy --json` on a successful new-CVM deploy.
-#[derive(Debug, Deserialize)]
-struct PhalaDeployOutput {
-    success: bool,
-    app_id: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// The CVM detail document returned by `phala cvms get <app-id> --json`.
+/// The CVM detail document returned by `phala cvms get <cvm-id> --json`.
 ///
 /// Field path is the verified shape of the Phala Cloud CVM-detail schema:
 /// the canonical compose hash is the top-level `compose_hash`, the OS
@@ -445,7 +436,10 @@ pub struct PhalaDeployArgs<'a> {
 /// pre-launch script, request a production OS image (`--image` plus
 /// `--no-dev-os` — never a `dstack-dev-*` image for an attested miner),
 /// and request JSON output plus `--wait` so the call returns only once the
-/// CVM is up.
+/// CVM is up. The deployed CVM's identity is *not* scraped from
+/// `phala deploy`'s stdout (its success output mixes a human-readable
+/// `Provisioning CVM ...` line with the JSON); it is resolved afterwards
+/// via `phala cvms get <name>`, keyed on the `--name` set here.
 ///
 /// Extracted from [`RealPhalaClient::deploy`] so the wiring can be asserted
 /// without spawning a subprocess.
@@ -473,9 +467,13 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
     ]
 }
 
-/// Run `phala cvms get <app-id> --json` once and parse the full deploy
+/// Run `phala cvms get <cvm-id> --json` once and parse the full deploy
 /// outcome — measured `compose_hash` + `os.os_image_hash` + the public
 /// endpoint — from the single CVM-detail document.
+///
+/// `cvm_id` is any identifier `phala cvms get` accepts: an `app_id`, a
+/// UUID, or the CVM *name*. `gm-miner deploy` passes the name it set with
+/// `phala deploy --name`.
 ///
 /// Returns `Ok(None)` when the command exited non-zero (the CVM is not
 /// ready) or when either hash or the endpoint is still absent/empty.
@@ -483,9 +481,9 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
 /// # Errors
 /// Returns an error only if `phala` cannot be spawned, or it exits
 /// successfully but emits output that is not valid `cvms get --json` JSON.
-fn read_phala_cvm_outcome(app_id: &str) -> Result<Option<DeployOutcome>> {
+fn read_phala_cvm_outcome(cvm_id: &str) -> Result<Option<DeployOutcome>> {
     let out = std::process::Command::new("phala")
-        .args(["cvms", "get", app_id, "--json"])
+        .args(["cvms", "get", cvm_id, "--json"])
         .output()
         .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
 
@@ -563,25 +561,30 @@ impl PhalaClient for RealPhalaClient {
             );
         }
 
-        let app_id = parse_phala_deploy_output(&out.stdout)?;
-        println!("Phala Cloud assigned app_id {app_id}; waiting for the CVM to report hashes ...");
+        // `phala deploy --json` succeeded. Its success-path stdout is not
+        // a clean JSON object (see `build_phala_deploy_args`), so the
+        // deployed CVM is resolved by name via the poll loop below rather
+        // than by scraping this output.
+        println!(
+            "phala deploy succeeded for CVM {}; waiting for the CVM to report hashes ...",
+            self.app_name
+        );
 
-        // Poll `phala cvms get` until the measured hashes and the public
-        // endpoint are all populated. `phala deploy --wait` returns once
-        // the CVM is up, but the platform may take a few more seconds to
-        // publish them in the CVM detail document.
-        poll_phala_cvm_outcome(&app_id, boot_timeout_secs)
+        poll_phala_cvm_outcome(&self.app_name, boot_timeout_secs)
     }
 }
 
-/// Poll `phala cvms get <app-id> --json` every [`POLL_INTERVAL_SECS`]
+/// Poll `phala cvms get <cvm-id> --json` every [`POLL_INTERVAL_SECS`]
 /// seconds until the measured hashes and the public endpoint are all
 /// non-empty, or until `timeout_secs` elapses.
+///
+/// `cvm_id` is any identifier `phala cvms get` accepts — `gm-miner deploy`
+/// passes the CVM name it set with `phala deploy --name`.
 ///
 /// # Errors
 /// Returns an error if `phala` cannot be spawned, emits unparseable JSON,
 /// or the outcome never appears before `timeout_secs` elapses.
-fn poll_phala_cvm_outcome(app_id: &str, timeout_secs: u64) -> Result<DeployOutcome> {
+fn poll_phala_cvm_outcome(cvm_id: &str, timeout_secs: u64) -> Result<DeployOutcome> {
     use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -590,7 +593,7 @@ fn poll_phala_cvm_outcome(app_id: &str, timeout_secs: u64) -> Result<DeployOutco
 
     loop {
         attempt += 1;
-        if let Some(outcome) = read_phala_cvm_outcome(app_id)? {
+        if let Some(outcome) = read_phala_cvm_outcome(cvm_id)? {
             return Ok(outcome);
         }
 
@@ -599,7 +602,7 @@ fn poll_phala_cvm_outcome(app_id: &str, timeout_secs: u64) -> Result<DeployOutco
             bail!(
                 "timed out after {timeout_secs}s waiting for the CVM to report \
                  its hashes and endpoint (compose_hash/os_image_hash/endpoint \
-                 never appeared in `phala cvms get {app_id} --json`); \
+                 never appeared in `phala cvms get {cvm_id} --json`); \
                  increase --boot-timeout-secs or check the Phala Cloud dashboard"
             );
         }
@@ -608,26 +611,6 @@ fn poll_phala_cvm_outcome(app_id: &str, timeout_secs: u64) -> Result<DeployOutco
         tracing::debug!(attempt, ?sleep, "deploy outcome not yet available; waiting");
         std::thread::sleep(sleep);
     }
-}
-
-/// Parse `phala deploy --json` output into the assigned `app_id`.
-///
-/// # Errors
-/// Returns an error if the output is not valid JSON, reports a failed
-/// deploy, or carries no `app_id`.
-fn parse_phala_deploy_output(stdout: &[u8]) -> Result<String> {
-    let parsed: PhalaDeployOutput =
-        serde_json::from_slice(stdout).context("parse phala deploy --json output")?;
-    if !parsed.success {
-        bail!(
-            "phala deploy reported failure: {}",
-            parsed.error.as_deref().unwrap_or("<no error detail>")
-        );
-    }
-    parsed
-        .app_id
-        .filter(|id| !id.is_empty())
-        .context("phala deploy succeeded but returned no app_id")
 }
 
 /// Render the `phala deploy` env file body from the provider keys, node
@@ -1184,8 +1167,8 @@ mod tests {
     /// `phala deploy` must be invoked with the compose file, env file,
     /// pre-launch script, instance type, disk size, OS image, `--wait`, and
     /// `--json` — the env file is what carries the (client-side-encrypted)
-    /// provider keys, and `--json` is required so the deploy output can be
-    /// parsed for `app_id`.
+    /// provider keys, `--wait` blocks until the CVM is up, and `--json`
+    /// keeps the deploy's diagnostics machine-readable.
     #[test]
     fn build_phala_deploy_args_wires_every_flag() {
         let args = build_phala_deploy_args(&deploy_args());
@@ -1344,30 +1327,43 @@ mod tests {
         assert!(parse_phala_cvm_endpoint(true, b"not json").is_err());
     }
 
-    // ── phala deploy output parsing ───────────────────────────────────────────
-
-    #[test]
-    fn parse_phala_deploy_output_extracts_app_id() {
-        let stdout = br#"{"success":true,"vm_uuid":"u","name":"n","app_id":"app_abc123"}"#;
-        let app_id = parse_phala_deploy_output(stdout).expect("must parse");
-        assert_eq!(app_id, "app_abc123");
-    }
-
-    #[test]
-    fn parse_phala_deploy_output_rejects_failure() {
-        let stdout = br#"{"success":false,"error":"quota exceeded"}"#;
-        let err = parse_phala_deploy_output(stdout).expect_err("failure must error");
-        assert!(err.to_string().contains("quota exceeded"));
-    }
-
-    #[test]
-    fn parse_phala_deploy_output_rejects_missing_app_id() {
-        let stdout = br#"{"success":true}"#;
-        let err = parse_phala_deploy_output(stdout).expect_err("missing app_id must error");
-        assert!(err.to_string().contains("app_id"));
-    }
-
     // ── phala cvms get detail parsing ─────────────────────────────────────────
+
+    /// Regression: the deployed CVM's identity is resolved via
+    /// `phala cvms get --json`, never by scraping `phala deploy`'s stdout.
+    ///
+    /// `phala deploy --json` mixes a human-readable `Provisioning CVM
+    /// <name>...` line into its success-path stdout before the JSON
+    /// object, so a whole-buffer `serde_json` parse fails at line 1.
+    /// `phala cvms get <name> --json` instead emits a single object: the
+    /// CVM detail spread under a top-level `success: true` wrapper (the
+    /// `phala` CLI's `context.success` shape). The CVM-detail parser must
+    /// read `compose_hash` / `os.os_image_hash` / `endpoints[0].app`
+    /// straight out of that wrapped object, tolerating the extra
+    /// `success` field.
+    #[test]
+    fn cvm_outcome_parses_from_cvms_get_success_envelope() {
+        let stdout = br#"{
+            "success":true,
+            "app_id":"app_abc",
+            "name":"gm-miner-1",
+            "compose_hash":"sha256:aaa",
+            "os":{"name":"dstack-0.5.7","os_image_hash":"sha256:bbb"},
+            "endpoints":[
+                {"app":"https://app_abc-8080.dstack-prod5.phala.network"}
+            ]
+        }"#;
+        let hashes = parse_phala_cvm_detail(true, stdout)
+            .expect("cvms get success envelope must parse")
+            .expect("both hashes present");
+        assert_eq!(hashes.compose_sha256, "sha256:aaa");
+        assert_eq!(hashes.os_image_hash, "sha256:bbb");
+
+        let endpoint = parse_phala_cvm_endpoint(true, stdout)
+            .expect("cvms get success envelope must parse")
+            .expect("endpoint present");
+        assert_eq!(endpoint, "https://app_abc-8080.dstack-prod5.phala.network");
+    }
 
     /// The verified field path: top-level `compose_hash` and nested
     /// `os.os_image_hash` in the `phala cvms get --json` document.
