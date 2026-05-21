@@ -159,10 +159,6 @@ enum Command {
         /// Do not automatically open the browser.
         #[arg(long)]
         no_browser: bool,
-
-        /// Override the auth server URL.
-        #[arg(long, env = "GM_AUTH_URL")]
-        auth_url: Option<String>,
     },
 
     /// Register this miner's image compose hash + capabilities with the registry.
@@ -316,10 +312,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Login {
-            no_browser,
-            auth_url,
-        } => cmd_login(cli.testnet, auth_url, cli.api_url, !no_browser).await,
+        Command::Login { no_browser } => cmd_login(cli.testnet, cli.api_url, !no_browser).await,
         Command::RegisterImage { app_name, dist_dir } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             // Re-send the network's persisted node secret so a standalone
@@ -811,7 +804,6 @@ fn resolve_node_secret(network: &str) -> Result<String> {
 
 async fn cmd_login(
     testnet: bool,
-    auth_url_override: Option<String>,
     api_url_override: Option<String>,
     open_browser: bool,
 ) -> Result<()> {
@@ -828,15 +820,12 @@ async fn cmd_login(
     // overwrite mainnet credentials when the operator omits --testnet.
     cfg.active_network = Some(if testnet { "testnet" } else { "mainnet" }.to_string());
 
-    let auth_url = auth_url_override.unwrap_or_else(|| cfg.auth_url());
-    let resolved_api_url = api_url_override.unwrap_or_else(|| cfg.api_url());
-    let client_id = cfg.client_id();
+    let api_url = api_url_override.unwrap_or_else(|| cfg.api_url());
 
-    let token = auth::device_login(&auth_url, &client_id, &["miner"], open_browser).await?;
+    let token = auth::device_login(&api_url, open_browser).await?;
 
     let entry = cfg.active_entry_mut();
-    entry.auth_url = Some(auth_url.clone());
-    entry.api_url = Some(resolved_api_url);
+    entry.api_url = Some(api_url);
     entry.tokens = Some(TokenEntry {
         access_token: Some(token.access_token.clone()),
         token_expires_at: token.expires_in.map(|s| {

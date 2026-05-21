@@ -1,17 +1,15 @@
-//! Taostats OAuth 2.0 device-code flow.
-//!
-//! Mirrors blockmachine's CLI auth pattern
-//! (`blockmachine_playground/cli/commands/auth.py`).
+//! OAuth 2.0 device-code flow via the gm registry proxy.
 //!
 //! Flow:
-//!   1. `POST /v1/device/code` → `device_code` + `user_code` + `verification_uri`
+//!   1. `POST {api_url}/auth/device/code` (no body) → `device_code` + `user_code` + `verification_uri`
 //!   2. Display URL + code; optionally open browser.
-//!   3. Poll `POST /v1/oauth/token` until authorized or expired.
+//!   3. Poll `POST {api_url}/auth/device/token` with `{"device_code": "..."}` until authorized or
+//!      expired.
 //!   4. Store `access_token` in `~/.gm-miner/config.json`.
 //!
-//! Token refresh is deferred (issue #65): the token endpoint's
-//! `refresh_token` is ignored, and an expired access token is handled by
-//! re-running `gm-miner login`.
+//! The registry server-side injects the correct OAuth `client_id` and subnet-scoped scope, so the
+//! CLI does not need to know either. Token refresh is deferred (issue #65): an expired access token
+//! is handled by re-running `gm-miner login`.
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -49,35 +47,25 @@ fn default_expires_in() -> u64 {
     900
 }
 
-/// Run the device-code flow. Returns the token response on success.
+/// Run the device-code flow against the registry proxy. Returns the token response on success.
 ///
-/// Prints instructions to stdout. Optionally opens the browser if
-/// `open_browser` is true.
+/// Prints instructions to stdout. Optionally opens the browser if `open_browser` is true.
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails, the response cannot be parsed,
 /// the device code flow times out, or the user denies access.
-pub async fn device_login(
-    auth_url: &str,
-    client_id: &str,
-    scopes: &[&str],
-    open_browser: bool,
-) -> Result<TokenResponse> {
+pub async fn device_login(api_url: &str, open_browser: bool) -> Result<TokenResponse> {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .context("build http client")?;
 
-    // Step 1: request device code.
+    // Step 1: request device code. No body — the registry injects client_id and scope.
     let resp = client
-        .post(format!("{auth_url}/v1/device/code"))
-        .json(&serde_json::json!({
-            "client_id": client_id,
-            "scopes": scopes,
-        }))
+        .post(format!("{api_url}/auth/device/code"))
         .send()
         .await
-        .context("POST /v1/device/code")?;
+        .context("POST /auth/device/code")?;
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -105,8 +93,7 @@ pub async fn device_login(
     // Step 2: poll until authorized.
     poll_for_token(
         &client,
-        auth_url,
-        client_id,
+        api_url,
         &dc.device_code,
         dc.interval,
         dc.expires_in,
@@ -116,8 +103,7 @@ pub async fn device_login(
 
 async fn poll_for_token(
     client: &Client,
-    auth_url: &str,
-    client_id: &str,
+    api_url: &str,
     device_code: &str,
     initial_interval: u64,
     expires_in: u64,
@@ -136,15 +122,13 @@ async fn poll_for_token(
         }
 
         let resp = client
-            .post(format!("{auth_url}/v1/oauth/token"))
+            .post(format!("{api_url}/auth/device/token"))
             .json(&serde_json::json!({
-                "client_id": client_id,
                 "device_code": device_code,
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             }))
             .send()
             .await
-            .context("POST /v1/oauth/token")?;
+            .context("POST /auth/device/token")?;
 
         let status = resp.status();
 
