@@ -1,11 +1,12 @@
 //! Tests for `gm-miner register-image` auto-discovery of the deployed
-//! miner's image hashes.
+//! miner's image hashes and endpoint.
 //!
 //! `register-image` reads the live hashes from `phala cvms get <app-id>
-//! --json` via `parse_phala_cvm_detail` — the same CVM-detail parser
-//! `gm-miner deploy` polls. These tests exercise that shared parser
-//! directly (it is pure: exit status + raw stdout in,
-//! `Option<DstackDeployResult>` out), so no real `phala` CLI is needed.
+//! --json` via `parse_phala_cvm_detail`, and the miner's public endpoint
+//! via `parse_phala_cvm_endpoint` — the same CVM-detail parsers `gm-miner
+//! deploy` uses. These tests exercise those pure parsers directly (exit
+//! status + raw stdout in, parsed value out), so no real `phala` CLI is
+//! needed.
 
 #![expect(
     clippy::unwrap_used,
@@ -13,7 +14,7 @@
     reason = "test assertions intentionally panic on unexpected values"
 )]
 
-use gm_miner_cli::deploy::{parse_phala_cvm_detail, DstackDeployResult};
+use gm_miner_cli::deploy::{parse_phala_cvm_detail, parse_phala_cvm_endpoint, DstackDeployResult};
 
 /// A fully-deployed CVM: `phala cvms get --json` succeeded and both hashes
 /// are populated → `register-image` discovers them and registers.
@@ -113,6 +114,31 @@ fn malformed_output_on_failure_is_not_an_error() {
     let parsed = parse_phala_cvm_detail(false, b"not json at all")
         .expect("a failed command must not attempt to parse stdout");
     assert!(parsed.is_none());
+}
+
+/// `register-image` must read the miner's public endpoint from
+/// `endpoints[0].app` so it can send the registry's required `endpoint`
+/// (and `attestation_endpoint`) field.
+#[test]
+fn parses_endpoint_from_deployed_cvm() {
+    let stdout = br#"{
+        "app_id":"app_abc",
+        "compose_hash":"abc","os":{"os_image_hash":"def"},
+        "endpoints":[{"app":"https://app_abc-8080.dstack-prod9.phala.network"}]
+    }"#;
+    let endpoint = parse_phala_cvm_endpoint(true, stdout)
+        .expect("valid CVM detail JSON must parse")
+        .expect("a populated endpoint must yield Some");
+    assert_eq!(endpoint, "https://app_abc-8080.dstack-prod9.phala.network");
+}
+
+/// A CVM whose gateway endpoint is not yet provisioned yields `None`, so
+/// `register-image` reports the missing endpoint instead of registering an
+/// empty one (which the registry rejects).
+#[test]
+fn missing_endpoint_yields_none() {
+    let stdout = br#"{"compose_hash":"abc","os":{"os_image_hash":"def"}}"#;
+    assert!(parse_phala_cvm_endpoint(true, stdout).unwrap().is_none());
 }
 
 /// `register-image` builds its "deploy first" error from the app id.

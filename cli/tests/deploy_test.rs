@@ -17,8 +17,8 @@ use gm_miner_cli::{
     config::{Config, ProviderKeys},
     deploy::{
         fetch_supported_versions, prepare_deploy_target, render_compose, select_version,
-        verify_hashes, DstackDeployResult, ImageProvisioner, ImageVersion, PhalaClient,
-        COMPOSE_TEMPLATE,
+        verify_hashes, DeployOutcome, DstackDeployResult, ImageProvisioner, ImageVersion,
+        PhalaClient, RegistryCredentials, COMPOSE_TEMPLATE,
     },
 };
 use std::collections::HashMap;
@@ -54,12 +54,16 @@ impl PhalaClient for StubPhala {
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
+        _registry_creds: Option<&RegistryCredentials>,
         _boot_timeout_secs: u64,
-    ) -> anyhow::Result<DstackDeployResult> {
+    ) -> anyhow::Result<DeployOutcome> {
         self.deploy_called.set(true);
-        Ok(DstackDeployResult {
-            compose_sha256: self.compose_sha256.clone(),
-            os_image_hash: self.os_image_hash.clone(),
+        Ok(DeployOutcome {
+            hashes: DstackDeployResult {
+                compose_sha256: self.compose_sha256.clone(),
+                os_image_hash: self.os_image_hash.clone(),
+            },
+            endpoint: "https://app_x-8080.dstack-prod5.phala.network".to_owned(),
         })
     }
 }
@@ -73,8 +77,9 @@ impl PhalaClient for TimedOutPhala {
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
+        _registry_creds: Option<&RegistryCredentials>,
         _boot_timeout_secs: u64,
-    ) -> anyhow::Result<DstackDeployResult> {
+    ) -> anyhow::Result<DeployOutcome> {
         anyhow::bail!(
             "timed out after 0s waiting for the CVM to report hashes \
              (compose_hash/os_image_hash never appeared in \
@@ -93,8 +98,9 @@ impl PhalaClient for FailingPhala {
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
+        _registry_creds: Option<&RegistryCredentials>,
         _boot_timeout_secs: u64,
-    ) -> anyhow::Result<DstackDeployResult> {
+    ) -> anyhow::Result<DeployOutcome> {
         anyhow::bail!("phala deploy exited with status 1");
     }
 }
@@ -247,11 +253,11 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", 300)
+        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
         .unwrap();
 
     assert!(stub.deploy_called.get(), "deploy must have been called");
-    assert!(verify_hashes(&actual, approved).is_ok());
+    assert!(verify_hashes(&actual.hashes, approved).is_ok());
 }
 
 /// Mismatch path: Phala Cloud returns different hashes → verify fails →
@@ -282,11 +288,11 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", 300)
+        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
         .unwrap();
 
-    let err =
-        verify_hashes(&actual, approved).expect_err("mismatched hashes must produce an error");
+    let err = verify_hashes(&actual.hashes, approved)
+        .expect_err("mismatched hashes must produce an error");
     assert!(err.to_string().contains("HASH MISMATCH"));
 }
 
@@ -380,7 +386,7 @@ fn phala_failure_surfaces_as_error() {
         google: None,
     };
     let err = FailingPhala
-        .deploy("compose-content", &keys, "test-node-secret-1234", 300)
+        .deploy("compose-content", &keys, "test-node-secret-1234", None, 300)
         .expect_err("failing phala must produce an error");
     assert!(err.to_string().contains("phala deploy exited"));
 }
@@ -397,7 +403,7 @@ fn timeout_error_is_actionable() {
         google: None,
     };
     let err = TimedOutPhala
-        .deploy("compose", &keys, "test-node-secret-1234", 0)
+        .deploy("compose", &keys, "test-node-secret-1234", None, 0)
         .expect_err("timed-out deploy must produce an error");
     let msg = err.to_string();
     assert!(
@@ -495,7 +501,13 @@ fn dist_dir_used_verbatim_when_provided() {
     use gm_miner_cli::deploy::RealPhalaClient;
 
     let explicit_dir = std::path::PathBuf::from("/tmp/my-full-project-dir");
-    let client = RealPhalaClient::new("gm-miner-1", explicit_dir.clone(), "tdx.medium", "40G");
+    let client = RealPhalaClient::new(
+        "gm-miner-1",
+        explicit_dir.clone(),
+        "tdx.medium",
+        "40G",
+        "dstack-0.5.7",
+    );
     assert_eq!(client.project_dir, explicit_dir);
     assert!(
         !client.project_dir.ends_with("gm-miner-1"),
@@ -654,13 +666,14 @@ fn prepare_deploy_target_embeds_provisioner_ref() {
     let provisioner = StubProvisioner {
         ref_: "ghcr.io/taostat/gm-miner@sha256:abc".to_owned(),
     };
-    let rendered = prepare_deploy_target(&provisioner).expect("orchestration must succeed");
+    let target = prepare_deploy_target(&provisioner).expect("orchestration must succeed");
+    assert_eq!(target.image_ref, "ghcr.io/taostat/gm-miner@sha256:abc");
     assert!(
-        rendered.contains("sha256:abc"),
+        target.rendered_compose.contains("sha256:abc"),
         "rendered compose must embed the pinned image ref"
     );
     assert!(
-        !rendered.contains("${GM_IMAGE_REF"),
+        !target.rendered_compose.contains("${GM_IMAGE_REF"),
         "the ${{GM_IMAGE_REF}} placeholder must be substituted"
     );
 }
@@ -674,9 +687,9 @@ fn prepare_deploy_target_embeds_prebuilt_ref() {
     let provisioner = StubProvisioner {
         ref_: "docker.io/taostat/gm-miner@sha256:deadbeef".to_owned(),
     };
-    let rendered = prepare_deploy_target(&provisioner).expect("prebuilt-ref must succeed");
+    let target = prepare_deploy_target(&provisioner).expect("prebuilt-ref must succeed");
     assert!(
-        rendered.contains("sha256:deadbeef"),
+        target.rendered_compose.contains("sha256:deadbeef"),
         "the provisioner's ref must be pinned into the compose file"
     );
 }
