@@ -43,6 +43,7 @@ fn config_with_expiry(api_url: &str, token: Option<&str>, expires_at: Option<Str
             tokens: token.map(|t| TokenEntry {
                 access_token: Some(t.to_owned()),
                 token_expires_at: expires_at,
+                ..Default::default()
             }),
             ..Default::default()
         },

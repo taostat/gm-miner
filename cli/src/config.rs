@@ -26,12 +26,16 @@ pub fn config_path() -> PathBuf {
 
 /// Per-network token set.
 ///
-/// No `refresh_token`: token refresh is deferred (issue #65). An expired
-/// access token surfaces as a 401 and the operator re-runs `gm-miner login`.
+/// `refresh_token` is captured from the device-code flow and used to mint a
+/// fresh access token silently when the stored one expires, avoiding a full
+/// browser re-login. Absent for a config written before refresh support
+/// existed — the operator simply re-runs `gm-miner login` in that case.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TokenEntry {
     pub access_token: Option<String>,
     pub token_expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
 }
 
 /// Margin treated as "about to expire": a token within this window of its

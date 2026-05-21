@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 use gm_miner_cli::{
     auth,
     client::{get_auth_config, RegistryClient},
-    config::{self, Config, ProviderKeys, TokenEntry},
+    config::{self, Config, ProviderKeys},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
         parse_phala_cvm_endpoint, preflight_phala_cli, prepare_deploy_target,
@@ -274,6 +274,7 @@ async fn main() -> Result<()> {
             boot_timeout_secs,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
             // --dist-dir is the staging directory used verbatim. Default:
             // dist/<app_name> relative to cwd. Resolve it once here so every
             // deploy step shares the same path.
@@ -300,6 +301,7 @@ async fn main() -> Result<()> {
         Command::Login { no_browser } => cmd_login(cli.testnet, cli.api_url, !no_browser).await,
         Command::RegisterImage { app_id } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
             // Re-send the network's persisted node secret so a standalone
             // re-registration keeps the registry's stored copy in sync
             // with what the deployed envoy enforces. Absent (a miner
@@ -313,6 +315,7 @@ async fn main() -> Result<()> {
         }
         Command::ListProducts => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_list_products(&mut client).await
         }
@@ -333,6 +336,7 @@ async fn main() -> Result<()> {
                 price_cache_write_1h.as_deref(),
             )?;
             let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_declare_product(&mut client, &provider, &model, price).await
         }
@@ -346,6 +350,7 @@ async fn main() -> Result<()> {
             price_cache_write_1h,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_update_prices(
                 &mut client,
@@ -361,6 +366,7 @@ async fn main() -> Result<()> {
         }
         Command::Status => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_status(&mut client).await
         }
@@ -407,6 +413,93 @@ fn load_config(testnet: bool, api_url_override: Option<String>) -> Result<Config
     }
 
     Ok(cfg)
+}
+
+/// Ensure the active network's access token is usable, refreshing it silently
+/// if it has expired (or is within the expiry margin).
+///
+/// Returns a [`Config`] whose active token is fresh. The sequence is:
+///   1. Token still valid → return `cfg` untouched (no network call).
+///   2. Token expired but a `refresh_token` is stored → POST the
+///      `refresh_token` grant. On success the new tokens are persisted and
+///      returned. The auth-gateway rotates the refresh token, so a rotated
+///      value in the response replaces the stored one.
+///   3. No refresh token, or the refresh was rejected (revoked / expired /
+///      grant not permitted) → fall back to the full device-code flow.
+///
+/// `open_browser` only affects the step-3 fallback; the refresh path never
+/// opens a browser.
+///
+/// # Errors
+/// Returns an error if `/auth/config` cannot be fetched, the device-flow
+/// fallback fails, or the refreshed config cannot be saved.
+async fn ensure_fresh_token(mut cfg: Config) -> Result<Config> {
+    let needs_refresh = cfg
+        .active_tokens()
+        .is_some_and(config::TokenEntry::is_expired_or_near);
+    if !needs_refresh {
+        return Ok(cfg);
+    }
+
+    let api_url = cfg.api_url();
+    let auth_cfg = get_auth_config(&api_url)
+        .await
+        .with_context(|| format!("fetch auth config from {api_url}/auth/config"))?;
+
+    let token = obtain_fresh_token(&cfg, &auth_cfg).await?;
+
+    // A refresh response may omit `refresh_token` when the auth-gateway
+    // chooses not to rotate it — keep the previously stored value so the
+    // next refresh still has something to present.
+    let previous_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
+    cfg.active_entry_mut().tokens = Some(token.to_entry_keeping(previous_refresh));
+    config::save(&cfg).context("save refreshed token")?;
+    Ok(cfg)
+}
+
+/// Obtain a fresh access token: try the stored `refresh_token` first, fall
+/// back to the device-code flow when there is none or it is rejected.
+///
+/// Split out of [`ensure_fresh_token`] so the refresh-vs-device decision is a
+/// single linear function with no config mutation.
+async fn obtain_fresh_token(
+    cfg: &Config,
+    auth_cfg: &gm_miner_cli::client::AuthConfig,
+) -> Result<auth::TokenResponse> {
+    let stored_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
+
+    let Some(refresh) = stored_refresh else {
+        eprintln!("Access token expired — re-authenticating.");
+        return device_login_from(auth_cfg, true).await;
+    };
+
+    match auth::refresh_token(&auth_cfg.token_url, &auth_cfg.client_id, &refresh).await? {
+        auth::RefreshOutcome::Refreshed(token) => {
+            eprintln!("Access token refreshed.");
+            Ok(token)
+        }
+        auth::RefreshOutcome::Rejected => {
+            eprintln!("Stored credentials have expired — re-authenticating.");
+            device_login_from(auth_cfg, true).await
+        }
+    }
+}
+
+/// Run the device-code flow using endpoints from an already-fetched
+/// [`AuthConfig`]. Shared by `cmd_login` and the [`ensure_fresh_token`]
+/// fallback so neither re-fetches `/auth/config`.
+async fn device_login_from(
+    auth_cfg: &gm_miner_cli::client::AuthConfig,
+    open_browser: bool,
+) -> Result<auth::TokenResponse> {
+    auth::device_login(
+        &auth_cfg.device_code_url,
+        &auth_cfg.token_url,
+        &auth_cfg.client_id,
+        &auth_cfg.scopes,
+        open_browser,
+    )
+    .await
 }
 
 /// Convert an optional USD/Mtok string to an optional picodollar string.
@@ -760,28 +853,11 @@ async fn cmd_login(
         .await
         .with_context(|| format!("fetch auth config from {api_url}/auth/config"))?;
 
-    let token = auth::device_login(
-        &auth_cfg.device_code_url,
-        &auth_cfg.token_url,
-        &auth_cfg.client_id,
-        &auth_cfg.scopes,
-        open_browser,
-    )
-    .await?;
+    let token = device_login_from(&auth_cfg, open_browser).await?;
 
     let entry = cfg.active_entry_mut();
     entry.api_url = Some(api_url);
-    entry.tokens = Some(TokenEntry {
-        access_token: Some(token.access_token.clone()),
-        token_expires_at: token.expires_in.map(|s| {
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "expires_in is a small positive number of seconds"
-            )]
-            let expiry = chrono::Utc::now() + chrono::Duration::seconds(s as i64);
-            expiry.to_rfc3339()
-        }),
-    });
+    entry.tokens = Some(token.to_entry());
 
     config::save(&cfg).context("save config")?;
 
