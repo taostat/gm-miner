@@ -29,6 +29,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY cli/Cargo.toml ./cli/
 
+## Copy dstack assets required by include_str! at compile time.
+COPY dstack/ ./dstack/
+
 ## Pre-build a dummy workspace to cache dependencies.
 RUN mkdir -p cli/src \
   && echo "fn main() {}" > cli/src/main.rs \
