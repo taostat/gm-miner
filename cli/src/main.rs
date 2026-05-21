@@ -3,10 +3,9 @@
 //! Subcommands:
 //!   set-api-keys    — persist provider API keys to ~/.gm-miner/config.json
 //!   deploy          — trust-correct single-shot deploy: fetch approved hashes,
-//!                     deploy via dstack-cloud, verify hashes, register image
+//!                     deploy via Phala Cloud, verify hashes, register image
 //!   login           — Taostats device-code OAuth flow
 //!   register-image  — re-register the deployed miner's image hashes
-//!                     (auto-discovered from dstack-cloud status)
 //!   list-products   — show the registry product catalog
 //!   declare-product — register a miner-product offer with prices in USD/Mtok
 //!   update-prices   — update prices on an existing offer
@@ -28,8 +27,9 @@ use gm_miner_cli::{
     client::{get_auth_config, RegistryClient},
     config::{self, Config, ProviderKeys, TokenEntry},
     deploy::{
-        fetch_supported_versions, format_created_at, prepare_deploy_target, select_version,
-        verify_hashes, DstackClient, GcpConfig, ImageProvisioner, DEFAULT_BOOT_TIMEOUT_SECS,
+        fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
+        preflight_phala_cli, prepare_deploy_target, select_version, verify_hashes,
+        ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS,
     },
     node_secret, picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
@@ -75,22 +75,26 @@ enum Command {
         google: Option<String>,
     },
 
-    /// Deploy the miner via dstack-cloud with trust-correct hash verification.
+    /// Deploy the miner to Phala Cloud with trust-correct hash verification.
     ///
     /// Reads provider API keys from ~/.gm-miner/config.json (set them first
     /// with `gm-miner set-api-keys`), fetches the registry-approved image
-    /// version, deploys via dstack-cloud, verifies the actual hashes match the
-    /// registry approval, then registers the image automatically.
+    /// version, builds and pushes the miner image to a public registry,
+    /// submits the compose stack to Phala Cloud, verifies the deployed CVM's
+    /// measured hashes match the registry approval, then registers the
+    /// image automatically.
     ///
-    /// On a fresh machine (no prior deploy) this automatically runs
-    /// `dstack-cloud new` to scaffold the project before deploying.
+    /// Phala Cloud manages the confidential VM, the KMS, and `app_id`
+    /// authorization. Authentication uses a Phala Cloud API key — set
+    /// `PHALA_CLOUD_API_KEY` or run `phala login` before deploying.
     Deploy {
-        /// Pre-built digest-pinned image reference (registry/repo/name@sha256:...).
+        /// Pre-built digest-pinned image reference (registry/repo@sha256:...).
         ///
         /// When set (or `GM_IMAGE_REF` is in env), the local image build is
         /// skipped and this ref is embedded in the compose file directly.
-        /// When omitted, the miner image is built and pushed to Artifact
-        /// Registry and the resulting digest is pinned automatically.
+        /// When omitted, the miner image is built and pushed to the public
+        /// registry given by `--image-repo` and the resulting digest is
+        /// pinned automatically.
         #[arg(long, env = "GM_IMAGE_REF")]
         image_ref: Option<String>,
 
@@ -99,56 +103,41 @@ enum Command {
         #[arg(long)]
         version: Option<usize>,
 
-        /// dstack-cloud app name.
+        /// Phala Cloud CVM name.
         #[arg(long, default_value = "gm-miner-1")]
         app_name: String,
 
-        /// dstack project directory (the full path used verbatim).
-        /// Defaults to `dist/<app_name>` relative to the current directory.
+        /// Staging directory for the rendered compose + env files (the full
+        /// path used verbatim). Defaults to `dist/<app_name>` relative to
+        /// the current directory.
         #[arg(long)]
         dist_dir: Option<std::path::PathBuf>,
 
-        /// GCP project ID for the dstack deployment. Required.
-        #[arg(long, env = "GCP_PROJECT_ID")]
-        gcp_project: String,
-
-        /// GCP region for the GCS bucket / Artifact Registry repo.
-        #[arg(long, env = "GCP_REGION", default_value = "us-central1")]
-        gcp_region: String,
-
-        /// GCP zone for the dstack CVM. Defaults to `<gcp-region>-a`.
-        #[arg(long, env = "GCP_ZONE")]
-        gcp_zone: Option<String>,
-
-        /// Compute Engine machine type for the CVM.
-        #[arg(long, env = "MACHINE_TYPE", default_value = "c3-standard-4")]
-        machine_type: String,
-
-        /// GCS bucket URI for dstack image upload.
-        /// Defaults to `gs://<gcp-project>-dstack` (same convention as deploy.sh).
-        #[arg(long, env = "GCS_BUCKET")]
-        gcs_bucket: Option<String>,
-
-        /// Artifact Registry repository name for the miner image.
-        #[arg(long, env = "AR_REPO", default_value = "gm-miner")]
-        ar_repo: String,
+        /// Public container registry repo to build and push the miner image
+        /// to — Phala Cloud pulls the image from here. Required unless
+        /// `--image-ref` is supplied. Example: `ghcr.io/<owner>/gm-miner`.
+        #[arg(long, env = "GM_IMAGE_REPO")]
+        image_repo: Option<String>,
 
         /// Image tag applied to the build before digest resolution.
         #[arg(long, env = "IMAGE_TAG", default_value = "v0.1.0")]
         image_tag: String,
 
-        /// dstack-cloud OS image URL pulled before deploy. Defaults to the
-        /// pinned Phala meta-dstack-cloud release used by deploy.sh.
-        #[arg(long, env = "DSTACK_OS_IMAGE_URL")]
-        os_image_url: Option<String>,
+        /// Phala Cloud instance type for the CVM.
+        #[arg(long, env = "PHALA_INSTANCE_TYPE", default_value = "tdx.medium")]
+        instance_type: String,
+
+        /// Disk size for the CVM (with unit, e.g. `40G`).
+        #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
+        disk_size: String,
 
         /// Repository root used as the Docker build context. Defaults to
         /// the current directory.
         #[arg(long)]
         repo_root: Option<std::path::PathBuf>,
 
-        /// How long to wait for the CVM to boot and populate hashes in
-        /// `dstack-cloud status --json` (seconds). Default: 300.
+        /// How long to wait for the CVM to boot and report its measured
+        /// hashes via `phala cvms get --json` (seconds). Default: 300.
         #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
         boot_timeout_secs: u64,
     },
@@ -167,18 +156,13 @@ enum Command {
     /// registers in one step.  Use this subcommand only for re-registering
     /// without redeploying (e.g. after a registry resync or for debugging).
     ///
-    /// The compose + OS image hashes are read automatically from the deployed
-    /// miner via `dstack-cloud status --json`; the dstack app must already be
-    /// deployed (`gm-miner deploy`).
+    /// The compose + OS image hashes are read automatically from the
+    /// deployed CVM via `phala cvms get <app-id> --json`; the CVM must
+    /// already be deployed (`gm-miner deploy`).
     RegisterImage {
-        /// dstack-cloud app name (must match the one used by `gm-miner deploy`).
-        #[arg(long, default_value = "gm-miner-1")]
-        app_name: String,
-
-        /// dstack project directory (the full path used verbatim).
-        /// Defaults to `dist/<app_name>` relative to the current directory.
+        /// Phala Cloud app id of the deployed CVM (e.g. `app_abc123`).
         #[arg(long)]
-        dist_dir: Option<std::path::PathBuf>,
+        app_id: String,
     },
 
     /// List all products in the registry catalog.
@@ -274,21 +258,17 @@ async fn main() -> Result<()> {
             version,
             app_name,
             dist_dir,
-            gcp_project,
-            gcp_region,
-            gcp_zone,
-            machine_type,
-            gcs_bucket,
-            ar_repo,
+            image_repo,
             image_tag,
-            os_image_url,
+            instance_type,
+            disk_size,
             repo_root,
             boot_timeout_secs,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
-            // --dist-dir is the project directory used verbatim. Default:
-            // dist/<app_name> relative to cwd (matches deploy.sh). Resolve it
-            // once here so every deploy step shares the same path.
+            // --dist-dir is the staging directory used verbatim. Default:
+            // dist/<app_name> relative to cwd. Resolve it once here so every
+            // deploy step shares the same path.
             let project_dir =
                 dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
             cmd_deploy_subcommand(
@@ -297,14 +277,10 @@ async fn main() -> Result<()> {
                     app_name,
                     image_ref,
                     project_dir,
-                    gcp_project,
-                    gcp_region,
-                    gcp_zone,
-                    machine_type,
-                    gcs_bucket,
-                    ar_repo,
+                    image_repo,
                     image_tag,
-                    os_image_url,
+                    instance_type,
+                    disk_size,
                     repo_root,
                     version,
                     boot_timeout_secs,
@@ -313,7 +289,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Login { no_browser } => cmd_login(cli.testnet, cli.api_url, !no_browser).await,
-        Command::RegisterImage { app_name, dist_dir } => {
+        Command::RegisterImage { app_id } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             // Re-send the network's persisted node secret so a standalone
             // re-registration keeps the registry's stored copy in sync
@@ -323,13 +299,8 @@ async fn main() -> Result<()> {
             let node_secret = cfg
                 .active_network_entry()
                 .and_then(|n| n.node_secret.clone());
-            // --dist-dir is used verbatim; default `dist/<app_name>` matches
-            // the convention `gm-miner deploy` uses, so re-registration reads
-            // the same dstack project the deploy wrote.
-            let project_dir =
-                dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
             let mut client = RegistryClient::new(cfg);
-            cmd_register_image(&mut client, &app_name, &project_dir, node_secret.as_deref()).await
+            cmd_register_image(&mut client, &app_id, node_secret.as_deref()).await
         }
         Command::ListProducts => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
@@ -470,19 +441,15 @@ fn error_detail(json: &serde_json::Value) -> String {
 struct DeployArgs {
     app_name: String,
     image_ref: Option<String>,
-    /// The resolved dstack project directory used verbatim by every step
-    /// (`RealDstackClient`, `pull_os_image`, ...). Set once in
-    /// `cmd_deploy_subcommand` from `--dist-dir` or the `dist/<app_name>`
-    /// default, so no later step recomputes — and diverges from — it.
+    /// The resolved staging directory used verbatim by every deploy step.
+    /// Set once in `cmd_deploy_subcommand` from `--dist-dir` or the
+    /// `dist/<app_name>` default, so no later step recomputes — and
+    /// diverges from — it.
     project_dir: std::path::PathBuf,
-    gcp_project: String,
-    gcp_region: String,
-    gcp_zone: Option<String>,
-    machine_type: String,
-    gcs_bucket: Option<String>,
-    ar_repo: String,
+    image_repo: Option<String>,
     image_tag: String,
-    os_image_url: Option<String>,
+    instance_type: String,
+    disk_size: String,
     repo_root: Option<std::path::PathBuf>,
     version: Option<usize>,
     boot_timeout_secs: u64,
@@ -492,118 +459,62 @@ struct DeployArgs {
 ///
 /// Separated from `main` to keep the dispatch match arm small.
 async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
-    let dstack = gm_miner_cli::deploy::RealDstackClient {
-        app_name: args.app_name.clone(),
-        project_dir: args.project_dir.clone(),
-    };
-
-    // The basename check only matters when this directory still needs
-    // `dstack-cloud new`, which creates `<cwd>/<app_name>/` — if the basename
-    // differs the bootstrapped directory and the one we read/patch diverge.
-    // An already-bootstrapped project (valid `app.json`) is deployed in place
-    // via `current_dir`, so any path is fine; don't reject custom dist dirs.
-    // The default `dist/<app_name>` always satisfies this, so the check only
-    // bites a custom `--dist-dir` whose basename differs from `--app-name`.
-    if !dstack.is_bootstrapped() {
-        let basename = args
-            .project_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if basename != args.app_name {
-            bail!(
-                "dist-dir basename must equal app-name when bootstrapping a fresh \
-                 project; got dist-dir={}, app-name={app_name}",
-                args.project_dir.display(),
-                app_name = args.app_name
-            );
-        }
-    }
-
-    // zone defaults to `<region>-a`, mirroring deploy.sh.
-    let zone = args
-        .gcp_zone
-        .clone()
-        .unwrap_or_else(|| format!("{}-a", args.gcp_region));
-    let bucket = args
-        .gcs_bucket
-        .clone()
-        .unwrap_or_else(|| GcpConfig::default_bucket(&args.gcp_project));
-    let gcp = GcpConfig {
-        project: args.gcp_project.clone(),
-        zone,
-        machine_type: args.machine_type.clone(),
-        instance_name: args.app_name.clone(),
-        bucket,
-    };
+    let phala = gm_miner_cli::deploy::RealPhalaClient::new(
+        args.app_name.clone(),
+        args.project_dir.clone(),
+        args.instance_type.clone(),
+        args.disk_size.clone(),
+    );
     let mut client = RegistryClient::new(cfg.clone());
-    cmd_deploy(&cfg, &mut client, &dstack, &args, &gcp).await
+    cmd_deploy(&cfg, &mut client, &phala, &args).await
 }
 
-/// Real [`ImageProvisioner`]: provisions GCP infrastructure and obtains the
-/// digest-pinned image ref via `gcloud` / `docker`.
+/// Real [`ImageProvisioner`]: builds the miner image and pushes it to a
+/// public container registry, returning the digest-pinned ref.
 ///
-/// When `args.image_ref` is supplied only `gcloud` is preflighted; the
-/// Artifact Registry setup and Docker steps are skipped entirely (the
-/// operator may have no Docker daemon on the host). The non-build GCP
-/// steps (project config, services, bucket) still run.
-///
-/// Without `--image-ref` this runs the full build flow: preflight for
-/// both `gcloud` and `docker`, `gcloud` project / services / bucket /
-/// Artifact-Registry setup, Docker auth, image build + push, and digest
-/// resolution.
-struct GcpImageProvisioner<'a> {
+/// When `args.image_ref` is supplied the build is skipped entirely and the
+/// pre-built ref is returned as-is. Without it, `--image-repo` must be set:
+/// the image is built with `docker buildx --push` to that public repo
+/// (Phala Cloud pulls from there) and the pushed digest is pinned.
+struct PublicRegistryProvisioner<'a> {
     args: &'a DeployArgs,
-    gcp: &'a GcpConfig,
 }
 
-impl ImageProvisioner for GcpImageProvisioner<'_> {
+impl ImageProvisioner for PublicRegistryProvisioner<'_> {
     fn provision(&self) -> Result<String> {
-        use gm_miner_cli::gcp as gcp_provision;
+        use gm_miner_cli::image;
 
         let args = self.args;
-        let gcp = self.gcp;
 
-        // Configure the GCP project + service APIs regardless of whether we
-        // build locally — `dstack-cloud deploy` needs compute / storage /
-        // confidentialcomputing enabled and the GCS bucket present.
-        println!("Provisioning GCP project {} ...", args.gcp_project);
         if let Some(pre_built) = &args.image_ref {
-            // Pre-built image: only gcloud is needed (no Docker, no AR repo).
-            gcp_provision::preflight_gcloud()?;
-            gcp_provision::configure_project(&args.gcp_project)?;
-            gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
             println!("Using pre-built image ref (skipping local build): {pre_built}");
             return Ok(pre_built.clone());
         }
 
-        // Local-build path: preflight both gcloud and docker, set up AR.
-        gcp_provision::preflight_tools()?;
-        gcp_provision::configure_project(&args.gcp_project)?;
-        gcp_provision::ensure_bucket(&gcp.bucket, &args.gcp_region)?;
-        gcp_provision::ensure_artifact_registry(&args.ar_repo, &args.gcp_region)?;
+        let repo = args.image_repo.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no image repo set; pass --image-repo <registry/owner/gm-miner> \
+                 (or set GM_IMAGE_REPO) so the miner image can be pushed to a \
+                 public registry, or pass --image-ref to use a pre-built image"
+            )
+        })?;
+
+        image::preflight_tools()?;
 
         let repo_root = args
             .repo_root
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let coords = gcp_provision::ImageCoordinates::derive(
-            &args.gcp_region,
-            &args.gcp_project,
-            &args.ar_repo,
-            &args.app_name,
-            &args.image_tag,
-        );
-        gcp_provision::configure_docker_auth(&coords.ar_host)?;
+        let coords = image::ImageCoordinates::new(repo, &args.image_tag);
 
         let image_version = git_short_sha(&repo_root);
-        println!("Building and pushing the miner image ...");
-        gcp_provision::build_and_push_image(&coords, &args.app_name, &image_version, &repo_root)
+        println!("Building and pushing the miner image to {repo} ...");
+        image::build_and_push_image(&coords, &image_version, &repo_root)
     }
 }
 
-/// Resolve the short git commit SHA of `repo_root` for the image version,
-/// falling back to `"unknown"` (matches deploy.sh's `GM_IMAGE_VERSION`).
+/// Resolve the short git commit SHA of `repo_root` for the image version
+/// (`GM_IMAGE_VERSION` build arg), falling back to `"unknown"`.
 fn git_short_sha(repo_root: &std::path::Path) -> String {
     std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -697,9 +608,8 @@ fn cmd_set_api_keys(
 async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
-    dstack: &dyn gm_miner_cli::deploy::DstackClient,
+    phala: &dyn PhalaClient,
     args: &DeployArgs,
-    gcp: &GcpConfig,
 ) -> Result<()> {
     // Step 1: ensure provider keys are configured.
     let keys = cfg
@@ -720,9 +630,14 @@ async fn cmd_deploy(
     // re-deploys (Mechanism 1 of attestation-and-identity.md).
     let node_secret = resolve_node_secret(cfg.active_network())?;
 
-    // Step 2: auth preflight. `dstack-cloud deploy` is slow and irreversible
-    // for the operator (CVM created, GCS bytes uploaded), so we refuse to
-    // start the deploy unless the registry will accept the eventual
+    // Step 1c: preflight that the `phala` CLI is installed. It is the
+    // runtime dependency of the deploy — catch a missing CLI now, with an
+    // install hint, before the multi-minute image build.
+    preflight_phala_cli()?;
+
+    // Step 2: auth preflight. The Phala Cloud deploy is slow and
+    // irreversible for the operator (CVM created), so we refuse to start
+    // the deploy unless the registry will accept the eventual
     // `register-image` call. The preflight is a cheap `GET /miners/me` —
     // a missing token / 401 fails fast with an actionable message before
     // any CVM work.
@@ -741,46 +656,33 @@ async fn cmd_deploy(
         format_created_at(&approved.created_at),
     );
 
-    // Steps 5-7: prepare the deploy target. The dstack project is
-    // bootstrapped (or its existing app.json trust-validated) *before* the
-    // multi-minute image build+push, so a fresh-machine bootstrap failure is
-    // hit cheaply instead of after a wasted build. `prepare_deploy_target`
-    // then provisions GCP + the image (via `GcpImageProvisioner`, which owns
-    // the build-vs-prebuilt branch) and renders the compose template.
-    let provisioner = GcpImageProvisioner { args, gcp };
-    let rendered = prepare_deploy_target(dstack, &provisioner, &args.app_name, gcp)?;
+    // Step 5: prepare the deploy target — build and push the miner image
+    // to the public registry (or accept a pre-built `--image-ref`) and
+    // render the compose template with the digest-pinned ref.
+    let provisioner = PublicRegistryProvisioner { args };
+    let rendered = prepare_deploy_target(&provisioner)?;
 
-    // Step 8: pull the dstack-cloud OS image referenced by the deploy.
-    // Use the single resolved `project_dir` (honours `--dist-dir`) so the
-    // pull runs in the same directory `RealDstackClient` deploys from.
-    let os_image_url = args
-        .os_image_url
-        .clone()
-        .unwrap_or_else(|| gm_miner_cli::gcp::DEFAULT_DSTACK_OS_IMAGE_URL.to_owned());
-    println!("Pulling the dstack-cloud OS image ...");
-    gm_miner_cli::gcp::pull_os_image(&os_image_url, &args.project_dir)?;
-
-    // Step 9: deploy via dstack-cloud, polling until hashes appear.
-    // On re-deploy the deploy() call also refreshes gcp_config before running
-    // `dstack-cloud deploy` so GCP coordinates stay current.
+    // Step 6: submit the compose stack to Phala Cloud and poll until the
+    // CVM reports its measured hashes. Phala Cloud provisions the TEEPod,
+    // runs the KMS, encrypts the env vars client-side to the CVM key, and
+    // assigns the `app_id`.
     println!(
-        "Deploying via dstack-cloud (boot timeout: {}s) ...",
+        "Deploying to Phala Cloud (boot timeout: {}s) ...",
         args.boot_timeout_secs
     );
-    let actual = dstack.deploy(&rendered, keys, &node_secret, gcp, args.boot_timeout_secs)?;
+    let actual = phala.deploy(&rendered, keys, &node_secret, args.boot_timeout_secs)?;
 
-    // Step 10: verify hashes. The returned hashes are normalized
+    // Step 7: verify hashes. The returned hashes are normalized
     // (lowercased, `sha256:` prefix stripped) so the loud check and the
-    // registration in step 11 agree on the exact value.
+    // registration in step 8 agree on the exact value.
     println!("Verifying hashes against registry approval ...");
     let verified = verify_hashes(&actual, approved)?;
     println!("  compose_hash  : OK ({})", verified.compose_sha256);
     println!("  os_image_hash : OK ({})", verified.os_image_hash);
 
-    // Step 11: register the image, carrying the node secret so the
+    // Step 8: register the image, carrying the node secret so the
     // registry stores it and serves it to the gateway. The hashes are
-    // already verified against the registry approval, so POST directly
-    // rather than re-reading dstack status.
+    // already verified against the registry approval, so POST directly.
     println!("Registering image with the registry ...");
     post_register_image(
         client,
@@ -863,38 +765,48 @@ async fn cmd_login(
 /// the registry without a full redeploy.
 ///
 /// Auto-discovers the deployed `compose_hash` + `os_image_hash` by reading
-/// `dstack-cloud status --json` for the dstack app at `project_dir` (the
-/// same status read `gm-miner deploy` performs), then POSTs them — and the
-/// persisted node secret — to `/miners/register`.
+/// `phala cvms get <app-id> --json` (the same CVM-detail read `gm-miner
+/// deploy` performs), then POSTs them — and the persisted node secret —
+/// to `/miners/register`.
 ///
-/// Fails with an actionable error if the dstack app is not deployed or its
-/// hashes are not yet populated.
+/// Fails with an actionable error if the CVM is not deployed or its
+/// measured hashes are not yet populated.
 async fn cmd_register_image(
     client: &mut RegistryClient,
-    app_name: &str,
-    project_dir: &std::path::Path,
+    app_id: &str,
     node_secret: Option<&str>,
 ) -> Result<()> {
-    let dstack = gm_miner_cli::deploy::RealDstackClient {
-        app_name: app_name.to_owned(),
-        project_dir: project_dir.to_path_buf(),
-    };
-    let hashes = dstack
-        .current_hashes()
-        .context("read deployed miner hashes from dstack-cloud status")?
+    preflight_phala_cli()?;
+
+    let out = std::process::Command::new("phala")
+        .args(["cvms", "get", app_id, "--json"])
+        .output()
+        .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
+    if !out.status.success() {
+        bail!(
+            "phala cvms get {app_id} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    let hashes = parse_phala_cvm_detail(out.status.success(), &out.stdout)
+        .context("read deployed miner hashes from phala cvms get")?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no deployed miner found for app '{app_name}' \
-                 (no compose/os-image hashes in `dstack-cloud status --json` \
-                 for {dir}); deploy first with `gm-miner deploy`",
-                dir = project_dir.display()
+                "no measured hashes for CVM '{app_id}' \
+                 (compose_hash/os_image_hash not present in \
+                 `phala cvms get {app_id} --json`); \
+                 deploy first with `gm-miner deploy`"
             )
         })?;
 
+    // Normalize before POST: `phala cvms get` may report a `sha256:`-prefixed
+    // hash, but the registry's `/miners/register` only accepts bare lowercase
+    // hex.
     post_register_image(
         client,
-        &hashes.compose_sha256,
-        &hashes.os_image_hash,
+        &normalize_hash(&hashes.compose_sha256),
+        &normalize_hash(&hashes.os_image_hash),
         node_secret,
     )
     .await
