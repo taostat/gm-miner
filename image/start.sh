@@ -17,11 +17,13 @@
 # capability failure for the affected provider. The 501 fallback in
 # envoy.yaml fires only when no provider header arrives.
 #
-# Process supervision: attestd runs in the background. If it exits the
+# Process supervision: attestd and envoy both run in the background;
+# this script stays PID 1 and `wait -n`s on both. When either exits the
 # whole container exits non-zero so the runtime's `restart:
-# unless-stopped` policy recreates it — a miner with a dead attestation
-# server fails the registry's attestation check and gets suspended, so
-# crashing fast and recovering is the correct behaviour.
+# unless-stopped` policy recreates the stack — a miner missing either
+# process cannot serve the registry, so crashing fast and recovering is
+# the correct behaviour. The exit log names which process died and its
+# status, so a genuine crash is diagnosable from `phala cvms logs`.
 
 set -euo pipefail
 
@@ -92,14 +94,6 @@ log "starting attestation server on ${ATTESTD_BIND_ADDR}"
 gm-miner-attestd &
 ATTESTD_PID=$!
 
-# If attestd dies, terminate envoy so the container exits and the
-# runtime restarts the whole stack.
-monitor_attestd() {
-  wait "${ATTESTD_PID}" 2>/dev/null || true
-  log "error: attestation server exited — stopping container"
-  kill -TERM "${ENVOY_PID}" 2>/dev/null || true
-}
-
 # ── Launch envoy ──────────────────────────────────────────────────────
 # Not `exec`d: the script stays PID 1 so it can supervise both
 # processes. SIGTERM from the container runtime is forwarded to both.
@@ -117,13 +111,46 @@ shutdown() {
 }
 trap shutdown TERM INT
 
-monitor_attestd &
+# ── Supervise both processes ──────────────────────────────────────────
+# `wait -n` blocks until *either* child exits, then returns that child's
+# status. It must run in this (the main) shell: `wait` can only reap a
+# shell's own children, so a backgrounded `( wait "$PID" )` subshell
+# sees neither attestd nor envoy as its child and returns 127
+# immediately — falsely reporting the process dead. Whichever process
+# exits first, the container must come down so the runtime's
+# `restart: unless-stopped` policy recreates the whole stack: a miner
+# missing either envoy or attestd cannot serve the registry.
+#
+# `|| FIRST_EXIT_STATUS=$?` captures the exited child's status AND keeps
+# `set -e` from aborting the script the instant a process exits
+# non-zero — without it the diagnostic block below never runs and the
+# exit cause is never logged.
+FIRST_EXIT_STATUS=0
+wait -n "${ATTESTD_PID}" "${ENVOY_PID}" || FIRST_EXIT_STATUS=$?
 
-# Exit with envoy's status. `wait` on a specific PID returns that
-# process's exit code; a non-zero code propagates so the runtime's
-# restart policy fires.
-wait "${ENVOY_PID}"
-ENVOY_STATUS=$?
-kill -TERM "${ATTESTD_PID}" 2>/dev/null || true
-log "envoy exited with status ${ENVOY_STATUS}"
-exit "${ENVOY_STATUS}"
+# Name the process that exited so the log states the real cause. `kill
+# -0` succeeds only while a pid is still alive; the dead one is the one
+# that triggered the `wait -n` return.
+if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
+  log "error: attestation server exited (status ${FIRST_EXIT_STATUS}) — stopping container"
+elif ! kill -0 "${ENVOY_PID}" 2>/dev/null; then
+  log "error: envoy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
+else
+  log "error: a supervised process exited (status ${FIRST_EXIT_STATUS}) — stopping container"
+fi
+
+# Stop the survivor and reap it before exiting.
+kill -TERM "${ATTESTD_PID}" "${ENVOY_PID}" 2>/dev/null || true
+wait 2>/dev/null || true
+
+# Always exit non-zero so the container runtime's `restart:
+# unless-stopped` policy recreates the stack. A supervised process
+# exiting *at all* — even with a clean status 0 (a graceful or
+# self-initiated shutdown) — leaves the miner missing one of its two
+# required services, which is a failure. The exit code is only a
+# diagnostic detail: surface it when it is non-zero, otherwise exit 1
+# so a status-0 child exit is still treated as a container failure.
+if [[ "${FIRST_EXIT_STATUS}" -ne 0 ]]; then
+  exit "${FIRST_EXIT_STATUS}"
+fi
+exit 1

@@ -35,7 +35,12 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8081";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Log to stderr, not stdout: the container entrypoint (start.sh)
+    // also logs to stderr, so a single stream keeps attestd's and the
+    // entrypoint's lines correctly interleaved in `phala cvms logs`,
+    // and an anyhow fatal-error printout (also stderr) lands in order.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -47,19 +52,28 @@ async fn main() -> Result<()> {
     let bind_addr =
         std::env::var("GM_ATTESTD_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_owned());
     let dstack_socket = std::env::var("DSTACK_SOCKET").ok();
+    tracing::info!(
+        miner_id = %miner_id,
+        bind_addr = %bind_addr,
+        dstack_socket = dstack_socket.as_deref().unwrap_or("<sdk default>"),
+        "attestd starting",
+    );
 
     // TEE-bound signing keypair. Derived from the dstack-KMS sealed key;
-    // a redeploy of the same image yields the same pubkey.
+    // a redeploy of the same image yields the same pubkey. Each dstack
+    // step is logged before it runs so a hang or a kill mid-bootstrap
+    // is visible in the container log.
+    tracing::info!("bootstrapping attestation keypair from dstack get_key");
     let keypair = SigningKeypair::bootstrap(&miner_id, dstack_socket.as_deref())
         .await
         .context("bootstrap miner attestation keypair from dstack")?;
     tracing::info!(
-        miner_id = %miner_id,
         miner_pubkey = %keypair.public_b64(),
         "attestation keypair bootstrapped",
     );
 
     // Fetch the static CVM attestation fields once at startup.
+    tracing::info!("fetching static CVM fields from dstack info");
     let provider: AppState = Arc::new(
         DstackAttestationProvider::bootstrap(miner_id.clone(), keypair, dstack_socket)
             .await
