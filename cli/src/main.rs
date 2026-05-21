@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use gm_miner_cli::{
     auth,
-    client::RegistryClient,
+    client::{get_auth_config, RegistryClient},
     config::{self, Config, ProviderKeys, TokenEntry},
     deploy::{
         fetch_supported_versions, format_created_at, prepare_deploy_target, select_version,
@@ -822,7 +822,21 @@ async fn cmd_login(
 
     let api_url = api_url_override.unwrap_or_else(|| cfg.api_url());
 
-    let token = auth::device_login(&api_url, open_browser).await?;
+    // Fetch OAuth endpoints and client identity from the registry. Nothing
+    // auth-related is baked into the binary — it all comes from the registry
+    // at login time.
+    let auth_cfg = get_auth_config(&api_url)
+        .await
+        .with_context(|| format!("fetch auth config from {api_url}/auth/config"))?;
+
+    let token = auth::device_login(
+        &auth_cfg.device_code_url,
+        &auth_cfg.token_url,
+        &auth_cfg.client_id,
+        &auth_cfg.scopes,
+        open_browser,
+    )
+    .await?;
 
     let entry = cfg.active_entry_mut();
     entry.api_url = Some(api_url);
