@@ -20,15 +20,20 @@
 //!   4. Select the newest supported version (or a pinned one if `--version`
 //!      given).
 //!   5. Prepare the deploy target ([`prepare_deploy_target`]): build and
-//!      push the miner image to a public registry (or accept a pre-built
+//!      push the miner image to a registry (or accept a pre-built
 //!      `--image-ref`), then render the bundled `dstack/docker-compose.yaml`
-//!      template with the digest-pinned ref.
+//!      template with the digest-pinned ref. Resolve private-registry pull
+//!      credentials from the image ref's host plus the operator-set
+//!      `GHCR_PULL_USERNAME` / `GHCR_PULL_TOKEN` env vars.
 //!   6. Submit the compose stack to Phala Cloud (via the [`PhalaClient`]
-//!      trait for testability), wait for the CVM to boot, and read back
-//!      the measured `compose_hash` + `os_image_hash`.
-//!   7. **Verify** both match the registry's approved version — refuse and
-//!      exit 1 if they don't.
-//!   8. Call `register_image` with the verified hashes.
+//!      trait for testability) — with a production OS image (`--image` +
+//!      `--no-dev-os`), the corrected digest-aware pre-launch script, and
+//!      the registry pull credentials in the encrypted env — wait for the
+//!      CVM to boot, and read back the measured `compose_hash` +
+//!      `os_image_hash` and the CVM's public endpoint.
+//!   7. **Verify** both hashes match the registry's approved version —
+//!      refuse and exit 1 if they don't.
+//!   8. Call `register_image` with the verified hashes and the endpoint.
 
 use anyhow::{bail, Context, Result};
 use chrono::DateTime;
@@ -71,6 +76,18 @@ pub struct DstackDeployResult {
     pub os_image_hash: String,
 }
 
+/// Everything `gm-miner deploy` needs back from a Phala Cloud deploy: the
+/// CVM's measured hashes (verified against the registry allow-list) and
+/// the CVM's public endpoint (sent to the registry on registration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployOutcome {
+    /// Measured `compose_hash` + `os_image_hash` for the CVM.
+    pub hashes: DstackDeployResult,
+    /// The CVM's public endpoint (`endpoints[0].app`), e.g.
+    /// `https://<app-id>-8080.dstack-<node>.phala.network`.
+    pub endpoint: String,
+}
+
 /// Abstraction over the `phala` CLI, injectable for tests.
 ///
 /// The real implementation ([`RealPhalaClient`]) shells out to
@@ -84,19 +101,23 @@ pub trait PhalaClient {
     /// the operator's provider API keys, encrypted client-side to the CVM
     /// key by `phala deploy`. `node_secret` is the miner's node secret
     /// (Mechanism 1 of `docs/plans/attestation-and-identity.md`), passed in
-    /// the same encrypted env as `GM_NODE_SECRET`. `boot_timeout_secs`
-    /// controls how long to poll for the measured hashes before giving up.
+    /// the same encrypted env as `GM_NODE_SECRET`. `registry_creds`, when
+    /// present, are private-registry pull credentials written into the
+    /// same encrypted env so the CVM's pre-launch script can `docker login`
+    /// and pull the (private) miner image. `boot_timeout_secs` controls how
+    /// long to poll for the measured hashes before giving up.
     ///
     /// # Errors
-    /// Returns an error if the deploy fails or the hashes cannot be read
-    /// back within `boot_timeout_secs`.
+    /// Returns an error if the deploy fails or the hashes/endpoint cannot
+    /// be read back within `boot_timeout_secs`.
     fn deploy(
         &self,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
         node_secret: &str,
+        registry_creds: Option<&RegistryCredentials>,
         boot_timeout_secs: u64,
-    ) -> Result<DstackDeployResult>;
+    ) -> Result<DeployOutcome>;
 }
 
 // ── Image provisioning abstraction ────────────────────────────────────────────
@@ -117,6 +138,17 @@ pub trait ImageProvisioner {
     fn provision(&self) -> Result<String>;
 }
 
+/// A prepared deploy target: the digest-pinned miner image ref and the
+/// compose file rendered to embed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployTarget {
+    /// Digest-pinned miner image reference, e.g.
+    /// `ghcr.io/owner/gm-miner@sha256:...`.
+    pub image_ref: String,
+    /// `docker-compose.yaml` content with `${GM_IMAGE_REF}` substituted.
+    pub rendered_compose: String,
+}
+
 /// Prepare the deploy target: provision the miner image, then render the
 /// compose file with the digest-pinned ref.
 ///
@@ -124,17 +156,108 @@ pub trait ImageProvisioner {
 /// it can be integration-tested against real code rather than a
 /// re-implemented copy of the branch logic.
 ///
-/// Returns the rendered `docker-compose.yaml` content (image ref pinned).
+/// Returns the digest-pinned image ref (needed to derive the registry
+/// pull credentials) and the rendered `docker-compose.yaml` content.
 ///
 /// # Errors
 /// Returns an error if image provisioning or compose rendering fails.
-pub fn prepare_deploy_target(provisioner: &dyn ImageProvisioner) -> Result<String> {
+pub fn prepare_deploy_target(provisioner: &dyn ImageProvisioner) -> Result<DeployTarget> {
     // Build/push the image (or accept a pre-built ref). The
     // build-vs-prebuilt branch lives entirely inside the `ImageProvisioner`.
     let image_ref = provisioner.provision()?;
 
     // Render the compose template with the digest-pinned ref.
-    render_compose(COMPOSE_TEMPLATE, &image_ref)
+    let rendered_compose = render_compose(COMPOSE_TEMPLATE, &image_ref)?;
+
+    Ok(DeployTarget {
+        image_ref,
+        rendered_compose,
+    })
+}
+
+// ── Private-registry pull credentials ─────────────────────────────────────────
+
+/// Default OS image passed to `phala deploy --image`.
+///
+/// The OS image version must match the dstack version of the Phala node
+/// the CVM lands on. The current prod nodes (prod5/prod9) run dstack
+/// v0.5.7, so `dstack-0.5.7` is the working default; `dstack-0.5.10`
+/// returns "no available resources".
+pub const DEFAULT_OS_IMAGE: &str = "dstack-0.5.7";
+
+/// Environment variable carrying the GHCR pull username.
+pub const GHCR_PULL_USERNAME_VAR: &str = "GHCR_PULL_USERNAME";
+/// Environment variable carrying the GHCR pull token (`read:packages`).
+pub const GHCR_PULL_TOKEN_VAR: &str = "GHCR_PULL_TOKEN";
+
+/// Pull credentials for a private container registry, written into the
+/// `phala deploy` env file so the CVM's pre-launch script can `docker
+/// login` and pull the miner image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryCredentials {
+    /// Registry host the credentials authenticate against, e.g. `ghcr.io`.
+    pub registry: String,
+    /// Registry username.
+    pub username: String,
+    /// Registry password / token.
+    pub password: String,
+}
+
+/// Extract the registry host from a container image reference.
+///
+/// A registry host is the first `/`-separated component, but only when it
+/// looks like a host (contains a `.` or `:`, or is the literal
+/// `localhost`). A ref with no such component — e.g. `library/alpine` —
+/// resolves to Docker Hub (`docker.io`), which is public.
+#[must_use]
+pub fn registry_host(image_ref: &str) -> String {
+    let first = image_ref.split('/').next().unwrap_or(image_ref);
+    if first == "localhost" || first.contains('.') || first.contains(':') {
+        first.to_owned()
+    } else {
+        "docker.io".to_owned()
+    }
+}
+
+/// Resolve private-registry pull credentials for `image_ref`.
+///
+/// Returns `Ok(None)` when the image lives on Docker Hub (`docker.io`),
+/// which is treated as public — no credentials are wired. For any other
+/// registry host the miner image is assumed private, so the operator-set
+/// `GHCR_PULL_USERNAME` / `GHCR_PULL_TOKEN` environment variables are
+/// required.
+///
+/// # Errors
+/// Returns an actionable error if the image is on a private registry and
+/// either credential environment variable is unset or empty.
+pub fn resolve_registry_credentials(image_ref: &str) -> Result<Option<RegistryCredentials>> {
+    let registry = registry_host(image_ref);
+    if registry == "docker.io" {
+        return Ok(None);
+    }
+
+    let username = non_empty_env(GHCR_PULL_USERNAME_VAR);
+    let password = non_empty_env(GHCR_PULL_TOKEN_VAR);
+
+    match (username, password) {
+        (Some(username), Some(password)) => Ok(Some(RegistryCredentials {
+            registry,
+            username,
+            password,
+        })),
+        _ => bail!(
+            "the miner image is on the private registry `{registry}` but the pull \
+             credentials are not set.\n  \
+             set {GHCR_PULL_USERNAME_VAR} and {GHCR_PULL_TOKEN_VAR} (a `read:packages` \
+             token) so the CVM can authenticate and pull the image"
+        ),
+    }
+}
+
+/// Read an environment variable, returning `None` when it is unset or
+/// whitespace-only.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
 // ── Real `phala` CLI implementation ───────────────────────────────────────────
@@ -150,6 +273,9 @@ pub struct RealPhalaClient {
     pub instance_type: String,
     /// Disk size for the CVM (`phala deploy --disk-size`).
     pub disk_size: String,
+    /// Production OS image for the CVM (`phala deploy --image`). Must match
+    /// the dstack version of the Phala node the CVM lands on.
+    pub os_image: String,
 }
 
 impl RealPhalaClient {
@@ -160,12 +286,14 @@ impl RealPhalaClient {
         project_dir: std::path::PathBuf,
         instance_type: impl Into<String>,
         disk_size: impl Into<String>,
+        os_image: impl Into<String>,
     ) -> Self {
         Self {
             app_name: app_name.into(),
             project_dir,
             instance_type: instance_type.into(),
             disk_size: disk_size.into(),
+            os_image: os_image.into(),
         }
     }
 }
@@ -182,19 +310,28 @@ struct PhalaDeployOutput {
 /// The CVM detail document returned by `phala cvms get <app-id> --json`.
 ///
 /// Field path is the verified shape of the Phala Cloud CVM-detail schema:
-/// the canonical compose hash is the top-level `compose_hash`, and the OS
-/// image hash is nested under `os.os_image_hash`. Both are read here; the
-/// registry allow-list is keyed on exactly these two values.
+/// the canonical compose hash is the top-level `compose_hash`, the OS
+/// image hash is nested under `os.os_image_hash`, and the CVM's public
+/// endpoint is `endpoints[0].app`. All three are read here.
 #[derive(Debug, Deserialize)]
 struct PhalaCvmDetail {
     compose_hash: Option<String>,
     os: Option<PhalaCvmOs>,
+    #[serde(default)]
+    endpoints: Vec<PhalaCvmEndpoint>,
 }
 
 /// The `os` sub-object of [`PhalaCvmDetail`].
 #[derive(Debug, Deserialize)]
 struct PhalaCvmOs {
     os_image_hash: Option<String>,
+}
+
+/// An entry of the `endpoints` array of [`PhalaCvmDetail`]. `app` is the
+/// public URL of the miner's envoy data plane (the `:8080` mapped port).
+#[derive(Debug, Deserialize)]
+struct PhalaCvmEndpoint {
+    app: Option<String>,
 }
 
 /// JSON-path documentation for the measured hashes, kept as a constant so
@@ -208,6 +345,38 @@ struct PhalaCvmOs {
 pub const PHALA_COMPOSE_HASH_FIELD: &str = "compose_hash";
 /// See [`PHALA_COMPOSE_HASH_FIELD`]; the OS image hash field path.
 pub const PHALA_OS_IMAGE_HASH_FIELD: &str = "os.os_image_hash";
+/// See [`PHALA_COMPOSE_HASH_FIELD`]; the miner endpoint field path.
+pub const PHALA_ENDPOINT_FIELD: &str = "endpoints[0].app";
+
+/// Parse the miner's public endpoint out of `phala cvms get <app-id>
+/// --json` output.
+///
+/// `succeeded` is the command's exit status; `stdout` is its raw stdout.
+/// The endpoint is `endpoints[0].app` — the public URL of the CVM's envoy
+/// data plane, e.g. `https://<app-id>-8080.dstack-<node>.phala.network`.
+///
+/// Returns `Ok(Some(..))` only when the command succeeded and the
+/// endpoint is present and non-empty; `Ok(None)` when the command exited
+/// non-zero or the endpoint is still absent/empty.
+///
+/// # Errors
+/// Returns an error if `succeeded` is true but `stdout` is not valid
+/// `cvms get --json` JSON.
+pub fn parse_phala_cvm_endpoint(succeeded: bool, stdout: &[u8]) -> Result<Option<String>> {
+    if !succeeded {
+        return Ok(None);
+    }
+
+    let detail: PhalaCvmDetail =
+        serde_json::from_slice(stdout).context("parse phala cvms get --json output")?;
+
+    Ok(detail
+        .endpoints
+        .into_iter()
+        .next()
+        .and_then(|e| e.app)
+        .filter(|app| !app.is_empty()))
+}
 
 /// Parse the measured hashes out of `phala cvms get <app-id> --json` output.
 ///
@@ -247,51 +416,74 @@ pub fn parse_phala_cvm_detail(
     }
 }
 
+/// Inputs for [`build_phala_deploy_args`], grouped so the call site does
+/// not need a long positional list.
+#[derive(Debug, Clone, Copy)]
+pub struct PhalaDeployArgs<'a> {
+    /// CVM name (`--name`).
+    pub app_name: &'a str,
+    /// Instance type (`--instance-type`).
+    pub instance_type: &'a str,
+    /// Disk size (`--disk-size`).
+    pub disk_size: &'a str,
+    /// Production OS image (`--image`).
+    pub os_image: &'a str,
+    /// Rendered compose file path (`--compose`).
+    pub compose_path: &'a str,
+    /// Env file path (`--env`).
+    pub env_path: &'a str,
+    /// Pre-launch script path (`--pre-launch-script`).
+    pub prelaunch_path: &'a str,
+}
+
 /// Build the argument list for `phala deploy`.
 ///
 /// `phala deploy` submits a Docker Compose stack to Phala Cloud, which
 /// provisions the `TEEPod`, runs the KMS, encrypts the env file client-side
 /// to the CVM key, and assigns the `app_id`. The flags pin the CVM name,
-/// instance type, disk size, compose file, and env file, and request JSON
-/// output plus `--wait` so the call returns only once the CVM is up.
+/// instance type, disk size, compose file, env file, and the corrected
+/// pre-launch script, request a production OS image (`--image` plus
+/// `--no-dev-os` — never a `dstack-dev-*` image for an attested miner),
+/// and request JSON output plus `--wait` so the call returns only once the
+/// CVM is up.
 ///
 /// Extracted from [`RealPhalaClient::deploy`] so the wiring can be asserted
 /// without spawning a subprocess.
 #[must_use]
-pub fn build_phala_deploy_args(
-    app_name: &str,
-    instance_type: &str,
-    disk_size: &str,
-    compose_path: &str,
-    env_path: &str,
-) -> Vec<String> {
+pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
     vec![
         "deploy".to_owned(),
         "--name".to_owned(),
-        app_name.to_owned(),
+        args.app_name.to_owned(),
         "--instance-type".to_owned(),
-        instance_type.to_owned(),
+        args.instance_type.to_owned(),
         "--disk-size".to_owned(),
-        disk_size.to_owned(),
+        args.disk_size.to_owned(),
+        "--image".to_owned(),
+        args.os_image.to_owned(),
+        "--no-dev-os".to_owned(),
         "--compose".to_owned(),
-        compose_path.to_owned(),
+        args.compose_path.to_owned(),
         "--env".to_owned(),
-        env_path.to_owned(),
+        args.env_path.to_owned(),
+        "--pre-launch-script".to_owned(),
+        args.prelaunch_path.to_owned(),
         "--wait".to_owned(),
         "--json".to_owned(),
     ]
 }
 
-/// Run `phala cvms get <app-id> --json` once and parse the measured
-/// `compose_hash` + `os.os_image_hash` via [`parse_phala_cvm_detail`].
+/// Run `phala cvms get <app-id> --json` once and parse the full deploy
+/// outcome — measured `compose_hash` + `os.os_image_hash` + the public
+/// endpoint — from the single CVM-detail document.
 ///
 /// Returns `Ok(None)` when the command exited non-zero (the CVM is not
-/// ready) or when either hash is still absent/empty.
+/// ready) or when either hash or the endpoint is still absent/empty.
 ///
 /// # Errors
 /// Returns an error only if `phala` cannot be spawned, or it exits
 /// successfully but emits output that is not valid `cvms get --json` JSON.
-fn read_phala_cvm_detail(app_id: &str) -> Result<Option<DstackDeployResult>> {
+fn read_phala_cvm_outcome(app_id: &str) -> Result<Option<DeployOutcome>> {
     let out = std::process::Command::new("phala")
         .args(["cvms", "get", app_id, "--json"])
         .output()
@@ -304,7 +496,14 @@ fn read_phala_cvm_detail(app_id: &str) -> Result<Option<DstackDeployResult>> {
         );
     }
 
-    parse_phala_cvm_detail(out.status.success(), &out.stdout)
+    let succeeded = out.status.success();
+    let Some(hashes) = parse_phala_cvm_detail(succeeded, &out.stdout)? else {
+        return Ok(None);
+    };
+    let Some(endpoint) = parse_phala_cvm_endpoint(succeeded, &out.stdout)? else {
+        return Ok(None);
+    };
+    Ok(Some(DeployOutcome { hashes, endpoint }))
 }
 
 impl PhalaClient for RealPhalaClient {
@@ -313,8 +512,9 @@ impl PhalaClient for RealPhalaClient {
         compose_yaml: &str,
         env_vars: &ProviderKeys,
         node_secret: &str,
+        registry_creds: Option<&RegistryCredentials>,
         boot_timeout_secs: u64,
-    ) -> Result<DstackDeployResult> {
+    ) -> Result<DeployOutcome> {
         use std::fs;
 
         fs::create_dir_all(&self.project_dir)
@@ -325,21 +525,31 @@ impl PhalaClient for RealPhalaClient {
         fs::write(&compose_path, compose_yaml)
             .with_context(|| format!("write {}", compose_path.display()))?;
 
+        // Write the corrected, digest-aware pre-launch script. Phala
+        // Cloud's auto-injected v0.0.14 script mis-parses digest-pinned
+        // image refs; this bundled copy fixes that.
+        let prelaunch_path = self.project_dir.join("prelaunch.sh");
+        fs::write(&prelaunch_path, PRELAUNCH_SCRIPT)
+            .with_context(|| format!("write {}", prelaunch_path.display()))?;
+
         // Write the env file at mode 0600 so the secrets are never visible
         // with broader permissions. `phala deploy` reads this file and
         // encrypts its contents client-side to the CVM key.
         let env_path = self.project_dir.join(".env");
-        write_env_file(&env_path, env_vars, node_secret)?;
+        write_env_file(&env_path, env_vars, node_secret, registry_creds)?;
 
         let compose_arg = compose_path.to_string_lossy().into_owned();
         let env_arg = env_path.to_string_lossy().into_owned();
-        let args = build_phala_deploy_args(
-            &self.app_name,
-            &self.instance_type,
-            &self.disk_size,
-            &compose_arg,
-            &env_arg,
-        );
+        let prelaunch_arg = prelaunch_path.to_string_lossy().into_owned();
+        let args = build_phala_deploy_args(&PhalaDeployArgs {
+            app_name: &self.app_name,
+            instance_type: &self.instance_type,
+            disk_size: &self.disk_size,
+            os_image: &self.os_image,
+            compose_path: &compose_arg,
+            env_path: &env_arg,
+            prelaunch_path: &prelaunch_arg,
+        });
 
         let out = std::process::Command::new("phala")
             .args(&args)
@@ -356,22 +566,22 @@ impl PhalaClient for RealPhalaClient {
         let app_id = parse_phala_deploy_output(&out.stdout)?;
         println!("Phala Cloud assigned app_id {app_id}; waiting for the CVM to report hashes ...");
 
-        // Poll `phala cvms get` until both measured hashes are populated.
-        // `phala deploy --wait` returns once the CVM is up, but the
-        // platform may take a few more seconds to publish the measured
-        // hashes in the CVM detail document.
-        poll_phala_cvm_detail(&app_id, boot_timeout_secs)
+        // Poll `phala cvms get` until the measured hashes and the public
+        // endpoint are all populated. `phala deploy --wait` returns once
+        // the CVM is up, but the platform may take a few more seconds to
+        // publish them in the CVM detail document.
+        poll_phala_cvm_outcome(&app_id, boot_timeout_secs)
     }
 }
 
 /// Poll `phala cvms get <app-id> --json` every [`POLL_INTERVAL_SECS`]
-/// seconds until both `compose_hash` and `os.os_image_hash` are non-empty,
-/// or until `timeout_secs` elapses.
+/// seconds until the measured hashes and the public endpoint are all
+/// non-empty, or until `timeout_secs` elapses.
 ///
 /// # Errors
 /// Returns an error if `phala` cannot be spawned, emits unparseable JSON,
-/// or the hashes never appear before `timeout_secs` elapses.
-fn poll_phala_cvm_detail(app_id: &str, timeout_secs: u64) -> Result<DstackDeployResult> {
+/// or the outcome never appears before `timeout_secs` elapses.
+fn poll_phala_cvm_outcome(app_id: &str, timeout_secs: u64) -> Result<DeployOutcome> {
     use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -380,22 +590,22 @@ fn poll_phala_cvm_detail(app_id: &str, timeout_secs: u64) -> Result<DstackDeploy
 
     loop {
         attempt += 1;
-        if let Some(result) = read_phala_cvm_detail(app_id)? {
-            return Ok(result);
+        if let Some(outcome) = read_phala_cvm_outcome(app_id)? {
+            return Ok(outcome);
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             bail!(
                 "timed out after {timeout_secs}s waiting for the CVM to report \
-                 hashes (compose_hash/os_image_hash never appeared in \
-                 `phala cvms get {app_id} --json`); \
+                 its hashes and endpoint (compose_hash/os_image_hash/endpoint \
+                 never appeared in `phala cvms get {app_id} --json`); \
                  increase --boot-timeout-secs or check the Phala Cloud dashboard"
             );
         }
 
         let sleep = remaining.min(poll);
-        tracing::debug!(attempt, ?sleep, "hashes not yet available; waiting");
+        tracing::debug!(attempt, ?sleep, "deploy outcome not yet available; waiting");
         std::thread::sleep(sleep);
     }
 }
@@ -420,21 +630,17 @@ fn parse_phala_deploy_output(stdout: &[u8]) -> Result<String> {
         .context("phala deploy succeeded but returned no app_id")
 }
 
-/// Write the provider keys + node secret to `env_path` at mode 0600.
+/// Render the `phala deploy` env file body from the provider keys, node
+/// secret, and (optional) private-registry pull credentials.
 ///
-/// Uses a temp-file-then-rename so the target file is always at mode 0600
-/// from the moment it exists — no window where a partially-written or
-/// broader-permission file is present on disk.
-fn write_env_file(
-    env_path: &std::path::Path,
+/// Extracted as a pure function so the exact env-file contents can be
+/// asserted in tests without touching the filesystem.
+#[must_use]
+pub fn render_env_file(
     env_vars: &ProviderKeys,
     node_secret: &str,
-) -> Result<()> {
-    use std::fs;
-    use std::io::Write as _;
-    #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
+    registry_creds: Option<&RegistryCredentials>,
+) -> String {
     let mut lines = String::new();
     if let Some(k) = &env_vars.anthropic {
         lines.push_str("ANTHROPIC_API_KEY=");
@@ -456,6 +662,42 @@ fn write_env_file(
     lines.push_str("GM_NODE_SECRET=");
     lines.push_str(node_secret);
     lines.push('\n');
+
+    // Private-registry pull credentials, consumed by the CVM's pre-launch
+    // script (`docker login` before pulling the private miner image).
+    if let Some(creds) = registry_creds {
+        lines.push_str("DSTACK_DOCKER_REGISTRY=");
+        lines.push_str(&creds.registry);
+        lines.push('\n');
+        lines.push_str("DSTACK_DOCKER_USERNAME=");
+        lines.push_str(&creds.username);
+        lines.push('\n');
+        lines.push_str("DSTACK_DOCKER_PASSWORD=");
+        lines.push_str(&creds.password);
+        lines.push('\n');
+    }
+
+    lines
+}
+
+/// Write the provider keys + node secret + registry credentials to
+/// `env_path` at mode 0600.
+///
+/// Uses a temp-file-then-rename so the target file is always at mode 0600
+/// from the moment it exists — no window where a partially-written or
+/// broader-permission file is present on disk.
+fn write_env_file(
+    env_path: &std::path::Path,
+    env_vars: &ProviderKeys,
+    node_secret: &str,
+    registry_creds: Option<&RegistryCredentials>,
+) -> Result<()> {
+    use std::fs;
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let lines = render_env_file(env_vars, node_secret, registry_creds);
 
     let parent = env_path
         .parent()
@@ -742,6 +984,16 @@ pub fn preflight_phala_cli() -> Result<()> {
 /// `dstack/docker-compose.yaml` relative to the workspace root.
 pub const COMPOSE_TEMPLATE: &str = include_str!("../../dstack/docker-compose.yaml");
 
+/// The corrected Phala Cloud pre-launch script, bundled at compile time
+/// from `dstack/prelaunch.sh`.
+///
+/// Phala Cloud auto-injects a pre-launch script (v0.0.14) whose GHCR
+/// pull-verification block mis-parses digest-pinned image refs and aborts
+/// the boot with a 404. `gm-miner deploy` always pins images by digest, so
+/// it always passes this corrected, digest-aware script via
+/// `phala deploy --pre-launch-script`.
+pub const PRELAUNCH_SCRIPT: &str = include_str!("../../dstack/prelaunch.sh");
+
 // ── Serialisable `ImageVersion` for tests ────────────────────────────────────
 
 /// Mirror of `ImageVersion` with `Serialize` — only used to build mock
@@ -917,26 +1169,35 @@ mod tests {
 
     // ── phala deploy argument wiring ──────────────────────────────────────────
 
+    fn deploy_args() -> PhalaDeployArgs<'static> {
+        PhalaDeployArgs {
+            app_name: "gm-miner-1",
+            instance_type: "tdx.medium",
+            disk_size: "40G",
+            os_image: "dstack-0.5.7",
+            compose_path: "/tmp/dist/docker-compose.yaml",
+            env_path: "/tmp/dist/.env",
+            prelaunch_path: "/tmp/dist/prelaunch.sh",
+        }
+    }
+
     /// `phala deploy` must be invoked with the compose file, env file,
-    /// instance type, disk size, `--wait`, and `--json` — the env file is
-    /// what carries the (client-side-encrypted) provider keys, and `--json`
-    /// is required so the deploy output can be parsed for `app_id`.
+    /// pre-launch script, instance type, disk size, OS image, `--wait`, and
+    /// `--json` — the env file is what carries the (client-side-encrypted)
+    /// provider keys, and `--json` is required so the deploy output can be
+    /// parsed for `app_id`.
     #[test]
     fn build_phala_deploy_args_wires_every_flag() {
-        let args = build_phala_deploy_args(
-            "gm-miner-1",
-            "tdx.medium",
-            "40G",
-            "/tmp/dist/docker-compose.yaml",
-            "/tmp/dist/.env",
-        );
+        let args = build_phala_deploy_args(&deploy_args());
         assert_eq!(args[0], "deploy");
         let pairs = [
             ("--name", "gm-miner-1"),
             ("--instance-type", "tdx.medium"),
             ("--disk-size", "40G"),
+            ("--image", "dstack-0.5.7"),
             ("--compose", "/tmp/dist/docker-compose.yaml"),
             ("--env", "/tmp/dist/.env"),
+            ("--pre-launch-script", "/tmp/dist/prelaunch.sh"),
         ];
         for (flag, value) in pairs {
             let pos = args.iter().position(|a| a == flag);
@@ -956,6 +1217,131 @@ mod tests {
             args.iter().any(|a| a == "--json"),
             "missing --json in {args:?}"
         );
+    }
+
+    /// An attested miner must never boot a dev OS image: `phala deploy`
+    /// must always carry `--no-dev-os`.
+    #[test]
+    fn build_phala_deploy_args_always_requests_production_os() {
+        let args = build_phala_deploy_args(&deploy_args());
+        assert!(
+            args.iter().any(|a| a == "--no-dev-os"),
+            "missing --no-dev-os in {args:?}"
+        );
+    }
+
+    // ── registry-host derivation ──────────────────────────────────────────────
+
+    #[test]
+    fn registry_host_extracts_ghcr() {
+        assert_eq!(
+            registry_host("ghcr.io/taostat/gm-miner@sha256:abc"),
+            "ghcr.io"
+        );
+    }
+
+    #[test]
+    fn registry_host_extracts_host_with_port() {
+        assert_eq!(
+            registry_host("localhost:5000/gm-miner@sha256:abc"),
+            "localhost:5000"
+        );
+    }
+
+    /// A ref with no host-looking first component is Docker Hub.
+    #[test]
+    fn registry_host_defaults_to_docker_hub() {
+        assert_eq!(registry_host("library/alpine:3"), "docker.io");
+        assert_eq!(registry_host("alpine"), "docker.io");
+    }
+
+    // ── private-registry credential resolution ────────────────────────────────
+
+    /// `resolve_registry_credentials` treats Docker Hub as public — no
+    /// credentials are required or returned.
+    #[test]
+    fn resolve_registry_credentials_skips_docker_hub() {
+        let creds = resolve_registry_credentials("library/alpine:3")
+            .expect("docker hub must not require creds");
+        assert!(creds.is_none(), "docker hub is public — no creds");
+    }
+
+    // ── env-file rendering ────────────────────────────────────────────────────
+
+    #[test]
+    fn render_env_file_writes_node_secret_and_keys() {
+        let keys = ProviderKeys {
+            anthropic: Some("sk-ant".to_owned()),
+            openai: None,
+            google: None,
+        };
+        let body = render_env_file(&keys, "node-secret-xyz", None);
+        assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
+        assert!(body.contains("GM_NODE_SECRET=node-secret-xyz\n"));
+        assert!(
+            !body.contains("DSTACK_DOCKER_"),
+            "no registry creds must be written when none are supplied"
+        );
+    }
+
+    /// When private-registry credentials are supplied, all three
+    /// `DSTACK_DOCKER_*` variables the pre-launch script needs must appear.
+    #[test]
+    fn render_env_file_writes_registry_credentials() {
+        let keys = ProviderKeys::default();
+        let creds = RegistryCredentials {
+            registry: "ghcr.io".to_owned(),
+            username: "miner-bot".to_owned(),
+            password: "ghp_token".to_owned(),
+        };
+        let body = render_env_file(&keys, "node-secret", Some(&creds));
+        assert!(body.contains("DSTACK_DOCKER_REGISTRY=ghcr.io\n"));
+        assert!(body.contains("DSTACK_DOCKER_USERNAME=miner-bot\n"));
+        assert!(body.contains("DSTACK_DOCKER_PASSWORD=ghp_token\n"));
+    }
+
+    // ── phala cvms get endpoint parsing ───────────────────────────────────────
+
+    /// The miner endpoint is `endpoints[0].app` in the CVM-detail document.
+    #[test]
+    fn parse_phala_cvm_endpoint_reads_first_app_url() {
+        let stdout = br#"{
+            "app_id":"app_abc",
+            "endpoints":[
+                {"app":"https://app_abc-8080.dstack-prod5.phala.network"},
+                {"app":"https://other"}
+            ]
+        }"#;
+        let endpoint = parse_phala_cvm_endpoint(true, stdout)
+            .expect("must parse")
+            .expect("endpoint present");
+        assert_eq!(endpoint, "https://app_abc-8080.dstack-prod5.phala.network");
+    }
+
+    #[test]
+    fn parse_phala_cvm_endpoint_non_zero_exit_is_none() {
+        let endpoint =
+            parse_phala_cvm_endpoint(false, b"garbage").expect("non-zero exit must not error");
+        assert!(endpoint.is_none());
+    }
+
+    #[test]
+    fn parse_phala_cvm_endpoint_missing_endpoints_is_none() {
+        let stdout = br#"{"app_id":"app_abc","status":"starting"}"#;
+        let endpoint = parse_phala_cvm_endpoint(true, stdout).expect("must parse");
+        assert!(endpoint.is_none(), "absent endpoints must yield None");
+    }
+
+    #[test]
+    fn parse_phala_cvm_endpoint_empty_app_is_none() {
+        let stdout = br#"{"endpoints":[{"app":""}]}"#;
+        let endpoint = parse_phala_cvm_endpoint(true, stdout).expect("must parse");
+        assert!(endpoint.is_none(), "empty endpoint must yield None");
+    }
+
+    #[test]
+    fn parse_phala_cvm_endpoint_invalid_json_errors() {
+        assert!(parse_phala_cvm_endpoint(true, b"not json").is_err());
     }
 
     // ── phala deploy output parsing ───────────────────────────────────────────
@@ -1044,6 +1430,7 @@ mod tests {
     fn hash_field_path_constants_are_documented() {
         assert_eq!(PHALA_COMPOSE_HASH_FIELD, "compose_hash");
         assert_eq!(PHALA_OS_IMAGE_HASH_FIELD, "os.os_image_hash");
+        assert_eq!(PHALA_ENDPOINT_FIELD, "endpoints[0].app");
     }
 
     // ── prepare_deploy_target ─────────────────────────────────────────────────
@@ -1058,13 +1445,14 @@ mod tests {
                 Ok("ghcr.io/taostat/gm-miner@sha256:deadbeef".to_owned())
             }
         }
-        let rendered = prepare_deploy_target(&StubProvisioner).expect("orchestration must succeed");
+        let target = prepare_deploy_target(&StubProvisioner).expect("orchestration must succeed");
+        assert_eq!(target.image_ref, "ghcr.io/taostat/gm-miner@sha256:deadbeef");
         assert!(
-            rendered.contains("sha256:deadbeef"),
+            target.rendered_compose.contains("sha256:deadbeef"),
             "the provisioner's ref must be pinned into the compose file"
         );
         assert!(
-            !rendered.contains("${GM_IMAGE_REF"),
+            !target.rendered_compose.contains("${GM_IMAGE_REF"),
             "the ${{GM_IMAGE_REF}} placeholder must be substituted"
         );
     }

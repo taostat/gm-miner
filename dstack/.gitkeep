@@ -1,3 +1,5 @@
-# Compose template for the miner workload.
+# Compose template and pre-launch script for the miner workload.
 # - docker-compose.yaml: references the miner image by digest;
 #   `gm-miner deploy` renders ${GM_IMAGE_REF} and submits it to Phala Cloud.
+# - prelaunch.sh: corrected Phala Cloud pre-launch script (digest-aware
+#   GHCR ref parsing); `gm-miner deploy` passes it via --pre-launch-script.

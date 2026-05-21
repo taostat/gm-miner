@@ -28,8 +28,9 @@ use gm_miner_cli::{
     config::{self, Config, ProviderKeys, TokenEntry},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
-        preflight_phala_cli, prepare_deploy_target, select_version, verify_hashes,
-        ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS,
+        parse_phala_cvm_endpoint, preflight_phala_cli, prepare_deploy_target,
+        resolve_registry_credentials, select_version, verify_hashes, ImageProvisioner, PhalaClient,
+        DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE, PHALA_ENDPOINT_FIELD,
     },
     node_secret, picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
@@ -130,6 +131,12 @@ enum Command {
         /// Disk size for the CVM (with unit, e.g. `40G`).
         #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
         disk_size: String,
+
+        /// Production OS image for the CVM (`phala deploy --image`). The
+        /// version must match the dstack version of the Phala node the CVM
+        /// lands on — prod5/prod9 currently run dstack v0.5.7.
+        #[arg(long, env = "PHALA_OS_IMAGE", default_value = DEFAULT_OS_IMAGE)]
+        os_image: String,
 
         /// Repository root used as the Docker build context. Defaults to
         /// the current directory.
@@ -262,6 +269,7 @@ async fn main() -> Result<()> {
             image_tag,
             instance_type,
             disk_size,
+            os_image,
             repo_root,
             boot_timeout_secs,
         } => {
@@ -281,6 +289,7 @@ async fn main() -> Result<()> {
                     image_tag,
                     instance_type,
                     disk_size,
+                    os_image,
                     repo_root,
                     version,
                     boot_timeout_secs,
@@ -450,6 +459,7 @@ struct DeployArgs {
     image_tag: String,
     instance_type: String,
     disk_size: String,
+    os_image: String,
     repo_root: Option<std::path::PathBuf>,
     version: Option<usize>,
     boot_timeout_secs: u64,
@@ -464,6 +474,7 @@ async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
         args.project_dir.clone(),
         args.instance_type.clone(),
         args.disk_size.clone(),
+        args.os_image.clone(),
     );
     let mut client = RegistryClient::new(cfg.clone());
     cmd_deploy(&cfg, &mut client, &phala, &args).await
@@ -657,10 +668,17 @@ async fn cmd_deploy(
     );
 
     // Step 5: prepare the deploy target — build and push the miner image
-    // to the public registry (or accept a pre-built `--image-ref`) and
-    // render the compose template with the digest-pinned ref.
+    // to the registry (or accept a pre-built `--image-ref`) and render the
+    // compose template with the digest-pinned ref.
     let provisioner = PublicRegistryProvisioner { args };
-    let rendered = prepare_deploy_target(&provisioner)?;
+    let target = prepare_deploy_target(&provisioner)?;
+
+    // Step 5b: resolve private-registry pull credentials. The miner image
+    // lives on a private GHCR repo, so the CVM's pre-launch script needs
+    // `DSTACK_DOCKER_*` env vars to `docker login` and pull. Derived from
+    // the image ref's registry host plus the operator-set
+    // GHCR_PULL_USERNAME / GHCR_PULL_TOKEN env vars.
+    let registry_creds = resolve_registry_credentials(&target.image_ref)?;
 
     // Step 6: submit the compose stack to Phala Cloud and poll until the
     // CVM reports its measured hashes. Phala Cloud provisions the TEEPod,
@@ -670,25 +688,36 @@ async fn cmd_deploy(
         "Deploying to Phala Cloud (boot timeout: {}s) ...",
         args.boot_timeout_secs
     );
-    let actual = phala.deploy(&rendered, keys, &node_secret, args.boot_timeout_secs)?;
+    let actual = phala.deploy(
+        &target.rendered_compose,
+        keys,
+        &node_secret,
+        registry_creds.as_ref(),
+        args.boot_timeout_secs,
+    )?;
 
     // Step 7: verify hashes. The returned hashes are normalized
     // (lowercased, `sha256:` prefix stripped) so the loud check and the
     // registration in step 8 agree on the exact value.
     println!("Verifying hashes against registry approval ...");
-    let verified = verify_hashes(&actual, approved)?;
+    let verified = verify_hashes(&actual.hashes, approved)?;
     println!("  compose_hash  : OK ({})", verified.compose_sha256);
     println!("  os_image_hash : OK ({})", verified.os_image_hash);
 
     // Step 8: register the image, carrying the node secret so the
-    // registry stores it and serves it to the gateway. The hashes are
-    // already verified against the registry approval, so POST directly.
+    // registry stores it and serves it to the gateway, and the CVM's
+    // endpoint (the registry requires `endpoint` + `attestation_endpoint`
+    // on every registration). The hashes are already verified against the
+    // registry approval, so POST directly.
     println!("Registering image with the registry ...");
     post_register_image(
         client,
-        &verified.compose_sha256,
-        &verified.os_image_hash,
-        Some(&node_secret),
+        &RegisterImageArgs {
+            compose_hash: &verified.compose_sha256,
+            os_image_hash: &verified.os_image_hash,
+            endpoint: &actual.endpoint,
+            node_secret: Some(&node_secret),
+        },
     )
     .await
 }
@@ -764,13 +793,13 @@ async fn cmd_login(
 /// `gm-miner register-image` — re-register the deployed miner's image with
 /// the registry without a full redeploy.
 ///
-/// Auto-discovers the deployed `compose_hash` + `os_image_hash` by reading
-/// `phala cvms get <app-id> --json` (the same CVM-detail read `gm-miner
-/// deploy` performs), then POSTs them — and the persisted node secret —
-/// to `/miners/register`.
+/// Auto-discovers the deployed `compose_hash` + `os_image_hash` + public
+/// endpoint by reading `phala cvms get <app-id> --json` (the same CVM-
+/// detail read `gm-miner deploy` performs), then POSTs them — and the
+/// persisted node secret — to `/miners/register`.
 ///
 /// Fails with an actionable error if the CVM is not deployed or its
-/// measured hashes are not yet populated.
+/// measured hashes / endpoint are not yet populated.
 async fn cmd_register_image(
     client: &mut RegistryClient,
     app_id: &str,
@@ -800,16 +829,43 @@ async fn cmd_register_image(
             )
         })?;
 
+    // The registry requires a non-empty `endpoint` on every registration —
+    // read it from the same CVM-detail document already fetched above.
+    let endpoint = parse_phala_cvm_endpoint(out.status.success(), &out.stdout)
+        .context("read deployed miner endpoint from phala cvms get")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no public endpoint for CVM '{app_id}' \
+                 ({PHALA_ENDPOINT_FIELD} not present in \
+                 `phala cvms get {app_id} --json`); \
+                 the CVM may not have finished provisioning its gateway endpoint"
+            )
+        })?;
+
     // Normalize before POST: `phala cvms get` may report a `sha256:`-prefixed
     // hash, but the registry's `/miners/register` only accepts bare lowercase
     // hex.
     post_register_image(
         client,
-        &normalize_hash(&hashes.compose_sha256),
-        &normalize_hash(&hashes.os_image_hash),
-        node_secret,
+        &RegisterImageArgs {
+            compose_hash: &normalize_hash(&hashes.compose_sha256),
+            os_image_hash: &normalize_hash(&hashes.os_image_hash),
+            endpoint: &endpoint,
+            node_secret,
+        },
     )
     .await
+}
+
+/// Fields sent to the registry's `/miners/register` endpoint.
+struct RegisterImageArgs<'a> {
+    compose_hash: &'a str,
+    os_image_hash: &'a str,
+    /// The miner's public envoy endpoint. The registry requires this.
+    endpoint: &'a str,
+    /// The miner's node secret, or `None` for a miner predating
+    /// node-secret auth.
+    node_secret: Option<&'a str>,
 }
 
 /// POST verified compose + OS image hashes to `/miners/register`.
@@ -818,18 +874,22 @@ async fn cmd_register_image(
 /// (hashes already verified against the registry approval).
 async fn post_register_image(
     client: &mut RegistryClient,
-    compose_hash: &str,
-    os_image_hash: &str,
-    node_secret: Option<&str>,
+    args: &RegisterImageArgs<'_>,
 ) -> Result<()> {
+    // The registry requires both `endpoint` and `attestation_endpoint` as
+    // non-empty strings. `attestation_endpoint` is reserved for future
+    // attested-channel work and not yet consumed by the registry, so the
+    // envoy endpoint is sent as a placeholder for both.
     let mut body = serde_json::json!({
-        "compose_hash": compose_hash,
-        "os_image_hash": os_image_hash,
+        "compose_hash": args.compose_hash,
+        "os_image_hash": args.os_image_hash,
+        "endpoint": args.endpoint,
+        "attestation_endpoint": args.endpoint,
     });
     // Include the node secret so the registry stores it and serves it to
     // the gateway (Mechanism 1 of attestation-and-identity.md). Omitted
     // when the miner has no secret — a miner predating node-secret auth.
-    if let Some(secret) = node_secret {
+    if let Some(secret) = args.node_secret {
         body["node_secret"] = serde_json::Value::String(secret.to_owned());
     }
 
@@ -852,8 +912,9 @@ async fn post_register_image(
     if let Some(s) = json.get("status").and_then(|v| v.as_str()) {
         println!("  Status   : {s}");
     }
-    println!("  Compose  : {compose_hash}");
-    println!("  OS image : {os_image_hash}");
+    println!("  Compose  : {}", args.compose_hash);
+    println!("  OS image : {}", args.os_image_hash);
+    println!("  Endpoint : {}", args.endpoint);
     Ok(())
 }
 
