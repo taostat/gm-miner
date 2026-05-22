@@ -38,6 +38,17 @@
 ## `/stats/prometheus` on the admin port (bound to localhost). This
 ## replaces the deleted capability sidecar's `/metrics` endpoint.
 ##
+## Load shedding: under saturation the data plane sheds load with an
+## HTTP 429 rather than by resetting connections. The HTTP local
+## rate-limit filter returns 429 when inbound request rate outruns its
+## token bucket — the observable saturation signal the gateway router
+## and registry admission loop key off. `/attestation/info` is exempt
+## so the registry can always reach the attestation surface. Separately,
+## the `overload_manager` caps total downstream connections as a
+## file-descriptor-exhaustion backstop: it is sized so the rate-limit
+## filter always sheds first, and it rejects at the connection-accept
+## layer (no status code) only in a pathological flood.
+##
 ## RA-TLS data plane (Mechanism 2 of attestation-and-identity.md): the
 ## `:8080` ingress listener terminates TLS with a certificate minted by
 ## dstack's native RA-TLS facility. At container start `start.sh` runs
@@ -75,6 +86,42 @@ admin:
     socket_address:
       address: 127.0.0.1
       port_value: 9901
+
+## ── File-descriptor exhaustion backstop ─────────────────────────────
+##  The data plane's saturation signal is the HTTP local rate-limit
+##  filter further down — a clean 429 the gateway router and the
+##  registry admission loop key off. That filter is what sheds load
+##  gracefully and observably.
+##
+##  This overload manager is a separate, lower-level guard with one job:
+##  cap the number of simultaneously open downstream connections so a
+##  connection flood can never exhaust the container's file descriptors.
+##  Envoy is a proxy — every downstream connection plus its upstream
+##  connection consumes fds — and fd starvation is the failure the
+##  admission benchmark traced: once Envoy can no longer open sockets it
+##  sheds load by resetting connections, with no status code at all.
+##
+##  The `downstream_connections` monitor enforces `max_active_downstream
+##  _connections` directly at the connection-accept layer: past the cap,
+##  new TCP connections are refused before they are accepted. A refused
+##  connection cannot be sent an HTTP response — that is inherent to
+##  rejecting at accept time — so this layer does NOT produce a graceful
+##  status code. It is deliberately sized as a backstop that effectively
+##  never fires: the rate-limit filter sheds load with a 429 long before
+##  connection count could approach this ceiling. Its value is bounding
+##  the worst case (a pathological flood) so the miner fails predictably
+##  at a known limit instead of unpredictably at fd exhaustion.
+##
+##  8192 is the ceiling: the container's fd soft limit is 65536 (see
+##  dstack/docker-compose.yaml) and Envoy's sizing guidance puts the
+##  connection limit below half the fd limit, leaving a wide margin for
+##  upstream connections and Envoy's own descriptors.
+overload_manager:
+  resource_monitors:
+    - name: "envoy.resource_monitors.global_downstream_max_connections"
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+        max_active_downstream_connections: 8192
 
 static_resources:
 
@@ -115,6 +162,36 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_http
                 use_remote_address: true
+                ## ── Rate-limited response body ──────────────────────
+                ##  The local rate-limit filter's own 429 carries the
+                ##  plain-text body `local_rate_limited`. Every other
+                ##  error this data plane emits (the 501 provider
+                ##  catch-all, the 401 node-key reject) is a JSON
+                ##  `{"error":...}` object; this mapper rewrites the
+                ##  rate-limit 429 to the same shape so a caller parses
+                ##  one error format.
+                ##
+                ##  The match is a status-code filter on 429, not the
+                ##  `RL` response flag: the local rate-limit filter
+                ##  rejects in the filter chain before the router runs,
+                ##  and `RL` is a router-set flag, so it is never
+                ##  present on a locally-rate-limited reply. 429 is
+                ##  unambiguous here — the rate-limit filter is the only
+                ##  thing on this data plane that produces it (the 401
+                ##  and 501 replies carry their own codes and their own
+                ##  JSON bodies, untouched by this mapper).
+                local_reply_config:
+                  mappers:
+                    - filter:
+                        status_code_filter:
+                          comparison:
+                            op: EQ
+                            value:
+                              default_value: 429
+                              runtime_key: local_reply.rate_limited.status
+                      body_format_override:
+                        json_format:
+                          error: "miner saturated — request rate limited"
                 route_config:
                   name: provider_routes
                   virtual_hosts:
@@ -144,6 +221,31 @@ static_resources:
                           route:
                             cluster: attestd
                             timeout: 10s
+                          ## Exempt the attestation surface from the
+                          ##  inbound rate limit. The registry's control
+                          ##  loop probes this path every cycle and
+                          ##  auditors curl it directly — it must answer
+                          ##  even while the miner is shedding inference
+                          ##  load, otherwise saturation reads as the
+                          ##  miner being down. An empty token_bucket
+                          ##  with the filter disabled turns the
+                          ##  rate-limit check off for this route only.
+                          typed_per_filter_config:
+                            envoy.filters.http.local_ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                              stat_prefix: ingress_http_rate_limit_attestation
+                              token_bucket:
+                                max_tokens: 1
+                                tokens_per_fill: 1
+                                fill_interval: 1s
+                              filter_enabled:
+                                default_value:
+                                  numerator: 0
+                                  denominator: HUNDRED
+                              filter_enforced:
+                                default_value:
+                                  numerator: 0
+                                  denominator: HUNDRED
 
                         ## ── Anthropic ───────────────────────────────────────
                         ##  Enabled only when ANTHROPIC_API_KEY is set.
@@ -323,6 +425,66 @@ static_resources:
                                 "{\"error\":\"missing or invalid x-gm-node-key\"}")
                             end
                           end
+                  ## ── Graceful load shedding ──────────────────────────
+                  ##  The miner's saturation signal. Without it a miner
+                  ##  past its capacity sheds load by resetting
+                  ##  connections — the admission benchmark saw connection
+                  ##  resets / `unexpected EOF` / timeouts and zero 429s
+                  ##  at any scale, so saturation was invisible to the
+                  ##  whole control plane. The gateway router and the
+                  ##  registry admission loop both treat HTTP 429 as the
+                  ##  "miner is saturated" signal; this filter is what
+                  ##  emits it.
+                  ##
+                  ##  Mechanism: a token bucket on inbound request rate.
+                  ##  `max_tokens` tokens refill every `fill_interval`;
+                  ##  each request spends one. When the bucket is empty
+                  ##  the request is rejected immediately with HTTP 429
+                  ##  instead of being admitted, held open as a stream,
+                  ##  and contributing to the overload that resets
+                  ##  connections. Capping request admission caps the
+                  ##  growth of concurrent streams: a request that gets a
+                  ##  429 never becomes a held-open connection. The HCM's
+                  ##  `local_reply_config` above rewrites that 429 to the
+                  ##  data plane's JSON `{"error":...}` shape.
+                  ##
+                  ##  Sizing: 500 tokens, full refill every second — the
+                  ##  miner admits a sustained 500 requests/sec and
+                  ##  bursts to 500. The admission benchmark drove
+                  ##  ungraceful degradation from a few hundred
+                  ##  concurrent connections upward; 500/s sits in that
+                  ##  band, so a saturation ramp trips a clean 429 well
+                  ##  before connection count could approach the
+                  ##  overload manager's fd-exhaustion ceiling. The
+                  ##  numbers are deliberately conservative and tunable
+                  ##  — they bound the image until per-CVM benchmarking
+                  ##  refines them; a change here re-measures the
+                  ##  compose hash.
+                  ##
+                  ##  The bucket is process-wide (not
+                  ##  per-downstream-connection): the limit is the
+                  ##  miner's whole-node admission rate, matching how the
+                  ##  gateway and registry reason about a miner's
+                  ##  capacity. `/attestation/info` is exempted via a
+                  ##  per-route override below — the registry's control
+                  ##  loop and auditors must still reach the attestation
+                  ##  surface while the miner is shedding inference load.
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: ingress_http_rate_limit
+                      token_bucket:
+                        max_tokens: 500
+                        tokens_per_fill: 500
+                        fill_interval: 1s
+                      filter_enabled:
+                        default_value:
+                          numerator: 100
+                          denominator: HUNDRED
+                      filter_enforced:
+                        default_value:
+                          numerator: 100
+                          denominator: HUNDRED
                   ## The router filter terminates the chain.
                   - name: envoy.filters.http.router
                     typed_config:
