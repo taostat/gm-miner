@@ -107,7 +107,10 @@ pub trait PhalaClient {
     /// the same encrypted env as `GM_NODE_SECRET`. `registry_creds`, when
     /// present, are private-registry pull credentials written into the
     /// same encrypted env so the CVM's pre-launch script can `docker login`
-    /// and pull the (private) miner image. `boot_timeout_secs` controls how
+    /// and pull the (private) miner image. `benchmark_upstream_url`, when
+    /// present, is written into the same encrypted env as
+    /// `GM_BENCHMARK_UPSTREAM_URL`, which activates envoy's
+    /// `x-gm-provider: benchmark` route. `boot_timeout_secs` controls how
     /// long to poll for the measured hashes before giving up.
     ///
     /// # Errors
@@ -119,6 +122,7 @@ pub trait PhalaClient {
         env_vars: &ProviderKeys,
         node_secret: &str,
         registry_creds: Option<&RegistryCredentials>,
+        benchmark_upstream_url: Option<&str>,
         boot_timeout_secs: u64,
     ) -> Result<DeployOutcome>;
 }
@@ -574,6 +578,7 @@ impl PhalaClient for RealPhalaClient {
         env_vars: &ProviderKeys,
         node_secret: &str,
         registry_creds: Option<&RegistryCredentials>,
+        benchmark_upstream_url: Option<&str>,
         boot_timeout_secs: u64,
     ) -> Result<DeployOutcome> {
         use std::fs;
@@ -597,7 +602,13 @@ impl PhalaClient for RealPhalaClient {
         // with broader permissions. `phala deploy` reads this file and
         // encrypts its contents client-side to the CVM key.
         let env_path = self.project_dir.join(".env");
-        write_env_file(&env_path, env_vars, node_secret, registry_creds)?;
+        write_env_file(
+            &env_path,
+            env_vars,
+            node_secret,
+            registry_creds,
+            benchmark_upstream_url,
+        )?;
 
         let compose_arg = compose_path.to_string_lossy().into_owned();
         let env_arg = env_path.to_string_lossy().into_owned();
@@ -677,7 +688,8 @@ fn poll_phala_cvm_outcome(cvm_id: &str, timeout_secs: u64) -> Result<DeployOutco
 }
 
 /// Render the `phala deploy` env file body from the provider keys, node
-/// secret, and (optional) private-registry pull credentials.
+/// secret, (optional) private-registry pull credentials, and (optional)
+/// benchmark upstream URL.
 ///
 /// Extracted as a pure function so the exact env-file contents can be
 /// asserted in tests without touching the filesystem.
@@ -686,6 +698,7 @@ pub fn render_env_file(
     env_vars: &ProviderKeys,
     node_secret: &str,
     registry_creds: Option<&RegistryCredentials>,
+    benchmark_upstream_url: Option<&str>,
 ) -> String {
     let mut lines = String::new();
     if let Some(k) = &env_vars.anthropic {
@@ -723,11 +736,20 @@ pub fn render_env_file(
         lines.push('\n');
     }
 
+    // Benchmark upstream URL. When present, envoy's `x-gm-provider:
+    // benchmark` route proxies to it; the route is compiled out at
+    // container start when the variable is absent.
+    if let Some(url) = benchmark_upstream_url {
+        lines.push_str("GM_BENCHMARK_UPSTREAM_URL=");
+        lines.push_str(url);
+        lines.push('\n');
+    }
+
     lines
 }
 
-/// Write the provider keys + node secret + registry credentials to
-/// `env_path` at mode 0600.
+/// Write the provider keys + node secret + registry credentials +
+/// benchmark upstream URL to `env_path` at mode 0600.
 ///
 /// Uses a temp-file-then-rename so the target file is always at mode 0600
 /// from the moment it exists — no window where a partially-written or
@@ -737,13 +759,19 @@ fn write_env_file(
     env_vars: &ProviderKeys,
     node_secret: &str,
     registry_creds: Option<&RegistryCredentials>,
+    benchmark_upstream_url: Option<&str>,
 ) -> Result<()> {
     use std::fs;
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let lines = render_env_file(env_vars, node_secret, registry_creds);
+    let lines = render_env_file(
+        env_vars,
+        node_secret,
+        registry_creds,
+        benchmark_upstream_url,
+    );
 
     let parent = env_path
         .parent()
@@ -1321,12 +1349,16 @@ mod tests {
             openai: None,
             google: None,
         };
-        let body = render_env_file(&keys, "node-secret-xyz", None);
+        let body = render_env_file(&keys, "node-secret-xyz", None, None);
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
         assert!(body.contains("GM_NODE_SECRET=node-secret-xyz\n"));
         assert!(
             !body.contains("DSTACK_DOCKER_"),
             "no registry creds must be written when none are supplied"
+        );
+        assert!(
+            !body.contains("GM_BENCHMARK_UPSTREAM_URL"),
+            "benchmark URL must be absent when none is supplied"
         );
     }
 
@@ -1340,10 +1372,24 @@ mod tests {
             username: "miner-bot".to_owned(),
             password: "ghp_token".to_owned(),
         };
-        let body = render_env_file(&keys, "node-secret", Some(&creds));
+        let body = render_env_file(&keys, "node-secret", Some(&creds), None);
         assert!(body.contains("DSTACK_DOCKER_REGISTRY=ghcr.io\n"));
         assert!(body.contains("DSTACK_DOCKER_USERNAME=miner-bot\n"));
         assert!(body.contains("DSTACK_DOCKER_PASSWORD=ghp_token\n"));
+    }
+
+    /// When a benchmark upstream URL is supplied, it must appear as
+    /// `GM_BENCHMARK_UPSTREAM_URL` so envoy's benchmark route activates.
+    #[test]
+    fn render_env_file_writes_benchmark_upstream_url() {
+        let keys = ProviderKeys::default();
+        let body = render_env_file(
+            &keys,
+            "node-secret",
+            None,
+            Some("https://test-benchmark.saygm.com"),
+        );
+        assert!(body.contains("GM_BENCHMARK_UPSTREAM_URL=https://test-benchmark.saygm.com\n"));
     }
 
     // ── phala cvms get endpoint parsing ───────────────────────────────────────
