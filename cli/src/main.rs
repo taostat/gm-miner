@@ -144,6 +144,17 @@ enum Command {
         #[arg(long)]
         repo_root: Option<std::path::PathBuf>,
 
+        /// Synthetic benchmark upstream URL.
+        ///
+        /// When set, it is written into the CVM's Phala-Cloud-encrypted env
+        /// as `GM_BENCHMARK_UPSTREAM_URL`, which activates envoy's
+        /// `x-gm-provider: benchmark` route (the route is compiled out at
+        /// container start when the variable is unset). The env file is not
+        /// part of the attestation-measured compose, so setting this does
+        /// not change the CVM's `compose_hash`.
+        #[arg(long, env = "GM_BENCHMARK_UPSTREAM_URL")]
+        benchmark_upstream_url: Option<String>,
+
         /// How long to wait for the CVM to boot and report its measured
         /// hashes via `phala cvms get --json` (seconds). Default: 300.
         #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
@@ -272,6 +283,7 @@ async fn main() -> Result<()> {
             disk_size,
             os_image,
             repo_root,
+            benchmark_upstream_url,
             boot_timeout_secs,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
@@ -293,6 +305,7 @@ async fn main() -> Result<()> {
                     disk_size,
                     os_image,
                     repo_root,
+                    benchmark_upstream_url,
                     version,
                     boot_timeout_secs,
                 },
@@ -555,6 +568,10 @@ struct DeployArgs {
     disk_size: String,
     os_image: String,
     repo_root: Option<std::path::PathBuf>,
+    /// Synthetic benchmark upstream URL. When set, written into the CVM's
+    /// encrypted env as `GM_BENCHMARK_UPSTREAM_URL` to activate envoy's
+    /// `x-gm-provider: benchmark` route.
+    benchmark_upstream_url: Option<String>,
     version: Option<usize>,
     boot_timeout_secs: u64,
 }
@@ -787,6 +804,7 @@ async fn cmd_deploy(
         keys,
         &node_secret,
         registry_creds.as_ref(),
+        args.benchmark_upstream_url.as_deref(),
         args.boot_timeout_secs,
     )?;
 
