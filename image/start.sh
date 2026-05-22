@@ -68,6 +68,14 @@ fi
 # the benchmark cluster is plain HTTP/1.1 and the route forwards the
 # request path unchanged. An explicit port is used as given; with none,
 # port 80 is the default.
+#
+# The host and port are validated here rather than at envoy startup: an
+# unvalidated value renders into envoy.yaml verbatim, and a malformed
+# one (non-numeric port, empty host) makes envoy reject the config and
+# crash-loop with an opaque JSON parse error. Catching it here fails
+# fast with a message that names the offending env var. Bracketed IPv6
+# literals are not supported — the benchmark upstream is a named
+# internal service.
 BENCHMARK_HOST=""
 BENCHMARK_PORT=""
 if [[ -n "${GM_BENCHMARK_UPSTREAM_URL:-}" ]]; then
@@ -80,8 +88,12 @@ if [[ -n "${GM_BENCHMARK_UPSTREAM_URL:-}" ]]; then
     BENCHMARK_HOST="${benchmark_authority}"
     BENCHMARK_PORT="80"
   fi
-  if [[ -z "${BENCHMARK_HOST}" || -z "${BENCHMARK_PORT}" ]]; then
-    log "error: GM_BENCHMARK_UPSTREAM_URL is set but not a host[:port] URL: ${GM_BENCHMARK_UPSTREAM_URL}"
+  if [[ -z "${BENCHMARK_HOST}" || "${BENCHMARK_HOST}" == *:* ]]; then
+    log "error: GM_BENCHMARK_UPSTREAM_URL has no usable host (bracketed IPv6 is unsupported): ${GM_BENCHMARK_UPSTREAM_URL}"
+    exit 1
+  fi
+  if [[ ! "${BENCHMARK_PORT}" =~ ^[0-9]+$ ]] || ((BENCHMARK_PORT < 1 || BENCHMARK_PORT > 65535)); then
+    log "error: GM_BENCHMARK_UPSTREAM_URL has an invalid port (want 1-65535): ${GM_BENCHMARK_UPSTREAM_URL}"
     exit 1
   fi
 fi
