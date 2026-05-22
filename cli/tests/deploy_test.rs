@@ -55,7 +55,6 @@ impl PhalaClient for StubPhala {
         _env_vars: &ProviderKeys,
         _node_secret: &str,
         _registry_creds: Option<&RegistryCredentials>,
-        _benchmark_upstream_url: Option<&str>,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DeployOutcome> {
         self.deploy_called.set(true);
@@ -79,7 +78,6 @@ impl PhalaClient for TimedOutPhala {
         _env_vars: &ProviderKeys,
         _node_secret: &str,
         _registry_creds: Option<&RegistryCredentials>,
-        _benchmark_upstream_url: Option<&str>,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DeployOutcome> {
         anyhow::bail!(
@@ -101,7 +99,6 @@ impl PhalaClient for FailingPhala {
         _env_vars: &ProviderKeys,
         _node_secret: &str,
         _registry_creds: Option<&RegistryCredentials>,
-        _benchmark_upstream_url: Option<&str>,
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DeployOutcome> {
         anyhow::bail!("phala deploy exited with status 1");
@@ -254,9 +251,9 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
         openai: None,
         google: None,
     };
-    let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc").unwrap();
+    let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, None, 300)
+        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
         .unwrap();
 
     assert!(stub.deploy_called.get(), "deploy must have been called");
@@ -289,9 +286,9 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
         openai: None,
         google: None,
     };
-    let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc").unwrap();
+    let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, None, 300)
+        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
         .unwrap();
 
     let err = verify_hashes(&actual.hashes, approved)
@@ -389,14 +386,7 @@ fn phala_failure_surfaces_as_error() {
         google: None,
     };
     let err = FailingPhala
-        .deploy(
-            "compose-content",
-            &keys,
-            "test-node-secret-1234",
-            None,
-            None,
-            300,
-        )
+        .deploy("compose-content", &keys, "test-node-secret-1234", None, 300)
         .expect_err("failing phala must produce an error");
     assert!(err.to_string().contains("phala deploy exited"));
 }
@@ -413,7 +403,7 @@ fn timeout_error_is_actionable() {
         google: None,
     };
     let err = TimedOutPhala
-        .deploy("compose", &keys, "test-node-secret-1234", None, None, 0)
+        .deploy("compose", &keys, "test-node-secret-1234", None, 0)
         .expect_err("timed-out deploy must produce an error");
     let msg = err.to_string();
     assert!(
@@ -676,7 +666,8 @@ fn prepare_deploy_target_embeds_provisioner_ref() {
     let provisioner = StubProvisioner {
         ref_: "ghcr.io/taostat/gm-miner@sha256:abc".to_owned(),
     };
-    let target = prepare_deploy_target(&provisioner).expect("orchestration must succeed");
+    let target =
+        prepare_deploy_target(&provisioner, "testnet").expect("orchestration must succeed");
     assert_eq!(target.image_ref, "ghcr.io/taostat/gm-miner@sha256:abc");
     assert!(
         target.rendered_compose.contains("sha256:abc"),
@@ -685,6 +676,10 @@ fn prepare_deploy_target_embeds_provisioner_ref() {
     assert!(
         !target.rendered_compose.contains("${GM_IMAGE_REF"),
         "the ${{GM_IMAGE_REF}} placeholder must be substituted"
+    );
+    assert!(
+        target.rendered_compose.contains("GM_NETWORK=testnet"),
+        "rendered compose must embed the active network as a literal"
     );
 }
 
@@ -697,10 +692,14 @@ fn prepare_deploy_target_embeds_prebuilt_ref() {
     let provisioner = StubProvisioner {
         ref_: "docker.io/taostat/gm-miner@sha256:deadbeef".to_owned(),
     };
-    let target = prepare_deploy_target(&provisioner).expect("prebuilt-ref must succeed");
+    let target = prepare_deploy_target(&provisioner, "mainnet").expect("prebuilt-ref must succeed");
     assert!(
         target.rendered_compose.contains("sha256:deadbeef"),
         "the provisioner's ref must be pinned into the compose file"
+    );
+    assert!(
+        target.rendered_compose.contains("GM_NETWORK=mainnet"),
+        "rendered compose must embed the active network as a literal"
     );
 }
 
@@ -713,7 +712,7 @@ fn prepare_deploy_target_propagates_build_failure() {
             anyhow::bail!("image build+push failed")
         }
     }
-    let err = prepare_deploy_target(&FailingProvisioner)
+    let err = prepare_deploy_target(&FailingProvisioner, "testnet")
         .expect_err("build failure must abort the deploy");
     assert!(err.to_string().contains("image build+push failed"));
 }

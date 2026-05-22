@@ -7,17 +7,17 @@
 ## probed (envoy substitutes an empty key) so the registry can detect
 ## "no key set" the same way it detects "key revoked".
 ##
-## The benchmark route (`x-gm-provider: benchmark`) is first-pass
-## apparatus for benchmarking miners against a synthetic upstream. It
-## is a plain proxy to the URL in `GM_BENCHMARK_UPSTREAM_URL` with no
-## auth-header injection. Unlike a provider route, its cluster cannot
-## be baked in statically — the upstream is a runtime-supplied URL —
-## so `start.sh` renders the route and cluster from that env var. When
-## `GM_BENCHMARK_UPSTREAM_URL` is unset `start.sh` drops the marked
-## benchmark block (the `gm:benchmark` sentinel lines below), the
-## route disappears, and a `benchmark` request falls through to the
-## 501 catch-all — the same "route is disabled" outcome a provider
-## route has when its key env var is unset.
+## The benchmark route (`x-gm-provider: benchmark`) proxies to a
+## synthetic benchmark upstream. The upstream URL is hardcoded per
+## network in `start.sh` and keyed off GM_NETWORK (rendered into the
+## compose by `gm-miner deploy`); `start.sh` substitutes the host/port
+## into this config's `__GM_BENCHMARK_HOST__` / `__GM_BENCHMARK_PORT__`
+## placeholders at container start, and keeps or drops the
+## `gm:benchmark-tls` sentinel block on the benchmark cluster depending
+## on the URL's scheme (kept for https, dropped for http). Because
+## both URLs live in the image source, the route cannot be redirected
+## at runtime — only by editing start.sh, which moves the compose_hash
+## and is rejected by the registry's attestation enforcement.
 ##
 ## Inbound auth (Mechanism 1 of attestation-and-identity.md): a Lua
 ## filter checks the `x-gm-node-key` header against the node secret
@@ -335,15 +335,12 @@ static_resources:
                                 value: "%ENVIRONMENT(GOOGLE_API_KEY)%"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
 
-                        ## gm:benchmark-begin
                         ## ── Benchmark ───────────────────────────────────────
-                        ##  Present only when GM_BENCHMARK_UPSTREAM_URL is set.
                         ##  A plain proxy to the synthetic benchmark upstream —
                         ##  no API key, no upstream auth header. start.sh
-                        ##  renders the cluster host/port from the env var, or
-                        ##  drops this whole marked block when the var is unset
-                        ##  (the route then disappears and a `benchmark`
-                        ##  request falls through to the 501 catch-all below).
+                        ##  resolves the per-network URL from GM_NETWORK and
+                        ##  substitutes the cluster host/port into the
+                        ##  placeholders below.
                         - match:
                             prefix: "/"
                             headers:
@@ -360,7 +357,6 @@ static_resources:
                             - x-gm-product
                             - x-gm-node-key
                             - x-gm-provider
-                        ## gm:benchmark-end
 
                         ## ── Fallback: no provider matched ─────────────────────
                         ##  Catch-all for requests whose `x-gm-provider` header
@@ -721,13 +717,12 @@ static_resources:
                   matcher:
                     exact: generativelanguage.googleapis.com
 
-    ## gm:benchmark-begin
     ## ── Benchmark ─────────────────────────────────────────────────────
-    ##  Synthetic benchmark upstream. Present only when start.sh renders
-    ##  this block — the host/port placeholders below are substituted
-    ##  from GM_BENCHMARK_UPSTREAM_URL. A plain HTTP/1.1 cluster with no
-    ##  transport_socket: the benchmark upstream is internal test
-    ##  apparatus, not a TLS provider API.
+    ##  Synthetic benchmark upstream. start.sh substitutes the host/port
+    ##  placeholders from the per-network URL it resolves from
+    ##  GM_NETWORK, and keeps or drops the `gm:benchmark-tls` sentinel
+    ##  block below depending on the URL's scheme — kept for https,
+    ##  dropped for http. When dropped the cluster is plain HTTP/1.1.
     - name: benchmark
       type: LOGICAL_DNS
       connect_timeout: 10s
@@ -741,4 +736,18 @@ static_resources:
                     socket_address:
                       address: __GM_BENCHMARK_HOST__
                       port_value: __GM_BENCHMARK_PORT__
-    ## gm:benchmark-end
+      ## gm:benchmark-tls-begin
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: __GM_BENCHMARK_HOST__
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: __GM_BENCHMARK_HOST__
+      ## gm:benchmark-tls-end

@@ -1,8 +1,18 @@
 ## gm miner compose template.
 ##
 ## Usage: `gm-miner deploy` renders this file, substituting GM_IMAGE_REF
-## with the digest-pinned image reference, then submits it to Phala Cloud
+## with the digest-pinned image reference and GM_NETWORK with the active
+## network name (`testnet` / `mainnet`), then submits it to Phala Cloud
 ## via `phala deploy`. Phala Cloud provisions the TDX CVM and runs the KMS.
+##
+## GM_NETWORK is a rendered literal, NOT an operator env var: its value
+## comes from the `--testnet` / mainnet (default) selection on `gm-miner
+## deploy` and is substituted into the compose source before the file is
+## submitted. That makes it part of the attestation-measured compose_hash,
+## so a miner cannot change the targeted network (and the per-network
+## benchmark upstream URL keyed off it inside the image) without moving
+## the compose_hash — which the registry's attestation enforcement
+## rejects.
 ##
 ## Provider keys (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY)
 ## are NOT rendered into this file — `phala deploy` encrypts them client-
@@ -66,12 +76,14 @@ services:
       - GOOGLE_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
-      ## Benchmark upstream — first-pass apparatus for benchmarking
-      ## miners against a synthetic upstream. When set, envoy's
-      ## `x-gm-provider: benchmark` route proxies to this URL; when
-      ## unset the benchmark route is disabled. Not set by a normal
-      ## `gm-miner deploy` — only a benchmark deployment populates it.
-      - GM_BENCHMARK_UPSTREAM_URL
+      ## Active network — `testnet` or `mainnet`. Rendered as a literal
+      ## by `gm-miner deploy` (not an operator env var), so the value is
+      ## part of the attestation-measured compose_hash. The image's
+      ## `start.sh` maps it to the matching benchmark upstream URL —
+      ## both URLs are hardcoded in the image, so a miner cannot point
+      ## the `x-gm-provider: benchmark` route at a colluding service
+      ## without moving the compose_hash, which the registry rejects.
+      - GM_NETWORK=__GM_NETWORK__
     volumes:
       ## dstack guest-agent socket. The attestation server calls
       ## get_key (TEE-bound keypair), get_quote (fresh TDX quote), and

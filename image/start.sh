@@ -23,16 +23,13 @@
 # capability failure for the affected provider. The 501 fallback in
 # envoy.yaml fires only when no provider header arrives.
 #
-# Benchmark route: the optional `x-gm-provider: benchmark` route proxies
-# to a synthetic upstream named by GM_BENCHMARK_UPSTREAM_URL. Its
-# cluster cannot be baked in statically (the upstream is a runtime URL),
-# so the route + cluster live between `## gm:benchmark-begin` and
-# `## gm:benchmark-end` sentinel lines in envoy.yaml. The rendering step
-# below substitutes the URL's host/port into that block, or drops the
-# whole block when GM_BENCHMARK_UPSTREAM_URL is unset — the route then
-# disappears and a `benchmark` request falls through to the 501
-# catch-all (the same "route disabled" outcome as an unset provider
-# key).
+# Benchmark route: the `x-gm-provider: benchmark` route proxies to the
+# benchmark upstream URL keyed off GM_NETWORK below. Both the testnet
+# and mainnet URLs are hardcoded in this script, so the upstream cannot
+# be redirected by editing an env var — only by editing this script,
+# which moves the compose_hash and is rejected by the registry's
+# attestation enforcement. The rendering step substitutes the resolved
+# URL's host/port into envoy.yaml.
 #
 # Process supervision: attestd and envoy both run in the background;
 # this script stays PID 1 and `wait -n`s on both. When either exits the
@@ -67,48 +64,61 @@ if [[ "${HAS_KEY}" -eq 0 ]]; then
 fi
 
 # ── Resolve the benchmark upstream ────────────────────────────────────
-# GM_BENCHMARK_UPSTREAM_URL, when set, names the synthetic upstream the
-# `x-gm-provider: benchmark` route proxies to. Envoy clusters take a
-# host and a port, not a URL, so the URL is split here. Only the host
-# (or host:port) authority is consumed — scheme and path are ignored:
-# the benchmark cluster is plain HTTP/1.1 and the route forwards the
-# request path unchanged. An explicit port is used as given; with none,
-# port 80 is the default.
+# The benchmark URL is hardcoded per network in this script, NOT taken
+# from a runtime env var: a miner cannot redirect the `x-gm-provider:
+# benchmark` route to a colluding service without editing this file,
+# which moves the compose_hash and is rejected by the registry's
+# attestation enforcement. GM_NETWORK is set by `gm-miner deploy` as a
+# rendered literal in dstack/docker-compose.yaml — part of the
+# attestation-measured compose source — so its value is fixed at deploy
+# time and equally tamper-evident.
 #
-# The host and port are validated here rather than at envoy startup: an
-# unvalidated value renders into envoy.yaml verbatim, and a malformed
-# one (non-numeric port, empty host) makes envoy reject the config and
-# crash-loop with an opaque JSON parse error. Catching it here fails
-# fast with a message that names the offending env var. Bracketed IPv6
-# literals are not supported — the benchmark upstream is a named
-# internal service.
-BENCHMARK_HOST=""
-BENCHMARK_PORT=""
-if [[ -n "${GM_BENCHMARK_UPSTREAM_URL:-}" ]]; then
-  benchmark_authority="${GM_BENCHMARK_UPSTREAM_URL#*://}"
-  benchmark_authority="${benchmark_authority%%/*}"
-  if [[ "${benchmark_authority}" == *:* ]]; then
-    BENCHMARK_HOST="${benchmark_authority%:*}"
-    BENCHMARK_PORT="${benchmark_authority##*:}"
-  else
-    BENCHMARK_HOST="${benchmark_authority}"
-    BENCHMARK_PORT="80"
-  fi
-  if [[ -z "${BENCHMARK_HOST}" || "${BENCHMARK_HOST}" == *:* ]]; then
-    log "error: GM_BENCHMARK_UPSTREAM_URL has no usable host (bracketed IPv6 is unsupported): ${GM_BENCHMARK_UPSTREAM_URL}"
+# Envoy clusters take a host and a port, not a URL: the literal URL
+# below is split into BENCHMARK_HOST / BENCHMARK_PORT / BENCHMARK_TLS,
+# then substituted into envoy.yaml's benchmark cluster. The scheme
+# decides both the default port (443 for https, 80 for http) and
+# whether the cluster carries an upstream TLS context — envoy.yaml's
+# `gm:benchmark-tls` sentinel block is kept when the URL is https and
+# dropped when it is http.
+case "${GM_NETWORK:?GM_NETWORK must be set (rendered into dstack/docker-compose.yaml by gm-miner deploy)}" in
+  testnet) BENCHMARK_URL="https://test-benchmark.saygm.com" ;;
+  mainnet) BENCHMARK_URL="https://benchmark.saygm.com" ;;
+  *)
+    log "error: unknown GM_NETWORK '${GM_NETWORK}' (want testnet or mainnet)"
     exit 1
-  fi
-  if [[ ! "${BENCHMARK_PORT}" =~ ^[0-9]+$ ]] || ((BENCHMARK_PORT < 1 || BENCHMARK_PORT > 65535)); then
-    log "error: GM_BENCHMARK_UPSTREAM_URL has an invalid port (want 1-65535): ${GM_BENCHMARK_UPSTREAM_URL}"
+    ;;
+esac
+
+case "${BENCHMARK_URL}" in
+  https://*)
+    BENCHMARK_TLS=1
+    benchmark_default_port=443
+    ;;
+  http://*)
+    BENCHMARK_TLS=0
+    benchmark_default_port=80
+    ;;
+  *)
+    log "error: BENCHMARK_URL must start with http:// or https:// (got '${BENCHMARK_URL}')"
     exit 1
-  fi
+    ;;
+esac
+
+benchmark_authority="${BENCHMARK_URL#*://}"
+benchmark_authority="${benchmark_authority%%/*}"
+if [[ "${benchmark_authority}" == *:* ]]; then
+  BENCHMARK_HOST="${benchmark_authority%:*}"
+  BENCHMARK_PORT="${benchmark_authority##*:}"
+else
+  BENCHMARK_HOST="${benchmark_authority}"
+  BENCHMARK_PORT="${benchmark_default_port}"
 fi
 
 # ── Render the envoy config ───────────────────────────────────────────
-# Two substitutions happen here, both literal token replaces (awk
-# index/substr, not gsub) so values with regex- or replacement-special
-# characters are handled verbatim. The rendered config goes to a
-# writable path; the baked-in /etc/envoy/envoy.yaml stays untouched.
+# Literal token replaces (awk index/substr, not gsub) so values with
+# regex- or replacement-special characters are handled verbatim. The
+# rendered config goes to a writable path; the baked-in
+# /etc/envoy/envoy.yaml stays untouched.
 #
 #   1. The node secret. Envoy's inbound Lua filter enforces x-gm-node-key
 #      against a config literal — Envoy's Lua sandbox does not document
@@ -116,18 +126,17 @@ fi
 #      read at Lua runtime. An unset GM_NODE_SECRET renders an empty
 #      literal, which the filter treats as "skip the check" (a miner
 #      predating node-secret auth).
-#   2. The benchmark route + cluster, delimited by `## gm:benchmark-begin`
-#      / `## gm:benchmark-end` sentinel lines (matched as whole lines so a
-#      mention of the word in a comment never triggers them). When
-#      GM_BENCHMARK_UPSTREAM_URL is set, the host/port placeholders are
-#      filled and the sentinel lines dropped; when it is unset, every line
-#      between the sentinels (sentinels included) is dropped, so the route
-#      and cluster vanish from the rendered config.
+#   2. The benchmark cluster's host and port — resolved above from the
+#      hardcoded per-network URL.
+#   3. The benchmark cluster's upstream TLS block, delimited by
+#      `## gm:benchmark-tls-begin` / `-end` whole-line sentinels. Kept
+#      when the URL is https; dropped (the cluster stays plain HTTP/1.1)
+#      when it is http.
 RENDERED_CONFIG=/tmp/envoy.rendered.yaml
 GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
-  GM_BENCHMARK_ENABLED="${GM_BENCHMARK_UPSTREAM_URL:+1}" \
   GM_BENCHMARK_HOST="${BENCHMARK_HOST}" \
   GM_BENCHMARK_PORT="${BENCHMARK_PORT}" \
+  GM_BENCHMARK_TLS="${BENCHMARK_TLS}" \
   awk '
   function subst(line, token, value,    out, rest, pos) {
     out = ""
@@ -140,13 +149,13 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   }
   BEGIN {
     secret = ENVIRON["GM_NODE_SECRET"]
-    bench_enabled = (ENVIRON["GM_BENCHMARK_ENABLED"] == "1")
     bench_host = ENVIRON["GM_BENCHMARK_HOST"]
     bench_port = ENVIRON["GM_BENCHMARK_PORT"]
+    bench_tls = (ENVIRON["GM_BENCHMARK_TLS"] == "1")
   }
-  /^[[:space:]]*## gm:benchmark-begin[[:space:]]*$/ { in_benchmark = 1; next }
-  /^[[:space:]]*## gm:benchmark-end[[:space:]]*$/   { in_benchmark = 0; next }
-  in_benchmark && !bench_enabled { next }
+  /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
+  /^[[:space:]]*## gm:benchmark-tls-end[[:space:]]*$/   { in_tls = 0; next }
+  in_tls && !bench_tls { next }
   {
     line = subst($0, "__GM_NODE_SECRET__", secret)
     line = subst(line, "__GM_BENCHMARK_HOST__", bench_host)
@@ -161,10 +170,10 @@ else
   log "warning: GM_NODE_SECRET unset — inbound data plane is unauthenticated"
 fi
 
-if [[ -n "${GM_BENCHMARK_UPSTREAM_URL:-}" ]]; then
-  log "GM_BENCHMARK_UPSTREAM_URL set — benchmark route proxies to ${BENCHMARK_HOST}:${BENCHMARK_PORT}"
+if [[ "${BENCHMARK_TLS}" -eq 1 ]]; then
+  log "benchmark route proxies to https://${BENCHMARK_HOST}:${BENCHMARK_PORT} (GM_NETWORK=${GM_NETWORK})"
 else
-  log "GM_BENCHMARK_UPSTREAM_URL unset — benchmark route disabled"
+  log "benchmark route proxies to http://${BENCHMARK_HOST}:${BENCHMARK_PORT} (GM_NETWORK=${GM_NETWORK})"
 fi
 
 GM_IMAGE_VERSION="${GM_IMAGE_VERSION:-unknown}"
