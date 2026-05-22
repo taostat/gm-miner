@@ -31,6 +31,12 @@ similar_names = "allow"
 name = "gm-miner-attestd"
 path = "src/main.rs"
 
+# One-shot RA-TLS certificate provisioner. start.sh runs it before
+# Envoy to mint the data-plane TLS cert via dstack's get_tls_key.
+[[bin]]
+name = "gm-miner-ratls"
+path = "src/bin/ratls.rs"
+
 [lib]
 name = "gm_miner_attestd"
 path = "src/lib.rs"

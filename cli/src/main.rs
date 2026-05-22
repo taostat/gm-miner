@@ -29,8 +29,9 @@ use gm_miner_cli::{
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
         parse_phala_cvm_endpoint, preflight_phala_cli, prepare_deploy_target,
-        resolve_registry_credentials, select_version, verify_hashes, ImageProvisioner, PhalaClient,
-        DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE, PHALA_ENDPOINT_FIELD,
+        resolve_registry_credentials, select_version, to_ratls_passthrough_endpoint, verify_hashes,
+        ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
+        PHALA_ENDPOINT_FIELD,
     },
     node_secret, picodollar,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
@@ -906,7 +907,10 @@ async fn cmd_register_image(
         })?;
 
     // The registry requires a non-empty `endpoint` on every registration —
-    // read it from the same CVM-detail document already fetched above.
+    // read it from the same CVM-detail document already fetched above,
+    // then rewrite it to the dstack TLS-passthrough (`s`-suffix) form so
+    // the registered URL is the one on which the miner's RA-TLS
+    // certificate is actually presented.
     let endpoint = parse_phala_cvm_endpoint(out.status.success(), &out.stdout)
         .context("read deployed miner endpoint from phala cvms get")?
         .ok_or_else(|| {
@@ -917,6 +921,8 @@ async fn cmd_register_image(
                  the CVM may not have finished provisioning its gateway endpoint"
             )
         })?;
+    let endpoint = to_ratls_passthrough_endpoint(&endpoint)
+        .context("derive the RA-TLS passthrough endpoint for registration")?;
 
     // Normalize before POST: `phala cvms get` may report a `sha256:`-prefixed
     // hash, but the registry's `/miners/register` only accepts bare lowercase
