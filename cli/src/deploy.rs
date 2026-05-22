@@ -107,11 +107,8 @@ pub trait PhalaClient {
     /// the same encrypted env as `GM_NODE_SECRET`. `registry_creds`, when
     /// present, are private-registry pull credentials written into the
     /// same encrypted env so the CVM's pre-launch script can `docker login`
-    /// and pull the (private) miner image. `benchmark_upstream_url`, when
-    /// present, is written into the same encrypted env as
-    /// `GM_BENCHMARK_UPSTREAM_URL`, which activates envoy's
-    /// `x-gm-provider: benchmark` route. `boot_timeout_secs` controls how
-    /// long to poll for the measured hashes before giving up.
+    /// and pull the (private) miner image. `boot_timeout_secs` controls
+    /// how long to poll for the measured hashes before giving up.
     ///
     /// # Errors
     /// Returns an error if the deploy fails or the hashes/endpoint cannot
@@ -122,7 +119,6 @@ pub trait PhalaClient {
         env_vars: &ProviderKeys,
         node_secret: &str,
         registry_creds: Option<&RegistryCredentials>,
-        benchmark_upstream_url: Option<&str>,
         boot_timeout_secs: u64,
     ) -> Result<DeployOutcome>;
 }
@@ -157,24 +153,25 @@ pub struct DeployTarget {
 }
 
 /// Prepare the deploy target: provision the miner image, then render the
-/// compose file with the digest-pinned ref.
-///
-/// This is the network-free core of the deploy orchestration, extracted so
-/// it can be integration-tested against real code rather than a
-/// re-implemented copy of the branch logic.
+/// compose file with the digest-pinned ref and the active network.
 ///
 /// Returns the digest-pinned image ref (needed to derive the registry
 /// pull credentials) and the rendered `docker-compose.yaml` content.
 ///
 /// # Errors
 /// Returns an error if image provisioning or compose rendering fails.
-pub fn prepare_deploy_target(provisioner: &dyn ImageProvisioner) -> Result<DeployTarget> {
+pub fn prepare_deploy_target(
+    provisioner: &dyn ImageProvisioner,
+    network: &str,
+) -> Result<DeployTarget> {
     // Build/push the image (or accept a pre-built ref). The
     // build-vs-prebuilt branch lives entirely inside the `ImageProvisioner`.
     let image_ref = provisioner.provision()?;
 
-    // Render the compose template with the digest-pinned ref.
-    let rendered_compose = render_compose(COMPOSE_TEMPLATE, &image_ref)?;
+    // Render the compose template with the digest-pinned ref and the
+    // active network — both end up as literals in the rendered compose
+    // and contribute to the attestation-measured compose_hash.
+    let rendered_compose = render_compose(COMPOSE_TEMPLATE, &image_ref, network)?;
 
     Ok(DeployTarget {
         image_ref,
@@ -578,7 +575,6 @@ impl PhalaClient for RealPhalaClient {
         env_vars: &ProviderKeys,
         node_secret: &str,
         registry_creds: Option<&RegistryCredentials>,
-        benchmark_upstream_url: Option<&str>,
         boot_timeout_secs: u64,
     ) -> Result<DeployOutcome> {
         use std::fs;
@@ -602,13 +598,7 @@ impl PhalaClient for RealPhalaClient {
         // with broader permissions. `phala deploy` reads this file and
         // encrypts its contents client-side to the CVM key.
         let env_path = self.project_dir.join(".env");
-        write_env_file(
-            &env_path,
-            env_vars,
-            node_secret,
-            registry_creds,
-            benchmark_upstream_url,
-        )?;
+        write_env_file(&env_path, env_vars, node_secret, registry_creds)?;
 
         let compose_arg = compose_path.to_string_lossy().into_owned();
         let env_arg = env_path.to_string_lossy().into_owned();
@@ -688,8 +678,7 @@ fn poll_phala_cvm_outcome(cvm_id: &str, timeout_secs: u64) -> Result<DeployOutco
 }
 
 /// Render the `phala deploy` env file body from the provider keys, node
-/// secret, (optional) private-registry pull credentials, and (optional)
-/// benchmark upstream URL.
+/// secret, and (optional) private-registry pull credentials.
 ///
 /// Extracted as a pure function so the exact env-file contents can be
 /// asserted in tests without touching the filesystem.
@@ -698,7 +687,6 @@ pub fn render_env_file(
     env_vars: &ProviderKeys,
     node_secret: &str,
     registry_creds: Option<&RegistryCredentials>,
-    benchmark_upstream_url: Option<&str>,
 ) -> String {
     let mut lines = String::new();
     if let Some(k) = &env_vars.anthropic {
@@ -736,20 +724,11 @@ pub fn render_env_file(
         lines.push('\n');
     }
 
-    // Benchmark upstream URL. When present, envoy's `x-gm-provider:
-    // benchmark` route proxies to it; the route is compiled out at
-    // container start when the variable is absent.
-    if let Some(url) = benchmark_upstream_url {
-        lines.push_str("GM_BENCHMARK_UPSTREAM_URL=");
-        lines.push_str(url);
-        lines.push('\n');
-    }
-
     lines
 }
 
-/// Write the provider keys + node secret + registry credentials +
-/// benchmark upstream URL to `env_path` at mode 0600.
+/// Write the provider keys + node secret + registry credentials to
+/// `env_path` at mode 0600.
 ///
 /// Uses a temp-file-then-rename so the target file is always at mode 0600
 /// from the moment it exists — no window where a partially-written or
@@ -759,19 +738,13 @@ fn write_env_file(
     env_vars: &ProviderKeys,
     node_secret: &str,
     registry_creds: Option<&RegistryCredentials>,
-    benchmark_upstream_url: Option<&str>,
 ) -> Result<()> {
     use std::fs;
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let lines = render_env_file(
-        env_vars,
-        node_secret,
-        registry_creds,
-        benchmark_upstream_url,
-    );
+    let lines = render_env_file(env_vars, node_secret, registry_creds);
 
     let parent = env_path
         .parent()
@@ -895,24 +868,35 @@ pub fn select_version(versions: &[ImageVersion], pin: Option<usize>) -> Result<&
 
 // ── Compose template rendering ────────────────────────────────────────────────
 
+/// Placeholder substituted with the active network name (`testnet` /
+/// `mainnet`) at compose render time. A literal in the rendered compose,
+/// so its value is part of the attestation-measured `compose_hash`.
+const GM_NETWORK_PLACEHOLDER: &str = "__GM_NETWORK__";
+
 /// Render the compose template, substituting `${GM_IMAGE_REF...}` with
-/// the supplied pinned image reference.
+/// the supplied pinned image reference and `__GM_NETWORK__` with the
+/// active network name.
 ///
 /// # Errors
-/// Returns an error if the substitution did not change the template (i.e.
-/// the placeholder was not found).
-pub fn render_compose(template: &str, pinned_image_ref: &str) -> Result<String> {
+/// Returns an error if either placeholder is missing.
+pub fn render_compose(template: &str, pinned_image_ref: &str, network: &str) -> Result<String> {
     // Replace the shell-variable placeholder pattern ${GM_IMAGE_REF...}
     // with the digest-pinned ref. We do a simple prefix match: anything
     // that starts with `${GM_IMAGE_REF` and ends at the next `}`.
-    let result = replace_image_ref_placeholder(template, pinned_image_ref);
-    if result == template {
+    let with_image = replace_image_ref_placeholder(template, pinned_image_ref);
+    if with_image == template {
         bail!(
             "compose template does not contain a GM_IMAGE_REF placeholder; \
              expected something like ${{GM_IMAGE_REF:?...}} in dstack/docker-compose.yaml"
         );
     }
-    Ok(result)
+    if !with_image.contains(GM_NETWORK_PLACEHOLDER) {
+        bail!(
+            "compose template does not contain a {GM_NETWORK_PLACEHOLDER} placeholder; \
+             expected GM_NETWORK={GM_NETWORK_PLACEHOLDER} in dstack/docker-compose.yaml"
+        );
+    }
+    Ok(with_image.replace(GM_NETWORK_PLACEHOLDER, network))
 }
 
 /// Replace every `${GM_IMAGE_REF...}` shell-variable expression in `text`
@@ -1102,9 +1086,10 @@ mod tests {
 
     #[test]
     fn placeholder_replaced_once() {
-        let template = "image: ${GM_IMAGE_REF:?GM_IMAGE_REF must be set}\n  ports:\n";
-        let rendered =
-            render_compose(template, "ghcr.io/o/app@sha256:abc123").expect("should render");
+        let template = "image: ${GM_IMAGE_REF:?GM_IMAGE_REF must be set}\n  \
+                        env: GM_NETWORK=__GM_NETWORK__\n  ports:\n";
+        let rendered = render_compose(template, "ghcr.io/o/app@sha256:abc123", "testnet")
+            .expect("should render");
         assert!(rendered.contains("ghcr.io/o/app@sha256:abc123"));
         assert!(!rendered.contains("GM_IMAGE_REF"));
     }
@@ -1112,7 +1097,46 @@ mod tests {
     #[test]
     fn placeholder_missing_returns_error() {
         let template = "image: my-image\n";
-        assert!(render_compose(template, "anything").is_err());
+        assert!(render_compose(template, "anything", "testnet").is_err());
+    }
+
+    /// The active network must appear as a rendered literal so it is
+    /// part of the attestation-measured `compose_hash`.
+    #[test]
+    fn network_placeholder_replaced() {
+        let template = "image: ${GM_IMAGE_REF:?}\n  env:\n    - GM_NETWORK=__GM_NETWORK__\n";
+        let rendered =
+            render_compose(template, "anything", "testnet").expect("should render testnet");
+        assert!(rendered.contains("GM_NETWORK=testnet"));
+        assert!(!rendered.contains("__GM_NETWORK__"));
+
+        let rendered =
+            render_compose(template, "anything", "mainnet").expect("should render mainnet");
+        assert!(rendered.contains("GM_NETWORK=mainnet"));
+    }
+
+    /// A template missing the network placeholder is a compose-file bug —
+    /// surface it as a clear error rather than silently rendering an
+    /// image without the network selector.
+    #[test]
+    fn network_placeholder_missing_returns_error() {
+        let template = "image: ${GM_IMAGE_REF:?}\n";
+        assert!(render_compose(template, "anything", "testnet").is_err());
+    }
+
+    /// The bundled compose template must carry both placeholders so a
+    /// real deploy renders correctly.
+    #[test]
+    fn bundled_compose_template_renders() {
+        let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/m@sha256:deadbeef", "testnet")
+            .expect("bundled compose template must render");
+        assert!(rendered.contains("ghcr.io/o/m@sha256:deadbeef"));
+        assert!(rendered.contains("GM_NETWORK=testnet"));
+        assert!(!rendered.contains("__GM_NETWORK__"));
+        assert!(
+            !rendered.contains("GM_BENCHMARK_UPSTREAM_URL"),
+            "GM_BENCHMARK_UPSTREAM_URL must no longer appear in the compose"
+        );
     }
 
     #[test]
@@ -1349,7 +1373,7 @@ mod tests {
             openai: None,
             google: None,
         };
-        let body = render_env_file(&keys, "node-secret-xyz", None, None);
+        let body = render_env_file(&keys, "node-secret-xyz", None);
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
         assert!(body.contains("GM_NODE_SECRET=node-secret-xyz\n"));
         assert!(
@@ -1358,7 +1382,7 @@ mod tests {
         );
         assert!(
             !body.contains("GM_BENCHMARK_UPSTREAM_URL"),
-            "benchmark URL must be absent when none is supplied"
+            "GM_BENCHMARK_UPSTREAM_URL must no longer be written to the env file"
         );
     }
 
@@ -1372,24 +1396,10 @@ mod tests {
             username: "miner-bot".to_owned(),
             password: "ghp_token".to_owned(),
         };
-        let body = render_env_file(&keys, "node-secret", Some(&creds), None);
+        let body = render_env_file(&keys, "node-secret", Some(&creds));
         assert!(body.contains("DSTACK_DOCKER_REGISTRY=ghcr.io\n"));
         assert!(body.contains("DSTACK_DOCKER_USERNAME=miner-bot\n"));
         assert!(body.contains("DSTACK_DOCKER_PASSWORD=ghp_token\n"));
-    }
-
-    /// When a benchmark upstream URL is supplied, it must appear as
-    /// `GM_BENCHMARK_UPSTREAM_URL` so envoy's benchmark route activates.
-    #[test]
-    fn render_env_file_writes_benchmark_upstream_url() {
-        let keys = ProviderKeys::default();
-        let body = render_env_file(
-            &keys,
-            "node-secret",
-            None,
-            Some("https://test-benchmark.saygm.com"),
-        );
-        assert!(body.contains("GM_BENCHMARK_UPSTREAM_URL=https://test-benchmark.saygm.com\n"));
     }
 
     // ── phala cvms get endpoint parsing ───────────────────────────────────────
@@ -1600,7 +1610,8 @@ mod tests {
                 Ok("ghcr.io/taostat/gm-miner@sha256:deadbeef".to_owned())
             }
         }
-        let target = prepare_deploy_target(&StubProvisioner).expect("orchestration must succeed");
+        let target =
+            prepare_deploy_target(&StubProvisioner, "testnet").expect("orchestration must succeed");
         assert_eq!(target.image_ref, "ghcr.io/taostat/gm-miner@sha256:deadbeef");
         assert!(
             target.rendered_compose.contains("sha256:deadbeef"),
@@ -1609,6 +1620,10 @@ mod tests {
         assert!(
             !target.rendered_compose.contains("${GM_IMAGE_REF"),
             "the ${{GM_IMAGE_REF}} placeholder must be substituted"
+        );
+        assert!(
+            target.rendered_compose.contains("GM_NETWORK=testnet"),
+            "the active network must be substituted into the compose"
         );
     }
 
@@ -1621,7 +1636,8 @@ mod tests {
                 bail!("image build+push failed")
             }
         }
-        let err = prepare_deploy_target(&FailingProvisioner).expect_err("build failure must abort");
+        let err = prepare_deploy_target(&FailingProvisioner, "testnet")
+            .expect_err("build failure must abort");
         assert!(err.to_string().contains("image build+push failed"));
     }
 }
