@@ -12,10 +12,12 @@
 ## network in `start.sh` and keyed off GM_NETWORK (rendered into the
 ## compose by `gm-miner deploy`); `start.sh` substitutes the host/port
 ## into this config's `__GM_BENCHMARK_HOST__` / `__GM_BENCHMARK_PORT__`
-## placeholders at container start. Because both URLs live in the image
-## source, the route cannot be redirected at runtime — only by editing
-## start.sh, which moves the compose_hash and is rejected by the
-## registry's attestation enforcement.
+## placeholders at container start, and keeps or drops the
+## `gm:benchmark-tls` sentinel block on the benchmark cluster depending
+## on the URL's scheme (kept for https, dropped for http). Because
+## both URLs live in the image source, the route cannot be redirected
+## at runtime — only by editing start.sh, which moves the compose_hash
+## and is rejected by the registry's attestation enforcement.
 ##
 ## Inbound auth (Mechanism 1 of attestation-and-identity.md): a Lua
 ## filter checks the `x-gm-node-key` header against the node secret
@@ -718,9 +720,9 @@ static_resources:
     ## ── Benchmark ─────────────────────────────────────────────────────
     ##  Synthetic benchmark upstream. start.sh substitutes the host/port
     ##  placeholders from the per-network URL it resolves from
-    ##  GM_NETWORK. A plain HTTP/1.1 cluster with no transport_socket:
-    ##  the benchmark upstream is internal test apparatus, not a TLS
-    ##  provider API.
+    ##  GM_NETWORK, and keeps or drops the `gm:benchmark-tls` sentinel
+    ##  block below depending on the URL's scheme — kept for https,
+    ##  dropped for http. When dropped the cluster is plain HTTP/1.1.
     - name: benchmark
       type: LOGICAL_DNS
       connect_timeout: 10s
@@ -734,3 +736,18 @@ static_resources:
                     socket_address:
                       address: __GM_BENCHMARK_HOST__
                       port_value: __GM_BENCHMARK_PORT__
+      ## gm:benchmark-tls-begin
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: __GM_BENCHMARK_HOST__
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: __GM_BENCHMARK_HOST__
+      ## gm:benchmark-tls-end

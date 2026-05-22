@@ -74,13 +74,32 @@ fi
 # time and equally tamper-evident.
 #
 # Envoy clusters take a host and a port, not a URL: the literal URL
-# below is split into BENCHMARK_HOST / BENCHMARK_PORT, then substituted
-# into envoy.yaml's benchmark cluster.
+# below is split into BENCHMARK_HOST / BENCHMARK_PORT / BENCHMARK_TLS,
+# then substituted into envoy.yaml's benchmark cluster. The scheme
+# decides both the default port (443 for https, 80 for http) and
+# whether the cluster carries an upstream TLS context — envoy.yaml's
+# `gm:benchmark-tls` sentinel block is kept when the URL is https and
+# dropped when it is http.
 case "${GM_NETWORK:?GM_NETWORK must be set (rendered into dstack/docker-compose.yaml by gm-miner deploy)}" in
   testnet) BENCHMARK_URL="https://test-benchmark.saygm.com" ;;
   mainnet) BENCHMARK_URL="https://benchmark.saygm.com" ;;
   *)
     log "error: unknown GM_NETWORK '${GM_NETWORK}' (want testnet or mainnet)"
+    exit 1
+    ;;
+esac
+
+case "${BENCHMARK_URL}" in
+  https://*)
+    BENCHMARK_TLS=1
+    benchmark_default_port=443
+    ;;
+  http://*)
+    BENCHMARK_TLS=0
+    benchmark_default_port=80
+    ;;
+  *)
+    log "error: BENCHMARK_URL must start with http:// or https:// (got '${BENCHMARK_URL}')"
     exit 1
     ;;
 esac
@@ -92,13 +111,13 @@ if [[ "${benchmark_authority}" == *:* ]]; then
   BENCHMARK_PORT="${benchmark_authority##*:}"
 else
   BENCHMARK_HOST="${benchmark_authority}"
-  BENCHMARK_PORT="80"
+  BENCHMARK_PORT="${benchmark_default_port}"
 fi
 
 # ── Render the envoy config ───────────────────────────────────────────
-# Three literal token replaces (awk index/substr, not gsub) so values
-# with regex- or replacement-special characters are handled verbatim.
-# The rendered config goes to a writable path; the baked-in
+# Literal token replaces (awk index/substr, not gsub) so values with
+# regex- or replacement-special characters are handled verbatim. The
+# rendered config goes to a writable path; the baked-in
 # /etc/envoy/envoy.yaml stays untouched.
 #
 #   1. The node secret. Envoy's inbound Lua filter enforces x-gm-node-key
@@ -109,10 +128,15 @@ fi
 #      predating node-secret auth).
 #   2. The benchmark cluster's host and port — resolved above from the
 #      hardcoded per-network URL.
+#   3. The benchmark cluster's upstream TLS block, delimited by
+#      `## gm:benchmark-tls-begin` / `-end` whole-line sentinels. Kept
+#      when the URL is https; dropped (the cluster stays plain HTTP/1.1)
+#      when it is http.
 RENDERED_CONFIG=/tmp/envoy.rendered.yaml
 GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_BENCHMARK_HOST="${BENCHMARK_HOST}" \
   GM_BENCHMARK_PORT="${BENCHMARK_PORT}" \
+  GM_BENCHMARK_TLS="${BENCHMARK_TLS}" \
   awk '
   function subst(line, token, value,    out, rest, pos) {
     out = ""
@@ -127,7 +151,11 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     secret = ENVIRON["GM_NODE_SECRET"]
     bench_host = ENVIRON["GM_BENCHMARK_HOST"]
     bench_port = ENVIRON["GM_BENCHMARK_PORT"]
+    bench_tls = (ENVIRON["GM_BENCHMARK_TLS"] == "1")
   }
+  /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
+  /^[[:space:]]*## gm:benchmark-tls-end[[:space:]]*$/   { in_tls = 0; next }
+  in_tls && !bench_tls { next }
   {
     line = subst($0, "__GM_NODE_SECRET__", secret)
     line = subst(line, "__GM_BENCHMARK_HOST__", bench_host)
@@ -142,7 +170,11 @@ else
   log "warning: GM_NODE_SECRET unset — inbound data plane is unauthenticated"
 fi
 
-log "benchmark route proxies to ${BENCHMARK_HOST}:${BENCHMARK_PORT} (GM_NETWORK=${GM_NETWORK})"
+if [[ "${BENCHMARK_TLS}" -eq 1 ]]; then
+  log "benchmark route proxies to https://${BENCHMARK_HOST}:${BENCHMARK_PORT} (GM_NETWORK=${GM_NETWORK})"
+else
+  log "benchmark route proxies to http://${BENCHMARK_HOST}:${BENCHMARK_PORT} (GM_NETWORK=${GM_NETWORK})"
+fi
 
 GM_IMAGE_VERSION="${GM_IMAGE_VERSION:-unknown}"
 log "image version: ${GM_IMAGE_VERSION}"
