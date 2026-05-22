@@ -1,10 +1,23 @@
-## gm miner Envoy configuration — three provider routes.
+## gm miner Envoy configuration — three provider routes plus an
+## optional benchmark route.
 ##
 ## Routes match on the `x-gm-provider` header set by the gateway and
 ## are gated on the upstream key being present in the container's
 ## environment. Unconfigured providers return 401 from upstream when
 ## probed (envoy substitutes an empty key) so the registry can detect
 ## "no key set" the same way it detects "key revoked".
+##
+## The benchmark route (`x-gm-provider: benchmark`) is first-pass
+## apparatus for benchmarking miners against a synthetic upstream. It
+## is a plain proxy to the URL in `GM_BENCHMARK_UPSTREAM_URL` with no
+## auth-header injection. Unlike a provider route, its cluster cannot
+## be baked in statically — the upstream is a runtime-supplied URL —
+## so `start.sh` renders the route and cluster from that env var. When
+## `GM_BENCHMARK_UPSTREAM_URL` is unset `start.sh` drops the marked
+## benchmark block (the `gm:benchmark` sentinel lines below), the
+## route disappears, and a `benchmark` request falls through to the
+## 501 catch-all — the same "route is disabled" outcome a provider
+## route has when its key env var is unset.
 ##
 ## Inbound auth (Mechanism 1 of attestation-and-identity.md): a Lua
 ## filter checks the `x-gm-node-key` header against the node secret
@@ -166,6 +179,33 @@ static_resources:
                                 key: x-goog-api-key
                                 value: "%ENVIRONMENT(GOOGLE_API_KEY)%"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
+
+                        ## gm:benchmark-begin
+                        ## ── Benchmark ───────────────────────────────────────
+                        ##  Present only when GM_BENCHMARK_UPSTREAM_URL is set.
+                        ##  A plain proxy to the synthetic benchmark upstream —
+                        ##  no API key, no upstream auth header. start.sh
+                        ##  renders the cluster host/port from the env var, or
+                        ##  drops this whole marked block when the var is unset
+                        ##  (the route then disappears and a `benchmark`
+                        ##  request falls through to the 501 catch-all below).
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "benchmark"
+                          route:
+                            cluster: benchmark
+                            host_rewrite_literal: __GM_BENCHMARK_HOST__
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                        ## gm:benchmark-end
 
                         ## ── Fallback: no provider matched ─────────────────────
                         ##  Catch-all for requests whose `x-gm-provider` header
@@ -356,3 +396,25 @@ static_resources:
                 - san_type: DNS
                   matcher:
                     exact: generativelanguage.googleapis.com
+
+    ## gm:benchmark-begin
+    ## ── Benchmark ─────────────────────────────────────────────────────
+    ##  Synthetic benchmark upstream. Present only when start.sh renders
+    ##  this block — the host/port placeholders below are substituted
+    ##  from GM_BENCHMARK_UPSTREAM_URL. A plain HTTP/1.1 cluster with no
+    ##  transport_socket: the benchmark upstream is internal test
+    ##  apparatus, not a TLS provider API.
+    - name: benchmark
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: benchmark
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: __GM_BENCHMARK_HOST__
+                      port_value: __GM_BENCHMARK_PORT__
+    ## gm:benchmark-end

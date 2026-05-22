@@ -17,6 +17,17 @@
 # capability failure for the affected provider. The 501 fallback in
 # envoy.yaml fires only when no provider header arrives.
 #
+# Benchmark route: the optional `x-gm-provider: benchmark` route proxies
+# to a synthetic upstream named by GM_BENCHMARK_UPSTREAM_URL. Its
+# cluster cannot be baked in statically (the upstream is a runtime URL),
+# so the route + cluster live between `## gm:benchmark-begin` and
+# `## gm:benchmark-end` sentinel lines in envoy.yaml. The rendering step
+# below substitutes the URL's host/port into that block, or drops the
+# whole block when GM_BENCHMARK_UPSTREAM_URL is unset — the route then
+# disappears and a `benchmark` request falls through to the 501
+# catch-all (the same "route disabled" outcome as an unset provider
+# key).
+#
 # Process supervision: attestd and envoy both run in the background;
 # this script stays PID 1 and `wait -n`s on both. When either exits the
 # whole container exits non-zero so the runtime's `restart:
@@ -49,28 +60,80 @@ if [[ "${HAS_KEY}" -eq 0 ]]; then
   exit 1
 fi
 
-# ── Render the node secret into the envoy config ──────────────────────
-# Envoy's inbound Lua filter enforces x-gm-node-key against a config
-# literal — Envoy's Lua sandbox does not document os.getenv support, so
-# the secret is substituted in here rather than read at Lua runtime. An
-# unset GM_NODE_SECRET renders an empty literal, which the filter treats
-# as "skip the check" (a miner predating node-secret auth).
+# ── Resolve the benchmark upstream ────────────────────────────────────
+# GM_BENCHMARK_UPSTREAM_URL, when set, names the synthetic upstream the
+# `x-gm-provider: benchmark` route proxies to. Envoy clusters take a
+# host and a port, not a URL, so the URL is split here. Only the host
+# (or host:port) authority is consumed — scheme and path are ignored:
+# the benchmark cluster is plain HTTP/1.1 and the route forwards the
+# request path unchanged. An explicit port is used as given; with none,
+# port 80 is the default.
+BENCHMARK_HOST=""
+BENCHMARK_PORT=""
+if [[ -n "${GM_BENCHMARK_UPSTREAM_URL:-}" ]]; then
+  benchmark_authority="${GM_BENCHMARK_UPSTREAM_URL#*://}"
+  benchmark_authority="${benchmark_authority%%/*}"
+  if [[ "${benchmark_authority}" == *:* ]]; then
+    BENCHMARK_HOST="${benchmark_authority%:*}"
+    BENCHMARK_PORT="${benchmark_authority##*:}"
+  else
+    BENCHMARK_HOST="${benchmark_authority}"
+    BENCHMARK_PORT="80"
+  fi
+  if [[ -z "${BENCHMARK_HOST}" || -z "${BENCHMARK_PORT}" ]]; then
+    log "error: GM_BENCHMARK_UPSTREAM_URL is set but not a host[:port] URL: ${GM_BENCHMARK_UPSTREAM_URL}"
+    exit 1
+  fi
+fi
+
+# ── Render the envoy config ───────────────────────────────────────────
+# Two substitutions happen here, both literal token replaces (awk
+# index/substr, not gsub) so values with regex- or replacement-special
+# characters are handled verbatim. The rendered config goes to a
+# writable path; the baked-in /etc/envoy/envoy.yaml stays untouched.
 #
-# The substitution is a literal token replace (awk index/substr, not
-# gsub) so a secret containing regex- or replacement-special characters
-# is handled verbatim. The rendered config goes to a writable path; the
-# baked-in /etc/envoy/envoy.yaml stays untouched.
+#   1. The node secret. Envoy's inbound Lua filter enforces x-gm-node-key
+#      against a config literal — Envoy's Lua sandbox does not document
+#      os.getenv support, so the secret is substituted in rather than
+#      read at Lua runtime. An unset GM_NODE_SECRET renders an empty
+#      literal, which the filter treats as "skip the check" (a miner
+#      predating node-secret auth).
+#   2. The benchmark route + cluster, delimited by `## gm:benchmark-begin`
+#      / `## gm:benchmark-end` sentinel lines (matched as whole lines so a
+#      mention of the word in a comment never triggers them). When
+#      GM_BENCHMARK_UPSTREAM_URL is set, the host/port placeholders are
+#      filled and the sentinel lines dropped; when it is unset, every line
+#      between the sentinels (sentinels included) is dropped, so the route
+#      and cluster vanish from the rendered config.
 RENDERED_CONFIG=/tmp/envoy.rendered.yaml
-GM_NODE_SECRET="${GM_NODE_SECRET:-}" awk '
-  BEGIN { token = "__GM_NODE_SECRET__"; secret = ENVIRON["GM_NODE_SECRET"] }
-  {
+GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
+  GM_BENCHMARK_ENABLED="${GM_BENCHMARK_UPSTREAM_URL:+1}" \
+  GM_BENCHMARK_HOST="${BENCHMARK_HOST}" \
+  GM_BENCHMARK_PORT="${BENCHMARK_PORT}" \
+  awk '
+  function subst(line, token, value,    out, rest, pos) {
     out = ""
-    rest = $0
+    rest = line
     while ((pos = index(rest, token)) > 0) {
-      out = out substr(rest, 1, pos - 1) secret
+      out = out substr(rest, 1, pos - 1) value
       rest = substr(rest, pos + length(token))
     }
-    print out rest
+    return out rest
+  }
+  BEGIN {
+    secret = ENVIRON["GM_NODE_SECRET"]
+    bench_enabled = (ENVIRON["GM_BENCHMARK_ENABLED"] == "1")
+    bench_host = ENVIRON["GM_BENCHMARK_HOST"]
+    bench_port = ENVIRON["GM_BENCHMARK_PORT"]
+  }
+  /^[[:space:]]*## gm:benchmark-begin[[:space:]]*$/ { in_benchmark = 1; next }
+  /^[[:space:]]*## gm:benchmark-end[[:space:]]*$/   { in_benchmark = 0; next }
+  in_benchmark && !bench_enabled { next }
+  {
+    line = subst($0, "__GM_NODE_SECRET__", secret)
+    line = subst(line, "__GM_BENCHMARK_HOST__", bench_host)
+    line = subst(line, "__GM_BENCHMARK_PORT__", bench_port)
+    print line
   }
 ' /etc/envoy/envoy.yaml >"${RENDERED_CONFIG}"
 
@@ -78,6 +141,12 @@ if [[ -n "${GM_NODE_SECRET:-}" ]]; then
   log "GM_NODE_SECRET set — envoy enforces x-gm-node-key on inbound requests"
 else
   log "warning: GM_NODE_SECRET unset — inbound data plane is unauthenticated"
+fi
+
+if [[ -n "${GM_BENCHMARK_UPSTREAM_URL:-}" ]]; then
+  log "GM_BENCHMARK_UPSTREAM_URL set — benchmark route proxies to ${BENCHMARK_HOST}:${BENCHMARK_PORT}"
+else
+  log "GM_BENCHMARK_UPSTREAM_URL unset — benchmark route disabled"
 fi
 
 GM_IMAGE_VERSION="${GM_IMAGE_VERSION:-unknown}"
