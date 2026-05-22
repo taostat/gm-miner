@@ -58,6 +58,12 @@ services:
       - GOOGLE_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
+      ## Benchmark upstream — first-pass apparatus for benchmarking
+      ## miners against a synthetic upstream. When set, envoy's
+      ## `x-gm-provider: benchmark` route proxies to this URL; when
+      ## unset the benchmark route is disabled. Not set by a normal
+      ## `gm-miner deploy` — only a benchmark deployment populates it.
+      - GM_BENCHMARK_UPSTREAM_URL
     volumes:
       ## dstack guest-agent socket. The attestation server calls
       ## get_key (TEE-bound keypair), get_quote (fresh TDX quote), and
