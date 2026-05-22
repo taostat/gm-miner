@@ -79,4 +79,22 @@ services:
       ## auto-mount it into app containers — without this bind mount
       ## attestd crash-loops on "Failed to connect to unix stream".
       - /var/run/dstack.sock:/var/run/dstack.sock
+    ## File-descriptor limit. Envoy is the data plane: every downstream
+    ## connection and every upstream connection it opens consumes a
+    ## file descriptor, so a streaming proxy at N concurrent connections
+    ## holds ~2N fds plus Envoy's own (epoll, the :8080 listener, the
+    ## attestd loopback socket, the dstack socket, logs). With nothing
+    ## set here the container inherits whatever the dstack CVM's
+    ## container runtime defaults to — on a containerd 2.x host that
+    ## soft limit is 1024, which caps the miner at roughly 500 streaming
+    ## connections before Envoy starts failing to open sockets and sheds
+    ## load by resetting connections. 65536 gives a multi-thousand-
+    ## connection budget with headroom; the overload-manager connection
+    ## ceiling in envoy.yaml is set well under half this value, per
+    ## Envoy's fd-sizing guidance. Declared here so it is part of the
+    ## attestation-measured compose hash.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped
