@@ -24,6 +24,33 @@
 ## Prometheus metrics: envoy's admin interface exposes
 ## `/stats/prometheus` on the admin port (bound to localhost). This
 ## replaces the deleted capability sidecar's `/metrics` endpoint.
+##
+## RA-TLS data plane (Mechanism 2 of attestation-and-identity.md): the
+## `:8080` ingress listener terminates TLS with a certificate minted by
+## dstack's native RA-TLS facility. At container start `start.sh` runs
+## `gm-miner-ratls`, which calls the dstack guest agent's `GetTlsKey`
+## RPC with `usage_ra_tls: true`; the guest agent generates a fresh
+## P-256 key, takes a TDX quote whose `report_data` commits to that key
+## (`SHA-512("ratls-cert:" || pubkey_der)`), and issues an X.509 leaf
+## carrying the quote in extension OID `1.3.6.1.4.1.62397.1.8`. The key
+## and cert PEM files land at `/tmp/gm-ratls/` and are referenced by the
+## listener's `DownstreamTlsContext` below. The gateway verifies the
+## embedded quote once per connection; every request on that connection
+## then inherits the attestation guarantee.
+##
+## Callers reach this listener through the dstack gateway's
+## TLS-passthrough URL (`https://<app-id>-8080s.<node>.phala.network`):
+## passthrough means the dstack gateway forwards the raw TLS stream so
+## the RA-TLS certificate Envoy serves is the one the caller receives.
+## The default `-8080` URL would have the dstack gateway terminate TLS
+## at its edge and hide this cert — `gm-miner deploy` registers the
+## `-8080s` form for that reason.
+##
+## `/attestation/info` stays reachable over this same TLS listener — the
+## registry's control loop and auditors connect over TLS and probe that
+## path. The RA-TLS cert is self-signed (trust comes from the embedded
+## quote, not from a CA chain or a hostname match), so a plain `curl`
+## needs `-k`; a verifying client checks the quote instead of the chain.
 
 admin:
   ## Bound to loopback only. The container exposes 9901 as informational
@@ -45,7 +72,31 @@ static_resources:
           address: 0.0.0.0
           port_value: 8080
       filter_chains:
-        - filters:
+        - ## ── RA-TLS termination ──────────────────────────────────────
+          ##  The ingress listener terminates TLS with the dstack-minted
+          ##  RA-TLS certificate. `gm-miner-ratls` writes the PEM key and
+          ##  cert to /tmp/gm-ratls/ before envoy starts (see start.sh);
+          ##  that step runs to completion first and a dstack failure
+          ##  aborts the container, so envoy never boots without the cert
+          ##  files in place.
+          ##
+          ##  No `validation_context` — the miner data plane does not
+          ##  request a client certificate. Caller identity is proven by
+          ##  the `x-gm-node-key` header (Mechanism 1, the Lua filter
+          ##  below); this TLS context exists to prove the *miner's*
+          ##  attestation to the gateway, the opposite direction. The
+          ##  certificate the gateway receives carries the TDX quote.
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/gm-ratls/cert.pem
+                    private_key:
+                      filename: /tmp/gm-ratls/key.pem
+          filters:
             - name: envoy.filters.network.http_connection_manager
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager

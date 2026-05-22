@@ -37,10 +37,12 @@ COPY attestd/Cargo.toml ./attestd/
 COPY dstack/ ./dstack/
 
 ## Pre-build a dummy workspace to cache dependencies. The attestd crate
-## ships both a bin and a lib, so the dummy tree needs both entry files.
-RUN mkdir -p cli/src attestd/src \
+## ships a lib and two bins (gm-miner-attestd, gm-miner-ratls), so the
+## dummy tree needs an entry file for each declared target.
+RUN mkdir -p cli/src attestd/src/bin \
   && echo "fn main() {}" > cli/src/main.rs \
   && echo "fn main() {}" > attestd/src/main.rs \
+  && echo "fn main() {}" > attestd/src/bin/ratls.rs \
   && echo "" > attestd/src/lib.rs \
   && cargo build --release --workspace 2>/dev/null || true \
   && rm -rf cli/src attestd/src
@@ -52,8 +54,10 @@ COPY attestd/ ./attestd/
 ## Build the workspace. Touch the entry points to invalidate the dummy
 ## build cache so the real sources compile.
 RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
+    attestd/src/bin/ratls.rs \
   && cargo build --release --workspace \
-  && strip target/release/gm-miner target/release/gm-miner-attestd
+  && strip target/release/gm-miner target/release/gm-miner-attestd \
+    target/release/gm-miner-ratls
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
 ## Envoy 1.32.x pinned by digest.
@@ -79,6 +83,10 @@ COPY --from=builder /build/target/release/gm-miner /usr/local/bin/gm-miner
 ## envoy routes GET /attestation/info to it on loopback.
 COPY --from=builder /build/target/release/gm-miner-attestd /usr/local/bin/gm-miner-attestd
 
+## Copy the RA-TLS provisioner. start.sh runs it once before envoy to
+## mint the data-plane TLS cert via the dstack guest agent.
+COPY --from=builder /build/target/release/gm-miner-ratls /usr/local/bin/gm-miner-ratls
+
 ## Copy Envoy config.
 COPY image/envoy.yaml /etc/envoy/envoy.yaml
 
@@ -86,9 +94,10 @@ COPY image/envoy.yaml /etc/envoy/envoy.yaml
 COPY image/start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh
 
-## Envoy data-plane port: upstream request proxying AND the registry's
-## GET /attestation/info probes (envoy routes that path to the
-## loopback-bound attestation server).
+## Envoy data-plane port: RA-TLS-terminated upstream request proxying
+## AND the registry's GET /attestation/info probes (envoy routes that
+## path to the loopback-bound attestation server). TLS is terminated
+## with the dstack-minted RA-TLS certificate (see start.sh / envoy.yaml).
 EXPOSE 8080
 ## Envoy admin port (Prometheus `/stats/prometheus` and runtime config
 ## introspection — bound to localhost via admin block in envoy.yaml,
@@ -96,10 +105,11 @@ EXPOSE 8080
 EXPOSE 9901
 
 ## Drop to non-root. The envoy base image has the envoy user (uid 100).
-## The attestation server runs as the same user; it needs only read
-## access to the bind-mounted /var/run/dstack.sock.
+## The RA-TLS provisioner and the attestation server run as the same
+## user; they need read access to the bind-mounted /var/run/dstack.sock
+## and write access to /tmp (world-writable) for the RA-TLS PEM files.
 USER envoy
 
-## start.sh launches the attestation server in the background, then
-## execs envoy as PID 1.
+## start.sh provisions the RA-TLS cert, launches the attestation server
+## in the background, then runs envoy.
 ENTRYPOINT ["/usr/local/bin/start.sh"]

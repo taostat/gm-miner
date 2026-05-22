@@ -83,8 +83,11 @@ pub struct DstackDeployResult {
 pub struct DeployOutcome {
     /// Measured `compose_hash` + `os_image_hash` for the CVM.
     pub hashes: DstackDeployResult,
-    /// The CVM's public endpoint (`endpoints[0].app`), e.g.
-    /// `https://<app-id>-8080.dstack-<node>.phala.network`.
+    /// The CVM's public RA-TLS data-plane endpoint — the dstack
+    /// TLS-passthrough (`s`-suffix) form of `endpoints[0].app`, e.g.
+    /// `https://<app-id>-8080s.dstack-<node>.phala.network`. Registered
+    /// with the registry so the gateway connects to the URL on which
+    /// the miner's RA-TLS certificate is actually presented.
     pub endpoint: String,
 }
 
@@ -369,6 +372,62 @@ pub fn parse_phala_cvm_endpoint(succeeded: bool, stdout: &[u8]) -> Result<Option
         .filter(|app| !app.is_empty()))
 }
 
+/// Rewrite a dstack `:8080` endpoint URL into its TLS-passthrough form.
+///
+/// `phala cvms get` reports the default port-mapped URL
+/// (`https://<app-id>-8080.dstack-<node>.phala.network`), which the
+/// dstack gateway serves with **TLS termination at the edge** — the
+/// caller sees the gateway's ACME certificate, not the miner's. The
+/// miner's RA-TLS data plane needs the dstack **`s`-suffix** form
+/// (`https://<app-id>-8080s.dstack-<node>.phala.network`): in that mode
+/// the gateway does TLS passthrough, so the TLS connection terminates
+/// on the miner's Envoy and the caller receives the dstack-minted
+/// RA-TLS certificate carrying the TDX quote. The registered endpoint
+/// must be this passthrough URL or the gateway can never verify
+/// Mechanism 2.
+///
+/// The transform appends `s` to the first DNS label, which dstack's
+/// ingress scheme (`<id>-<port>[s|g]`) defines as the port suffix. An
+/// endpoint already in `s`-suffix form is returned unchanged.
+///
+/// # Errors
+///
+/// Returns an error when `endpoint` is not a URL whose host's first
+/// label ends in `-<port-digits>` — i.e. not the dstack port-mapped
+/// shape this transform understands. Failing here is deliberate: a
+/// deploy must not register an endpoint that cannot present the RA-TLS
+/// cert.
+pub fn to_ratls_passthrough_endpoint(endpoint: &str) -> Result<String> {
+    let (scheme, rest) = endpoint
+        .split_once("://")
+        .with_context(|| format!("endpoint is not an absolute URL: {endpoint}"))?;
+    // The authority runs up to the first `/`, `?`, or `#`.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let (first_label, host_rest) = authority.split_once('.').with_context(|| {
+        format!("endpoint host has no dotted domain to derive a passthrough URL from: {endpoint}")
+    })?;
+
+    // The port suffix is the run of trailing digits after the last `-`.
+    let (label_head, port) = first_label.rsplit_once('-').with_context(|| {
+        format!("endpoint host label {first_label:?} is not the dstack <id>-<port> shape")
+    })?;
+    if let Some(port_digits) = port.strip_suffix('s') {
+        // Already a passthrough URL — leave it untouched, but only if
+        // what precedes the `s` really is the port.
+        if !port_digits.is_empty() && port_digits.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(endpoint.to_owned());
+        }
+    }
+    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!(
+            "endpoint host label {first_label:?} does not end in a numeric port; \
+             cannot derive the dstack TLS-passthrough form of {endpoint}"
+        );
+    }
+    Ok(format!("{scheme}://{label_head}-{port}s.{host_rest}{tail}"))
+}
+
 /// Parse the measured hashes out of `phala cvms get <app-id> --json` output.
 ///
 /// `succeeded` is the command's exit status; `stdout` is its raw stdout.
@@ -501,6 +560,10 @@ fn read_phala_cvm_outcome(cvm_id: &str) -> Result<Option<DeployOutcome>> {
     let Some(endpoint) = parse_phala_cvm_endpoint(succeeded, &out.stdout)? else {
         return Ok(None);
     };
+    // Register the TLS-passthrough form: the miner's RA-TLS cert is only
+    // presented to callers on the dstack `s`-suffix URL (see
+    // `to_ratls_passthrough_endpoint`).
+    let endpoint = to_ratls_passthrough_endpoint(&endpoint)?;
     Ok(Some(DeployOutcome { hashes, endpoint }))
 }
 
@@ -1306,6 +1369,56 @@ mod tests {
         let endpoint =
             parse_phala_cvm_endpoint(false, b"garbage").expect("non-zero exit must not error");
         assert!(endpoint.is_none());
+    }
+
+    #[test]
+    fn ratls_passthrough_appends_s_after_the_port() {
+        let got = to_ratls_passthrough_endpoint("https://app_abc-8080.dstack-prod5.phala.network")
+            .expect("port-mapped URL transforms");
+        assert_eq!(got, "https://app_abc-8080s.dstack-prod5.phala.network");
+    }
+
+    #[test]
+    fn ratls_passthrough_preserves_path_and_query() {
+        let got = to_ratls_passthrough_endpoint(
+            "https://app_abc-8080.dstack-prod5.phala.network/attestation/info?nonce=x",
+        )
+        .expect("URL with path transforms");
+        assert_eq!(
+            got,
+            "https://app_abc-8080s.dstack-prod5.phala.network/attestation/info?nonce=x"
+        );
+    }
+
+    #[test]
+    fn ratls_passthrough_is_idempotent_on_s_suffix_urls() {
+        let already = "https://app_abc-8080s.dstack-prod5.phala.network";
+        assert_eq!(
+            to_ratls_passthrough_endpoint(already).expect("s-suffix URL is left as-is"),
+            already
+        );
+    }
+
+    #[test]
+    fn ratls_passthrough_rejects_non_port_mapped_host() {
+        // A plain `<app-id>.dstack...` host (default port 80/443) has no
+        // `-<port>` label, so no passthrough form can be derived.
+        assert!(
+            to_ratls_passthrough_endpoint("https://app_abc.dstack-prod5.phala.network").is_err()
+        );
+    }
+
+    #[test]
+    fn ratls_passthrough_rejects_non_numeric_port_label() {
+        assert!(
+            to_ratls_passthrough_endpoint("https://app_abc-envoy.dstack-prod5.phala.network")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ratls_passthrough_rejects_non_url() {
+        assert!(to_ratls_passthrough_endpoint("app_abc-8080.dstack-prod5.phala.network").is_err());
     }
 
     #[test]

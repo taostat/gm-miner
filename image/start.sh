@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # gm miner container entrypoint.
 #
-# The miner runtime is two co-located processes:
+# Startup runs one one-shot provisioning step, then launches two
+# co-located long-running processes:
 #
+#   0. gm-miner-ratls (one-shot) — mints the data-plane RA-TLS
+#      certificate via dstack's GetTlsKey RPC and writes the key/cert
+#      PEM files envoy's :8080 DownstreamTlsContext references. Runs to
+#      completion before envoy starts; a failure aborts the container.
 #   1. gm-miner-attestd — serves GET /attestation/info with a fresh
 #      Intel TDX quote from the dstack guest agent. Bound to loopback;
 #      envoy routes the single /attestation/info path to it.
-#   2. envoy — the data plane on :8080. Proxies provider inference
-#      traffic and the registry's x-gm-provider capability probes, and
-#      forwards /attestation/info to the attestation server.
+#   2. envoy — the data plane on :8080. Terminates RA-TLS with the
+#      minted certificate, proxies provider inference traffic and the
+#      registry's x-gm-provider capability probes, and forwards
+#      /attestation/info to the attestation server.
 #
 # Disabled-route handling: envoy's static config carries all three
 # provider clusters. Routes match on `x-gm-provider`. When the
@@ -82,6 +88,25 @@ fi
 
 GM_IMAGE_VERSION="${GM_IMAGE_VERSION:-unknown}"
 log "image version: ${GM_IMAGE_VERSION}"
+
+# ── Provision the data-plane RA-TLS certificate ───────────────────────
+# Mechanism 2 of attestation-and-identity.md. gm-miner-ratls calls the
+# dstack guest agent's GetTlsKey RPC (over /var/run/dstack.sock) with
+# usage_ra_tls=true: the guest agent mints a fresh TLS key, takes a TDX
+# quote bound to that key, and issues an X.509 cert carrying the quote.
+# It writes the PEM key/cert to /tmp/gm-ratls/; envoy's :8080
+# DownstreamTlsContext references those exact paths (the paths are a
+# build-time contract baked into both gm-miner-ratls and envoy.yaml).
+#
+# This is a one-shot step that must finish before envoy starts — envoy
+# fails to bind a TLS listener if the cert files are absent. A dstack
+# failure here is fatal: gm-miner-ratls exits non-zero, `set -e` aborts
+# the container, and the runtime's `restart: unless-stopped` policy
+# retries the whole startup — the same fail-fast posture attestd uses
+# for its own dstack calls.
+log "minting data-plane RA-TLS certificate via dstack get_tls_key"
+gm-miner-ratls
+log "RA-TLS certificate ready"
 
 # ── Launch the attestation server ─────────────────────────────────────
 # gm-miner-attestd binds 127.0.0.1:8081 (envoy's `attestd` cluster

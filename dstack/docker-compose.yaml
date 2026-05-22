@@ -22,6 +22,17 @@
 ## server). The registry probes :8080 — `x-gm-provider` for capability,
 ## and `GET /attestation/info` which envoy routes to attestd.
 ##
+## RA-TLS data plane (Mechanism 2 of attestation-and-identity.md): envoy
+## terminates TLS on :8080 with a certificate minted by dstack's RA-TLS
+## facility (see image/start.sh, image/envoy.yaml). For the gateway to
+## receive that certificate the data plane MUST be reached through the
+## dstack gateway's TLS-passthrough URL — the `s`-suffix form
+## `https://<app-id>-8080s.<node>.phala.network`. The default `-8080`
+## (no suffix) URL has the dstack gateway terminate TLS at the edge with
+## its own ACME certificate, which would hide the miner's RA-TLS cert.
+## `gm-miner deploy` registers the `-8080s` passthrough URL with the
+## registry for exactly this reason.
+##
 ## dstack guest-agent socket: attestd calls the dstack guest agent's
 ## get_key (the TEE-bound attestation keypair) and get_quote / info
 ## endpoints over /var/run/dstack.sock. dstack exposes the socket on
@@ -35,7 +46,9 @@ services:
     ports:
       ## Envoy data plane — receives gateway inference traffic, the
       ## registry's `x-gm-provider` capability probes, and the
-      ## registry's `GET /attestation/info` attestation probes.
+      ## registry's `GET /attestation/info` attestation probes. Envoy
+      ## terminates RA-TLS here; callers reach it via the dstack
+      ## TLS-passthrough URL (`<app-id>-8080s.<node>.phala.network`).
       - "8080:8080"
     environment:
       ## Provider API keys — encrypted client-side to the CVM key by
