@@ -50,6 +50,14 @@ services:
       ## terminates RA-TLS here; callers reach it via the dstack
       ## TLS-passthrough URL (`<app-id>-8080s.<node>.phala.network`).
       - "8080:8080"
+      ## Envoy Prometheus metrics — the `metrics` listener (image/
+      ## envoy.yaml) serves ONLY `/stats/prometheus`, gated on the
+      ## `x-gm-node-key` node secret; the full admin interface stays
+      ## loopback-only. The registry control loop and the benchmark
+      ## runner scrape it. Plaintext here — the dstack ingress fronts
+      ## the port with TLS at its edge, so callers reach it at the
+      ## default `<app-id>-9902.<node>.phala.network` URL.
+      - "9902:9902"
     environment:
       ## Provider API keys — encrypted client-side to the CVM key by
       ## `phala deploy`. Set only the keys you own.

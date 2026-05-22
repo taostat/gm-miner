@@ -34,9 +34,11 @@
 ##     x-gm-product, x-gm-node-key) before forwarding upstream.
 ##   - Replace Authorization with the upstream key from env.
 ##
-## Prometheus metrics: envoy's admin interface exposes
-## `/stats/prometheus` on the admin port (bound to localhost). This
-## replaces the deleted capability sidecar's `/metrics` endpoint.
+## Prometheus metrics: the `metrics` listener on :9902 below surfaces
+## `/stats/prometheus` (and only that path) to external scrapers, gated
+## on `x-gm-node-key`. The full admin interface stays loopback-only.
+## See that listener's own comment for the rationale. This replaces the
+## deleted capability sidecar's `/metrics` endpoint.
 ##
 ## RA-TLS data plane (Mechanism 2 of attestation-and-identity.md): the
 ## `:8080` ingress listener terminates TLS with a certificate minted by
@@ -328,6 +330,95 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
+    ## ── Prometheus metrics listener ──────────────────────────────────
+    ##  Surfaces ONLY `/stats/prometheus` to the outside. The full Envoy
+    ##  admin interface on :9901 (loopback) also serves `/quitquitquit`,
+    ##  a live config dump, and other privileged endpoints — none of
+    ##  those may be reachable from outside the CVM. This listener's
+    ##  route table matches the single exact path `/stats/prometheus`
+    ##  and forwards it to the `metrics_admin` loopback cluster (the
+    ##  admin port); every other path falls through to a 404. The admin
+    ##  interface itself stays loopback-only.
+    ##
+    ##  Plaintext, no TLS: unlike the :8080 data plane this listener does
+    ##  not carry buyer content or upstream keys, only Envoy's own
+    ##  operational counters, and the dstack ingress already fronts the
+    ##  port with TLS at its edge for the default `<app-id>-9902` URL.
+    ##
+    ##  The node-secret Lua gate is reused here (the same
+    ##  `__GM_NODE_SECRET__` literal start.sh renders into the data
+    ##  plane's filter): metrics are gated on `x-gm-node-key` so they are
+    ##  not wide-open — every legitimate scraper (the registry control
+    ##  loop, the benchmark runner) already holds the node key. Unlike
+    ##  the data plane there is no `/attestation/info` exemption: every
+    ##  path on this listener requires the header. When GM_NODE_SECRET is
+    ##  unset start.sh renders an empty literal and the gate is skipped,
+    ##  matching the data plane's pre-Mechanism-1 posture.
+    - name: metrics
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 9902
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: metrics_http
+                route_config:
+                  name: metrics_routes
+                  virtual_hosts:
+                    - name: metrics
+                      domains: ["*"]
+                      routes:
+                        ## Exact-path match: only /stats/prometheus is
+                        ## proxied to the admin port. The header strip
+                        ## keeps the node key out of the loopback hop.
+                        - match:
+                            path: "/stats/prometheus"
+                          route:
+                            cluster: metrics_admin
+                            timeout: 10s
+                          request_headers_to_remove:
+                            - x-gm-node-key
+                        ## Every other path — including the rest of the
+                        ## admin surface — returns 404 and never reaches
+                        ## the admin port.
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 404
+                            body:
+                              inline_string: |
+                                {"error":"not found; only /stats/prometheus is exposed"}
+                http_filters:
+                  ## Same node-secret gate as the data plane, without
+                  ## the /attestation/info exemption — every path here
+                  ## requires x-gm-node-key. start.sh substitutes
+                  ## __GM_NODE_SECRET__ with the GM_NODE_SECRET env var;
+                  ## an empty literal (var unset) skips the check.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          local expected = "__GM_NODE_SECRET__"
+                          function envoy_on_request(handle)
+                            if expected == "" then
+                              return
+                            end
+                            local presented = handle:headers():get("x-gm-node-key")
+                            if presented ~= expected then
+                              handle:respond(
+                                {[":status"] = "401",
+                                 ["content-type"] = "application/json"},
+                                "{\"error\":\"missing or invalid x-gm-node-key\"}")
+                            end
+                          end
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
   clusters:
 
     ## ── Attestation server ────────────────────────────────────────────
@@ -348,6 +439,26 @@ static_resources:
                     socket_address:
                       address: 127.0.0.1
                       port_value: 8081
+
+    ## ── Metrics admin ─────────────────────────────────────────────────
+    ##  Envoy's own admin interface on loopback (127.0.0.1:9901 — see the
+    ##  `admin` block above). The `metrics` listener forwards exactly one
+    ##  path, `/stats/prometheus`, to this cluster; the admin port is
+    ##  never bound to a routable address. Plaintext HTTP/1.1 over
+    ##  loopback inside the TEE — the hop stays in the container's
+    ##  network namespace.
+    - name: metrics_admin
+      type: STATIC
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: metrics_admin
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9901
 
     ## ── Anthropic ─────────────────────────────────────────────────────
     - name: anthropic

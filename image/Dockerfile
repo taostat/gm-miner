@@ -99,10 +99,17 @@ RUN chmod +x /usr/local/bin/start.sh
 ## path to the loopback-bound attestation server). TLS is terminated
 ## with the dstack-minted RA-TLS certificate (see start.sh / envoy.yaml).
 EXPOSE 8080
-## Envoy admin port (Prometheus `/stats/prometheus` and runtime config
-## introspection — bound to localhost via admin block in envoy.yaml,
-## the EXPOSE is informational only).
+## Envoy admin port — runtime config introspection, `/quitquitquit`, and
+## the raw `/stats/prometheus`. Bound to localhost via the admin block
+## in envoy.yaml; the EXPOSE is informational only and the port is never
+## published to the host.
 EXPOSE 9901
+## Envoy Prometheus metrics port. The `metrics` listener in envoy.yaml
+## serves ONLY `/stats/prometheus` (gated on x-gm-node-key) and proxies
+## it to the loopback admin port; the rest of the admin surface stays
+## unreachable. Published by dstack/docker-compose.yaml so scrapers can
+## reach it; the EXPOSE itself is informational.
+EXPOSE 9902
 
 ## Drop to non-root. The envoy base image has the envoy user (uid 100).
 ## The RA-TLS provisioner and the attestation server run as the same
