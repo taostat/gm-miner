@@ -153,6 +153,12 @@ static_resources:
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
               common_tls_context:
+                ## Advertise h2 then http/1.1 on ALPN. Order matters:
+                ## h2 first means a client offering both gets h2; a
+                ## client offering only http/1.1 still gets h1 (Envoy
+                ## falls back to the first overlap). Pairs with
+                ## `codec_type: AUTO` on the HCM above.
+                alpn_protocols: ["h2", "http/1.1"]
                 tls_certificates:
                   - certificate_chain:
                       filename: /tmp/gm-ratls/cert.pem
@@ -163,6 +169,20 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_http
+                ## ── HTTP/2 via ALPN ─────────────────────────────────
+                ##  Envoy's HCM default is HTTP/1.1 only. `AUTO` selects
+                ##  h1 or h2 per connection based on the ALPN protocol
+                ##  the client negotiated during the TLS handshake.
+                ##  Backward-compatible with existing h1 callers (the
+                ##  gateway with prior-knowledge off, the registry's
+                ##  control-loop probes, auditors, the benchmark runner)
+                ##  and forward-compatible with h2-capable clients
+                ##  (the gateway once GM_MINER_HTTP2_PRIOR_KNOWLEDGE=1).
+                ##  Pair with `alpn_protocols: ["h2","http/1.1"]` on the
+                ##  DownstreamTlsContext below — Envoy advertises h2
+                ##  first, falls back to h1 for clients that don't
+                ##  offer h2.
+                codec_type: AUTO
                 use_remote_address: true
                 ## ── Rate-limited response body ──────────────────────
                 ##  The local rate-limit filter's own 429 carries the
