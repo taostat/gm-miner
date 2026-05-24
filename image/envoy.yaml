@@ -184,6 +184,36 @@ static_resources:
                 ##  offer h2.
                 codec_type: AUTO
                 use_remote_address: true
+                ## ── HTTP/1.1 stream-level error isolation ───────────
+                ##  Without this, a malformed HTTP/1.1 request closes
+                ##  the whole connection. The HTTP/2 codec's equivalent
+                ##  switch lives on `http2_protocol_options` below and
+                ##  is the load-bearing one for h2: a single buyer's
+                ##  bad request would otherwise reset every other
+                ##  multiplexed stream on the same connection — at ~800
+                ##  concurrent SSE streams that is hundreds of
+                ##  collateral cancellations per malformed request.
+                stream_error_on_invalid_http_message: true
+                http2_protocol_options:
+                  ## ── HTTP/2 stream-level error isolation ──────────
+                  ##  Treat malformed requests as STREAM errors rather
+                  ##  than connection-level errors. Without this, a
+                  ##  single buyer's bad frame would `GOAWAY` the whole
+                  ##  h2 connection and drop every other in-flight
+                  ##  stream — at the ~800 concurrent SSE level the
+                  ##  hot-path optimisation iter-3 confirmed, that is
+                  ##  the dominant tail-latency event.
+                  override_stream_error_on_invalid_http_message: true
+                  ## ── Concurrent-stream ceiling ────────────────────
+                  ##  Advertised to the gateway in the h2 SETTINGS
+                  ##  frame. Envoy's documented default is 2^31-1
+                  ##  (effectively unbounded). Pinning to 1024 makes
+                  ##  the explicit ceiling visible to operators and
+                  ##  matches the gateway-side cap; it sits well
+                  ##  inside the listener's overload-manager / fd-
+                  ##  budget envelope, which caps downstream
+                  ##  connections at 8192 above.
+                  max_concurrent_streams: 1024
                 ## ── Rate-limited response body ──────────────────────
                 ##  The local rate-limit filter's own 429 carries the
                 ##  plain-text body `local_rate_limited`. Every other
