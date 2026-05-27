@@ -39,11 +39,11 @@ Clap 4.5 binary `gm-miner` with eight subcommands:
 | `update-prices` | `PATCH /miners/products/{provider}/{model}/prices` |
 | `status` | `GET /miners/me`; prints miner and per-product eligibility |
 
-All price flags (`--price-input`, `--price-output`, `--price-cache-read`, `--price-cache-write-5m`, `--price-cache-write-1h`) accept USD/Mtok strings and convert to picodollars/Mtok (×10¹²) before sending to the registry.
+All price flags (`--price-input`, `--price-output`, `--price-cache-read`, `--price-cache-write-5m`, `--price-cache-write-1h`) accept USD/Mtok strings and convert to nano-dollars/Mtok (×10⁹) before sending to the registry.
 
 Config persisted to `~/.gm-miner/config.json` (chmod 600 on Unix). Supports `--testnet` flag and `--api-url` override. Network-keyed config allows separate mainnet/testnet credentials.
 
-Tests: 12 tests in `cli/tests/picodollar_test.rs` covering conversion, boundary conditions, and display formatting. 7 unit tests inline in `cli/src/picodollar.rs`.
+Tests: 12 tests in `cli/tests/nanodollar_test.rs` covering conversion, boundary conditions, and display formatting. 7 unit tests inline in `cli/src/nanodollar.rs`.
 
 ### dstack compose template (`dstack/`)
 
@@ -62,7 +62,7 @@ The full deploy pipeline lives in the `gm-miner deploy` subcommand (`cli/src/dep
 
 **Provider route discrimination** — The gateway adds `x-gm-provider: anthropic|openai|gemini` to every proxied request. Envoy dispatches on this header. Path-based routing would not work reliably across providers (all use similar `/v1/chat/completions` paths).
 
-**Picodollar ceiling** — `u64::MAX as f64` rounds up, making a naive overflow check wrong. Used a practical constant `18.4 USD/Mtok` (safely below the true ceiling of ~18.446 USD/Mtok) to avoid ambiguity.
+**nano-dollar ceiling** — `u64::MAX as f64` rounds up, making a naive overflow check wrong. Used a practical constant `18.4 USD/Mtok` (safely below the true ceiling of ~18.446 USD/Mtok) to avoid ambiguity.
 
 ## Build verification
 

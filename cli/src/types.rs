@@ -43,17 +43,19 @@ impl std::str::FromStr for Provider {
     }
 }
 
-/// Per-dimension miner price block, all values in picodollars/Mtok as strings.
+/// Per-dimension miner price block, all values in nano-dollars/Mtok as
+/// JSON Numbers (u64). Nano-dollar amounts fit inside 2^53, so the wire
+/// format is bare integers — see the nano-dollar-denomination contract.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MinerPriceBlock {
-    pub input_per_mtok_pdollars: String,
-    pub output_per_mtok_pdollars: String,
+    pub input_per_mtok_ndollars: u64,
+    pub output_per_mtok_ndollars: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_per_mtok_pdollars: Option<String>,
+    pub cache_read_per_mtok_ndollars: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write_5m_per_mtok_pdollars: Option<String>,
+    pub cache_write_5m_per_mtok_ndollars: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write_1h_per_mtok_pdollars: Option<String>,
+    pub cache_write_1h_per_mtok_ndollars: Option<u64>,
 }
 
 /// A product entry returned by GET /products.
