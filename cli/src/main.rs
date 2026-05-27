@@ -12,7 +12,7 @@
 //!   status          — show current registration state and per-product eligibility
 //!
 //! All prices accepted by the CLI are in USD per million tokens (e.g. "3.00")
-//! and are auto-converted to picodollars/Mtok before being sent to the registry.
+//! and are auto-converted to nano-dollars/Mtok before being sent to the registry.
 //!
 //! Contract: workstreams.md §W4
 
@@ -33,7 +33,7 @@ use gm_miner_cli::{
         ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
         PHALA_ENDPOINT_FIELD,
     },
-    node_secret, picodollar,
+    nanodollar, node_secret,
     types::{MinerPriceBlock, MinerStatus, Product, Provider},
 };
 
@@ -503,11 +503,11 @@ async fn device_login_from(
     .await
 }
 
-/// Convert an optional USD/Mtok string to an optional picodollar string.
-fn opt_usd_to_pdollars(input: Option<&str>) -> Result<Option<String>> {
+/// Convert an optional USD/Mtok string to an optional nano-dollar integer.
+fn opt_usd_to_ndollars(input: Option<&str>) -> Result<Option<u64>> {
     match input {
         None => Ok(None),
-        Some(s) => Ok(Some(picodollar::usd_per_mtok_to_pdollars(s)?.to_string())),
+        Some(s) => Ok(Some(nanodollar::usd_per_mtok_to_ndollars(s)?)),
     }
 }
 
@@ -519,11 +519,11 @@ fn build_price_block(
     price_cache_write_1h: Option<&str>,
 ) -> Result<MinerPriceBlock> {
     Ok(MinerPriceBlock {
-        input_per_mtok_pdollars: picodollar::usd_per_mtok_to_pdollars(price_input)?.to_string(),
-        output_per_mtok_pdollars: picodollar::usd_per_mtok_to_pdollars(price_output)?.to_string(),
-        cache_read_per_mtok_pdollars: opt_usd_to_pdollars(price_cache_read)?,
-        cache_write_5m_per_mtok_pdollars: opt_usd_to_pdollars(price_cache_write_5m)?,
-        cache_write_1h_per_mtok_pdollars: opt_usd_to_pdollars(price_cache_write_1h)?,
+        input_per_mtok_ndollars: nanodollar::usd_per_mtok_to_ndollars(price_input)?,
+        output_per_mtok_ndollars: nanodollar::usd_per_mtok_to_ndollars(price_output)?,
+        cache_read_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_read)?,
+        cache_write_5m_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_write_5m)?,
+        cache_write_1h_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_write_1h)?,
     })
 }
 
@@ -1055,19 +1055,8 @@ async fn cmd_declare_product(
         bail!("declare-product failed ({status}): {}", error_detail(&json));
     }
 
-    // The price strings were produced by `usd_per_mtok_to_pdollars` so they
-    // are valid u64s; surface any parse failure instead of silently showing
-    // "$0.000000/Mtok", which would mask a bug rather than report it.
-    let input_pico: u64 = price
-        .input_per_mtok_pdollars
-        .parse()
-        .with_context(|| format!("parse input price '{}'", price.input_per_mtok_pdollars))?;
-    let output_pico: u64 = price
-        .output_per_mtok_pdollars
-        .parse()
-        .with_context(|| format!("parse output price '{}'", price.output_per_mtok_pdollars))?;
-    let input_usd = picodollar::pdollars_to_usd_per_mtok(input_pico);
-    let output_usd = picodollar::pdollars_to_usd_per_mtok(output_pico);
+    let input_usd = nanodollar::ndollars_to_usd_per_mtok(price.input_per_mtok_ndollars);
+    let output_usd = nanodollar::ndollars_to_usd_per_mtok(price.output_per_mtok_ndollars);
 
     println!("Product declared.");
     println!("  Provider : {provider}");
@@ -1103,32 +1092,32 @@ async fn cmd_update_prices(
     let mut miner_price = serde_json::Map::new();
     if let Some(p) = price_input {
         miner_price.insert(
-            "input_per_mtok_pdollars".into(),
-            serde_json::Value::String(picodollar::usd_per_mtok_to_pdollars(p)?.to_string()),
+            "input_per_mtok_ndollars".into(),
+            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
         );
     }
     if let Some(p) = price_output {
         miner_price.insert(
-            "output_per_mtok_pdollars".into(),
-            serde_json::Value::String(picodollar::usd_per_mtok_to_pdollars(p)?.to_string()),
+            "output_per_mtok_ndollars".into(),
+            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
         );
     }
     if let Some(p) = price_cache_read {
         miner_price.insert(
-            "cache_read_per_mtok_pdollars".into(),
-            serde_json::Value::String(picodollar::usd_per_mtok_to_pdollars(p)?.to_string()),
+            "cache_read_per_mtok_ndollars".into(),
+            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
         );
     }
     if let Some(p) = price_cache_write_5m {
         miner_price.insert(
-            "cache_write_5m_per_mtok_pdollars".into(),
-            serde_json::Value::String(picodollar::usd_per_mtok_to_pdollars(p)?.to_string()),
+            "cache_write_5m_per_mtok_ndollars".into(),
+            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
         );
     }
     if let Some(p) = price_cache_write_1h {
         miner_price.insert(
-            "cache_write_1h_per_mtok_pdollars".into(),
-            serde_json::Value::String(picodollar::usd_per_mtok_to_pdollars(p)?.to_string()),
+            "cache_write_1h_per_mtok_ndollars".into(),
+            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
         );
     }
 

@@ -17,7 +17,7 @@ declaration, and price management.
 - `cli/src/deploy.rs` — `PhalaClient` trait + `RealPhalaClient`; deploy orchestration: compose rendering, `phala deploy`, `phala cvms get` hash polling, hash verification
 - `cli/src/image.rs` — miner image build/push: `docker buildx --push` to a public registry, digest resolution
 - `cli/src/node_secret.rs` — per-network node secret: generated once, persisted in config, embedded in compose env so envoy enforces it
-- `cli/src/picodollar.rs` — USD/Mtok string → picodollars (u64) conversion; integer-only, no floats
+- `cli/src/nanodollar.rs` — USD/Mtok string → nano-dollars (u64) conversion; integer-only, no floats
 - `cli/src/types.rs` — shared types: `MinerPriceBlock`, `MinerStatus`, `Product`, `Provider`
 - `image/` — the miner container image (Dockerfile, envoy config)
 - `dstack/` — the compose template `gm-miner deploy` renders and submits to Phala Cloud
@@ -55,7 +55,7 @@ cargo test -p gm-miner-cli
 
 ## Key conventions
 
-- All prices are accepted by the CLI as USD per million tokens (e.g. `"3.00"`) and converted to picodollars/Mtok (u64) before being sent to the registry. Conversion is decimal-string-only — no floats — so every picodollar of a sub-cent price is preserved exactly.
+- All prices are accepted by the CLI as USD per million tokens (e.g. `"3.00"`) and converted to nano-dollars/Mtok (u64) before being sent to the registry. Conversion is decimal-string-only — no floats — so every nano-dollar of a sub-cent price is preserved exactly.
 - The node secret is generated once per network (`mainnet`/`testnet`) and persisted to `~/.gm-miner/config.json`. It is embedded in the container's compose env, enforced by envoy, and stored in the registry — all three must stay in lockstep across re-deploys.
 - `--testnet` / `--api-url` are resolved on every invocation and never sticky-overwrite the stored config's `active_network`. A prior `--testnet` run does not silently affect the next command.
 - `deploy` is the happy path: it verifies that the deployed compose hash and OS image hash exactly match the registry's approved version before registering the image. `register-image` exists only for re-registration without redeploying.
