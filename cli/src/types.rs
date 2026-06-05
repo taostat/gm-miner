@@ -102,9 +102,11 @@ pub struct MinerStatus {
 
 /// Per-product eligibility entry in `MinerStatus`.
 ///
-/// `discount_bp` is `None` for a product the miner has never declared an
-/// offer for — the registry returns the catalog-wide product row with a
-/// null discount in that case.
+/// The registry only includes rows for products the miner has actually
+/// declared an offer for (`GET /miners/me` joins `MinerProductOffer` with
+/// `Product`), so `discount_bp` is always populated in practice. The
+/// `Option` is a forward-compatibility hedge against the `OpenAPI` schema,
+/// which marks the field nullable.
 #[derive(Debug, Deserialize)]
 pub struct ProductOfferStatus {
     pub provider: String,
