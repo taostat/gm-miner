@@ -1,18 +1,21 @@
 //! gm-miner CLI.
 //!
 //! Subcommands:
-//!   set-api-keys    — persist provider API keys to ~/.gm-miner/config.json
-//!   deploy          — trust-correct single-shot deploy: fetch approved hashes,
-//!                     deploy via Phala Cloud, verify hashes, register image
-//!   login           — Taostats device-code OAuth flow
-//!   register-image  — re-register the deployed miner's image hashes
-//!   list-products   — show the registry product catalog
-//!   declare-product — register a miner-product offer with prices in USD/Mtok
-//!   update-prices   — update prices on an existing offer
-//!   status          — show current registration state and per-product eligibility
+//!   set-api-keys     — persist provider API keys to ~/.gm-miner/config.json
+//!   deploy           — trust-correct single-shot deploy: fetch approved hashes,
+//!                      deploy via Phala Cloud, verify hashes, register image
+//!   login            — Taostats device-code OAuth flow
+//!   register-image   — re-register the deployed miner's image hashes
+//!   list-products    — show the miner's declared offers (GET /miners/me)
+//!   declare-product  — declare a single offer (--provider X --model Y --discount-bp N)
+//!   declare-products — fan out one discount over the whole catalog, or one provider
+//!   status           — show current registration state and per-product eligibility
 //!
-//! All prices accepted by the CLI are in USD per million tokens (e.g. "3.00")
-//! and are auto-converted to nano-dollars/Mtok before being sent to the registry.
+//! Pricing follows the registry's pct-discount model: a miner declares
+//! a single `discount_bp` in `[0, 9990]` per (provider, model) offer, and
+//! the gateway derives the miner payout as
+//! `retail × (10_000 − discount_bp) / 10_000` at settlement. See
+//! `docs/plans/miner-pct-discount-pricing.md` in the gm repo.
 //!
 //! Contract: workstreams.md §W4
 
@@ -33,9 +36,14 @@ use gm_miner_cli::{
         ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
         PHALA_ENDPOINT_FIELD,
     },
-    nanodollar, node_secret,
-    types::{MinerPriceBlock, MinerStatus, Product, Provider},
+    node_secret,
+    types::{MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider},
 };
+
+/// Inclusive upper bound on `discount_bp`. The registry's pydantic schema
+/// pins the same value (`registry/.../schemas.py::ProductDeclarationRequest`);
+/// kept in sync by the API-shape pin in the PR plan §3.1.
+const MAX_DISCOUNT_BP: u32 = 9_990;
 
 #[derive(Parser)]
 #[command(
@@ -173,65 +181,47 @@ enum Command {
         app_id: String,
     },
 
-    /// List all products in the registry catalog.
+    /// Show the miner's declared offers (`provider`, `model`, `discount_bp`,
+    /// `is_offered`, `is_eligible`) from `GET /miners/me`. Use `status` for
+    /// the broader miner registration view.
     ListProducts,
 
-    /// Declare a miner-product offer with prices in USD per million tokens.
+    /// Declare a single miner-product offer.
+    ///
+    /// One POST to `/miners/products`. For batch declarations against the
+    /// whole catalog (or one provider's slice), use `declare-products`.
     DeclareProduct {
         /// Provider: anthropic, openai, or gemini.
+        #[arg(long)]
         provider: Provider,
 
-        /// Model identifier, e.g. claude-sonnet-4-6.
+        /// Model identifier, e.g. `claude-sonnet-4-6`.
+        #[arg(long)]
         model: String,
 
-        /// Input token price in USD/Mtok (e.g. "2.80").
-        #[arg(long)]
-        price_input: String,
-
-        /// Output token price in USD/Mtok (e.g. "14.00").
-        #[arg(long)]
-        price_output: String,
-
-        /// Cache read price in USD/Mtok (optional).
-        #[arg(long)]
-        price_cache_read: Option<String>,
-
-        /// Cache write 5m price in USD/Mtok (optional).
-        #[arg(long)]
-        price_cache_write_5m: Option<String>,
-
-        /// Cache write 1h price in USD/Mtok (optional).
-        #[arg(long)]
-        price_cache_write_1h: Option<String>,
+        /// Discount in basis points off retail; range [0, 9990]. `0` quotes
+        /// at retail, `9990` quotes at 0.1% of retail (the cap keeps the
+        /// miner's per-request revenue strictly positive).
+        #[arg(long, value_parser = parse_discount_bp)]
+        discount_bp: u32,
     },
 
-    /// Update prices on an existing miner-product offer.
-    UpdatePrices {
-        /// Provider: anthropic, openai, or gemini.
-        provider: Provider,
-
-        /// Model identifier.
-        model: String,
-
-        /// Input token price in USD/Mtok.
+    /// Fan a single discount out across multiple offers.
+    ///
+    /// Discovers products via the public `GET /products` endpoint, filters
+    /// by `--provider` when set, then POSTs one offer per surviving entry.
+    /// Per-product failures are reported individually and do not abort the
+    /// loop — the final summary lists ok/err counts.
+    DeclareProducts {
+        /// Optional provider filter. When set, only products from this
+        /// provider are declared. Omit to fan out over the whole catalog.
         #[arg(long)]
-        price_input: Option<String>,
+        provider: Option<Provider>,
 
-        /// Output token price in USD/Mtok.
-        #[arg(long)]
-        price_output: Option<String>,
-
-        /// Cache read price in USD/Mtok.
-        #[arg(long)]
-        price_cache_read: Option<String>,
-
-        /// Cache write 5m price in USD/Mtok.
-        #[arg(long)]
-        price_cache_write_5m: Option<String>,
-
-        /// Cache write 1h price in USD/Mtok.
-        #[arg(long)]
-        price_cache_write_1h: Option<String>,
+        /// Discount in basis points off retail; range [0, 9990]. Applied
+        /// to every product the fan-out touches.
+        #[arg(long, value_parser = parse_discount_bp)]
+        discount_bp: u32,
     },
 
     /// Show the miner's current registration status and per-product eligibility.
@@ -239,11 +229,6 @@ enum Command {
 }
 
 #[tokio::main]
-#[expect(
-    clippy::too_many_lines,
-    reason = "main is a pure dispatch function; each arm is a one-liner or a \
-              call to a dedicated cmd_* handler — no logic lives here"
-)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
@@ -323,47 +308,21 @@ async fn main() -> Result<()> {
         Command::DeclareProduct {
             provider,
             model,
-            price_input,
-            price_output,
-            price_cache_read,
-            price_cache_write_5m,
-            price_cache_write_1h,
+            discount_bp,
         } => {
-            let price = build_price_block(
-                &price_input,
-                &price_output,
-                price_cache_read.as_deref(),
-                price_cache_write_5m.as_deref(),
-                price_cache_write_1h.as_deref(),
-            )?;
             let cfg = load_config(cli.testnet, cli.api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_declare_product(&mut client, &provider, &model, price).await
+            cmd_declare_product(&mut client, &provider, &model, discount_bp).await
         }
-        Command::UpdatePrices {
+        Command::DeclareProducts {
             provider,
-            model,
-            price_input,
-            price_output,
-            price_cache_read,
-            price_cache_write_5m,
-            price_cache_write_1h,
+            discount_bp,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_update_prices(
-                &mut client,
-                &provider,
-                &model,
-                price_input.as_deref(),
-                price_output.as_deref(),
-                price_cache_read.as_deref(),
-                price_cache_write_5m.as_deref(),
-                price_cache_write_1h.as_deref(),
-            )
-            .await
+            cmd_declare_products(&mut client, provider.as_ref(), discount_bp).await
         }
         Command::Status => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
@@ -503,28 +462,27 @@ async fn device_login_from(
     .await
 }
 
-/// Convert an optional USD/Mtok string to an optional nano-dollar integer.
-fn opt_usd_to_ndollars(input: Option<&str>) -> Result<Option<u64>> {
-    match input {
-        None => Ok(None),
-        Some(s) => Ok(Some(nanodollar::usd_per_mtok_to_ndollars(s)?)),
+/// clap `value_parser` for `--discount-bp`.
+///
+/// Accepts any `u32` parseable from the CLI argument and rejects values
+/// above [`MAX_DISCOUNT_BP`]. Sub-zero values are rejected automatically
+/// by `u32` parsing; the friendly error message at this layer covers both
+/// over-cap and the implicit "no negatives" rule so the user only sees one
+/// message instead of two different `clap` errors.
+fn parse_discount_bp(s: &str) -> Result<u32, String> {
+    let parsed = s.parse::<u32>().map_err(|_| {
+        format!(
+            "invalid --discount-bp {s:?}: must be an integer in [0, {MAX_DISCOUNT_BP}] \
+             (0 = quote at retail, {MAX_DISCOUNT_BP} = maximum legal discount)"
+        )
+    })?;
+    if parsed > MAX_DISCOUNT_BP {
+        return Err(format!(
+            "--discount-bp {parsed} is above the cap of {MAX_DISCOUNT_BP}; \
+             the registry rejects anything above 9990 (would zero the miner's revenue)"
+        ));
     }
-}
-
-fn build_price_block(
-    price_input: &str,
-    price_output: &str,
-    price_cache_read: Option<&str>,
-    price_cache_write_5m: Option<&str>,
-    price_cache_write_1h: Option<&str>,
-) -> Result<MinerPriceBlock> {
-    Ok(MinerPriceBlock {
-        input_per_mtok_ndollars: nanodollar::usd_per_mtok_to_ndollars(price_input)?,
-        output_per_mtok_ndollars: nanodollar::usd_per_mtok_to_ndollars(price_output)?,
-        cache_read_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_read)?,
-        cache_write_5m_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_write_5m)?,
-        cache_write_1h_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_write_1h)?,
-    })
+    Ok(parsed)
 }
 
 /// Extract a human-readable error detail from a registry JSON error body.
@@ -1000,8 +958,15 @@ async fn post_register_image(
     Ok(())
 }
 
+/// `gm-miner list-products` — show the miner's declared offers.
+///
+/// Calls `GET /miners/me` and tabulates each `ProductOfferStatus`. Helps the
+/// operator verify what their `declare-product[s]` calls actually persisted.
 async fn cmd_list_products(client: &mut RegistryClient) -> Result<()> {
-    let resp = client.get("/products").await.context("GET /products")?;
+    let resp = client
+        .get(gm_miner_cli::client::ME_PATH)
+        .await
+        .context("GET /miners/me")?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -1009,36 +974,126 @@ async fn cmd_list_products(client: &mut RegistryClient) -> Result<()> {
         bail!("list-products failed ({status}): {body}");
     }
 
-    let products: Vec<Product> = resp.json().await.context("parse products")?;
+    let miner: MinerStatus = resp.json().await.context("parse miner status")?;
 
-    if products.is_empty() {
-        println!("No products in catalog.");
+    if miner.products.is_empty() {
+        println!("No products declared.");
         return Ok(());
     }
 
-    println!("{:<12} {:<40} STATUS", "PROVIDER", "MODEL");
-    println!("{}", "-".repeat(60));
-    for p in &products {
-        println!("{:<12} {:<40} {}", p.provider, p.model, p.status);
+    println!(
+        "{:<12} {:<40} {:<12} {:<8} {:<8}",
+        "PROVIDER", "MODEL", "DISCOUNT_BP", "OFFERED", "ELIGIBLE"
+    );
+    println!("{}", "-".repeat(84));
+    for p in &miner.products {
+        let bp = p
+            .discount_bp
+            .map_or_else(|| "—".to_owned(), |v| v.to_string());
+        println!(
+            "{:<12} {:<40} {:<12} {:<8} {:<8}",
+            p.provider,
+            p.model,
+            bp,
+            if p.is_offered { "yes" } else { "no" },
+            if p.is_eligible { "yes" } else { "no" },
+        );
     }
-    println!("\n{} products total.", products.len());
+    println!("\n{} offers total.", miner.products.len());
     Ok(())
 }
 
+/// `gm-miner declare-product` — POST one (provider, model, `discount_bp`)
+/// offer to `/miners/products`. The registry treats POST as upsert, so this
+/// also handles updating an existing offer's discount.
 async fn cmd_declare_product(
     client: &mut RegistryClient,
     provider: &Provider,
     model: &str,
-    price: MinerPriceBlock,
+    discount_bp: u32,
 ) -> Result<()> {
-    // Serialize via the typed MinerPriceBlock so its skip_serializing_if
-    // attrs kick in and unset cache_* fields are omitted entirely
-    // (rather than sent as JSON null, which the registry rejects).
-    let body = serde_json::json!({
-        "provider": provider.as_str(),
-        "model": model,
-        "miner_price": price,
-    });
+    post_declare_product(client, provider, model, discount_bp).await?;
+    println!("Product declared.");
+    println!("  Provider    : {provider}");
+    println!("  Model       : {model}");
+    println!("  Discount bp : {discount_bp}");
+    Ok(())
+}
+
+/// `gm-miner declare-products` — fan a single discount out over the catalog.
+///
+/// 1. Public `GET /products` discovers every active product.
+/// 2. If `provider_filter` is set, drops products from other providers.
+/// 3. Drops deprecated products (the registry rejects offers on them anyway).
+/// 4. POSTs one offer per surviving product. Each result is printed
+///    individually (`provider/model: discount_bp=N → ok|ERROR …`).
+/// 5. Reports a final ok/err summary.
+///
+/// Per-product failures do not abort the loop. The function returns `Ok(())`
+/// when every POST succeeded and an aggregated error otherwise so the CLI
+/// exits non-zero on partial failure.
+async fn cmd_declare_products(
+    client: &mut RegistryClient,
+    provider_filter: Option<&Provider>,
+    discount_bp: u32,
+) -> Result<()> {
+    let catalog = fetch_catalog(client).await?;
+    let targets = filter_catalog(&catalog.products, provider_filter);
+
+    if targets.is_empty() {
+        let scope =
+            provider_filter.map_or_else(|| "the catalog".to_owned(), |p| format!("provider {p}"));
+        bail!("no active products found in {scope} to declare against");
+    }
+
+    println!(
+        "Declaring discount_bp={discount_bp} on {} product(s)...",
+        targets.len()
+    );
+
+    let mut ok_count = 0_usize;
+    let mut err_count = 0_usize;
+    for product in &targets {
+        match post_declare_product(client, &product.provider, &product.model, discount_bp).await {
+            Ok(()) => {
+                println!(
+                    "  {}/{}: discount_bp={discount_bp} → ok",
+                    product.provider, product.model
+                );
+                ok_count += 1;
+            }
+            Err(err) => {
+                println!(
+                    "  {}/{}: discount_bp={discount_bp} → ERROR {err}",
+                    product.provider, product.model
+                );
+                err_count += 1;
+            }
+        }
+    }
+
+    println!("\nSummary: {ok_count} ok, {err_count} failed.");
+    if err_count > 0 {
+        bail!("{err_count} of {} declarations failed", targets.len());
+    }
+    Ok(())
+}
+
+/// Issue one `POST /miners/products` and translate the result into a typed
+/// `Result<(), anyhow::Error>` so both `declare-product` and
+/// `declare-products` share the same wire-shape + error-detail logic.
+async fn post_declare_product(
+    client: &mut RegistryClient,
+    provider: &Provider,
+    model: &str,
+    discount_bp: u32,
+) -> Result<()> {
+    let body = serde_json::to_value(ProductDeclarationRequest {
+        provider: provider.as_str(),
+        model,
+        discount_bp,
+    })
+    .context("serialize declare-product body")?;
 
     let resp = client
         .post("/miners/products", &body)
@@ -1052,89 +1107,35 @@ async fn cmd_declare_product(
         .context("parse declare-product response")?;
 
     if !status.is_success() {
-        bail!("declare-product failed ({status}): {}", error_detail(&json));
+        bail!("registry returned {status}: {}", error_detail(&json));
     }
-
-    let input_usd = nanodollar::ndollars_to_usd_per_mtok(price.input_per_mtok_ndollars);
-    let output_usd = nanodollar::ndollars_to_usd_per_mtok(price.output_per_mtok_ndollars);
-
-    println!("Product declared.");
-    println!("  Provider : {provider}");
-    println!("  Model    : {model}");
-    println!("  Input    : ${input_usd}/Mtok");
-    println!("  Output   : ${output_usd}/Mtok");
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "all args are distinct price fields; no better grouping"
-)]
-async fn cmd_update_prices(
-    client: &mut RegistryClient,
-    provider: &Provider,
-    model: &str,
-    price_input: Option<&str>,
-    price_output: Option<&str>,
-    price_cache_read: Option<&str>,
-    price_cache_write_5m: Option<&str>,
-    price_cache_write_1h: Option<&str>,
-) -> Result<()> {
-    if price_input.is_none()
-        && price_output.is_none()
-        && price_cache_read.is_none()
-        && price_cache_write_5m.is_none()
-        && price_cache_write_1h.is_none()
-    {
-        bail!("at least one --price-* flag must be specified");
-    }
-
-    let mut miner_price = serde_json::Map::new();
-    if let Some(p) = price_input {
-        miner_price.insert(
-            "input_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-    if let Some(p) = price_output {
-        miner_price.insert(
-            "output_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-    if let Some(p) = price_cache_read {
-        miner_price.insert(
-            "cache_read_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-    if let Some(p) = price_cache_write_5m {
-        miner_price.insert(
-            "cache_write_5m_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-    if let Some(p) = price_cache_write_1h {
-        miner_price.insert(
-            "cache_write_1h_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-
-    let path = format!("/miners/products/{}/{}/prices", provider.as_str(), model);
-    let body = serde_json::json!({ "miner_price": miner_price });
-
-    let resp = client.patch(&path, &body).await.context("PATCH prices")?;
-
+/// Pull the catalog from the public `GET /products` endpoint.
+async fn fetch_catalog(client: &mut RegistryClient) -> Result<ProductCatalogResponse> {
+    let resp = client.get("/products").await.context("GET /products")?;
     let status = resp.status();
-    let json: serde_json::Value = resp.json().await.context("parse update-prices response")?;
-
     if !status.is_success() {
-        bail!("update-prices failed ({status}): {}", error_detail(&json));
+        let body = resp.text().await.unwrap_or_default();
+        bail!("GET /products failed ({status}): {body}");
     }
+    resp.json::<ProductCatalogResponse>()
+        .await
+        .context("parse product catalog")
+}
 
-    println!("Prices updated for {provider}/{model}.");
-    Ok(())
+/// Filter the catalog down to the set of products a fan-out should hit:
+/// active only, optionally narrowed to one provider.
+fn filter_catalog<'a>(
+    products: &'a [Product],
+    provider_filter: Option<&Provider>,
+) -> Vec<&'a Product> {
+    products
+        .iter()
+        .filter(|p| p.status == "active")
+        .filter(|p| provider_filter.is_none_or(|target| &p.provider == target))
+        .collect()
 }
 
 async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
@@ -1170,15 +1171,19 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
 
     println!("\nProducts:");
     println!(
-        "{:<12} {:<40} {:<10} {:<10}",
-        "PROVIDER", "MODEL", "OFFERED", "ELIGIBLE"
+        "{:<12} {:<40} {:<12} {:<8} {:<8}",
+        "PROVIDER", "MODEL", "DISCOUNT_BP", "OFFERED", "ELIGIBLE"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(84));
     for p in &miner.products {
+        let bp = p
+            .discount_bp
+            .map_or_else(|| "—".to_owned(), |v| v.to_string());
         println!(
-            "{:<12} {:<40} {:<10} {:<10}",
+            "{:<12} {:<40} {:<12} {:<8} {:<8}",
             p.provider,
             p.model,
+            bp,
             if p.is_offered { "yes" } else { "no" },
             if p.is_eligible { "yes" } else { "no" },
         );

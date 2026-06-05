@@ -191,31 +191,4 @@ impl RegistryClient {
             .context("authentication preflight (GET /miners/me)")?;
         Ok(())
     }
-
-    /// Issue an authenticated PATCH request with a JSON body.
-    ///
-    /// # Errors
-    /// Returns an error if the access token is missing, the request fails, or
-    /// the server returns 401.
-    pub async fn patch(&mut self, path: &str, body: &Value) -> Result<Response> {
-        let url = format!("{}{path}", self.api_url());
-        let token = self
-            .access_token()
-            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gm-miner login` first"))?
-            .to_owned();
-
-        let resp = self
-            .client
-            .patch(&url)
-            .bearer_auth(&token)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?;
-
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            bail!("authentication expired — run `gm-miner login` again");
-        }
-        Ok(resp)
-    }
 }

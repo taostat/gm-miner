@@ -1,14 +1,28 @@
 //! Types shared between CLI commands and tests.
+//!
+//! Wire shapes mirror the registry's pct-discount API
+//! (see registry/openapi.json in the gm repo, post-PR-C):
+//!
+//! * `POST /miners/products` body = `{provider, model, discount_bp}` —
+//!   pct-discount replaced the old per-dimension `miner_price` block.
+//! * `GET /products`  → `ProductCatalogResponse`.
+//! * `GET /miners/me` → `MinerStatusResponse`.
 
 use serde::{Deserialize, Serialize};
 
 /// Provider identifier — must match the canonical enum in product.json.
+///
+/// `Benchmark` is the registry's price-0 admission-benchmark provider
+/// (see docs/plans/admission-benchmark.md in the gm repo). It can appear in
+/// catalog responses but is not a valid `--provider` value for declarations:
+/// the CLI surfaces it for completeness on reads only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Anthropic,
     OpenAI,
     Gemini,
+    Benchmark,
 }
 
 impl Provider {
@@ -18,6 +32,7 @@ impl Provider {
             Self::Anthropic => "anthropic",
             Self::OpenAI => "openai",
             Self::Gemini => "gemini",
+            Self::Benchmark => "benchmark",
         }
     }
 }
@@ -36,6 +51,7 @@ impl std::str::FromStr for Provider {
             "anthropic" => Ok(Self::Anthropic),
             "openai" => Ok(Self::OpenAI),
             "gemini" => Ok(Self::Gemini),
+            "benchmark" => Ok(Self::Benchmark),
             other => anyhow::bail!(
                 "unknown provider {other:?} — must be one of: anthropic, openai, gemini"
             ),
@@ -43,30 +59,25 @@ impl std::str::FromStr for Provider {
     }
 }
 
-/// Per-dimension miner price block, all values in nano-dollars/Mtok as
-/// JSON Numbers (u64). Nano-dollar amounts fit inside 2^53, so the wire
-/// format is bare integers — see the nano-dollar-denomination contract.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct MinerPriceBlock {
-    pub input_per_mtok_ndollars: u64,
-    pub output_per_mtok_ndollars: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_per_mtok_ndollars: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write_5m_per_mtok_ndollars: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write_1h_per_mtok_ndollars: Option<u64>,
-}
-
-/// A product entry returned by GET /products.
+/// One entry in the registry product catalog (`GET /products`).
+///
+/// The retail price block is intentionally not deserialised — the CLI never
+/// looks at upstream retail prices. Only `provider` + `model` matter for
+/// fan-out, and `status` lets us drop deprecated products from the loop.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Product {
-    pub provider: String,
+    pub provider: Provider,
     pub model: String,
     pub status: String,
 }
 
-/// Response from GET /miners/me (status endpoint).
+/// Wrapper response shape returned by `GET /products` (`ProductCatalogResponse`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProductCatalogResponse {
+    pub products: Vec<Product>,
+}
+
+/// Response from `GET /miners/me` (`MinerStatusResponse`).
 #[derive(Debug, Deserialize)]
 pub struct MinerStatus {
     pub hotkey: String,
@@ -76,12 +87,29 @@ pub struct MinerStatus {
     pub products: Vec<ProductOfferStatus>,
 }
 
-/// Per-product eligibility in the status response.
+/// Per-product eligibility entry in `MinerStatus`.
+///
+/// `discount_bp` is `None` for a product the miner has never declared an
+/// offer for — the registry returns the catalog-wide product row with a
+/// null discount in that case.
 #[derive(Debug, Deserialize)]
 pub struct ProductOfferStatus {
     pub provider: String,
     pub model: String,
     pub is_offered: bool,
     pub is_eligible: bool,
-    pub miner_price: Option<MinerPriceBlock>,
+    pub discount_bp: Option<u32>,
+}
+
+/// Body of `POST /miners/products` (`ProductDeclarationRequest`).
+///
+/// `discount_bp` is a basis-point discount off retail applied uniformly to
+/// every dimension; range `[0, 9990]` (the upper cap leaves the miner with
+/// strictly positive revenue). See `docs/plans/miner-pct-discount-pricing.md`
+/// §3.1 in the gm repo for the math.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProductDeclarationRequest<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub discount_bp: u32,
 }
