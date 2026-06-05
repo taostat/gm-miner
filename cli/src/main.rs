@@ -7,7 +7,7 @@
 //!   login            — Taostats device-code OAuth flow
 //!   register-image   — re-register the deployed miner's image hashes
 //!   list-products    — show the miner's declared offers (GET /miners/me)
-//!   declare-product  — declare a single offer (--provider X --model Y --discount-bp N)
+//!   declare-product  — declare a single offer (--provider X --model Y --discount-pct N)
 //!   declare-products — fan out one discount over the whole catalog, or one provider
 //!   status           — show current registration state and per-product eligibility
 //!
@@ -37,7 +37,10 @@ use gm_miner_cli::{
         PHALA_ENDPOINT_FIELD,
     },
     node_secret,
-    types::{MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider},
+    types::{
+        MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider,
+        RetailDimensions,
+    },
 };
 
 /// Inclusive upper bound on `discount_bp`. The registry's pydantic schema
@@ -181,7 +184,7 @@ enum Command {
         app_id: String,
     },
 
-    /// Show the miner's declared offers (`provider`, `model`, `discount_bp`,
+    /// Show the miner's declared offers (`provider`, `model`, discount percent,
     /// `is_offered`, `is_eligible`) from `GET /miners/me`. Use `status` for
     /// the broader miner registration view.
     ListProducts,
@@ -199,10 +202,12 @@ enum Command {
         #[arg(long)]
         model: String,
 
-        /// Discount in basis points off retail; range [0, 9990]. `0` quotes
-        /// at retail, `9990` quotes at 0.1% of retail (the cap keeps the
-        /// miner's per-request revenue strictly positive).
-        #[arg(long, value_parser = parse_discount_bp)]
+        /// Percent off retail; range [0, 99.90]. You will receive
+        /// (100 - PCT)% of retail per token (e.g. `--discount-pct 10.5`
+        /// means you keep 89.5% of every per-Mtok dollar). `0` is at
+        /// retail; the `99.90` cap keeps the per-request revenue
+        /// strictly positive.
+        #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
         discount_bp: u32,
     },
 
@@ -218,9 +223,10 @@ enum Command {
         #[arg(long)]
         provider: Option<Provider>,
 
-        /// Discount in basis points off retail; range [0, 9990]. Applied
-        /// to every product the fan-out touches.
-        #[arg(long, value_parser = parse_discount_bp)]
+        /// Percent off retail; range [0, 99.90]. You will receive
+        /// (100 - PCT)% of retail per token, applied to every product
+        /// the fan-out touches.
+        #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
         discount_bp: u32,
     },
 
@@ -462,27 +468,111 @@ async fn device_login_from(
     .await
 }
 
-/// clap `value_parser` for `--discount-bp`.
+/// clap `value_parser` for `--discount-pct`.
 ///
-/// Accepts any `u32` parseable from the CLI argument and rejects values
-/// above [`MAX_DISCOUNT_BP`]. Sub-zero values are rejected automatically
-/// by `u32` parsing; the friendly error message at this layer covers both
-/// over-cap and the implicit "no negatives" rule so the user only sees one
-/// message instead of two different `clap` errors.
-fn parse_discount_bp(s: &str) -> Result<u32, String> {
-    let parsed = s.parse::<u32>().map_err(|_| {
-        format!(
-            "invalid --discount-bp {s:?}: must be an integer in [0, {MAX_DISCOUNT_BP}] \
-             (0 = quote at retail, {MAX_DISCOUNT_BP} = maximum legal discount)"
-        )
-    })?;
+/// Parses a percent string with up to two decimal places into the registry's
+/// integer basis-point wire value without floating-point arithmetic.
+fn parse_discount_pct(s: &str) -> Result<u32, String> {
+    let mut parts = s.split('.');
+    let whole_s = parts.next().unwrap_or_default();
+    let cents_s = parts.next();
+    if parts.next().is_some() {
+        return Err(format!(
+            "invalid --discount-pct {s:?}: use a percent in [0, 99.90] with at most one decimal point"
+        ));
+    }
+    if whole_s.is_empty() || !whole_s.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "invalid --discount-pct {s:?}: whole percent must be non-negative digits"
+        ));
+    }
+
+    let whole = whole_s
+        .parse::<u32>()
+        .map_err(|_| format!("invalid --discount-pct {s:?}: whole percent is too large"))?;
+    let cents = match cents_s {
+        None | Some("") => 0,
+        Some(cents_s) if cents_s.len() > 2 => {
+            return Err(format!(
+                "invalid --discount-pct {s:?}: use at most 2 decimal places"
+            ));
+        }
+        Some(cents_s) if cents_s.chars().all(|c| c.is_ascii_digit()) => {
+            let cents = cents_s.parse::<u32>().map_err(|_| {
+                format!("invalid --discount-pct {s:?}: decimal percent is not parseable")
+            })?;
+            if cents_s.len() == 1 {
+                cents * 10
+            } else {
+                cents
+            }
+        }
+        _ => {
+            return Err(format!(
+                "invalid --discount-pct {s:?}: decimal percent must contain digits only"
+            ));
+        }
+    };
+
+    let parsed = whole
+        .checked_mul(100)
+        .and_then(|v| v.checked_add(cents))
+        .ok_or_else(|| format!("invalid --discount-pct {s:?}: percent is too large"))?;
     if parsed > MAX_DISCOUNT_BP {
         return Err(format!(
-            "--discount-bp {parsed} is above the cap of {MAX_DISCOUNT_BP}; \
-             the registry rejects anything above 9990 (would zero the miner's revenue)"
+            "--discount-pct {s:?} is above the cap of 99.90%; \
+             the registry rejects anything above {MAX_DISCOUNT_BP} bp"
         ));
     }
     Ok(parsed)
+}
+
+fn format_discount_pct(discount_bp: u32) -> String {
+    let whole = discount_bp / 100;
+    let cents = discount_bp % 100;
+    if cents == 0 {
+        return whole.to_string();
+    }
+    format!("{whole}.{cents:02}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+/// Effective per-Mtok ndollars the miner receives for one dimension:
+/// `floor(retail × (10_000 − discount_bp) / 10_000)`. Matches the
+/// gateway's per-dimension floor in `gateway/src/money/settle.rs::
+/// effective_per_mtok_prices`, so what we display here is byte-for-byte
+/// the number the miner is paid.
+fn effective_per_mtok_ndollars(retail_ndollars: u64, discount_bp: u32) -> u64 {
+    let bp = u128::from(discount_bp.min(MAX_DISCOUNT_BP));
+    let total = u128::from(retail_ndollars);
+    let effective = (total * (10_000 - bp)) / 10_000;
+    u64::try_from(effective).unwrap_or(retail_ndollars)
+}
+
+/// Render a per-Mtok ndollar value as a dollar amount with 3 decimal
+/// places (e.g. `3_000_000_000 → "$3.000"`, `2_685_000_000 → "$2.685"`).
+/// One nano-dollar is `10^-9` USD; 3 decimals is one-tenth of a cent
+/// per Mtok, which is the resolution the operator actually cares about.
+fn format_per_mtok_usd(ndollars: u64) -> String {
+    let dollars = ndollars / 1_000_000_000;
+    let millis = (ndollars % 1_000_000_000) / 1_000_000;
+    format!("${dollars}.{millis:03}")
+}
+
+/// One-line summary of the per-Mtok rate the miner will receive on a
+/// product, given retail dimensions and a discount. Shared between
+/// the single-product declaration output and the fan-out summary so
+/// every site renders the same shape.
+fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> String {
+    let eff_in = effective_per_mtok_ndollars(retail.input_per_mtok_ndollars, discount_bp);
+    let eff_out = effective_per_mtok_ndollars(retail.output_per_mtok_ndollars, discount_bp);
+    format!(
+        "{} in / {} out per Mtok",
+        format_per_mtok_usd(eff_in),
+        format_per_mtok_usd(eff_out)
+    )
 }
 
 /// Extract a human-readable error detail from a registry JSON error body.
@@ -981,20 +1071,46 @@ async fn cmd_list_products(client: &mut RegistryClient) -> Result<()> {
         return Ok(());
     }
 
+    // Join against the catalog so each row can render the effective
+    // per-Mtok rate the miner actually receives. The catalog is the
+    // single source of truth for retail; doing the join here avoids
+    // adding a retail block to `/miners/me` on the registry side.
+    let catalog = fetch_catalog(client).await?;
+    let retail_by_key: std::collections::HashMap<_, _> = catalog
+        .products
+        .iter()
+        .map(|p| {
+            (
+                (p.provider.clone(), p.model.as_str()),
+                &p.retail_price.dimensions,
+            )
+        })
+        .collect();
+
     println!(
-        "{:<12} {:<40} {:<12} {:<8} {:<8}",
-        "PROVIDER", "MODEL", "DISCOUNT_BP", "OFFERED", "ELIGIBLE"
+        "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
+        "PROVIDER", "MODEL", "DISCOUNT", "YOU RECEIVE / MTOK", "OFFERED", "ELIGIBLE"
     );
-    println!("{}", "-".repeat(84));
+    println!("{}", "-".repeat(110));
     for p in &miner.products {
-        let bp = p
-            .discount_bp
-            .map_or_else(|| "—".to_owned(), |v| v.to_string());
+        let provider: Result<Provider, _> = p.provider.parse();
+        let (discount_label, rate_label) = match (p.discount_bp, provider) {
+            (Some(bp), Ok(prov)) => {
+                let label = format!("{}%", format_discount_pct(bp));
+                let rate = retail_by_key.get(&(prov, p.model.as_str())).map_or_else(
+                    || "(retail unknown)".to_owned(),
+                    |dims| effective_rate_summary(dims, bp),
+                );
+                (label, rate)
+            }
+            _ => ("—".to_owned(), "—".to_owned()),
+        };
         println!(
-            "{:<12} {:<40} {:<12} {:<8} {:<8}",
+            "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
             p.provider,
             p.model,
-            bp,
+            discount_label,
+            rate_label,
             if p.is_offered { "yes" } else { "no" },
             if p.is_eligible { "yes" } else { "no" },
         );
@@ -1006,17 +1122,49 @@ async fn cmd_list_products(client: &mut RegistryClient) -> Result<()> {
 /// `gm-miner declare-product` — POST one (provider, model, `discount_bp`)
 /// offer to `/miners/products`. The registry treats POST as upsert, so this
 /// also handles updating an existing offer's discount.
+///
+/// Fetches the catalog first so the success output can render retail +
+/// the effective per-Mtok rate the miner will actually receive. The
+/// extra HTTP call also catches "unknown product" before the POST goes
+/// out, which lets the CLI fail with a clearer error than the registry's
+/// generic 404.
 async fn cmd_declare_product(
     client: &mut RegistryClient,
     provider: &Provider,
     model: &str,
     discount_bp: u32,
 ) -> Result<()> {
+    let catalog = fetch_catalog(client).await?;
+    let product = catalog
+        .products
+        .iter()
+        .find(|p| &p.provider == provider && p.model == model)
+        .ok_or_else(|| anyhow::anyhow!("{provider}/{model} is not in the registry catalog"))?;
+
     post_declare_product(client, provider, model, discount_bp).await?;
-    println!("Product declared.");
-    println!("  Provider    : {provider}");
-    println!("  Model       : {model}");
-    println!("  Discount bp : {discount_bp}");
+
+    let dims = &product.retail_price.dimensions;
+    let retail_in = format_per_mtok_usd(dims.input_per_mtok_ndollars);
+    let retail_out = format_per_mtok_usd(dims.output_per_mtok_ndollars);
+    let eff_in = format_per_mtok_usd(effective_per_mtok_ndollars(
+        dims.input_per_mtok_ndollars,
+        discount_bp,
+    ));
+    let eff_out = format_per_mtok_usd(effective_per_mtok_ndollars(
+        dims.output_per_mtok_ndollars,
+        discount_bp,
+    ));
+    // What the miner keeps per token, as a percentage of retail. With
+    // discount_bp = 0 this reads "100%"; at the 99.90% cap this is
+    // "0.1% of retail" — the minimum positive payout.
+    let kept_bp = 10_000_u32.saturating_sub(discount_bp);
+    let kept_pct = format_discount_pct(kept_bp);
+
+    println!("{provider}/{model}");
+    println!("  Retail       : {retail_in} input / {retail_out} output per Mtok");
+    println!("  Declared     : {}% off", format_discount_pct(discount_bp));
+    println!("  You receive  : {eff_in} input / {eff_out} output per Mtok ({kept_pct}% of retail)");
+    println!("  → ok");
     Ok(())
 }
 
@@ -1026,7 +1174,7 @@ async fn cmd_declare_product(
 /// 2. If `provider_filter` is set, drops products from other providers.
 /// 3. Drops deprecated products (the registry rejects offers on them anyway).
 /// 4. POSTs one offer per surviving product. Each result is printed
-///    individually (`provider/model: discount_bp=N → ok|ERROR …`).
+///    individually (`provider/model: N% → ok|ERROR …`).
 /// 5. Reports a final ok/err summary.
 ///
 /// Per-product failures do not abort the loop. The function returns `Ok(())`
@@ -1046,25 +1194,27 @@ async fn cmd_declare_products(
         bail!("no active products found in {scope} to declare against");
     }
 
+    let discount_pct = format_discount_pct(discount_bp);
     println!(
-        "Declaring discount_bp={discount_bp} on {} product(s)...",
+        "Declaring {discount_pct}% off retail on {} product(s)...",
         targets.len()
     );
 
     let mut ok_count = 0_usize;
     let mut err_count = 0_usize;
     for product in &targets {
+        let rate = effective_rate_summary(&product.retail_price.dimensions, discount_bp);
         match post_declare_product(client, &product.provider, &product.model, discount_bp).await {
             Ok(()) => {
                 println!(
-                    "  {}/{}: discount_bp={discount_bp} → ok",
+                    "  {}/{}: {discount_pct}% off → {rate} → ok",
                     product.provider, product.model
                 );
                 ok_count += 1;
             }
             Err(err) => {
                 println!(
-                    "  {}/{}: discount_bp={discount_bp} → ERROR {err}",
+                    "  {}/{}: {discount_pct}% off → {rate} → ERROR {err}",
                     product.provider, product.model
                 );
                 err_count += 1;
@@ -1179,13 +1329,14 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     println!("\nProducts:");
     println!(
         "{:<12} {:<40} {:<12} {:<8} {:<8}",
-        "PROVIDER", "MODEL", "DISCOUNT_BP", "OFFERED", "ELIGIBLE"
+        "PROVIDER", "MODEL", "DISCOUNT", "OFFERED", "ELIGIBLE"
     );
     println!("{}", "-".repeat(84));
     for p in &miner.products {
-        let bp = p
-            .discount_bp
-            .map_or_else(|| "—".to_owned(), |v| v.to_string());
+        let bp = p.discount_bp.map_or_else(
+            || "—".to_owned(),
+            |v| format!("{}%", format_discount_pct(v)),
+        );
         println!(
             "{:<12} {:<40} {:<12} {:<8} {:<8}",
             p.provider,
@@ -1204,32 +1355,187 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     reason = "tests intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{filter_catalog, parse_discount_bp, Product, Provider, MAX_DISCOUNT_BP};
+    use super::{
+        effective_per_mtok_ndollars, effective_rate_summary, filter_catalog, format_discount_pct,
+        format_per_mtok_usd, parse_discount_pct, Cli, Command, Product, Provider, MAX_DISCOUNT_BP,
+    };
+    use gm_miner_cli::types::{RetailDimensions, RetailPrice};
 
     fn p(provider: Provider, model: &str, status: &str) -> Product {
         Product {
             provider,
             model: model.to_owned(),
             status: status.to_owned(),
+            retail_price: RetailPrice {
+                dimensions: RetailDimensions {
+                    input_per_mtok_ndollars: 3_000_000_000,
+                    output_per_mtok_ndollars: 15_000_000_000,
+                },
+            },
         }
     }
 
     #[test]
-    fn discount_bp_accepts_boundary_values() {
-        assert_eq!(parse_discount_bp("0").unwrap(), 0);
-        assert_eq!(parse_discount_bp("9990").unwrap(), MAX_DISCOUNT_BP);
+    fn discount_pct_accepts_examples() {
+        assert_eq!(parse_discount_pct("0").unwrap(), 0);
+        assert_eq!(parse_discount_pct("5").unwrap(), 500);
+        assert_eq!(parse_discount_pct("10.5").unwrap(), 1050);
+        assert_eq!(parse_discount_pct("10.55").unwrap(), 1055);
+        assert_eq!(parse_discount_pct("99.90").unwrap(), MAX_DISCOUNT_BP);
     }
 
     #[test]
-    fn discount_bp_rejects_above_cap() {
-        let err = parse_discount_bp("9991").unwrap_err();
+    fn discount_pct_rejects_negative() {
+        let err = parse_discount_pct("-0.1").unwrap_err();
+        assert!(err.contains("non-negative"), "got: {err}");
+    }
+
+    #[test]
+    fn discount_pct_rejects_above_cap() {
+        let err = parse_discount_pct("99.91").unwrap_err();
         assert!(err.contains("above the cap"), "got: {err}");
     }
 
     #[test]
-    fn discount_bp_rejects_non_integer() {
-        let err = parse_discount_bp("0.5").unwrap_err();
-        assert!(err.contains("must be an integer"), "got: {err}");
+    fn discount_pct_rejects_more_than_two_decimals() {
+        let err = parse_discount_pct("10.555").unwrap_err();
+        assert!(err.contains("at most 2 decimal"), "got: {err}");
+    }
+
+    #[test]
+    fn discount_pct_rejects_unparseable() {
+        let err = parse_discount_pct("abc").unwrap_err();
+        assert!(err.contains("digits"), "got: {err}");
+    }
+
+    #[test]
+    fn discount_pct_rejects_malformed() {
+        let err = parse_discount_pct("10.5.5").unwrap_err();
+        assert!(err.contains("at most one decimal point"), "got: {err}");
+    }
+
+    #[test]
+    fn format_discount_pct_trims_trailing_zeroes() {
+        assert_eq!(format_discount_pct(1050), "10.5");
+        assert_eq!(format_discount_pct(1055), "10.55");
+        assert_eq!(format_discount_pct(500), "5");
+        assert_eq!(format_discount_pct(9990), "99.9");
+        assert_eq!(format_discount_pct(0), "0");
+        // 10_000 bp is what we keep when discount = 0, used by the
+        // "you keep X% of retail" line in declare-product output.
+        assert_eq!(format_discount_pct(10_000), "100");
+        assert_eq!(format_discount_pct(10), "0.1");
+    }
+
+    #[test]
+    fn effective_per_mtok_matches_gateway_floor() {
+        // 6% discount on $3/Mtok retail → $2.82/Mtok per gateway settle.rs.
+        assert_eq!(
+            effective_per_mtok_ndollars(3_000_000_000, 600),
+            2_820_000_000
+        );
+        // 10.5% discount on $3/Mtok input → $2.685/Mtok.
+        assert_eq!(
+            effective_per_mtok_ndollars(3_000_000_000, 1050),
+            2_685_000_000
+        );
+        // Discount = 0 returns retail verbatim.
+        assert_eq!(
+            effective_per_mtok_ndollars(15_000_000_000, 0),
+            15_000_000_000
+        );
+        // Discount = 99.90% leaves 0.10% of retail.
+        assert_eq!(
+            effective_per_mtok_ndollars(15_000_000_000, MAX_DISCOUNT_BP),
+            15_000_000
+        );
+    }
+
+    #[test]
+    fn format_per_mtok_usd_renders_three_decimals() {
+        assert_eq!(format_per_mtok_usd(3_000_000_000), "$3.000");
+        assert_eq!(format_per_mtok_usd(2_685_000_000), "$2.685");
+        assert_eq!(format_per_mtok_usd(15_000_000), "$0.015");
+        assert_eq!(format_per_mtok_usd(0), "$0.000");
+    }
+
+    #[test]
+    fn effective_rate_summary_renders_in_and_out() {
+        let dims = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+        };
+        assert_eq!(
+            effective_rate_summary(&dims, 1050),
+            "$2.685 in / $13.425 out per Mtok"
+        );
+        assert_eq!(
+            effective_rate_summary(&dims, 0),
+            "$3.000 in / $15.000 out per Mtok"
+        );
+    }
+
+    #[test]
+    fn clap_accepts_discount_pct_for_single_declare() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "declare-product",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-6",
+            "--discount-pct",
+            "10.55",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::DeclareProduct {
+                discount_bp: 1055,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clap_accepts_discount_pct_for_fan_out_declare() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "declare-products",
+            "--provider",
+            "openai",
+            "--discount-pct",
+            "5",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::DeclareProducts {
+                discount_bp: 500,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clap_rejects_removed_discount_bp_flag() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "declare-product",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-6",
+            "--discount-bp",
+            "500",
+        ]);
+        assert!(result.is_err(), "expected --discount-bp to be rejected");
+        let Some(err) = result.err() else {
+            return;
+        };
+        assert!(err.to_string().contains("unexpected argument"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// discovery as a defence in depth — today the registry omits the entry
 /// from `GET /products` entirely, but the CLI must not regress if that
 /// changes).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Anthropic,
@@ -74,14 +74,32 @@ impl std::str::FromStr for Provider {
 
 /// One entry in the registry product catalog (`GET /products`).
 ///
-/// The retail price block is intentionally not deserialised — the CLI never
-/// looks at upstream retail prices. Only `provider` + `model` matter for
-/// fan-out, and `status` lets us drop deprecated products from the loop.
+/// `retail_price` carries the two anchor dimensions the CLI needs to show
+/// the miner the effective per-Mtok rate they'll receive after applying
+/// their declared discount. Other retail fields are intentionally
+/// ignored — the CLI doesn't bill, the gateway does.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Product {
     pub provider: Provider,
     pub model: String,
     pub status: String,
+    pub retail_price: RetailPrice,
+}
+
+/// Per-product retail price block returned by `GET /products`. The CLI
+/// only deserialises the `dimensions` sub-block; modifiers + surcharges
+/// stay on the wire and are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetailPrice {
+    pub dimensions: RetailDimensions,
+}
+
+/// The two anchor per-Mtok dimensions every product carries. Used to
+/// render the effective miner payout per request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetailDimensions {
+    pub input_per_mtok_ndollars: u64,
+    pub output_per_mtok_ndollars: u64,
 }
 
 /// Wrapper response shape returned by `GET /products` (`ProductCatalogResponse`).

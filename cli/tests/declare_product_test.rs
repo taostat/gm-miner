@@ -111,11 +111,20 @@ fn provider_benchmark_deserialises_but_cli_rejects_it() {
 fn product_catalog_response_parses_wrapper_shape() {
     // GET /products returns ProductCatalogResponse, NOT a bare array —
     // matches the new OpenAPI schema (registry/openapi.json post-PR-C).
+    let retail = serde_json::json!({
+        "dimensions": {
+            "input_per_mtok_ndollars": 3_000_000_000_u64,
+            "output_per_mtok_ndollars": 15_000_000_000_u64,
+        }
+    });
     let body = serde_json::json!({
         "products": [
-            {"provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active"},
-            {"provider": "openai", "model": "gpt-5.5", "status": "active"},
-            {"provider": "gemini", "model": "gemini-1.0", "status": "deprecated"},
+            {"provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active",
+             "retail_price": retail},
+            {"provider": "openai", "model": "gpt-5.5", "status": "active",
+             "retail_price": retail},
+            {"provider": "gemini", "model": "gemini-1.0", "status": "deprecated",
+             "retail_price": retail},
         ],
         "generated_at": "2026-06-05T10:00:00Z",
     });
