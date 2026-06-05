@@ -96,28 +96,10 @@ pub struct RetailPrice {
 
 /// The two anchor per-Mtok dimensions every product carries. Used to
 /// render the effective miner payout per request.
-///
-/// Wire shape: the registry's `PriceDimensions` schema encodes every
-/// per-Mtok price as a **picodollar** value (10^-12 USD), serialised as
-/// a JSON string to dodge the JS 53-bit integer limit. We use
-/// `deserialize_u64_from_str` to lift the wire string back to `u64`.
-/// The two-token-unit gap from picodollars to nano-dollars only matters
-/// when emitting the validator log's `effective_price_ndollars` block,
-/// which is a separate code path on the gateway side.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetailDimensions {
-    #[serde(deserialize_with = "deserialize_u64_from_str")]
-    pub input_per_mtok_pdollars: u64,
-    #[serde(deserialize_with = "deserialize_u64_from_str")]
-    pub output_per_mtok_pdollars: u64,
-}
-
-fn deserialize_u64_from_str<'de, D>(d: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(d)?;
-    s.parse::<u64>().map_err(serde::de::Error::custom)
+    pub input_per_mtok_ndollars: u64,
+    pub output_per_mtok_ndollars: u64,
 }
 
 /// Wrapper response shape returned by `GET /products` (`ProductCatalogResponse`).

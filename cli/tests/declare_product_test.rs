@@ -111,13 +111,10 @@ fn provider_benchmark_deserialises_but_cli_rejects_it() {
 fn product_catalog_response_parses_wrapper_shape() {
     // GET /products returns ProductCatalogResponse, NOT a bare array —
     // matches the new OpenAPI schema (registry/openapi.json post-PR-C).
-    // The registry's PriceDimensions wire shape encodes per-Mtok prices
-    // as decimal *strings* of picodollars (10^-12 USD) to dodge JS's
-    // 53-bit integer limit. $3/Mtok = 3 * 10^12 pdollars.
     let retail = serde_json::json!({
         "dimensions": {
-            "input_per_mtok_pdollars": "3000000000000",
-            "output_per_mtok_pdollars": "15000000000000",
+            "input_per_mtok_ndollars": 3_000_000_000_u64,
+            "output_per_mtok_ndollars": 15_000_000_000_u64,
         }
     });
     let body = serde_json::json!({
