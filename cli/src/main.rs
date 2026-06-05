@@ -1126,7 +1126,13 @@ async fn fetch_catalog(client: &mut RegistryClient) -> Result<ProductCatalogResp
 }
 
 /// Filter the catalog down to the set of products a fan-out should hit:
-/// active only, optionally narrowed to one provider.
+/// active, declarable, optionally narrowed to one provider.
+///
+/// `benchmark` entries are always dropped — every miner serves that pool
+/// automatically (see `docs/plans/admission-benchmark.md`) and the
+/// registry rejects declarations against it. Today the registry never
+/// emits a benchmark row from `GET /products`; this filter is the
+/// defence-in-depth that keeps the fan-out clean if that changes.
 fn filter_catalog<'a>(
     products: &'a [Product],
     provider_filter: Option<&Provider>,
@@ -1134,6 +1140,7 @@ fn filter_catalog<'a>(
     products
         .iter()
         .filter(|p| p.status == "active")
+        .filter(|p| p.provider != Provider::Benchmark)
         .filter(|p| provider_filter.is_none_or(|target| &p.provider == target))
         .collect()
 }
@@ -1189,4 +1196,86 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "tests intentionally panic on unexpected values"
+)]
+mod tests {
+    use super::{filter_catalog, parse_discount_bp, Product, Provider, MAX_DISCOUNT_BP};
+
+    fn p(provider: Provider, model: &str, status: &str) -> Product {
+        Product {
+            provider,
+            model: model.to_owned(),
+            status: status.to_owned(),
+        }
+    }
+
+    #[test]
+    fn discount_bp_accepts_boundary_values() {
+        assert_eq!(parse_discount_bp("0").unwrap(), 0);
+        assert_eq!(parse_discount_bp("9990").unwrap(), MAX_DISCOUNT_BP);
+    }
+
+    #[test]
+    fn discount_bp_rejects_above_cap() {
+        let err = parse_discount_bp("9991").unwrap_err();
+        assert!(err.contains("above the cap"), "got: {err}");
+    }
+
+    #[test]
+    fn discount_bp_rejects_non_integer() {
+        let err = parse_discount_bp("0.5").unwrap_err();
+        assert!(err.contains("must be an integer"), "got: {err}");
+    }
+
+    #[test]
+    fn filter_catalog_keeps_active_real_providers() {
+        let products = [
+            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
+            p(Provider::OpenAI, "gpt-5.5", "active"),
+            p(Provider::Gemini, "gemini-2.5-pro", "active"),
+        ];
+        let kept = filter_catalog(&products, None);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn filter_catalog_drops_deprecated() {
+        let products = [
+            p(Provider::Anthropic, "claude-old", "deprecated"),
+            p(Provider::OpenAI, "gpt-5.5", "active"),
+        ];
+        let kept = filter_catalog(&products, None);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].model, "gpt-5.5");
+    }
+
+    #[test]
+    fn filter_catalog_drops_benchmark_even_when_active() {
+        // The registry's benchmark pool is auto-synthesized; declarations
+        // against it 404. If a future registry change ever exposes a
+        // benchmark row in GET /products, the fan-out must still skip it.
+        let products = [
+            p(Provider::Benchmark, "gpt-bench", "active"),
+            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
+        ];
+        let kept = filter_catalog(&products, None);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].provider, Provider::Anthropic);
+    }
+
+    #[test]
+    fn filter_catalog_narrows_to_one_provider() {
+        let products = [
+            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
+            p(Provider::OpenAI, "gpt-5.5", "active"),
+        ];
+        let kept = filter_catalog(&products, Some(&Provider::OpenAI));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].provider, Provider::OpenAI);
+    }
 }

@@ -85,19 +85,26 @@ fn declaration_request_max_discount_at_cap() {
 }
 
 #[test]
-fn provider_benchmark_round_trips_through_serde() {
-    // The registry's catalog includes a `benchmark` provider for the
-    // admission-benchmark fixture pool; the CLI must parse it without
-    // failing so fan-out discovery does not crash on a benchmark entry.
-    let p = Provider::from_str("benchmark").unwrap();
+fn provider_benchmark_deserialises_but_cli_rejects_it() {
+    // serde must accept "benchmark" — otherwise any GET that mentions
+    // the registry's benchmark provider would fail to decode and break
+    // fan-out discovery.
+    let p: Provider = serde_json::from_value(serde_json::json!("benchmark")).unwrap();
     assert_eq!(p, Provider::Benchmark);
     assert_eq!(p.as_str(), "benchmark");
+    assert_eq!(
+        serde_json::to_value(&p).unwrap(),
+        serde_json::json!("benchmark")
+    );
 
-    let json = serde_json::to_value(&p).unwrap();
-    assert_eq!(json, serde_json::json!("benchmark"));
-
-    let back: Provider = serde_json::from_value(json).unwrap();
-    assert_eq!(back, Provider::Benchmark);
+    // FromStr drives clap's `--provider` parser. Declaring against the
+    // benchmark pool is invalid (the registry has no catalog row for it
+    // and would 404), so the CLI parser must fail closed and explain why.
+    let err = Provider::from_str("benchmark").unwrap_err().to_string();
+    assert!(
+        err.contains("not declarable") && err.contains("benchmark"),
+        "error must name the rejection reason; got: {err}"
+    );
 }
 
 #[test]

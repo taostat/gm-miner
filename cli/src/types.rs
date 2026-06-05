@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 
 /// Provider identifier — must match the canonical enum in product.json.
 ///
-/// `Benchmark` is the registry's price-0 admission-benchmark provider
-/// (see docs/plans/admission-benchmark.md in the gm repo). It can appear in
-/// catalog responses but is not a valid `--provider` value for declarations:
-/// the CLI surfaces it for completeness on reads only.
+/// `Benchmark` exists so a serde decode of any payload that mentions the
+/// registry's `benchmark` provider does not fail. It is intentionally not
+/// declarable via the CLI: see [`FromStr`] (rejects the literal "benchmark")
+/// and [`filter_catalog`](crate) (drops benchmark rows from fan-out
+/// discovery as a defence in depth — today the registry omits the entry
+/// from `GET /products` entirely, but the CLI must not regress if that
+/// changes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -46,12 +49,22 @@ impl std::fmt::Display for Provider {
 impl std::str::FromStr for Provider {
     type Err = anyhow::Error;
 
+    /// Parse a `--provider` CLI value. `benchmark` is intentionally
+    /// rejected here even though `Provider::Benchmark` is a valid serde
+    /// variant: the registry's benchmark pool is auto-synthesized from
+    /// every routable miner (see `docs/plans/admission-benchmark.md`),
+    /// has no product-catalog row, and `declare_product` 404s on any
+    /// attempt to declare it. Failing at the CLI parser surfaces the
+    /// error before any registry round-trip.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "anthropic" => Ok(Self::Anthropic),
             "openai" => Ok(Self::OpenAI),
             "gemini" => Ok(Self::Gemini),
-            "benchmark" => Ok(Self::Benchmark),
+            "benchmark" => anyhow::bail!(
+                "provider \"benchmark\" is not declarable — every gm miner serves \
+                 the benchmark pool automatically; see docs/plans/admission-benchmark.md"
+            ),
             other => anyhow::bail!(
                 "unknown provider {other:?} — must be one of: anthropic, openai, gemini"
             ),
