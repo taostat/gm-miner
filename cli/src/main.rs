@@ -539,25 +539,24 @@ fn format_discount_pct(discount_bp: u32) -> String {
         .to_owned()
 }
 
-/// Effective per-Mtok ndollars the miner receives for one dimension:
+/// Effective per-Mtok picodollars the miner receives for one dimension:
 /// `floor(retail × (10_000 − discount_bp) / 10_000)`. Matches the
-/// gateway's per-dimension floor in `gateway/src/money/settle.rs::
-/// effective_per_mtok_prices`, so what we display here is byte-for-byte
-/// the number the miner is paid.
-fn effective_per_mtok_ndollars(retail_ndollars: u64, discount_bp: u32) -> u64 {
+/// gateway's per-dimension floor in `gateway/src/money/settle.rs`, so
+/// what we display here is byte-for-byte the number the miner is paid.
+fn effective_per_mtok_pdollars(retail_pdollars: u64, discount_bp: u32) -> u64 {
     let bp = u128::from(discount_bp.min(MAX_DISCOUNT_BP));
-    let total = u128::from(retail_ndollars);
+    let total = u128::from(retail_pdollars);
     let effective = (total * (10_000 - bp)) / 10_000;
-    u64::try_from(effective).unwrap_or(retail_ndollars)
+    u64::try_from(effective).unwrap_or(retail_pdollars)
 }
 
-/// Render a per-Mtok ndollar value as a dollar amount with 3 decimal
-/// places (e.g. `3_000_000_000 → "$3.000"`, `2_685_000_000 → "$2.685"`).
-/// One nano-dollar is `10^-9` USD; 3 decimals is one-tenth of a cent
-/// per Mtok, which is the resolution the operator actually cares about.
-fn format_per_mtok_usd(ndollars: u64) -> String {
-    let dollars = ndollars / 1_000_000_000;
-    let millis = (ndollars % 1_000_000_000) / 1_000_000;
+/// Render a per-Mtok picodollar value as a dollar amount with 3 decimal
+/// places (e.g. `3_000_000_000_000 → "$3.000"`, `2_685_000_000_000 →
+/// "$2.685"`). One picodollar is `10^-12` USD; 3 decimals is one-tenth
+/// of a cent per Mtok, which is the resolution operators care about.
+fn format_per_mtok_usd(pdollars: u64) -> String {
+    let dollars = pdollars / 1_000_000_000_000;
+    let millis = (pdollars % 1_000_000_000_000) / 1_000_000_000;
     format!("${dollars}.{millis:03}")
 }
 
@@ -566,8 +565,8 @@ fn format_per_mtok_usd(ndollars: u64) -> String {
 /// the single-product declaration output and the fan-out summary so
 /// every site renders the same shape.
 fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> String {
-    let eff_in = effective_per_mtok_ndollars(retail.input_per_mtok_ndollars, discount_bp);
-    let eff_out = effective_per_mtok_ndollars(retail.output_per_mtok_ndollars, discount_bp);
+    let eff_in = effective_per_mtok_pdollars(retail.input_per_mtok_pdollars, discount_bp);
+    let eff_out = effective_per_mtok_pdollars(retail.output_per_mtok_pdollars, discount_bp);
     format!(
         "{} in / {} out per Mtok",
         format_per_mtok_usd(eff_in),
@@ -1144,14 +1143,14 @@ async fn cmd_declare_product(
     post_declare_product(client, provider, model, discount_bp).await?;
 
     let dims = &product.retail_price.dimensions;
-    let retail_in = format_per_mtok_usd(dims.input_per_mtok_ndollars);
-    let retail_out = format_per_mtok_usd(dims.output_per_mtok_ndollars);
-    let eff_in = format_per_mtok_usd(effective_per_mtok_ndollars(
-        dims.input_per_mtok_ndollars,
+    let retail_in = format_per_mtok_usd(dims.input_per_mtok_pdollars);
+    let retail_out = format_per_mtok_usd(dims.output_per_mtok_pdollars);
+    let eff_in = format_per_mtok_usd(effective_per_mtok_pdollars(
+        dims.input_per_mtok_pdollars,
         discount_bp,
     ));
-    let eff_out = format_per_mtok_usd(effective_per_mtok_ndollars(
-        dims.output_per_mtok_ndollars,
+    let eff_out = format_per_mtok_usd(effective_per_mtok_pdollars(
+        dims.output_per_mtok_pdollars,
         discount_bp,
     ));
     // What the miner keeps per token, as a percentage of retail. With
@@ -1356,7 +1355,7 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
 )]
 mod tests {
     use super::{
-        effective_per_mtok_ndollars, effective_rate_summary, filter_catalog, format_discount_pct,
+        effective_per_mtok_pdollars, effective_rate_summary, filter_catalog, format_discount_pct,
         format_per_mtok_usd, parse_discount_pct, Cli, Command, Product, Provider, MAX_DISCOUNT_BP,
     };
     use gm_miner_cli::types::{RetailDimensions, RetailPrice};
@@ -1368,8 +1367,10 @@ mod tests {
             status: status.to_owned(),
             retail_price: RetailPrice {
                 dimensions: RetailDimensions {
-                    input_per_mtok_ndollars: 3_000_000_000,
-                    output_per_mtok_ndollars: 15_000_000_000,
+                    // $3/Mtok input, $15/Mtok output — Claude Sonnet 4.6 retail
+                    // expressed in picodollars (the on-the-wire unit).
+                    input_per_mtok_pdollars: 3_000_000_000_000,
+                    output_per_mtok_pdollars: 15_000_000_000_000,
                 },
             },
         }
@@ -1429,41 +1430,42 @@ mod tests {
 
     #[test]
     fn effective_per_mtok_matches_gateway_floor() {
-        // 6% discount on $3/Mtok retail → $2.82/Mtok per gateway settle.rs.
+        // All values in picodollars (the wire unit). $3/Mtok = 3e12 pdollars.
+        // 6% discount on $3 → $2.82.
         assert_eq!(
-            effective_per_mtok_ndollars(3_000_000_000, 600),
-            2_820_000_000
+            effective_per_mtok_pdollars(3_000_000_000_000, 600),
+            2_820_000_000_000
         );
-        // 10.5% discount on $3/Mtok input → $2.685/Mtok.
+        // 10.5% discount on $3 → $2.685.
         assert_eq!(
-            effective_per_mtok_ndollars(3_000_000_000, 1050),
-            2_685_000_000
+            effective_per_mtok_pdollars(3_000_000_000_000, 1050),
+            2_685_000_000_000
         );
         // Discount = 0 returns retail verbatim.
         assert_eq!(
-            effective_per_mtok_ndollars(15_000_000_000, 0),
-            15_000_000_000
+            effective_per_mtok_pdollars(15_000_000_000_000, 0),
+            15_000_000_000_000
         );
         // Discount = 99.90% leaves 0.10% of retail.
         assert_eq!(
-            effective_per_mtok_ndollars(15_000_000_000, MAX_DISCOUNT_BP),
-            15_000_000
+            effective_per_mtok_pdollars(15_000_000_000_000, MAX_DISCOUNT_BP),
+            15_000_000_000
         );
     }
 
     #[test]
     fn format_per_mtok_usd_renders_three_decimals() {
-        assert_eq!(format_per_mtok_usd(3_000_000_000), "$3.000");
-        assert_eq!(format_per_mtok_usd(2_685_000_000), "$2.685");
-        assert_eq!(format_per_mtok_usd(15_000_000), "$0.015");
+        assert_eq!(format_per_mtok_usd(3_000_000_000_000), "$3.000");
+        assert_eq!(format_per_mtok_usd(2_685_000_000_000), "$2.685");
+        assert_eq!(format_per_mtok_usd(15_000_000_000), "$0.015");
         assert_eq!(format_per_mtok_usd(0), "$0.000");
     }
 
     #[test]
     fn effective_rate_summary_renders_in_and_out() {
         let dims = RetailDimensions {
-            input_per_mtok_ndollars: 3_000_000_000,
-            output_per_mtok_ndollars: 15_000_000_000,
+            input_per_mtok_pdollars: 3_000_000_000_000,
+            output_per_mtok_pdollars: 15_000_000_000_000,
         };
         assert_eq!(
             effective_rate_summary(&dims, 1050),
