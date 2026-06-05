@@ -5,6 +5,5 @@ pub mod client;
 pub mod config;
 pub mod deploy;
 pub mod image;
-pub mod nanodollar;
 pub mod node_secret;
 pub mod types;

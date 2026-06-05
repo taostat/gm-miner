@@ -1,18 +1,21 @@
 //! gm-miner CLI.
 //!
 //! Subcommands:
-//!   set-api-keys    — persist provider API keys to ~/.gm-miner/config.json
-//!   deploy          — trust-correct single-shot deploy: fetch approved hashes,
-//!                     deploy via Phala Cloud, verify hashes, register image
-//!   login           — Taostats device-code OAuth flow
-//!   register-image  — re-register the deployed miner's image hashes
-//!   list-products   — show the registry product catalog
-//!   declare-product — register a miner-product offer with prices in USD/Mtok
-//!   update-prices   — update prices on an existing offer
-//!   status          — show current registration state and per-product eligibility
+//!   set-api-keys     — persist provider API keys to ~/.gm-miner/config.json
+//!   deploy           — trust-correct single-shot deploy: fetch approved hashes,
+//!                      deploy via Phala Cloud, verify hashes, register image
+//!   login            — Taostats device-code OAuth flow
+//!   register-image   — re-register the deployed miner's image hashes
+//!   list-products    — show the miner's declared offers (GET /miners/me)
+//!   declare-product  — declare a single offer (--provider X --model Y --discount-pct N)
+//!   declare-products — fan out one discount over the whole catalog, or one provider
+//!   status           — show current registration state and per-product eligibility
 //!
-//! All prices accepted by the CLI are in USD per million tokens (e.g. "3.00")
-//! and are auto-converted to nano-dollars/Mtok before being sent to the registry.
+//! Pricing follows the registry's pct-discount model: a miner declares
+//! a single `discount_bp` in `[0, 9990]` per (provider, model) offer, and
+//! the gateway derives the miner payout as
+//! `retail × (10_000 − discount_bp) / 10_000` at settlement. See
+//! `docs/plans/miner-pct-discount-pricing.md` in the gm repo.
 //!
 //! Contract: workstreams.md §W4
 
@@ -33,9 +36,17 @@ use gm_miner_cli::{
         ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
         PHALA_ENDPOINT_FIELD,
     },
-    nanodollar, node_secret,
-    types::{MinerPriceBlock, MinerStatus, Product, Provider},
+    node_secret,
+    types::{
+        MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider,
+        RetailDimensions,
+    },
 };
+
+/// Inclusive upper bound on `discount_bp`. The registry's pydantic schema
+/// pins the same value (`registry/.../schemas.py::ProductDeclarationRequest`);
+/// kept in sync by the API-shape pin in the PR plan §3.1.
+const MAX_DISCOUNT_BP: u32 = 9_990;
 
 #[derive(Parser)]
 #[command(
@@ -173,65 +184,50 @@ enum Command {
         app_id: String,
     },
 
-    /// List all products in the registry catalog.
+    /// Show the miner's declared offers (`provider`, `model`, discount percent,
+    /// `is_offered`, `is_eligible`) from `GET /miners/me`. Use `status` for
+    /// the broader miner registration view.
     ListProducts,
 
-    /// Declare a miner-product offer with prices in USD per million tokens.
+    /// Declare a single miner-product offer.
+    ///
+    /// One POST to `/miners/products`. For batch declarations against the
+    /// whole catalog (or one provider's slice), use `declare-products`.
     DeclareProduct {
         /// Provider: anthropic, openai, or gemini.
+        #[arg(long)]
         provider: Provider,
 
-        /// Model identifier, e.g. claude-sonnet-4-6.
+        /// Model identifier, e.g. `claude-sonnet-4-6`.
+        #[arg(long)]
         model: String,
 
-        /// Input token price in USD/Mtok (e.g. "2.80").
-        #[arg(long)]
-        price_input: String,
-
-        /// Output token price in USD/Mtok (e.g. "14.00").
-        #[arg(long)]
-        price_output: String,
-
-        /// Cache read price in USD/Mtok (optional).
-        #[arg(long)]
-        price_cache_read: Option<String>,
-
-        /// Cache write 5m price in USD/Mtok (optional).
-        #[arg(long)]
-        price_cache_write_5m: Option<String>,
-
-        /// Cache write 1h price in USD/Mtok (optional).
-        #[arg(long)]
-        price_cache_write_1h: Option<String>,
+        /// Percent off retail; range [0, 99.90]. You will receive
+        /// (100 - PCT)% of retail per token (e.g. `--discount-pct 10.5`
+        /// means you keep 89.5% of every per-Mtok dollar). `0` is at
+        /// retail; the `99.90` cap keeps the per-request revenue
+        /// strictly positive.
+        #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
+        discount_bp: u32,
     },
 
-    /// Update prices on an existing miner-product offer.
-    UpdatePrices {
-        /// Provider: anthropic, openai, or gemini.
-        provider: Provider,
-
-        /// Model identifier.
-        model: String,
-
-        /// Input token price in USD/Mtok.
+    /// Fan a single discount out across multiple offers.
+    ///
+    /// Discovers products via the public `GET /products` endpoint, filters
+    /// by `--provider` when set, then POSTs one offer per surviving entry.
+    /// Per-product failures are reported individually and do not abort the
+    /// loop — the final summary lists ok/err counts.
+    DeclareProducts {
+        /// Optional provider filter. When set, only products from this
+        /// provider are declared. Omit to fan out over the whole catalog.
         #[arg(long)]
-        price_input: Option<String>,
+        provider: Option<Provider>,
 
-        /// Output token price in USD/Mtok.
-        #[arg(long)]
-        price_output: Option<String>,
-
-        /// Cache read price in USD/Mtok.
-        #[arg(long)]
-        price_cache_read: Option<String>,
-
-        /// Cache write 5m price in USD/Mtok.
-        #[arg(long)]
-        price_cache_write_5m: Option<String>,
-
-        /// Cache write 1h price in USD/Mtok.
-        #[arg(long)]
-        price_cache_write_1h: Option<String>,
+        /// Percent off retail; range [0, 99.90]. You will receive
+        /// (100 - PCT)% of retail per token, applied to every product
+        /// the fan-out touches.
+        #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
+        discount_bp: u32,
     },
 
     /// Show the miner's current registration status and per-product eligibility.
@@ -239,11 +235,6 @@ enum Command {
 }
 
 #[tokio::main]
-#[expect(
-    clippy::too_many_lines,
-    reason = "main is a pure dispatch function; each arm is a one-liner or a \
-              call to a dedicated cmd_* handler — no logic lives here"
-)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
@@ -323,47 +314,21 @@ async fn main() -> Result<()> {
         Command::DeclareProduct {
             provider,
             model,
-            price_input,
-            price_output,
-            price_cache_read,
-            price_cache_write_5m,
-            price_cache_write_1h,
+            discount_bp,
         } => {
-            let price = build_price_block(
-                &price_input,
-                &price_output,
-                price_cache_read.as_deref(),
-                price_cache_write_5m.as_deref(),
-                price_cache_write_1h.as_deref(),
-            )?;
             let cfg = load_config(cli.testnet, cli.api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_declare_product(&mut client, &provider, &model, price).await
+            cmd_declare_product(&mut client, &provider, &model, discount_bp).await
         }
-        Command::UpdatePrices {
+        Command::DeclareProducts {
             provider,
-            model,
-            price_input,
-            price_output,
-            price_cache_read,
-            price_cache_write_5m,
-            price_cache_write_1h,
+            discount_bp,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_update_prices(
-                &mut client,
-                &provider,
-                &model,
-                price_input.as_deref(),
-                price_output.as_deref(),
-                price_cache_read.as_deref(),
-                price_cache_write_5m.as_deref(),
-                price_cache_write_1h.as_deref(),
-            )
-            .await
+            cmd_declare_products(&mut client, provider.as_ref(), discount_bp).await
         }
         Command::Status => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
@@ -503,28 +468,111 @@ async fn device_login_from(
     .await
 }
 
-/// Convert an optional USD/Mtok string to an optional nano-dollar integer.
-fn opt_usd_to_ndollars(input: Option<&str>) -> Result<Option<u64>> {
-    match input {
-        None => Ok(None),
-        Some(s) => Ok(Some(nanodollar::usd_per_mtok_to_ndollars(s)?)),
+/// clap `value_parser` for `--discount-pct`.
+///
+/// Parses a percent string with up to two decimal places into the registry's
+/// integer basis-point wire value without floating-point arithmetic.
+fn parse_discount_pct(s: &str) -> Result<u32, String> {
+    let mut parts = s.split('.');
+    let whole_s = parts.next().unwrap_or_default();
+    let cents_s = parts.next();
+    if parts.next().is_some() {
+        return Err(format!(
+            "invalid --discount-pct {s:?}: use a percent in [0, 99.90] with at most one decimal point"
+        ));
     }
+    if whole_s.is_empty() || !whole_s.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "invalid --discount-pct {s:?}: whole percent must be non-negative digits"
+        ));
+    }
+
+    let whole = whole_s
+        .parse::<u32>()
+        .map_err(|_| format!("invalid --discount-pct {s:?}: whole percent is too large"))?;
+    let cents = match cents_s {
+        None | Some("") => 0,
+        Some(cents_s) if cents_s.len() > 2 => {
+            return Err(format!(
+                "invalid --discount-pct {s:?}: use at most 2 decimal places"
+            ));
+        }
+        Some(cents_s) if cents_s.chars().all(|c| c.is_ascii_digit()) => {
+            let cents = cents_s.parse::<u32>().map_err(|_| {
+                format!("invalid --discount-pct {s:?}: decimal percent is not parseable")
+            })?;
+            if cents_s.len() == 1 {
+                cents * 10
+            } else {
+                cents
+            }
+        }
+        _ => {
+            return Err(format!(
+                "invalid --discount-pct {s:?}: decimal percent must contain digits only"
+            ));
+        }
+    };
+
+    let parsed = whole
+        .checked_mul(100)
+        .and_then(|v| v.checked_add(cents))
+        .ok_or_else(|| format!("invalid --discount-pct {s:?}: percent is too large"))?;
+    if parsed > MAX_DISCOUNT_BP {
+        return Err(format!(
+            "--discount-pct {s:?} is above the cap of 99.90%; \
+             the registry rejects anything above {MAX_DISCOUNT_BP} bp"
+        ));
+    }
+    Ok(parsed)
 }
 
-fn build_price_block(
-    price_input: &str,
-    price_output: &str,
-    price_cache_read: Option<&str>,
-    price_cache_write_5m: Option<&str>,
-    price_cache_write_1h: Option<&str>,
-) -> Result<MinerPriceBlock> {
-    Ok(MinerPriceBlock {
-        input_per_mtok_ndollars: nanodollar::usd_per_mtok_to_ndollars(price_input)?,
-        output_per_mtok_ndollars: nanodollar::usd_per_mtok_to_ndollars(price_output)?,
-        cache_read_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_read)?,
-        cache_write_5m_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_write_5m)?,
-        cache_write_1h_per_mtok_ndollars: opt_usd_to_ndollars(price_cache_write_1h)?,
-    })
+fn format_discount_pct(discount_bp: u32) -> String {
+    let whole = discount_bp / 100;
+    let cents = discount_bp % 100;
+    if cents == 0 {
+        return whole.to_string();
+    }
+    format!("{whole}.{cents:02}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+/// Effective per-Mtok ndollars the miner receives for one dimension:
+/// `floor(retail × (10_000 − discount_bp) / 10_000)`. Matches the
+/// gateway's per-dimension floor in `gateway/src/money/settle.rs::
+/// effective_per_mtok_prices`, so what we display here is byte-for-byte
+/// the number the miner is paid.
+fn effective_per_mtok_ndollars(retail_ndollars: u64, discount_bp: u32) -> u64 {
+    let bp = u128::from(discount_bp.min(MAX_DISCOUNT_BP));
+    let total = u128::from(retail_ndollars);
+    let effective = (total * (10_000 - bp)) / 10_000;
+    u64::try_from(effective).unwrap_or(retail_ndollars)
+}
+
+/// Render a per-Mtok ndollar value as a dollar amount with 3 decimal
+/// places (e.g. `3_000_000_000 → "$3.000"`, `2_685_000_000 → "$2.685"`).
+/// One nano-dollar is `10^-9` USD; 3 decimals is one-tenth of a cent
+/// per Mtok, which is the resolution the operator actually cares about.
+fn format_per_mtok_usd(ndollars: u64) -> String {
+    let dollars = ndollars / 1_000_000_000;
+    let millis = (ndollars % 1_000_000_000) / 1_000_000;
+    format!("${dollars}.{millis:03}")
+}
+
+/// One-line summary of the per-Mtok rate the miner will receive on a
+/// product, given retail dimensions and a discount. Shared between
+/// the single-product declaration output and the fan-out summary so
+/// every site renders the same shape.
+fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> String {
+    let eff_in = effective_per_mtok_ndollars(retail.input_per_mtok_ndollars, discount_bp);
+    let eff_out = effective_per_mtok_ndollars(retail.output_per_mtok_ndollars, discount_bp);
+    format!(
+        "{} in / {} out per Mtok",
+        format_per_mtok_usd(eff_in),
+        format_per_mtok_usd(eff_out)
+    )
 }
 
 /// Extract a human-readable error detail from a registry JSON error body.
@@ -1000,8 +1048,15 @@ async fn post_register_image(
     Ok(())
 }
 
+/// `gm-miner list-products` — show the miner's declared offers.
+///
+/// Calls `GET /miners/me` and tabulates each `ProductOfferStatus`. Helps the
+/// operator verify what their `declare-product[s]` calls actually persisted.
 async fn cmd_list_products(client: &mut RegistryClient) -> Result<()> {
-    let resp = client.get("/products").await.context("GET /products")?;
+    let resp = client
+        .get(gm_miner_cli::client::ME_PATH)
+        .await
+        .context("GET /miners/me")?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -1009,36 +1064,186 @@ async fn cmd_list_products(client: &mut RegistryClient) -> Result<()> {
         bail!("list-products failed ({status}): {body}");
     }
 
-    let products: Vec<Product> = resp.json().await.context("parse products")?;
+    let miner: MinerStatus = resp.json().await.context("parse miner status")?;
 
-    if products.is_empty() {
-        println!("No products in catalog.");
+    if miner.products.is_empty() {
+        println!("No products declared.");
         return Ok(());
     }
 
-    println!("{:<12} {:<40} STATUS", "PROVIDER", "MODEL");
-    println!("{}", "-".repeat(60));
-    for p in &products {
-        println!("{:<12} {:<40} {}", p.provider, p.model, p.status);
+    // Join against the catalog so each row can render the effective
+    // per-Mtok rate the miner actually receives. The catalog is the
+    // single source of truth for retail; doing the join here avoids
+    // adding a retail block to `/miners/me` on the registry side.
+    let catalog = fetch_catalog(client).await?;
+    let retail_by_key: std::collections::HashMap<_, _> = catalog
+        .products
+        .iter()
+        .map(|p| {
+            (
+                (p.provider.clone(), p.model.as_str()),
+                &p.retail_price.dimensions,
+            )
+        })
+        .collect();
+
+    println!(
+        "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
+        "PROVIDER", "MODEL", "DISCOUNT", "YOU RECEIVE / MTOK", "OFFERED", "ELIGIBLE"
+    );
+    println!("{}", "-".repeat(110));
+    for p in &miner.products {
+        let provider: Result<Provider, _> = p.provider.parse();
+        let (discount_label, rate_label) = match (p.discount_bp, provider) {
+            (Some(bp), Ok(prov)) => {
+                let label = format!("{}%", format_discount_pct(bp));
+                let rate = retail_by_key.get(&(prov, p.model.as_str())).map_or_else(
+                    || "(retail unknown)".to_owned(),
+                    |dims| effective_rate_summary(dims, bp),
+                );
+                (label, rate)
+            }
+            _ => ("—".to_owned(), "—".to_owned()),
+        };
+        println!(
+            "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
+            p.provider,
+            p.model,
+            discount_label,
+            rate_label,
+            if p.is_offered { "yes" } else { "no" },
+            if p.is_eligible { "yes" } else { "no" },
+        );
     }
-    println!("\n{} products total.", products.len());
+    println!("\n{} offers total.", miner.products.len());
     Ok(())
 }
 
+/// `gm-miner declare-product` — POST one (provider, model, `discount_bp`)
+/// offer to `/miners/products`. The registry treats POST as upsert, so this
+/// also handles updating an existing offer's discount.
+///
+/// Fetches the catalog first so the success output can render retail +
+/// the effective per-Mtok rate the miner will actually receive. The
+/// extra HTTP call also catches "unknown product" before the POST goes
+/// out, which lets the CLI fail with a clearer error than the registry's
+/// generic 404.
 async fn cmd_declare_product(
     client: &mut RegistryClient,
     provider: &Provider,
     model: &str,
-    price: MinerPriceBlock,
+    discount_bp: u32,
 ) -> Result<()> {
-    // Serialize via the typed MinerPriceBlock so its skip_serializing_if
-    // attrs kick in and unset cache_* fields are omitted entirely
-    // (rather than sent as JSON null, which the registry rejects).
-    let body = serde_json::json!({
-        "provider": provider.as_str(),
-        "model": model,
-        "miner_price": price,
-    });
+    let catalog = fetch_catalog(client).await?;
+    let product = catalog
+        .products
+        .iter()
+        .find(|p| &p.provider == provider && p.model == model)
+        .ok_or_else(|| anyhow::anyhow!("{provider}/{model} is not in the registry catalog"))?;
+
+    post_declare_product(client, provider, model, discount_bp).await?;
+
+    let dims = &product.retail_price.dimensions;
+    let retail_in = format_per_mtok_usd(dims.input_per_mtok_ndollars);
+    let retail_out = format_per_mtok_usd(dims.output_per_mtok_ndollars);
+    let eff_in = format_per_mtok_usd(effective_per_mtok_ndollars(
+        dims.input_per_mtok_ndollars,
+        discount_bp,
+    ));
+    let eff_out = format_per_mtok_usd(effective_per_mtok_ndollars(
+        dims.output_per_mtok_ndollars,
+        discount_bp,
+    ));
+    // What the miner keeps per token, as a percentage of retail. With
+    // discount_bp = 0 this reads "100%"; at the 99.90% cap this is
+    // "0.1% of retail" — the minimum positive payout.
+    let kept_bp = 10_000_u32.saturating_sub(discount_bp);
+    let kept_pct = format_discount_pct(kept_bp);
+
+    println!("{provider}/{model}");
+    println!("  Retail       : {retail_in} input / {retail_out} output per Mtok");
+    println!("  Declared     : {}% off", format_discount_pct(discount_bp));
+    println!("  You receive  : {eff_in} input / {eff_out} output per Mtok ({kept_pct}% of retail)");
+    println!("  → ok");
+    Ok(())
+}
+
+/// `gm-miner declare-products` — fan a single discount out over the catalog.
+///
+/// 1. Public `GET /products` discovers every active product.
+/// 2. If `provider_filter` is set, drops products from other providers.
+/// 3. Drops deprecated products (the registry rejects offers on them anyway).
+/// 4. POSTs one offer per surviving product. Each result is printed
+///    individually (`provider/model: N% → ok|ERROR …`).
+/// 5. Reports a final ok/err summary.
+///
+/// Per-product failures do not abort the loop. The function returns `Ok(())`
+/// when every POST succeeded and an aggregated error otherwise so the CLI
+/// exits non-zero on partial failure.
+async fn cmd_declare_products(
+    client: &mut RegistryClient,
+    provider_filter: Option<&Provider>,
+    discount_bp: u32,
+) -> Result<()> {
+    let catalog = fetch_catalog(client).await?;
+    let targets = filter_catalog(&catalog.products, provider_filter);
+
+    if targets.is_empty() {
+        let scope =
+            provider_filter.map_or_else(|| "the catalog".to_owned(), |p| format!("provider {p}"));
+        bail!("no active products found in {scope} to declare against");
+    }
+
+    let discount_pct = format_discount_pct(discount_bp);
+    println!(
+        "Declaring {discount_pct}% off retail on {} product(s)...",
+        targets.len()
+    );
+
+    let mut ok_count = 0_usize;
+    let mut err_count = 0_usize;
+    for product in &targets {
+        let rate = effective_rate_summary(&product.retail_price.dimensions, discount_bp);
+        match post_declare_product(client, &product.provider, &product.model, discount_bp).await {
+            Ok(()) => {
+                println!(
+                    "  {}/{}: {discount_pct}% off → {rate} → ok",
+                    product.provider, product.model
+                );
+                ok_count += 1;
+            }
+            Err(err) => {
+                println!(
+                    "  {}/{}: {discount_pct}% off → {rate} → ERROR {err}",
+                    product.provider, product.model
+                );
+                err_count += 1;
+            }
+        }
+    }
+
+    println!("\nSummary: {ok_count} ok, {err_count} failed.");
+    if err_count > 0 {
+        bail!("{err_count} of {} declarations failed", targets.len());
+    }
+    Ok(())
+}
+
+/// Issue one `POST /miners/products` and translate the result into a typed
+/// `Result<(), anyhow::Error>` so both `declare-product` and
+/// `declare-products` share the same wire-shape + error-detail logic.
+async fn post_declare_product(
+    client: &mut RegistryClient,
+    provider: &Provider,
+    model: &str,
+    discount_bp: u32,
+) -> Result<()> {
+    let body = serde_json::to_value(ProductDeclarationRequest {
+        provider: provider.as_str(),
+        model,
+        discount_bp,
+    })
+    .context("serialize declare-product body")?;
 
     let resp = client
         .post("/miners/products", &body)
@@ -1052,89 +1257,42 @@ async fn cmd_declare_product(
         .context("parse declare-product response")?;
 
     if !status.is_success() {
-        bail!("declare-product failed ({status}): {}", error_detail(&json));
+        bail!("registry returned {status}: {}", error_detail(&json));
     }
-
-    let input_usd = nanodollar::ndollars_to_usd_per_mtok(price.input_per_mtok_ndollars);
-    let output_usd = nanodollar::ndollars_to_usd_per_mtok(price.output_per_mtok_ndollars);
-
-    println!("Product declared.");
-    println!("  Provider : {provider}");
-    println!("  Model    : {model}");
-    println!("  Input    : ${input_usd}/Mtok");
-    println!("  Output   : ${output_usd}/Mtok");
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "all args are distinct price fields; no better grouping"
-)]
-async fn cmd_update_prices(
-    client: &mut RegistryClient,
-    provider: &Provider,
-    model: &str,
-    price_input: Option<&str>,
-    price_output: Option<&str>,
-    price_cache_read: Option<&str>,
-    price_cache_write_5m: Option<&str>,
-    price_cache_write_1h: Option<&str>,
-) -> Result<()> {
-    if price_input.is_none()
-        && price_output.is_none()
-        && price_cache_read.is_none()
-        && price_cache_write_5m.is_none()
-        && price_cache_write_1h.is_none()
-    {
-        bail!("at least one --price-* flag must be specified");
-    }
-
-    let mut miner_price = serde_json::Map::new();
-    if let Some(p) = price_input {
-        miner_price.insert(
-            "input_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-    if let Some(p) = price_output {
-        miner_price.insert(
-            "output_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-    if let Some(p) = price_cache_read {
-        miner_price.insert(
-            "cache_read_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-    if let Some(p) = price_cache_write_5m {
-        miner_price.insert(
-            "cache_write_5m_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-    if let Some(p) = price_cache_write_1h {
-        miner_price.insert(
-            "cache_write_1h_per_mtok_ndollars".into(),
-            serde_json::Value::from(nanodollar::usd_per_mtok_to_ndollars(p)?),
-        );
-    }
-
-    let path = format!("/miners/products/{}/{}/prices", provider.as_str(), model);
-    let body = serde_json::json!({ "miner_price": miner_price });
-
-    let resp = client.patch(&path, &body).await.context("PATCH prices")?;
-
+/// Pull the catalog from the public `GET /products` endpoint.
+async fn fetch_catalog(client: &mut RegistryClient) -> Result<ProductCatalogResponse> {
+    let resp = client.get("/products").await.context("GET /products")?;
     let status = resp.status();
-    let json: serde_json::Value = resp.json().await.context("parse update-prices response")?;
-
     if !status.is_success() {
-        bail!("update-prices failed ({status}): {}", error_detail(&json));
+        let body = resp.text().await.unwrap_or_default();
+        bail!("GET /products failed ({status}): {body}");
     }
+    resp.json::<ProductCatalogResponse>()
+        .await
+        .context("parse product catalog")
+}
 
-    println!("Prices updated for {provider}/{model}.");
-    Ok(())
+/// Filter the catalog down to the set of products a fan-out should hit:
+/// active, declarable, optionally narrowed to one provider.
+///
+/// `benchmark` entries are always dropped — every miner serves that pool
+/// automatically (see `docs/plans/admission-benchmark.md`) and the
+/// registry rejects declarations against it. Today the registry never
+/// emits a benchmark row from `GET /products`; this filter is the
+/// defence-in-depth that keeps the fan-out clean if that changes.
+fn filter_catalog<'a>(
+    products: &'a [Product],
+    provider_filter: Option<&Provider>,
+) -> Vec<&'a Product> {
+    products
+        .iter()
+        .filter(|p| p.status == "active")
+        .filter(|p| p.provider != Provider::Benchmark)
+        .filter(|p| provider_filter.is_none_or(|target| &p.provider == target))
+        .collect()
 }
 
 async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
@@ -1170,18 +1328,260 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
 
     println!("\nProducts:");
     println!(
-        "{:<12} {:<40} {:<10} {:<10}",
-        "PROVIDER", "MODEL", "OFFERED", "ELIGIBLE"
+        "{:<12} {:<40} {:<12} {:<8} {:<8}",
+        "PROVIDER", "MODEL", "DISCOUNT", "OFFERED", "ELIGIBLE"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(84));
     for p in &miner.products {
+        let bp = p.discount_bp.map_or_else(
+            || "—".to_owned(),
+            |v| format!("{}%", format_discount_pct(v)),
+        );
         println!(
-            "{:<12} {:<40} {:<10} {:<10}",
+            "{:<12} {:<40} {:<12} {:<8} {:<8}",
             p.provider,
             p.model,
+            bp,
             if p.is_offered { "yes" } else { "no" },
             if p.is_eligible { "yes" } else { "no" },
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "tests intentionally panic on unexpected values"
+)]
+mod tests {
+    use super::{
+        effective_per_mtok_ndollars, effective_rate_summary, filter_catalog, format_discount_pct,
+        format_per_mtok_usd, parse_discount_pct, Cli, Command, Product, Provider, MAX_DISCOUNT_BP,
+    };
+    use gm_miner_cli::types::{RetailDimensions, RetailPrice};
+
+    fn p(provider: Provider, model: &str, status: &str) -> Product {
+        Product {
+            provider,
+            model: model.to_owned(),
+            status: status.to_owned(),
+            retail_price: RetailPrice {
+                dimensions: RetailDimensions {
+                    input_per_mtok_ndollars: 3_000_000_000,
+                    output_per_mtok_ndollars: 15_000_000_000,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn discount_pct_accepts_examples() {
+        assert_eq!(parse_discount_pct("0").unwrap(), 0);
+        assert_eq!(parse_discount_pct("5").unwrap(), 500);
+        assert_eq!(parse_discount_pct("10.5").unwrap(), 1050);
+        assert_eq!(parse_discount_pct("10.55").unwrap(), 1055);
+        assert_eq!(parse_discount_pct("99.90").unwrap(), MAX_DISCOUNT_BP);
+    }
+
+    #[test]
+    fn discount_pct_rejects_negative() {
+        let err = parse_discount_pct("-0.1").unwrap_err();
+        assert!(err.contains("non-negative"), "got: {err}");
+    }
+
+    #[test]
+    fn discount_pct_rejects_above_cap() {
+        let err = parse_discount_pct("99.91").unwrap_err();
+        assert!(err.contains("above the cap"), "got: {err}");
+    }
+
+    #[test]
+    fn discount_pct_rejects_more_than_two_decimals() {
+        let err = parse_discount_pct("10.555").unwrap_err();
+        assert!(err.contains("at most 2 decimal"), "got: {err}");
+    }
+
+    #[test]
+    fn discount_pct_rejects_unparseable() {
+        let err = parse_discount_pct("abc").unwrap_err();
+        assert!(err.contains("digits"), "got: {err}");
+    }
+
+    #[test]
+    fn discount_pct_rejects_malformed() {
+        let err = parse_discount_pct("10.5.5").unwrap_err();
+        assert!(err.contains("at most one decimal point"), "got: {err}");
+    }
+
+    #[test]
+    fn format_discount_pct_trims_trailing_zeroes() {
+        assert_eq!(format_discount_pct(1050), "10.5");
+        assert_eq!(format_discount_pct(1055), "10.55");
+        assert_eq!(format_discount_pct(500), "5");
+        assert_eq!(format_discount_pct(9990), "99.9");
+        assert_eq!(format_discount_pct(0), "0");
+        // 10_000 bp is what we keep when discount = 0, used by the
+        // "you keep X% of retail" line in declare-product output.
+        assert_eq!(format_discount_pct(10_000), "100");
+        assert_eq!(format_discount_pct(10), "0.1");
+    }
+
+    #[test]
+    fn effective_per_mtok_matches_gateway_floor() {
+        // 6% discount on $3/Mtok retail → $2.82/Mtok per gateway settle.rs.
+        assert_eq!(
+            effective_per_mtok_ndollars(3_000_000_000, 600),
+            2_820_000_000
+        );
+        // 10.5% discount on $3/Mtok input → $2.685/Mtok.
+        assert_eq!(
+            effective_per_mtok_ndollars(3_000_000_000, 1050),
+            2_685_000_000
+        );
+        // Discount = 0 returns retail verbatim.
+        assert_eq!(
+            effective_per_mtok_ndollars(15_000_000_000, 0),
+            15_000_000_000
+        );
+        // Discount = 99.90% leaves 0.10% of retail.
+        assert_eq!(
+            effective_per_mtok_ndollars(15_000_000_000, MAX_DISCOUNT_BP),
+            15_000_000
+        );
+    }
+
+    #[test]
+    fn format_per_mtok_usd_renders_three_decimals() {
+        assert_eq!(format_per_mtok_usd(3_000_000_000), "$3.000");
+        assert_eq!(format_per_mtok_usd(2_685_000_000), "$2.685");
+        assert_eq!(format_per_mtok_usd(15_000_000), "$0.015");
+        assert_eq!(format_per_mtok_usd(0), "$0.000");
+    }
+
+    #[test]
+    fn effective_rate_summary_renders_in_and_out() {
+        let dims = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+        };
+        assert_eq!(
+            effective_rate_summary(&dims, 1050),
+            "$2.685 in / $13.425 out per Mtok"
+        );
+        assert_eq!(
+            effective_rate_summary(&dims, 0),
+            "$3.000 in / $15.000 out per Mtok"
+        );
+    }
+
+    #[test]
+    fn clap_accepts_discount_pct_for_single_declare() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "declare-product",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-6",
+            "--discount-pct",
+            "10.55",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::DeclareProduct {
+                discount_bp: 1055,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clap_accepts_discount_pct_for_fan_out_declare() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "declare-products",
+            "--provider",
+            "openai",
+            "--discount-pct",
+            "5",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::DeclareProducts {
+                discount_bp: 500,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clap_rejects_removed_discount_bp_flag() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "declare-product",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-6",
+            "--discount-bp",
+            "500",
+        ]);
+        assert!(result.is_err(), "expected --discount-bp to be rejected");
+        let Some(err) = result.err() else {
+            return;
+        };
+        assert!(err.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn filter_catalog_keeps_active_real_providers() {
+        let products = [
+            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
+            p(Provider::OpenAI, "gpt-5.5", "active"),
+            p(Provider::Gemini, "gemini-2.5-pro", "active"),
+        ];
+        let kept = filter_catalog(&products, None);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn filter_catalog_drops_deprecated() {
+        let products = [
+            p(Provider::Anthropic, "claude-old", "deprecated"),
+            p(Provider::OpenAI, "gpt-5.5", "active"),
+        ];
+        let kept = filter_catalog(&products, None);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].model, "gpt-5.5");
+    }
+
+    #[test]
+    fn filter_catalog_drops_benchmark_even_when_active() {
+        // The registry's benchmark pool is auto-synthesized; declarations
+        // against it 404. If a future registry change ever exposes a
+        // benchmark row in GET /products, the fan-out must still skip it.
+        let products = [
+            p(Provider::Benchmark, "gpt-bench", "active"),
+            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
+        ];
+        let kept = filter_catalog(&products, None);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].provider, Provider::Anthropic);
+    }
+
+    #[test]
+    fn filter_catalog_narrows_to_one_provider() {
+        let products = [
+            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
+            p(Provider::OpenAI, "gpt-5.5", "active"),
+        ];
+        let kept = filter_catalog(&products, Some(&Provider::OpenAI));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].provider, Provider::OpenAI);
+    }
 }
