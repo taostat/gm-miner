@@ -59,23 +59,15 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Mutable per-worker state carried across one refresh attempt.
-///
-/// The active refresh token is read from / written to this struct
-/// instead of from the env var — providers (both Anthropic and `OpenAI`,
-/// per the research file) rotate the refresh token on every refresh.
-/// The rotated token lives in memory only for Phase A; a sidecar
-/// restart picks up the original env-var token (still valid until the
-/// next rotation lands).
-struct WorkerState {
-    refresh_token: String,
-}
-
 /// Spawn-friendly entry point: drives one provider's refresh forever.
 ///
 /// `cancel` is the shutdown token — flipping it cancels the in-flight
 /// sleep and the worker returns. The HTTP client is shared so the
-/// connection pool serves every provider.
+/// connection pool serves every provider. Both Anthropic and `OpenAI`
+/// (per the research file) rotate the refresh token on every refresh
+/// — the rotated token lives in memory only for Phase A; a sidecar
+/// restart picks up the original env-var token, still valid until the
+/// next rotation lands.
 pub async fn run_provider_worker(
     client: reqwest::Client,
     provider: OauthProvider,
@@ -86,9 +78,7 @@ pub async fn run_provider_worker(
     cancel: CancellationToken,
 ) {
     let endpoints = provider.endpoints();
-    let mut ws = WorkerState {
-        refresh_token: initial_refresh_token,
-    };
+    let mut refresh_token = initial_refresh_token;
     metrics.seed_provider(provider);
 
     loop {
@@ -107,7 +97,12 @@ pub async fn run_provider_worker(
         }
 
         let attempt_outcome = attempt_with_retries(
-            &client, endpoints, &mut ws, &state, &metrics, policy, &cancel,
+            &client,
+            endpoints,
+            &refresh_token,
+            &metrics,
+            policy,
+            &cancel,
         )
         .await;
 
@@ -120,7 +115,7 @@ pub async fn run_provider_worker(
                 let new_expiry = outcome.expires_at;
                 state.record_success(outcome.access_token, new_expiry).await;
                 if let Some(rotated) = outcome.rotated_refresh_token {
-                    ws.refresh_token = rotated;
+                    refresh_token = rotated;
                 }
                 metrics.record_refresh_success(provider);
                 metrics.set_provider_down(provider, false);
@@ -161,13 +156,11 @@ enum AttemptOutcome {
 /// + jitter between failed attempts.
 ///
 /// Pulled out of [`run_provider_worker`] for readability — the
-/// function is still under the workspace's complexity cap and tests
-/// can target it via the public test helpers below.
+/// function is still under the workspace's complexity cap.
 async fn attempt_with_retries(
     client: &reqwest::Client,
     endpoints: crate::provider::ProviderEndpoints,
-    ws: &mut WorkerState,
-    _state: &ProviderState,
+    refresh_token: &str,
     metrics: &Metrics,
     policy: RetryPolicy,
     cancel: &CancellationToken,
@@ -178,7 +171,7 @@ async fn attempt_with_retries(
     // `max_retries + 1` total attempts: the first attempt is not a
     // retry. A `max_retries == 0` policy gives one attempt and bails.
     for attempt in 0..=policy.max_retries {
-        match refresh_once(client, endpoints, &ws.refresh_token).await {
+        match refresh_once(client, endpoints, refresh_token).await {
             Ok(outcome) => return AttemptOutcome::Success(outcome),
             Err(RefreshError { reason, message }) => {
                 metrics.record_refresh_failure(provider, reason);

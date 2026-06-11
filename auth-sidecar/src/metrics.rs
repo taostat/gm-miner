@@ -33,9 +33,6 @@ pub struct Metrics {
     /// `1` when the worker has exhausted its retry budget and Envoy
     /// is expected to return 503 on this provider's route.
     provider_down: GaugeVec,
-    /// Build / version of the sidecar binary. Constant — set once at
-    /// startup. Lets scrapers diff sidecar versions across miners.
-    build_info: Gauge,
 }
 
 /// Error type for the metrics initialiser. Prometheus's `register_*`
@@ -92,12 +89,16 @@ impl Metrics {
         )?;
         registry.register(Box::new(provider_down.clone()))?;
 
+        // Build-info gauge — constant `1`, scrapers diff sidecar
+        // versions by labels not values. Registered directly into the
+        // registry without keeping a handle: we never mutate it after
+        // construction.
         let build_info = Gauge::with_opts(Opts::new(
             "gm_miner_auth_sidecar_build_info",
             "Always 1; the value carries no information — diff scrapers by labels.",
         ))?;
         build_info.set(1.0);
-        registry.register(Box::new(build_info.clone()))?;
+        registry.register(Box::new(build_info))?;
 
         // NB: `gm_miner_subscription_quota_remaining` is intentionally
         // omitted. Anthropic exposes per-call quota via
@@ -119,15 +120,7 @@ impl Metrics {
             refresh_success,
             refresh_failure,
             provider_down,
-            build_info,
         })
-    }
-
-    /// Reference to the shared registry. The `/metrics` HTTP handler
-    /// borrows this to encode the scrape response.
-    #[must_use]
-    pub fn registry(&self) -> &Registry {
-        &self.registry
     }
 
     /// Initialise every provider's series so they appear in the
@@ -189,13 +182,6 @@ impl Metrics {
         self.provider_down
             .with_label_values(&[provider.as_str()])
             .set(if down { 1.0 } else { 0.0 });
-    }
-
-    /// Re-set the build-info gauge to 1. Idempotent — exists so the
-    /// startup log can confirm the metric is wired even when no
-    /// scrape has happened.
-    pub fn touch_build_info(&self) {
-        self.build_info.set(1.0);
     }
 
     /// Encode the registry into the Prometheus text-exposition format.

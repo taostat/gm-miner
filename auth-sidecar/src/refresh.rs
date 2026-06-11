@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::provider::{OauthProvider, ProviderEndpoints, RefreshEncoding};
+use crate::provider::{ProviderEndpoints, RefreshEncoding};
 
 /// Classification of why a refresh failed. Drives both backoff
 /// behaviour and the Prometheus `reason` label.
@@ -143,9 +143,8 @@ pub async fn refresh_once(
     parsed.into_outcome(Utc::now())
 }
 
-/// Public for test reuse only — `refresh_once` is the only intended
-/// caller. Builds the HTTP request envelope per the provider's
-/// encoding.
+/// Build the refresh HTTP request envelope per the provider's
+/// encoding. Pulled out so `refresh_once` body fits in one screen.
 fn build_refresh_request(
     client: &reqwest::Client,
     endpoints: ProviderEndpoints,
@@ -254,15 +253,6 @@ fn classify_error_body(body: &str) -> FailureReason {
     }
 }
 
-/// Pick a unique provider endpoint variant for a `OauthProvider`. The
-/// only purpose of this is so the integration tests can refer to one
-/// provider by name without leaking the `endpoints()` boundary.
-#[doc(hidden)]
-#[must_use]
-pub fn endpoints_for(provider: OauthProvider) -> ProviderEndpoints {
-    provider.endpoints()
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -270,6 +260,7 @@ pub fn endpoints_for(provider: OauthProvider) -> ProviderEndpoints {
 )]
 mod tests {
     use super::*;
+    use crate::provider::OauthProvider;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

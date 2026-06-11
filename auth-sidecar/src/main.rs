@@ -48,7 +48,6 @@ async fn main() -> Result<()> {
     );
 
     let metrics = Metrics::new().context("init prometheus metrics")?;
-    metrics.touch_build_info();
 
     let mut states = Vec::with_capacity(cfg.providers.len());
     for p in &cfg.providers {
