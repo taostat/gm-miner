@@ -42,19 +42,38 @@ pub struct PastedOauthAuth {
     pub expires_at_rfc3339: String,
 }
 
-/// Raw JSON envelope tolerant of both nested (Hermes `auth.json`) and
-/// flat (Claude Code `.credentials.json` / Codex CLI) layouts.
+/// Raw JSON envelope tolerant of the three layouts operators actually
+/// paste from real CLIs:
+///
+/// 1. **Hermes-style** — top-level `openai-codex` or `anthropic` block.
+/// 2. **Codex CLI stock** — `~/.codex/auth.json` wraps the credentials
+///    under a `tokens` key (alongside an unrelated `OPENAI_API_KEY`).
+/// 3. **Claude Code stock** — `~/.claude/.credentials.json` wraps the
+///    credentials under a `claudeAiOauth` key.
+/// 4. **Flat** — top-level fields directly, used by some other CLIs.
+///
+/// Provider-specific blocks (Hermes nested, Codex `tokens`, Claude Code
+/// `claudeAiOauth`) take priority over the flat fallback when the file
+/// targets that provider. This lets an operator paste either a curated
+/// auth.json or the unmodified stock file from their CLI.
 #[derive(Debug, Deserialize)]
 struct RawAuthFile {
-    // Hermes-style nested layouts. Either provider's nested block, when
-    // present, takes priority over the flat fields below.
+    // Hermes-style nested layouts.
     #[serde(default, rename = "openai-codex")]
     openai_codex: Option<RawOauthBlock>,
     #[serde(default)]
     anthropic: Option<RawOauthBlock>,
 
-    // Flat layout (Claude Code / Codex CLI / `claude` MCP) — read when
-    // no nested block applies.
+    // Codex CLI stock auth.json — credentials nested under `tokens`.
+    #[serde(default)]
+    tokens: Option<RawOauthBlock>,
+
+    // Claude Code stock .credentials.json — credentials nested under
+    // `claudeAiOauth`.
+    #[serde(default, rename = "claudeAiOauth")]
+    claude_ai_oauth: Option<RawOauthBlock>,
+
+    // Flat layout — read when no nested block applies.
     #[serde(flatten)]
     flat: RawOauthBlock,
 }
@@ -114,13 +133,18 @@ impl std::fmt::Display for OauthProvider {
 pub fn parse_pasted_auth_json(bytes: &[u8], provider: OauthProvider) -> Result<PastedOauthAuth> {
     let raw: RawAuthFile = serde_json::from_slice(bytes).context("parse pasted auth.json")?;
 
-    // Prefer the nested provider-specific block when present; fall
-    // through to the flat top-level shape otherwise. Either path
-    // produces the same `RawOauthBlock`, so the downstream extraction
-    // is unconditional.
+    // Prefer the nested provider-specific block when present, falling
+    // through wrapper variants in order of specificity, then to the
+    // flat top-level shape. Either path produces the same
+    // `RawOauthBlock`, so the downstream extraction is unconditional.
+    //
+    // Codex priority: Hermes `openai-codex` block → Codex CLI `tokens`
+    // wrapper → flat.
+    // Anthropic priority: Hermes `anthropic` block → Claude Code
+    // `claudeAiOauth` wrapper → flat.
     let block = match provider {
-        OauthProvider::Openai => raw.openai_codex.unwrap_or(raw.flat),
-        OauthProvider::Anthropic => raw.anthropic.unwrap_or(raw.flat),
+        OauthProvider::Openai => raw.openai_codex.or(raw.tokens).unwrap_or(raw.flat),
+        OauthProvider::Anthropic => raw.anthropic.or(raw.claude_ai_oauth).unwrap_or(raw.flat),
     };
 
     let access_token = block.access_token.ok_or_else(|| {
@@ -311,6 +335,65 @@ mod tests {
         let parsed = parse_pasted_auth_json(&body, OauthProvider::Openai).unwrap();
         assert_eq!(parsed.initial_access_token, "at-nested");
         assert_eq!(parsed.refresh_token, "rt-nested");
+    }
+
+    #[test]
+    fn parses_codex_cli_stock_auth_json() {
+        // ~/.codex/auth.json wraps credentials under `tokens`, alongside
+        // an unrelated `OPENAI_API_KEY` field. The operator pastes the
+        // file unmodified.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "OPENAI_API_KEY": "sk-unrelated",
+            "tokens": {
+                "access_token": "at-codex-stock",
+                "refresh_token": "rt-codex-stock",
+                "expires_at": 1_900_000_000_i64,
+            },
+        }))
+        .unwrap();
+        let parsed = parse_pasted_auth_json(&body, OauthProvider::Openai).unwrap();
+        assert_eq!(parsed.initial_access_token, "at-codex-stock");
+        assert_eq!(parsed.refresh_token, "rt-codex-stock");
+    }
+
+    #[test]
+    fn parses_claude_code_stock_credentials_json() {
+        // ~/.claude/.credentials.json wraps credentials under
+        // `claudeAiOauth` with camelCase + ms-since-epoch.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "at-claude-stock",
+                "refreshToken": "rt-claude-stock",
+                "expiresAt": 1_900_000_000_000_i64,
+                "scopes": ["user:inference"],
+            },
+        }))
+        .unwrap();
+        let parsed = parse_pasted_auth_json(&body, OauthProvider::Anthropic).unwrap();
+        assert_eq!(parsed.initial_access_token, "at-claude-stock");
+        assert_eq!(parsed.refresh_token, "rt-claude-stock");
+    }
+
+    #[test]
+    fn nested_hermes_block_beats_codex_tokens_wrapper() {
+        // Defence in depth: if a file carries BOTH the Hermes nested
+        // block and the Codex `tokens` wrapper, the explicit
+        // provider-named block wins.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "openai-codex": {
+                "access_token": "at-hermes",
+                "refresh_token": "rt-hermes",
+                "expires_at": 1_900_000_000_i64,
+            },
+            "tokens": {
+                "access_token": "at-codex",
+                "refresh_token": "rt-codex",
+                "expires_at": 1_800_000_000_i64,
+            },
+        }))
+        .unwrap();
+        let parsed = parse_pasted_auth_json(&body, OauthProvider::Openai).unwrap();
+        assert_eq!(parsed.initial_access_token, "at-hermes");
     }
 
     #[test]
