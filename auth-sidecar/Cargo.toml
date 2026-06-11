@@ -1,0 +1,67 @@
+[package]
+name = "gm-miner-auth-sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "gm miner OAuth-subscription token-refresh sidecar — runs alongside Envoy inside the miner's TEE container. Reads sealed OAuth env vars at startup, periodically refreshes provider access tokens against the upstream OAuth endpoints, and exposes the current Bearer tokens to Envoy on a loopback HTTP endpoint."
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"
+
+[[bin]]
+name = "gm-miner-auth-sidecar"
+path = "src/main.rs"
+
+[lib]
+name = "gm_miner_auth_sidecar"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+# Cancellation primitive for the refresh worker — `tokio::select!` on
+# `cancel.cancelled()` is the standard tokio shutdown idiom and lives
+# in the `tokio-util` extras crate, not in `tokio` proper.
+tokio-util = { version = "0.7", default-features = false }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+# Random jitter for the refresh-backoff schedule. `small_rng` keeps the
+# binary footprint down — cryptographic randomness is not required for
+# jitter sizing.
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+# Prometheus text-exposition format. The crate produces a `/metrics`
+# body in the same shape Envoy and the rest of the gm stack emit, so
+# scrapers consume both surfaces with one config.
+prometheus = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# In-process axum router driver — tests round-trip requests through
+# `Router::oneshot` without binding a port.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+wiremock = "0.6"
