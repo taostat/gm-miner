@@ -806,17 +806,27 @@ async fn cmd_deploy(
     phala: &dyn PhalaClient,
     args: &DeployArgs,
 ) -> Result<()> {
-    // Step 1: ensure provider keys are configured.
-    let keys = cfg
-        .provider_keys
-        .as_ref()
-        .filter(|k| k.any_set())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no provider keys; run `gm-miner set-api-keys \
-                 --anthropic <key>` (and/or --openai / --google) first"
-            )
-        })?;
+    // Step 1: ensure at least one provider credential is configured.
+    // Accept either:
+    //   - API keys via `gm-miner set-api-keys` (provider_keys.any_set()), or
+    //   - OAuth subscription bundles via --paste-claude-auth / --paste-codex-auth
+    //     flags on this command (args.anthropic_oauth / args.openai_oauth).
+    // A deploy with only OAuth bundles renders with an empty ProviderKeys; the
+    // sidecar + envoy route subscription traffic via the pasted refresh tokens.
+    let oauth_configured = args.anthropic_oauth.is_some() || args.openai_oauth.is_some();
+    let empty_keys = gm_miner_cli::config::ProviderKeys::default();
+    let keys = match cfg.provider_keys.as_ref().filter(|k| k.any_set()) {
+        Some(k) => k,
+        None if oauth_configured => &empty_keys,
+        None => {
+            anyhow::bail!(
+                "no provider credentials; run `gm-miner set-api-keys \
+                 --anthropic <key>` (and/or --openai / --google) first, \
+                 or pass --paste-claude-auth / --paste-codex-auth to use \
+                 an OAuth subscription"
+            );
+        }
+    };
 
     // Step 1b: resolve the node secret for the network this deploy
     // targets. Generated once per network and persisted to the CLI
