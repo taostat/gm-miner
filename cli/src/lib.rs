@@ -6,4 +6,6 @@ pub mod config;
 pub mod deploy;
 pub mod image;
 pub mod node_secret;
+pub mod oauth_subscription;
+pub mod tos;
 pub mod types;

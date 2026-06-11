@@ -40,6 +40,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderKeys;
+use crate::oauth_subscription::OauthEnvVars;
 
 /// Default poll interval when waiting for the CVM to boot (seconds).
 pub const POLL_INTERVAL_SECS: u64 = 5;
@@ -91,6 +92,20 @@ pub struct DeployOutcome {
     pub endpoint: String,
 }
 
+/// All inputs to one [`PhalaClient::deploy`] call, grouped so the trait
+/// signature stays short as the env-var surface grows.
+#[derive(Debug, Clone)]
+pub struct DeployRequest<'a> {
+    /// Rendered compose file content (`${GM_IMAGE_REF}` already substituted).
+    pub compose_yaml: &'a str,
+    /// All env vars written into the `phala deploy` env file:
+    /// provider keys, node secret, registry pull credentials, and any
+    /// OAuth subscription bundles.
+    pub env: DeployEnvInputs<'a>,
+    /// How long to poll for the measured hashes before giving up.
+    pub boot_timeout_secs: u64,
+}
+
 /// Abstraction over the `phala` CLI, injectable for tests.
 ///
 /// The real implementation ([`RealPhalaClient`]) shells out to
@@ -100,27 +115,13 @@ pub trait PhalaClient {
     /// Deploy the compose stack to Phala Cloud and return the compose + OS
     /// image hashes the platform measured for the resulting CVM.
     ///
-    /// `compose_yaml` is the rendered compose file content; `env_vars` are
-    /// the operator's provider API keys, encrypted client-side to the CVM
-    /// key by `phala deploy`. `node_secret` is the miner's node secret
-    /// (Mechanism 1 of `docs/plans/attestation-and-identity.md`), passed in
-    /// the same encrypted env as `GM_NODE_SECRET`. `registry_creds`, when
-    /// present, are private-registry pull credentials written into the
-    /// same encrypted env so the CVM's pre-launch script can `docker login`
-    /// and pull the (private) miner image. `boot_timeout_secs` controls
-    /// how long to poll for the measured hashes before giving up.
+    /// Every input is bundled in [`DeployRequest`]; see that struct's
+    /// fields for the per-input contract.
     ///
     /// # Errors
     /// Returns an error if the deploy fails or the hashes/endpoint cannot
-    /// be read back within `boot_timeout_secs`.
-    fn deploy(
-        &self,
-        compose_yaml: &str,
-        env_vars: &ProviderKeys,
-        node_secret: &str,
-        registry_creds: Option<&RegistryCredentials>,
-        boot_timeout_secs: u64,
-    ) -> Result<DeployOutcome>;
+    /// be read back within `request.boot_timeout_secs`.
+    fn deploy(&self, request: &DeployRequest<'_>) -> Result<DeployOutcome>;
 }
 
 // ── Image provisioning abstraction ────────────────────────────────────────────
@@ -569,14 +570,7 @@ fn read_phala_cvm_outcome(cvm_id: &str) -> Result<Option<DeployOutcome>> {
 }
 
 impl PhalaClient for RealPhalaClient {
-    fn deploy(
-        &self,
-        compose_yaml: &str,
-        env_vars: &ProviderKeys,
-        node_secret: &str,
-        registry_creds: Option<&RegistryCredentials>,
-        boot_timeout_secs: u64,
-    ) -> Result<DeployOutcome> {
+    fn deploy(&self, request: &DeployRequest<'_>) -> Result<DeployOutcome> {
         use std::fs;
 
         fs::create_dir_all(&self.project_dir)
@@ -584,7 +578,7 @@ impl PhalaClient for RealPhalaClient {
 
         // Write the rendered compose file.
         let compose_path = self.project_dir.join("docker-compose.yaml");
-        fs::write(&compose_path, compose_yaml)
+        fs::write(&compose_path, request.compose_yaml)
             .with_context(|| format!("write {}", compose_path.display()))?;
 
         // Write the corrected, digest-aware pre-launch script. Phala
@@ -598,7 +592,7 @@ impl PhalaClient for RealPhalaClient {
         // with broader permissions. `phala deploy` reads this file and
         // encrypts its contents client-side to the CVM key.
         let env_path = self.project_dir.join(".env");
-        write_env_file(&env_path, env_vars, node_secret, registry_creds)?;
+        write_env_file(&env_path, &request.env)?;
 
         let compose_arg = compose_path.to_string_lossy().into_owned();
         let env_arg = env_path.to_string_lossy().into_owned();
@@ -634,7 +628,7 @@ impl PhalaClient for RealPhalaClient {
             self.app_name
         );
 
-        poll_phala_cvm_outcome(&self.app_name, boot_timeout_secs)
+        poll_phala_cvm_outcome(&self.app_name, request.boot_timeout_secs)
     }
 }
 
@@ -677,29 +671,51 @@ fn poll_phala_cvm_outcome(cvm_id: &str, timeout_secs: u64) -> Result<DeployOutco
     }
 }
 
+/// Inputs to [`render_env_file`], grouped so the call site does not need
+/// a long positional list as the env surface grows (provider keys, node
+/// secret, registry pull credentials, and per-provider OAuth subscription
+/// bundles).
+#[derive(Debug, Clone)]
+pub struct DeployEnvInputs<'a> {
+    /// Provider API keys. Each non-empty field becomes a
+    /// `<PROVIDER>_API_KEY=...` line; empty / `None` provider keys are
+    /// omitted so envoy injects an empty value and the upstream 401s.
+    pub provider_keys: &'a ProviderKeys,
+    /// The miner's node secret. Always written: `cmd_deploy` resolves it
+    /// before this call.
+    pub node_secret: &'a str,
+    /// Private-registry pull credentials, when the miner image lives on a
+    /// non-public registry. Consumed by the CVM's pre-launch script.
+    pub registry_creds: Option<&'a RegistryCredentials>,
+    /// Optional Anthropic OAuth subscription bundle (Phase A manual paste).
+    /// When set, three sealed env vars are emitted — see
+    /// `crate::oauth_subscription::OauthEnvVars` for the names.
+    pub anthropic_oauth: Option<&'a OauthEnvVars>,
+    /// Optional `OpenAI` / Codex OAuth subscription bundle (Phase A manual
+    /// paste). Same shape as `anthropic_oauth`.
+    pub openai_oauth: Option<&'a OauthEnvVars>,
+}
+
 /// Render the `phala deploy` env file body from the provider keys, node
-/// secret, and (optional) private-registry pull credentials.
+/// secret, (optional) private-registry pull credentials, and (optional)
+/// per-provider OAuth subscription bundles.
 ///
 /// Extracted as a pure function so the exact env-file contents can be
 /// asserted in tests without touching the filesystem.
 #[must_use]
-pub fn render_env_file(
-    env_vars: &ProviderKeys,
-    node_secret: &str,
-    registry_creds: Option<&RegistryCredentials>,
-) -> String {
+pub fn render_env_file(inputs: &DeployEnvInputs<'_>) -> String {
     let mut lines = String::new();
-    if let Some(k) = &env_vars.anthropic {
+    if let Some(k) = &inputs.provider_keys.anthropic {
         lines.push_str("ANTHROPIC_API_KEY=");
         lines.push_str(k);
         lines.push('\n');
     }
-    if let Some(k) = &env_vars.openai {
+    if let Some(k) = &inputs.provider_keys.openai {
         lines.push_str("OPENAI_API_KEY=");
         lines.push_str(k);
         lines.push('\n');
     }
-    if let Some(k) = &env_vars.google {
+    if let Some(k) = &inputs.provider_keys.google {
         lines.push_str("GOOGLE_API_KEY=");
         lines.push_str(k);
         lines.push('\n');
@@ -707,12 +723,12 @@ pub fn render_env_file(
     // The node secret envoy enforces as the x-gm-node-key header. Always
     // written: `cmd_deploy` resolves it before this call.
     lines.push_str("GM_NODE_SECRET=");
-    lines.push_str(node_secret);
+    lines.push_str(inputs.node_secret);
     lines.push('\n');
 
     // Private-registry pull credentials, consumed by the CVM's pre-launch
     // script (`docker login` before pulling the private miner image).
-    if let Some(creds) = registry_creds {
+    if let Some(creds) = inputs.registry_creds {
         lines.push_str("DSTACK_DOCKER_REGISTRY=");
         lines.push_str(&creds.registry);
         lines.push('\n');
@@ -724,27 +740,49 @@ pub fn render_env_file(
         lines.push('\n');
     }
 
+    // OAuth subscription bundles (Phase A manual-paste UX, see
+    // `docs/auth-modes.md`). One triplet per provider. Phase B will
+    // add the in-CVM refresh worker that consumes these; the env-var
+    // surface is pinned here so the upgrade is drop-in.
+    write_oauth_bundle(&mut lines, inputs.anthropic_oauth);
+    write_oauth_bundle(&mut lines, inputs.openai_oauth);
+
     lines
 }
 
-/// Write the provider keys + node secret + registry credentials to
-/// `env_path` at mode 0600.
+/// Emit one OAuth subscription triplet (refresh token, initial access
+/// token, `expires_at`) into the env file. No-op when `bundle` is `None`.
+fn write_oauth_bundle(lines: &mut String, bundle: Option<&OauthEnvVars>) {
+    let Some(b) = bundle else {
+        return;
+    };
+    lines.push_str(b.refresh_token_var);
+    lines.push('=');
+    lines.push_str(&b.refresh_token);
+    lines.push('\n');
+    lines.push_str(b.initial_access_token_var);
+    lines.push('=');
+    lines.push_str(&b.initial_access_token);
+    lines.push('\n');
+    lines.push_str(b.expires_at_var);
+    lines.push('=');
+    lines.push_str(&b.expires_at_rfc3339);
+    lines.push('\n');
+}
+
+/// Write the provider keys + node secret + registry credentials + OAuth
+/// bundles to `env_path` at mode 0600.
 ///
 /// Uses a temp-file-then-rename so the target file is always at mode 0600
 /// from the moment it exists — no window where a partially-written or
 /// broader-permission file is present on disk.
-fn write_env_file(
-    env_path: &std::path::Path,
-    env_vars: &ProviderKeys,
-    node_secret: &str,
-    registry_creds: Option<&RegistryCredentials>,
-) -> Result<()> {
+fn write_env_file(env_path: &std::path::Path, inputs: &DeployEnvInputs<'_>) -> Result<()> {
     use std::fs;
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let lines = render_env_file(env_vars, node_secret, registry_creds);
+    let lines = render_env_file(inputs);
 
     let parent = env_path
         .parent()
@@ -1373,7 +1411,13 @@ mod tests {
             openai: None,
             google: None,
         };
-        let body = render_env_file(&keys, "node-secret-xyz", None);
+        let body = render_env_file(&DeployEnvInputs {
+            provider_keys: &keys,
+            node_secret: "node-secret-xyz",
+            registry_creds: None,
+            anthropic_oauth: None,
+            openai_oauth: None,
+        });
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
         assert!(body.contains("GM_NODE_SECRET=node-secret-xyz\n"));
         assert!(
@@ -1383,6 +1427,10 @@ mod tests {
         assert!(
             !body.contains("GM_BENCHMARK_UPSTREAM_URL"),
             "GM_BENCHMARK_UPSTREAM_URL must no longer be written to the env file"
+        );
+        assert!(
+            !body.contains("GM_ANTHROPIC_OAUTH_") && !body.contains("GM_OPENAI_OAUTH_"),
+            "no OAuth bundles must be written when none are supplied"
         );
     }
 
@@ -1396,10 +1444,45 @@ mod tests {
             username: "miner-bot".to_owned(),
             password: "ghp_token".to_owned(),
         };
-        let body = render_env_file(&keys, "node-secret", Some(&creds));
+        let body = render_env_file(&DeployEnvInputs {
+            provider_keys: &keys,
+            node_secret: "node-secret",
+            registry_creds: Some(&creds),
+            anthropic_oauth: None,
+            openai_oauth: None,
+        });
         assert!(body.contains("DSTACK_DOCKER_REGISTRY=ghcr.io\n"));
         assert!(body.contains("DSTACK_DOCKER_USERNAME=miner-bot\n"));
         assert!(body.contains("DSTACK_DOCKER_PASSWORD=ghp_token\n"));
+    }
+
+    /// OAuth subscription bundles must emit the three `GM_<PROVIDER>_OAUTH_*`
+    /// env vars per provider when supplied, alongside provider keys.
+    #[test]
+    fn render_env_file_writes_oauth_bundles_when_supplied() {
+        use crate::oauth_subscription::{OauthEnvVars, OauthProvider, PastedOauthAuth};
+
+        let keys = ProviderKeys::default();
+        let auth = PastedOauthAuth {
+            refresh_token: "rt-anth".to_owned(),
+            initial_access_token: "at-anth".to_owned(),
+            expires_at_rfc3339: "2030-01-01T00:00:00+00:00".to_owned(),
+        };
+        let anth_envs = OauthEnvVars::for_provider(OauthProvider::Anthropic, auth);
+        let body = render_env_file(&DeployEnvInputs {
+            provider_keys: &keys,
+            node_secret: "ns",
+            registry_creds: None,
+            anthropic_oauth: Some(&anth_envs),
+            openai_oauth: None,
+        });
+        assert!(body.contains("GM_ANTHROPIC_OAUTH_REFRESH_TOKEN=rt-anth\n"));
+        assert!(body.contains("GM_ANTHROPIC_OAUTH_INITIAL_ACCESS_TOKEN=at-anth\n"));
+        assert!(body.contains("GM_ANTHROPIC_OAUTH_EXPIRES_AT=2030-01-01T00:00:00+00:00\n"));
+        assert!(
+            !body.contains("GM_OPENAI_OAUTH_"),
+            "openai bundle must not appear when None"
+        );
     }
 
     // ── phala cvms get endpoint parsing ───────────────────────────────────────

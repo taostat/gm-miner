@@ -17,8 +17,8 @@ use gm_miner_cli::{
     config::{Config, ProviderKeys},
     deploy::{
         fetch_supported_versions, prepare_deploy_target, render_compose, select_version,
-        verify_hashes, DeployOutcome, DstackDeployResult, ImageProvisioner, ImageVersion,
-        PhalaClient, RegistryCredentials, COMPOSE_TEMPLATE,
+        verify_hashes, DeployEnvInputs, DeployOutcome, DeployRequest, DstackDeployResult,
+        ImageProvisioner, ImageVersion, PhalaClient, COMPOSE_TEMPLATE,
     },
 };
 use std::collections::HashMap;
@@ -49,14 +49,7 @@ impl StubPhala {
 }
 
 impl PhalaClient for StubPhala {
-    fn deploy(
-        &self,
-        _compose_yaml: &str,
-        _env_vars: &ProviderKeys,
-        _node_secret: &str,
-        _registry_creds: Option<&RegistryCredentials>,
-        _boot_timeout_secs: u64,
-    ) -> anyhow::Result<DeployOutcome> {
+    fn deploy(&self, _request: &DeployRequest<'_>) -> anyhow::Result<DeployOutcome> {
         self.deploy_called.set(true);
         Ok(DeployOutcome {
             hashes: DstackDeployResult {
@@ -72,14 +65,7 @@ impl PhalaClient for StubPhala {
 struct TimedOutPhala;
 
 impl PhalaClient for TimedOutPhala {
-    fn deploy(
-        &self,
-        _compose_yaml: &str,
-        _env_vars: &ProviderKeys,
-        _node_secret: &str,
-        _registry_creds: Option<&RegistryCredentials>,
-        _boot_timeout_secs: u64,
-    ) -> anyhow::Result<DeployOutcome> {
+    fn deploy(&self, _request: &DeployRequest<'_>) -> anyhow::Result<DeployOutcome> {
         anyhow::bail!(
             "timed out after 0s waiting for the CVM to report hashes \
              (compose_hash/os_image_hash never appeared in \
@@ -93,15 +79,30 @@ impl PhalaClient for TimedOutPhala {
 struct FailingPhala;
 
 impl PhalaClient for FailingPhala {
-    fn deploy(
-        &self,
-        _compose_yaml: &str,
-        _env_vars: &ProviderKeys,
-        _node_secret: &str,
-        _registry_creds: Option<&RegistryCredentials>,
-        _boot_timeout_secs: u64,
-    ) -> anyhow::Result<DeployOutcome> {
+    fn deploy(&self, _request: &DeployRequest<'_>) -> anyhow::Result<DeployOutcome> {
         anyhow::bail!("phala deploy exited with status 1");
+    }
+}
+
+/// Build a `DeployRequest` for a stub test from the parts most call sites
+/// pass — provider keys + node secret + boot timeout. OAuth bundles and
+/// registry credentials default to `None`.
+fn stub_deploy_request<'a>(
+    compose_yaml: &'a str,
+    provider_keys: &'a ProviderKeys,
+    node_secret: &'a str,
+    boot_timeout_secs: u64,
+) -> DeployRequest<'a> {
+    DeployRequest {
+        compose_yaml,
+        env: DeployEnvInputs {
+            provider_keys,
+            node_secret,
+            registry_creds: None,
+            anthropic_oauth: None,
+            openai_oauth: None,
+        },
+        boot_timeout_secs,
     }
 }
 
@@ -252,9 +253,8 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
         google: None,
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
-    let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
-        .unwrap();
+    let request = stub_deploy_request(&rendered, &keys, "test-node-secret-1234", 300);
+    let actual = stub.deploy(&request).unwrap();
 
     assert!(stub.deploy_called.get(), "deploy must have been called");
     assert!(verify_hashes(&actual.hashes, approved).is_ok());
@@ -287,9 +287,8 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
         google: None,
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
-    let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
-        .unwrap();
+    let request = stub_deploy_request(&rendered, &keys, "test-node-secret-1234", 300);
+    let actual = stub.deploy(&request).unwrap();
 
     let err = verify_hashes(&actual.hashes, approved)
         .expect_err("mismatched hashes must produce an error");
@@ -385,8 +384,9 @@ fn phala_failure_surfaces_as_error() {
         openai: None,
         google: None,
     };
+    let request = stub_deploy_request("compose-content", &keys, "test-node-secret-1234", 300);
     let err = FailingPhala
-        .deploy("compose-content", &keys, "test-node-secret-1234", None, 300)
+        .deploy(&request)
         .expect_err("failing phala must produce an error");
     assert!(err.to_string().contains("phala deploy exited"));
 }
@@ -402,8 +402,9 @@ fn timeout_error_is_actionable() {
         openai: None,
         google: None,
     };
+    let request = stub_deploy_request("compose", &keys, "test-node-secret-1234", 0);
     let err = TimedOutPhala
-        .deploy("compose", &keys, "test-node-secret-1234", None, 0)
+        .deploy(&request)
         .expect_err("timed-out deploy must produce an error");
     let msg = err.to_string();
     assert!(

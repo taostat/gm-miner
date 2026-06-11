@@ -33,10 +33,12 @@ use gm_miner_cli::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
         parse_phala_cvm_endpoint, preflight_phala_cli, prepare_deploy_target,
         resolve_registry_credentials, select_version, to_ratls_passthrough_endpoint, verify_hashes,
-        ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
-        PHALA_ENDPOINT_FIELD,
+        DeployEnvInputs, DeployRequest, ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS,
+        DEFAULT_OS_IMAGE, PHALA_ENDPOINT_FIELD,
     },
     node_secret,
+    oauth_subscription::{self, OauthEnvVars, OauthProvider, PastedOauthAuth},
+    tos,
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider,
         RetailDimensions,
@@ -69,6 +71,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap parses exactly one variant per invocation, so the \
+              enum is short-lived and stack size is not a concern"
+)]
 enum Command {
     /// Persist provider API keys to ~/.gm-miner/config.json (mode 0600).
     ///
@@ -159,6 +166,22 @@ enum Command {
         /// hashes via `phala cvms get --json` (seconds). Default: 300.
         #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
         boot_timeout_secs: u64,
+
+        /// Path to a `~/.codex/auth.json` (or Hermes `auth.json` carrying
+        /// an `openai-codex` block) exported on your laptop. When set,
+        /// the `OpenAI` provider is wired in `oauth_subscription` mode
+        /// using your personal `ChatGPT` Plus subscription. See
+        /// `docs/auth-modes.md` for the `ToS` guidance; a one-time
+        /// confirmation banner is printed before the deploy proceeds.
+        #[arg(long)]
+        paste_codex_auth: Option<std::path::PathBuf>,
+
+        /// Path to a `~/.claude/.credentials.json` (or Hermes
+        /// `auth.json` carrying an `anthropic` block) exported on your
+        /// laptop. Same Phase A manual-paste UX as `--paste-codex-auth`,
+        /// but for the Claude Pro/Max subscription.
+        #[arg(long)]
+        paste_claude_auth: Option<std::path::PathBuf>,
     },
 
     /// Authenticate with Taostats (device-code OAuth flow) and store
@@ -264,6 +287,8 @@ async fn main() -> Result<()> {
             os_image,
             repo_root,
             boot_timeout_secs,
+            paste_codex_auth,
+            paste_claude_auth,
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
@@ -272,6 +297,14 @@ async fn main() -> Result<()> {
             // deploy step shares the same path.
             let project_dir =
                 dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
+
+            // Phase A OAuth subscription wiring. Either paste flag triggers
+            // the one-time ToS confirmation banner before the deploy starts
+            // (see `docs/auth-modes.md`); the parsed bundle then rides into
+            // the encrypted `phala deploy` env as `GM_<PROVIDER>_OAUTH_*`.
+            let (anthropic_oauth, openai_oauth) =
+                resolve_oauth_pastes(paste_claude_auth.as_deref(), paste_codex_auth.as_deref())?;
+
             cmd_deploy_subcommand(
                 cfg,
                 DeployArgs {
@@ -286,6 +319,8 @@ async fn main() -> Result<()> {
                     repo_root,
                     version,
                     boot_timeout_secs,
+                    anthropic_oauth,
+                    openai_oauth,
                 },
             )
             .await
@@ -605,6 +640,13 @@ struct DeployArgs {
     repo_root: Option<std::path::PathBuf>,
     version: Option<usize>,
     boot_timeout_secs: u64,
+    /// Phase A OAuth subscription bundle for Anthropic, parsed from the
+    /// operator-pasted Claude Code / Hermes auth.json (set via
+    /// `--paste-claude-auth`). `None` keeps the existing `api_key` path.
+    anthropic_oauth: Option<OauthEnvVars>,
+    /// Phase A OAuth subscription bundle for `OpenAI` / Codex (set via
+    /// `--paste-codex-auth`). Same shape as `anthropic_oauth`.
+    openai_oauth: Option<OauthEnvVars>,
 }
 
 /// Build and run the deploy subcommand from parsed CLI arguments.
@@ -830,13 +872,17 @@ async fn cmd_deploy(
         "Deploying to Phala Cloud (boot timeout: {}s) ...",
         args.boot_timeout_secs
     );
-    let actual = phala.deploy(
-        &target.rendered_compose,
-        keys,
-        &node_secret,
-        registry_creds.as_ref(),
-        args.boot_timeout_secs,
-    )?;
+    let actual = phala.deploy(&DeployRequest {
+        compose_yaml: &target.rendered_compose,
+        env: DeployEnvInputs {
+            provider_keys: keys,
+            node_secret: &node_secret,
+            registry_creds: registry_creds.as_ref(),
+            anthropic_oauth: args.anthropic_oauth.as_ref(),
+            openai_oauth: args.openai_oauth.as_ref(),
+        },
+        boot_timeout_secs: args.boot_timeout_secs,
+    })?;
 
     // Step 7: verify hashes. The returned hashes are normalized
     // (lowercased, `sha256:` prefix stripped) so the loud check and the
@@ -862,6 +908,54 @@ async fn cmd_deploy(
         },
     )
     .await
+}
+
+/// Read and parse the OAuth subscription auth.json paste flags, gating
+/// on a one-time `ToS` confirmation banner before the deploy proceeds.
+///
+/// Returns `(anthropic_bundle, openai_bundle)` — each `Some` only when
+/// the corresponding `--paste-*-auth` flag was set. When at least one
+/// flag is set the [`ToS confirmation`](gm_miner_cli::tos) is required;
+/// declining (or piping the wrong phrase) aborts the deploy before any
+/// CVM work runs.
+///
+/// # Errors
+/// Returns an error if either file cannot be read, fails to parse, or
+/// the operator declines the `ToS` prompt.
+fn resolve_oauth_pastes(
+    paste_claude_auth: Option<&std::path::Path>,
+    paste_codex_auth: Option<&std::path::Path>,
+) -> Result<(Option<OauthEnvVars>, Option<OauthEnvVars>)> {
+    if paste_claude_auth.is_none() && paste_codex_auth.is_none() {
+        return Ok((None, None));
+    }
+
+    // Either paste flag triggers the same one-time disclaimer. Read
+    // stdin from a buffered handle so `require_confirmation` can pull a
+    // single line. The banner goes to stderr to keep stdout clean.
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut err = std::io::stderr();
+    tos::require_confirmation(&mut input, &mut err)
+        .context("ToS confirmation required for OAuth subscription auth")?;
+
+    let anthropic_oauth = paste_claude_auth
+        .map(|path| parse_oauth_paste(path, OauthProvider::Anthropic))
+        .transpose()?
+        .map(|auth| OauthEnvVars::for_provider(OauthProvider::Anthropic, auth));
+    let openai_oauth = paste_codex_auth
+        .map(|path| parse_oauth_paste(path, OauthProvider::Openai))
+        .transpose()?
+        .map(|auth| OauthEnvVars::for_provider(OauthProvider::Openai, auth));
+    Ok((anthropic_oauth, openai_oauth))
+}
+
+/// Read `path` and parse it as a pasted OAuth auth.json for `provider`.
+fn parse_oauth_paste(path: &std::path::Path, provider: OauthProvider) -> Result<PastedOauthAuth> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read pasted {provider} auth.json from {}", path.display()))?;
+    oauth_subscription::parse_pasted_auth_json(&bytes, provider)
+        .with_context(|| format!("parse pasted {provider} auth.json from {}", path.display()))
 }
 
 /// Resolve the miner's node secret for `network`: reuse the value
