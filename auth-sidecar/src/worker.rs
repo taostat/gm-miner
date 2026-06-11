@@ -115,6 +115,33 @@ pub async fn run_provider_worker(
                 let new_expiry = outcome.expires_at;
                 state.record_success(outcome.access_token, new_expiry).await;
                 if let Some(rotated) = outcome.rotated_refresh_token {
+                    // [PHASE A LIMITATION — see PR #45 body]
+                    // The rotated refresh token lives in this local
+                    // variable only. We do NOT persist it across
+                    // container restarts: dstack does not yet expose
+                    // an attested writable volume that survives a
+                    // redeploy, and the sealed env vars are write-once
+                    // at deploy time.
+                    //
+                    // For providers that strictly enforce single-use
+                    // refresh tokens (Anthropic), a sidecar restart
+                    // after a rotation here will reload the original
+                    // sealed-env token, the next refresh attempt will
+                    // 401, and the provider will be marked down until
+                    // the operator re-pastes a fresh auth.json via
+                    // `gm-miner deploy --paste-*-auth`.
+                    //
+                    // Acceptable for Phase A pre-launch:
+                    //   - Restarts are rare (CVM redeploys are
+                    //     deliberate).
+                    //   - The operator can fall back to api-key mode
+                    //     for any provider where this matters.
+                    //   - The failure mode is loud: provider_down
+                    //     gauge flips to 1, gateway routes around.
+                    //
+                    // Phase B will swap this in-memory rebind for a
+                    // dstack-sealed local write so rotated tokens
+                    // survive restarts.
                     refresh_token = rotated;
                 }
                 metrics.record_refresh_success(provider);
