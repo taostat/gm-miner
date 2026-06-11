@@ -104,8 +104,16 @@ async fn get_token(
     };
     let snapshot = cell.snapshot().await;
     let healthy = snapshot.healthy;
+    // The `healthy` bit only tracks "the worker has not exhausted its
+    // retry budget" — it does NOT track whether the token is still
+    // valid right now. If the pasted initial token was already expired,
+    // or the worker hasn't reached its first refresh yet, the snapshot
+    // can be healthy AND carry a token that is past its expiry. Return
+    // 503 in that case too — Envoy will surface the provider as down,
+    // which is the right signal to the gateway's capacity router.
+    let expired = snapshot.expires_at <= chrono::Utc::now();
     let body = TokenResponse::from(snapshot);
-    if !healthy {
+    if !healthy || expired {
         // Envoy maps 503 from the sidecar to 503 from its data plane
         // for that provider's route — the gateway's capacity router
         // and the registry's probe both already treat 503 from a

@@ -590,10 +590,33 @@ static_resources:
                       ##  config strips `x-api-key` explicitly; we keep
                       ##  the script focused on the Authorization header
                       ##  alone.
+                      ## Lua per-route scripts override the filter's
+                      ## `default_source_code` rather than chain with
+                      ## it — a route with `LuaPerRoute.name` set runs
+                      ## ONLY the named script. The node-secret check
+                      ## from the default script is therefore inlined
+                      ## at the top of each OAuth injector so an OAuth
+                      ## route still enforces `x-gm-node-key` the same
+                      ## way the api-key routes (which fall through to
+                      ## `default_source_code`) do. Without this
+                      ## inline, the OAuth routes would happily inject
+                      ## a subscription bearer for any caller — a
+                      ## security regression vs. the api-key routes.
                       source_codes:
                         anthropic_oauth_inject:
                           inline_string: |
+                            local expected = "__GM_NODE_SECRET__"
                             function envoy_on_request(handle)
+                              if expected ~= "" then
+                                local presented = handle:headers():get("x-gm-node-key")
+                                if presented ~= expected then
+                                  handle:respond(
+                                    {[":status"] = "401",
+                                     ["content-type"] = "application/json"},
+                                    "{\"error\":\"missing or invalid x-gm-node-key\"}")
+                                  return
+                                end
+                              end
                               local resp_headers, resp_body = handle:httpCall(
                                 "auth_sidecar",
                                 {[":method"] = "GET",
@@ -629,7 +652,18 @@ static_resources:
                             end
                         openai_oauth_inject:
                           inline_string: |
+                            local expected = "__GM_NODE_SECRET__"
                             function envoy_on_request(handle)
+                              if expected ~= "" then
+                                local presented = handle:headers():get("x-gm-node-key")
+                                if presented ~= expected then
+                                  handle:respond(
+                                    {[":status"] = "401",
+                                     ["content-type"] = "application/json"},
+                                    "{\"error\":\"missing or invalid x-gm-node-key\"}")
+                                  return
+                                end
+                              end
                               local resp_headers, resp_body = handle:httpCall(
                                 "auth_sidecar",
                                 {[":method"] = "GET",
