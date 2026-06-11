@@ -359,7 +359,17 @@ static_resources:
                             host_rewrite_literal: api.anthropic.com
                             timeout: 120s
                           request_headers_to_remove:
-                            - authorization
+                            ## NOTE: `authorization` is NOT in this list
+                            ## (compare with the api-key route above).
+                            ## Route-level `request_headers_to_remove` is
+                            ## applied AFTER decoder filters, so stripping
+                            ## `authorization` here would delete the
+                            ## bearer that the OAuth Lua just injected,
+                            ## leaving the upstream request unauthenticated.
+                            ## The Lua's `handle:headers():replace(
+                            ## "authorization", ...)` overwrites any
+                            ## caller-supplied value, so leaving the
+                            ## header in place is safe.
                             - x-api-key
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -437,7 +447,14 @@ static_resources:
                             prefix_rewrite: "/backend-api/codex/"
                             timeout: 120s
                           request_headers_to_remove:
-                            - authorization
+                            ## NOTE: `authorization` is NOT in this list.
+                            ## Same reason as the anthropic OAuth route
+                            ## above — route-level header removal runs
+                            ## AFTER the OAuth Lua filter, so stripping
+                            ## here would erase the just-injected bearer.
+                            ## The Lua's `replace("authorization", ...)`
+                            ## overwrites any caller-supplied value, so
+                            ## leaving the header in place is safe.
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
