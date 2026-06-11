@@ -300,14 +300,26 @@ static_resources:
                                   denominator: HUNDRED
 
                         ## ── Anthropic ───────────────────────────────────────
-                        ##  Enabled only when ANTHROPIC_API_KEY is set.
-                        ##  The route matches any path beginning with /v1/ that
-                        ##  was tagged with x-gm-product: anthropic/* by the
+                        ##  Enabled only when ANTHROPIC_API_KEY is set
+                        ##  (api-key mode) or when GM_ANTHROPIC_OAUTH_REFRESH_
+                        ##  TOKEN is set (oauth-subscription mode). The route
+                        ##  matches any path beginning with /v1/ that was
+                        ##  tagged with x-gm-product: anthropic/* by the
                         ##  gateway. The header x-gm-provider is set by the
                         ##  gateway; we use it as the route discriminator so
                         ##  Envoy's static config can separate providers while
                         ##  the template engine strips the route block entirely
                         ##  when the key is absent.
+                        ##
+                        ##  start.sh keeps exactly one of the two anthropic
+                        ##  route blocks below: the api-key block when
+                        ##  ANTHROPIC_API_KEY is set OR when no oauth refresh
+                        ##  token is set (the default fallback); the
+                        ##  oauth-subscription block when GM_ANTHROPIC_OAUTH_
+                        ##  REFRESH_TOKEN is set. The two blocks are wrapped
+                        ##  in whole-line sentinels so awk can keep or drop
+                        ##  each independently.
+                        ## gm:anthropic-apikey-begin
                         - match:
                             prefix: "/"
                             headers:
@@ -334,9 +346,55 @@ static_resources:
                                 key: anthropic-version
                                 value: "2023-06-01"
                               append_action: ADD_IF_ABSENT
+                        ## gm:anthropic-apikey-end
+                        ## gm:anthropic-oauth-begin
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "anthropic"
+                          route:
+                            cluster: anthropic
+                            host_rewrite_literal: api.anthropic.com
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-api-key
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                          request_headers_to_add:
+                            - header:
+                                key: anthropic-version
+                                value: "2023-06-01"
+                              append_action: ADD_IF_ABSENT
+                          ## Per-route Lua: fetch the current bearer
+                          ## token from the auth sidecar and inject
+                          ## Authorization. See the `auth_oauth_inject`
+                          ## per-filter config block at the end of this
+                          ## listener for the shared script body.
+                          typed_per_filter_config:
+                            envoy.filters.http.lua:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.LuaPerRoute
+                              name: anthropic_oauth_inject
+                        ## gm:anthropic-oauth-end
 
                         ## ── OpenAI ──────────────────────────────────────────
-                        ##  Enabled only when OPENAI_API_KEY is set.
+                        ##  Enabled only when OPENAI_API_KEY is set (api-key
+                        ##  mode) or when GM_OPENAI_OAUTH_REFRESH_TOKEN is set
+                        ##  (oauth-subscription mode). The two routes use
+                        ##  different upstream clusters: the api-key route
+                        ##  proxies to api.openai.com (the published API), the
+                        ##  oauth-subscription route proxies to chatgpt.com
+                        ##  with the /backend-api/codex prefix that the
+                        ##  research file documents as the Codex
+                        ##  subscription's upstream surface. start.sh keeps
+                        ##  exactly one of the blocks based on env-var
+                        ##  presence.
+                        ## gm:openai-apikey-begin
                         - match:
                             prefix: "/"
                             headers:
@@ -359,6 +417,37 @@ static_resources:
                                 key: authorization
                                 value: "Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                        ## gm:openai-apikey-end
+                        ## gm:openai-oauth-begin
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "openai"
+                          route:
+                            cluster: openai_oauth
+                            host_rewrite_literal: chatgpt.com
+                            ## Prefix the gateway path with /backend-api/codex
+                            ## — the Codex-subscription upstream lives at
+                            ## chatgpt.com/backend-api/codex/v1/chat/completions
+                            ## per the research file; the gateway sends the
+                            ## bare /v1/... path the OpenAI API normally takes
+                            ## and we shift the namespace here.
+                            prefix_rewrite: "/backend-api/codex/"
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                          typed_per_filter_config:
+                            envoy.filters.http.lua:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.LuaPerRoute
+                              name: openai_oauth_inject
+                        ## gm:openai-oauth-end
 
                         ## ── Gemini ──────────────────────────────────────────
                         ##  Enabled only when GOOGLE_API_KEY is set.
@@ -473,6 +562,100 @@ static_resources:
                                 "{\"error\":\"missing or invalid x-gm-node-key\"}")
                             end
                           end
+                      ## ── OAuth-subscription bearer injection ──────────
+                      ##  Per-route Lua scripts attached to the anthropic-
+                      ##  oauth and openai-oauth route blocks above. The
+                      ##  scripts fetch the current bearer token from the
+                      ##  co-located auth sidecar (`auth_sidecar` cluster
+                      ##  below) and inject `Authorization: Bearer <token>`
+                      ##  before the request forwards upstream.
+                      ##
+                      ##  `httpCall` is fully synchronous from the Lua
+                      ##  script's point of view (Envoy yields the
+                      ##  coroutine and runs the callback when the response
+                      ##  lands). A 503 from the sidecar means the worker
+                      ##  marked the provider unhealthy or the sidecar is
+                      ##  down — we surface 503 to the caller so the
+                      ##  gateway's capacity router and the registry's
+                      ##  probe both observe a clean "provider down"
+                      ##  signal.
+                      ##
+                      ##  The script also strips `:authority` rewriting:
+                      ##  the route's `host_rewrite_literal` already sets
+                      ##  the upstream host, but the Anthropic OAuth
+                      ##  surface requires the `anthropic-beta` advisory
+                      ##  the route adds via `request_headers_to_add`, and
+                      ##  some upstreams reject a request that carries
+                      ##  both `Authorization` and `x-api-key`. The route
+                      ##  config strips `x-api-key` explicitly; we keep
+                      ##  the script focused on the Authorization header
+                      ##  alone.
+                      source_codes:
+                        anthropic_oauth_inject:
+                          inline_string: |
+                            function envoy_on_request(handle)
+                              local resp_headers, resp_body = handle:httpCall(
+                                "auth_sidecar",
+                                {[":method"] = "GET",
+                                 [":path"] = "/token/anthropic",
+                                 [":authority"] = "auth_sidecar",
+                                 ["accept"] = "application/json"},
+                                "",
+                                2000)
+                              local status = tonumber(resp_headers[":status"]) or 0
+                              if status ~= 200 then
+                                handle:respond(
+                                  {[":status"] = "503",
+                                   ["content-type"] = "application/json"},
+                                  "{\"error\":\"anthropic oauth subscription unavailable on this miner\"}")
+                                return
+                              end
+                              -- Minimal JSON access-token extraction —
+                              -- Envoy's bundled Lua does not ship cjson,
+                              -- so we parse the field with a string
+                              -- match. The sidecar's response shape is a
+                              -- single-line JSON object with `access_token`
+                              -- always present (see auth-sidecar's
+                              -- `TokenResponse`).
+                              local token = resp_body:match('"access_token"%s*:%s*"([^"]+)"')
+                              if not token or token == "" then
+                                handle:respond(
+                                  {[":status"] = "503",
+                                   ["content-type"] = "application/json"},
+                                  "{\"error\":\"anthropic oauth token missing from sidecar response\"}")
+                                return
+                              end
+                              handle:headers():replace("authorization", "Bearer " .. token)
+                            end
+                        openai_oauth_inject:
+                          inline_string: |
+                            function envoy_on_request(handle)
+                              local resp_headers, resp_body = handle:httpCall(
+                                "auth_sidecar",
+                                {[":method"] = "GET",
+                                 [":path"] = "/token/openai",
+                                 [":authority"] = "auth_sidecar",
+                                 ["accept"] = "application/json"},
+                                "",
+                                2000)
+                              local status = tonumber(resp_headers[":status"]) or 0
+                              if status ~= 200 then
+                                handle:respond(
+                                  {[":status"] = "503",
+                                   ["content-type"] = "application/json"},
+                                  "{\"error\":\"openai oauth subscription unavailable on this miner\"}")
+                                return
+                              end
+                              local token = resp_body:match('"access_token"%s*:%s*"([^"]+)"')
+                              if not token or token == "" then
+                                handle:respond(
+                                  {[":status"] = "503",
+                                   ["content-type"] = "application/json"},
+                                  "{\"error\":\"openai oauth token missing from sidecar response\"}")
+                                return
+                              end
+                              handle:headers():replace("authorization", "Bearer " .. token)
+                            end
                   ## ── Graceful load shedding ──────────────────────────
                   ##  The miner's saturation signal. Without it a miner
                   ##  past its capacity sheds load by resetting
@@ -668,6 +851,46 @@ static_resources:
                       address: 127.0.0.1
                       port_value: 9901
 
+    ## ── Auth sidecar ──────────────────────────────────────────────────
+    ##  The co-located `gm-miner-auth-sidecar` process. Binds loopback
+    ##  only (127.0.0.1:7100 — see start.sh / GM_AUTH_SIDECAR_TOKEN_BIND_
+    ##  ADDR); the OAuth-subscription Lua filter on each provider's
+    ##  route fetches `GET /token/{provider}` on every request and
+    ##  injects the returned bearer as `Authorization`. Plaintext
+    ##  HTTP/1.1 over loopback inside the TEE — the hop never leaves the
+    ##  container's network namespace.
+    - name: auth_sidecar
+      type: STATIC
+      connect_timeout: 2s
+      load_assignment:
+        cluster_name: auth_sidecar
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 7100
+
+    ## ── Auth sidecar metrics ──────────────────────────────────────────
+    ##  Loopback to the sidecar's Prometheus endpoint (127.0.0.1:7101 —
+    ##  see start.sh / GM_AUTH_SIDECAR_METRICS_BIND_ADDR). Used by the
+    ##  metrics listener's federated scrape path below to surface the
+    ##  sidecar's gm_miner_oauth_* series under the same external
+    ##  `/stats/prometheus` URL as Envoy's own counters.
+    - name: auth_sidecar_metrics
+      type: STATIC
+      connect_timeout: 2s
+      load_assignment:
+        cluster_name: auth_sidecar_metrics
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 7101
+
     ## ── Anthropic ─────────────────────────────────────────────────────
     - name: anthropic
       type: LOGICAL_DNS
@@ -733,6 +956,48 @@ static_resources:
                 - san_type: DNS
                   matcher:
                     exact: api.openai.com
+
+    ## ── OpenAI OAuth subscription (Codex) ─────────────────────────────
+    ##  The Codex / ChatGPT Plus subscription upstream lives at
+    ##  chatgpt.com/backend-api/codex per `docs/research/oauth-
+    ##  subscription-prior-art.md`. The `openai-oauth` route above sets
+    ##  `prefix_rewrite: /backend-api/codex/` so the path the gateway
+    ##  sends (`/v1/chat/completions`) lands at
+    ##  `/backend-api/codex/v1/chat/completions` upstream. Distinct
+    ##  cluster from `openai` because the host, SNI, and SAN matcher all
+    ##  diverge — sharing the api.openai.com cluster would fail the
+    ##  upstream's TLS SAN check.
+    - name: openai_oauth
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: openai_oauth
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: chatgpt.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: chatgpt.com
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: chatgpt.com
 
     ## ── Gemini ────────────────────────────────────────────────────────
     - name: gemini

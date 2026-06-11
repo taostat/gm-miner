@@ -32,32 +32,38 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY cli/Cargo.toml ./cli/
 COPY attestd/Cargo.toml ./attestd/
+COPY auth-sidecar/Cargo.toml ./auth-sidecar/
 
 ## Copy dstack assets required by include_str! at compile time.
 COPY dstack/ ./dstack/
 
 ## Pre-build a dummy workspace to cache dependencies. The attestd crate
-## ships a lib and two bins (gm-miner-attestd, gm-miner-ratls), so the
-## dummy tree needs an entry file for each declared target.
-RUN mkdir -p cli/src attestd/src/bin \
+## ships a lib and two bins (gm-miner-attestd, gm-miner-ratls); the
+## auth-sidecar crate ships a lib + one bin (gm-miner-auth-sidecar).
+## The dummy tree needs an entry file for each declared target.
+RUN mkdir -p cli/src attestd/src/bin auth-sidecar/src \
   && echo "fn main() {}" > cli/src/main.rs \
   && echo "fn main() {}" > attestd/src/main.rs \
   && echo "fn main() {}" > attestd/src/bin/ratls.rs \
   && echo "" > attestd/src/lib.rs \
+  && echo "fn main() {}" > auth-sidecar/src/main.rs \
+  && echo "" > auth-sidecar/src/lib.rs \
   && cargo build --release --workspace 2>/dev/null || true \
-  && rm -rf cli/src attestd/src
+  && rm -rf cli/src attestd/src auth-sidecar/src
 
 ## Copy real sources.
 COPY cli/ ./cli/
 COPY attestd/ ./attestd/
+COPY auth-sidecar/ ./auth-sidecar/
 
 ## Build the workspace. Touch the entry points to invalidate the dummy
 ## build cache so the real sources compile.
 RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
     attestd/src/bin/ratls.rs \
+    auth-sidecar/src/main.rs auth-sidecar/src/lib.rs \
   && cargo build --release --workspace \
   && strip target/release/gm-miner target/release/gm-miner-attestd \
-    target/release/gm-miner-ratls
+    target/release/gm-miner-ratls target/release/gm-miner-auth-sidecar
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
 ## Envoy 1.32.x pinned by digest.
@@ -86,6 +92,14 @@ COPY --from=builder /build/target/release/gm-miner-attestd /usr/local/bin/gm-min
 ## Copy the RA-TLS provisioner. start.sh runs it once before envoy to
 ## mint the data-plane TLS cert via the dstack guest agent.
 COPY --from=builder /build/target/release/gm-miner-ratls /usr/local/bin/gm-miner-ratls
+
+## Copy the OAuth-subscription refresh sidecar. start.sh launches it
+## alongside envoy when at least one provider is configured in
+## oauth_subscription mode; envoy's per-route Lua filter fetches the
+## current bearer token from it via the loopback `auth_sidecar`
+## cluster on every data-plane request. Skipped on api-key-only
+## deployments — see start.sh for the launch condition.
+COPY --from=builder /build/target/release/gm-miner-auth-sidecar /usr/local/bin/gm-miner-auth-sidecar
 
 ## Copy Envoy config.
 COPY image/envoy.yaml /etc/envoy/envoy.yaml
