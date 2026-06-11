@@ -772,6 +772,37 @@ static_resources:
                             timeout: 10s
                           request_headers_to_remove:
                             - x-gm-node-key
+                        ## /sidecar/metrics — the auth sidecar's own
+                        ## Prometheus surface (gm_miner_oauth_* gauges +
+                        ## counters). Served only when the sidecar is
+                        ## running; on api-key-only deployments the
+                        ## cluster's loopback target is bound to nothing
+                        ## and envoy returns 503. Same x-gm-node-key
+                        ## gate as the data-plane stats path; the
+                        ## sidecar's own metrics body is the
+                        ## text-exposition format the prometheus crate
+                        ## emits, identical in shape to envoy's.
+                        - match:
+                            path: "/sidecar/metrics"
+                          route:
+                            cluster: auth_sidecar_metrics
+                            timeout: 10s
+                            ## Rewrite the path so the sidecar handler
+                            ## (which routes on bare `/metrics`) is
+                            ## reachable via the external
+                            ## `/sidecar/metrics` URL — keeps the two
+                            ## scrape surfaces namespaced from the
+                            ## operator's point of view. `regex_rewrite`
+                            ## with an anchored pattern rewrites only
+                            ## the exact path; `prefix_rewrite` requires
+                            ## a `prefix:` match block, which would let
+                            ## `/sidecar/metricsX` resolve too.
+                            regex_rewrite:
+                              pattern:
+                                regex: "^/sidecar/metrics$"
+                              substitution: "/metrics"
+                          request_headers_to_remove:
+                            - x-gm-node-key
                         ## Every other path — including the rest of the
                         ## admin surface — returns 404 and never reaches
                         ## the admin port.
@@ -781,7 +812,7 @@ static_resources:
                             status: 404
                             body:
                               inline_string: |
-                                {"error":"not found; only /stats/prometheus is exposed"}
+                                {"error":"not found; only /stats/prometheus and /sidecar/metrics are exposed"}
                 http_filters:
                   ## Same node-secret gate as the data plane, without
                   ## the /attestation/info exemption — every path here

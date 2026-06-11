@@ -76,22 +76,91 @@ explicit before any deploy that wires a paste flag.
 A revoked subscription token, a rate-limited 429, or a provider-side policy
 change is the operator's responsibility to detect and recover from.
 
+## In-CVM refresh worker (Phase A)
+
+Phase A ships the manual paste UX above plus an in-CVM sidecar process
+(`gm-miner-auth-sidecar`) that refreshes the access token before it
+expires. The operator pastes once at deploy; the sidecar keeps the
+token live without intervention as long as the refresh token remains
+valid (typically months — providers rotate the refresh token on every
+refresh and the sidecar honours the rotation in memory).
+
+The sidecar runs as a third process alongside `envoy` and
+`gm-miner-attestd` inside the same TEE container. It is only launched
+when at least one provider is in `oauth_subscription` mode; api-key-
+only deployments skip it.
+
+### Wire shape
+
+| Surface | Bound | Purpose |
+|---------|-------|---------|
+| `GET 127.0.0.1:7100/token/{provider}` | loopback | Envoy fetches the current bearer token on every data-plane request via a per-route Lua filter |
+| `GET 127.0.0.1:7101/metrics` | loopback | Prometheus text exposition of `gm_miner_oauth_*` series, federated by the data-plane `metrics` listener at `/sidecar/metrics` |
+| `GET 127.0.0.1:7100/healthz` | loopback | Always 200 |
+
+### Refresh schedule
+
+* Refresh skew: 120 seconds before `expires_at` (matches Hermes per
+  `docs/research/oauth-subscription-prior-art.md`).
+* Retry budget on failure: 3 retries with exponential backoff
+  (2s → 4s → 8s, capped at 60s) and ±25% jitter.
+* Once the budget is exhausted the provider is marked unhealthy and
+  Envoy's OAuth route returns 503 for that provider's traffic until a
+  later probe succeeds. The gateway's capacity router and the registry
+  probe both treat 503 from a miner as "provider unavailable", so the
+  routing layer drops the dead provider until the sidecar recovers.
+* While the provider is unhealthy the sidecar continues to probe on a
+  slow 5-minute cadence — a transient upstream blip recovers without
+  operator intervention.
+
+### Observability
+
+The metrics surface lives under the same `x-gm-node-key`-gated metrics
+URL operators already scrape. Two paths are reachable:
+
+| Path | Source | Notes |
+|------|--------|-------|
+| `/stats/prometheus` | Envoy admin | Existing envoy counters, unchanged |
+| `/sidecar/metrics` | auth sidecar | `gm_miner_oauth_*` series — only meaningful in OAuth-subscription mode |
+
+Series exposed by the sidecar:
+
+| Series | Type | Labels |
+|--------|------|--------|
+| `gm_miner_oauth_token_expires_in_seconds` | gauge | `provider` |
+| `gm_miner_oauth_refresh_success_total` | counter | `provider` |
+| `gm_miner_oauth_refresh_failure_total` | counter | `provider`, `reason` (`network`, `unauthorized`, `rate_limited`, `malformed`) |
+| `gm_miner_provider_down` | gauge | `provider` — `1` when the sidecar has marked the provider unhealthy |
+| `gm_miner_auth_sidecar_build_info` | gauge | always `1` |
+
+A `gm_miner_subscription_quota_remaining` gauge was considered but is
+deliberately omitted: the sidecar only sees the refresh exchange, not
+the inference call, so the `anthropic-ratelimit-*` response headers
+documented in the research file are out of reach from this layer.
+Surfacing per-request quota will require an Envoy response-header
+tap, which is Phase B work.
+
+### Capacity feedback to the gateway
+
+The miner already drops to zero capacity for a provider when Envoy
+returns 503 on that provider's route — the gateway's capacity-aware
+router treats 503 as "provider unavailable" and routes around. The
+sidecar's `provider_down` gauge is the in-band reason: when it flips
+to `1` the OAuth Lua filter starts returning 503 for that provider,
+and the gateway already takes the right action without any new
+gateway code in this PR.
+
 ## Phase B (not yet implemented)
 
-Phase B will run the OAuth flow inside the gm-miner CLI itself — no laptop-side
-CLI roundtrip — and refresh access tokens automatically inside the CVM. The
-env-var surface (`GM_<PROVIDER>_OAUTH_*`) is reserved so a Phase B upgrade is a
+Phase B will run the OAuth flow inside the gm-miner CLI itself — no
+laptop-side CLI roundtrip — so a fresh refresh token can be minted
+without re-running the laptop CLI. The env-var surface
+(`GM_<PROVIDER>_OAUTH_*`) is reserved so a Phase B upgrade is a
 drop-in for any operator already running Phase A.
 
-The in-CVM refresh worker and per-provider upstream adapter for the
-`oauth_subscription` mode are not yet implemented. Until Phase B lands, a
-Phase A deploy will:
-
-  1. Carry a valid initial access token only for as long as the provider's
-     access-token lifetime permits (typically 1 hour for Anthropic, 1 hour for
-     `OpenAI`).
-  2. Stop serving traffic for that provider when the access token expires.
-
-Operators running Phase A today should expect to re-paste the auth file at
-least once per access-token lifetime, or pair the manual-paste with an
-external cron that re-runs `gm-miner deploy` on a schedule.
+Until Phase B lands, the refresh-token lifetime is the operational
+ceiling: if a refresh token is revoked (the operator signs out of
+ChatGPT / Claude on their laptop, or the provider rotates it
+server-side), the sidecar will mark that provider down until the
+operator re-runs `gm-miner deploy --paste-{codex,claude}-auth` with a
+fresh file.
