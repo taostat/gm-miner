@@ -710,17 +710,34 @@ async fn cmd_deploy_subcommand(
 ///      requires an already-registered hotkey, so a 404 here fails before
 ///      the CVM is created (unlike `deploy`, which registers the hotkey).
 async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
-    if cfg
+    if let Some(existing) = cfg
         .active_network_entry()
         .and_then(|e| e.worker_by_app_name(&args.app_name))
-        .is_some_and(|w| !w.worker_id.is_empty())
     {
-        bail!(
-            "a worker named '{}' is already registered on this network; \
-             pass a distinct --app-name (e.g. --app-name gm-miner-2) so the \
-             new worker gets its own CVM and node secret",
-            args.app_name
-        );
+        if !existing.worker_id.is_empty() {
+            bail!(
+                "a worker named '{}' is already registered on this network; \
+                 pass a distinct --app-name (e.g. --app-name gm-miner-2) so the \
+                 new worker gets its own CVM and node secret",
+                args.app_name
+            );
+        }
+        // A provisional record with a real app_id is a CVM that launched but
+        // whose registry POST never landed. Re-running `worker add` would
+        // deploy a *second* CVM and orphan the first. `register-image` only
+        // recovers worker #1, so point the operator at deleting the orphan.
+        if !existing.app_id.is_empty() {
+            bail!(
+                "worker '{}' has a CVM ({}) that was deployed but never \
+                 registered. `worker add` would launch a second CVM and orphan \
+                 it. Tear the existing one down first:\n  phala cvms delete {}\n\
+                 then re-run `gm-miner worker add --app-name {}`.",
+                args.app_name,
+                existing.app_id,
+                existing.app_id,
+                args.app_name
+            );
+        }
     }
 
     let mut client = RegistryClient::new(cfg.clone());
@@ -1900,6 +1917,56 @@ mod tests {
         assert!(
             !err.to_string().contains("already registered"),
             "a provisional record must not block a retry; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_add_refuses_to_orphan_an_unregistered_cvm() {
+        use super::{cmd_worker_add, DeployArgs};
+        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+
+        // A provisional record carrying a real app_id is a CVM that launched
+        // but never registered. Re-running `worker add` must refuse and name
+        // the orphan rather than silently deploying a second CVM.
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                workers: vec![WorkerRecord {
+                    worker_id: String::new(),
+                    app_id: "app_orphan".to_owned(),
+                    app_name: "gm-miner-2".to_owned(),
+                    node_secret: "provisional".to_owned(),
+                }],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+        let args = DeployArgs {
+            app_name: "gm-miner-2".to_owned(),
+            image_ref: None,
+            project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
+            image_repo: None,
+            image_tag: "v0.1.0".to_owned(),
+            instance_type: "tdx.medium".to_owned(),
+            disk_size: "40G".to_owned(),
+            os_image: "dstack-0.5.7".to_owned(),
+            repo_root: None,
+            version: None,
+            boot_timeout_secs: 300,
+        };
+
+        let err = cmd_worker_add(cfg, args)
+            .await
+            .expect_err("a provisional CVM must block a re-deploy");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("app_orphan") && msg.contains("phala cvms delete"),
+            "must name the orphaned CVM and how to tear it down; got: {msg}"
         );
     }
 
