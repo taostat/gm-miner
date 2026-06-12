@@ -146,3 +146,43 @@ pub struct ProductDeclarationRequest<'a> {
     pub model: &'a str,
     pub discount_bp: u32,
 }
+
+/// Body of `POST /miners/{hotkey}/workers` (`WorkerCreateRequest`).
+///
+/// The same shape `POST /miners/register` accepts for the first worker —
+/// the per-worker `node_secret` becomes the worker's `x-gm-node-key`
+/// credential the registry serves to the gateway.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerCreateRequest<'a> {
+    pub endpoint: &'a str,
+    pub attestation_endpoint: &'a str,
+    pub compose_hash: &'a str,
+    pub os_image_hash: &'a str,
+    /// `None` omits the field; the registry's schema marks it nullable. A
+    /// `worker add` always carries the freshly-generated per-worker secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_secret: Option<&'a str>,
+}
+
+/// Response from `POST /miners/{hotkey}/workers` (`WorkerCreateResponse`).
+#[derive(Debug, Deserialize)]
+pub struct WorkerCreateResponse {
+    pub worker_id: String,
+    pub miner_hotkey: String,
+    pub status: String,
+}
+
+/// One worker in the `GET /miners/{hotkey}/workers` response (`WorkerEntry`).
+#[derive(Debug, Deserialize)]
+pub struct WorkerEntry {
+    pub worker_id: String,
+    pub endpoint: String,
+    pub status: String,
+    pub last_attestation_at: Option<String>,
+}
+
+/// Response from `GET /miners/{hotkey}/workers` (`WorkerListResponse`).
+#[derive(Debug, Deserialize)]
+pub struct WorkerListResponse {
+    pub workers: Vec<WorkerEntry>,
+}

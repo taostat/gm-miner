@@ -65,22 +65,158 @@ impl TokenEntry {
     }
 }
 
+/// One deployed data-plane worker (Phala CVM) under the active hotkey.
+///
+/// The CLI tracks the operator's deployed CVMs so `worker list` can map
+/// the registry's worker rows back to Phala `app_id`s and so a re-deploy
+/// or `register-image` of an existing worker reuses the exact same
+/// `node_secret` — what envoy enforces, what the registry stores, and
+/// what the gateway presents all have to agree.
+///
+/// `node_secret` is per-worker (never shared between workers): a leaked
+/// or rotated secret burns only the one worker.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRecord {
+    /// The registry's worker id (ULID), assigned by the registry on
+    /// `POST /miners/register` (worker #1) or `POST /miners/{hotkey}/workers`.
+    pub worker_id: String,
+    /// The Phala Cloud `app_id` of the deployed CVM. Stored so `worker
+    /// remove` can remind the operator which CVM to `phala cvms delete`.
+    pub app_id: String,
+    /// The operator-chosen CVM name passed to `phala deploy --name`. The
+    /// stable local handle for the worker — a re-deploy reuses the
+    /// record matched on this name.
+    pub app_name: String,
+    /// The worker's `x-gm-node-key` pre-shared credential (Mechanism 1 of
+    /// `docs/plans/attestation-and-identity.md`).
+    pub node_secret: String,
+}
+
 /// Per-network configuration.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetworkEntry {
     pub api_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenEntry>,
-    /// The miner's node secret for this network (Mechanism 1 of
-    /// `docs/plans/attestation-and-identity.md`). Scoped per network so
-    /// a mainnet and a testnet deployment from the same config get
-    /// distinct `x-gm-node-key` values — a secret leaked or rotated for
-    /// one node never authenticates the other. Generated once on the
-    /// first `gm-miner deploy` for the network and reused thereafter so
-    /// the value baked into the container's env, what envoy enforces,
-    /// and what the registry stores all stay in lockstep.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_secret: Option<String>,
+    /// The miner's deployed workers for this network. Scoped per network
+    /// so a mainnet and a testnet deployment from the same config get
+    /// distinct workers (and distinct per-worker `x-gm-node-key` values).
+    /// Populated as the operator runs `gm-miner deploy` (worker #1) and
+    /// `gm-miner worker add` (further capacity).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workers: Vec<WorkerRecord>,
+    /// Secret persisted by a pre-multi-worker CLI under the network-level
+    /// `node_secret` key. It lets an upgraded CLI recover the `x-gm-node-key`
+    /// the operator's already-deployed worker #1 enforces. It is round-tripped
+    /// through saves (`login`, token refresh, `set-api-keys`) so an upgrade
+    /// followed by a login does not drop it before the migrating deploy or
+    /// `register-image` runs; [`upsert_worker`] clears it the moment the first
+    /// [`WorkerRecord`] lands, since the secret then lives in that record.
+    ///
+    /// [`upsert_worker`]: NetworkEntry::upsert_worker
+    #[serde(
+        default,
+        rename = "node_secret",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_node_secret: Option<String>,
+}
+
+impl NetworkEntry {
+    /// The worker record whose `app_name` matches, if any.
+    #[must_use]
+    pub fn worker_by_app_name(&self, app_name: &str) -> Option<&WorkerRecord> {
+        self.workers.iter().find(|w| w.app_name == app_name)
+    }
+
+    /// The worker record whose registry `worker_id` matches, if any.
+    #[must_use]
+    pub fn worker_by_id(&self, worker_id: &str) -> Option<&WorkerRecord> {
+        self.workers.iter().find(|w| w.worker_id == worker_id)
+    }
+
+    /// The worker record whose Phala `app_id` matches, if any.
+    #[must_use]
+    pub fn worker_by_app_id(&self, app_id: &str) -> Option<&WorkerRecord> {
+        self.workers.iter().find(|w| w.app_id == app_id)
+    }
+
+    /// The pre-multi-worker `node_secret` to fall back on, if this network
+    /// has no tracked workers yet. A network with `WorkerRecord`s has
+    /// migrated past the legacy single-secret model, so the legacy value is
+    /// ignored to avoid leaking a stale secret onto a fresh worker.
+    #[must_use]
+    pub fn legacy_node_secret(&self) -> Option<&str> {
+        if !self.workers.is_empty() {
+            return None;
+        }
+        self.legacy_node_secret
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Whether the worker tracked for `app_id` is worker #1 (the first
+    /// record, created by `gm-miner deploy`). Used to gate `register-image`,
+    /// which only re-registers worker #1; a tracked-but-not-first CVM is a
+    /// `worker add` worker. `None` when `app_id` is not tracked — the caller
+    /// decides what an untracked CVM means.
+    #[must_use]
+    pub fn is_primary_worker(&self, app_id: &str) -> Option<bool> {
+        let tracked = self.worker_by_app_id(app_id)?;
+        let first = self.workers.first()?;
+        Some(first.worker_id == tracked.worker_id)
+    }
+
+    /// Whether the worker tracked for `app_name` is worker #1 (the first
+    /// record). `deploy` gates on this: re-running `deploy --app-name` for
+    /// worker #1 is a legitimate re-register, but for a secondary worker it
+    /// would corrupt the mapping. `None` when `app_name` is not tracked —
+    /// the caller treats that as a fresh worker #1.
+    #[must_use]
+    pub fn is_primary_worker_by_app_name(&self, app_name: &str) -> Option<bool> {
+        let tracked = self.worker_by_app_name(app_name)?;
+        let first = self.workers.first()?;
+        Some(first.app_name == tracked.app_name)
+    }
+
+    /// Insert a worker record, dropping any prior record for the same worker
+    /// so a re-deploy updates in place rather than accumulating duplicates.
+    ///
+    /// "Same worker" is the registry `worker_id` (stable across re-deploys)
+    /// when the incoming record carries one — this catches a re-deploy that
+    /// changed its `--app-name`, which an app-name-only match would miss,
+    /// leaving a stale record that `is_primary_worker_by_app_name` could
+    /// later mis-read. The `app_name` is always also matched so the empty-
+    /// `worker_id` pre-registration stub a fresh deploy writes is superseded
+    /// (rather than orphaned) when the registry's `worker_id` lands.
+    ///
+    /// Worker order is preserved: the record lands at the position of the
+    /// first match (or the end when new), so the first record stays worker #1
+    /// across re-deploys and `is_primary_worker*` keeps reading correctly.
+    pub fn upsert_worker(&mut self, record: WorkerRecord) {
+        let matches = |w: &WorkerRecord| {
+            let same_worker = !record.worker_id.is_empty() && w.worker_id == record.worker_id;
+            same_worker || w.app_name == record.app_name
+        };
+        match self.workers.iter().position(matches) {
+            Some(idx) => {
+                self.workers.retain(|w| !matches(w));
+                self.workers.insert(idx.min(self.workers.len()), record);
+            }
+            None => self.workers.push(record),
+        }
+        // The migration is complete once a worker record exists: the secret
+        // now lives in the record, so the legacy network-level copy is dead
+        // and must not linger to be re-read or re-serialized.
+        self.legacy_node_secret = None;
+    }
+
+    /// Drop the worker record whose registry `worker_id` matches. Returns
+    /// the removed record so the caller can report the freed `app_id`.
+    pub fn remove_worker_by_id(&mut self, worker_id: &str) -> Option<WorkerRecord> {
+        let idx = self.workers.iter().position(|w| w.worker_id == worker_id)?;
+        Some(self.workers.remove(idx))
+    }
 }
 
 /// Provider API keys persisted by `gm-miner set-api-keys`.
@@ -203,4 +339,282 @@ pub fn save(cfg: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions intentionally panic on unexpected values"
+)]
+mod tests {
+    use super::{Config, NetworkEntry, WorkerRecord};
+    use std::collections::HashMap;
+
+    fn worker(worker_id: &str, app_name: &str, secret: &str) -> WorkerRecord {
+        WorkerRecord {
+            worker_id: worker_id.to_owned(),
+            app_id: format!("app_{worker_id}"),
+            app_name: app_name.to_owned(),
+            node_secret: secret.to_owned(),
+        }
+    }
+
+    fn config_with_workers(network: &str, workers: Vec<WorkerRecord>) -> Config {
+        let mut networks = HashMap::new();
+        networks.insert(
+            network.to_owned(),
+            NetworkEntry {
+                workers,
+                ..Default::default()
+            },
+        );
+        Config {
+            networks,
+            active_network: Some(network.to_owned()),
+            provider_keys: None,
+        }
+    }
+
+    #[test]
+    fn workers_vec_round_trips_through_json() {
+        let cfg = config_with_workers(
+            "testnet",
+            vec![
+                worker("01J0A", "gm-miner-1", "secret-a"),
+                worker("01J0B", "gm-miner-2", "secret-b"),
+            ],
+        );
+
+        let bytes = serde_json::to_vec(&cfg).expect("serialize config");
+        let back: Config = serde_json::from_slice(&bytes).expect("deserialize config");
+
+        let entry = back.networks.get("testnet").expect("testnet entry");
+        assert_eq!(entry.workers.len(), 2);
+        assert_eq!(entry.workers[0].worker_id, "01J0A");
+        assert_eq!(entry.workers[0].app_id, "app_01J0A");
+        assert_eq!(entry.workers[0].app_name, "gm-miner-1");
+        assert_eq!(entry.workers[0].node_secret, "secret-a");
+        assert_eq!(entry.workers[1].worker_id, "01J0B");
+        assert_eq!(entry.workers[1].node_secret, "secret-b");
+    }
+
+    #[test]
+    fn empty_workers_vec_is_omitted_from_json() {
+        // A network that never deployed must not bloat config.json with an
+        // empty `workers` array, matching the skip-if-empty contract.
+        let cfg = config_with_workers("mainnet", Vec::new());
+        let json = serde_json::to_string(&cfg).expect("serialize config");
+        assert!(
+            !json.contains("workers"),
+            "empty workers vec must be skipped: {json}"
+        );
+    }
+
+    #[test]
+    fn config_without_workers_field_defaults_to_empty() {
+        // A config.json written before the workers field existed must
+        // still parse — `#[serde(default)]` fills an empty vec.
+        let json = r#"{"networks":{"testnet":{"api_url":"https://x"}},"active_network":"testnet"}"#;
+        let cfg: Config = serde_json::from_str(json).expect("parse legacy config");
+        let entry = cfg.networks.get("testnet").expect("testnet entry");
+        assert!(entry.workers.is_empty());
+    }
+
+    #[test]
+    fn legacy_node_secret_is_read_and_round_trips_until_migrated() {
+        // A pre-multi-worker config stored its single secret under the
+        // network-level `node_secret` key. It must be readable (so an
+        // upgraded CLI can recover it) AND survive an interim save such as
+        // `login` or a token refresh — otherwise the secret is lost before
+        // the migrating deploy/register-image ever runs.
+        let json = r#"{"networks":{"testnet":{"api_url":"https://x","node_secret":"legacy-key"}},"active_network":"testnet"}"#;
+        let cfg: Config = serde_json::from_str(json).expect("parse legacy config");
+        let entry = cfg.networks.get("testnet").expect("testnet entry");
+        assert_eq!(entry.legacy_node_secret(), Some("legacy-key"));
+
+        let resaved = serde_json::to_string(&cfg).expect("serialize config");
+        assert!(
+            resaved.contains(r#""node_secret":"legacy-key""#),
+            "legacy node_secret must round-trip until migrated: {resaved}"
+        );
+    }
+
+    #[test]
+    fn upsert_worker_clears_the_legacy_secret() {
+        // Once the first worker record lands the migration is done; the
+        // legacy network-level secret must be dropped so it can't be
+        // re-read or re-serialized.
+        let mut entry = NetworkEntry {
+            legacy_node_secret: Some("legacy-key".to_owned()),
+            ..Default::default()
+        };
+        entry.upsert_worker(worker("01J0A", "gm-miner-1", "legacy-key"));
+        assert_eq!(entry.legacy_node_secret, None);
+
+        let json = serde_json::to_string(&entry).expect("serialize entry");
+        assert!(
+            !json.contains("legacy-key") || json.matches("legacy-key").count() == 1,
+            "the only legacy-key left must be inside the worker record: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_node_secret_ignored_once_workers_exist() {
+        // A network that has migrated to per-worker records must not leak the
+        // stale legacy secret onto a fresh worker.
+        let entry = NetworkEntry {
+            workers: vec![worker("01J0A", "gm-miner-1", "fresh")],
+            legacy_node_secret: Some("legacy-key".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(entry.legacy_node_secret(), None);
+    }
+
+    #[test]
+    fn legacy_node_secret_rejects_blank() {
+        let entry = NetworkEntry {
+            legacy_node_secret: Some("   ".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(entry.legacy_node_secret(), None);
+    }
+
+    #[test]
+    fn is_primary_worker_by_app_name_matches_first_record() {
+        let entry = NetworkEntry {
+            workers: vec![
+                worker("01J0A", "gm-miner-1", "a"),
+                worker("01J0B", "gm-miner-2", "b"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            entry.is_primary_worker_by_app_name("gm-miner-1"),
+            Some(true)
+        );
+        assert_eq!(
+            entry.is_primary_worker_by_app_name("gm-miner-2"),
+            Some(false)
+        );
+        assert_eq!(entry.is_primary_worker_by_app_name("gm-miner-9"), None);
+    }
+
+    #[test]
+    fn upsert_worker_replaces_on_matching_app_name() {
+        let mut entry = NetworkEntry {
+            workers: vec![worker("01J0A", "gm-miner-1", "old")],
+            ..Default::default()
+        };
+        // A re-deploy of the same CVM keeps one record, with the new
+        // worker_id/secret — never a duplicate.
+        entry.upsert_worker(worker("01J0C", "gm-miner-1", "new"));
+        assert_eq!(entry.workers.len(), 1);
+        assert_eq!(entry.workers[0].worker_id, "01J0C");
+        assert_eq!(entry.workers[0].node_secret, "new");
+    }
+
+    #[test]
+    fn upsert_worker_appends_distinct_app_name() {
+        let mut entry = NetworkEntry {
+            workers: vec![worker("01J0A", "gm-miner-1", "a")],
+            ..Default::default()
+        };
+        entry.upsert_worker(worker("01J0B", "gm-miner-2", "b"));
+        assert_eq!(entry.workers.len(), 2);
+    }
+
+    #[test]
+    fn upsert_worker_matches_renamed_worker_by_id() {
+        // Worker #1 redeployed under a new --app-name keeps the same registry
+        // worker_id. The upsert must update it in place (no stale duplicate,
+        // position preserved) rather than appending a second primary record.
+        let mut entry = NetworkEntry {
+            workers: vec![
+                worker("01J0A", "gm-miner-1", "a"),
+                worker("01J0B", "gm-miner-2", "b"),
+            ],
+            ..Default::default()
+        };
+        entry.upsert_worker(worker("01J0A", "gm-miner-renamed", "a2"));
+        assert_eq!(entry.workers.len(), 2, "no stale duplicate");
+        assert_eq!(entry.workers[0].worker_id, "01J0A", "position preserved");
+        assert_eq!(entry.workers[0].app_name, "gm-miner-renamed");
+        assert_eq!(entry.workers[0].node_secret, "a2");
+        assert_eq!(entry.workers[1].app_name, "gm-miner-2");
+        // worker #1 stays primary after the rename.
+        assert_eq!(
+            entry.is_primary_worker_by_app_name("gm-miner-renamed"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn upsert_worker_supersedes_a_preregistration_stub() {
+        // A fresh deploy first writes a stub with an empty worker_id (matched
+        // on app_name); when the registry's worker_id lands, the final upsert
+        // must replace that stub in place, not append alongside it.
+        let mut entry = NetworkEntry {
+            workers: vec![worker("", "gm-miner-1", "secret")],
+            ..Default::default()
+        };
+        entry.upsert_worker(worker("01J0A", "gm-miner-1", "secret"));
+        assert_eq!(entry.workers.len(), 1);
+        assert_eq!(entry.workers[0].worker_id, "01J0A");
+    }
+
+    #[test]
+    fn remove_worker_by_id_returns_and_drops_the_record() {
+        let mut entry = NetworkEntry {
+            workers: vec![
+                worker("01J0A", "gm-miner-1", "a"),
+                worker("01J0B", "gm-miner-2", "b"),
+            ],
+            ..Default::default()
+        };
+        let removed = entry
+            .remove_worker_by_id("01J0A")
+            .expect("worker present to remove");
+        assert_eq!(removed.app_id, "app_01J0A");
+        assert_eq!(entry.workers.len(), 1);
+        assert_eq!(entry.workers[0].worker_id, "01J0B");
+        assert!(entry.remove_worker_by_id("nope").is_none());
+    }
+
+    #[test]
+    fn is_primary_worker_distinguishes_first_from_added() {
+        // The deploy-created worker (first record) is primary; a worker-add
+        // worker (later record) is not. register-image gates on this.
+        let entry = NetworkEntry {
+            workers: vec![
+                worker("01J0A", "gm-miner-1", "a"),
+                worker("01J0B", "gm-miner-2", "b"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(entry.is_primary_worker("app_01J0A"), Some(true));
+        assert_eq!(entry.is_primary_worker("app_01J0B"), Some(false));
+        // An untracked app_id is None — the caller treats it separately.
+        assert_eq!(entry.is_primary_worker("app_unknown"), None);
+    }
+
+    #[test]
+    fn lookups_match_by_app_name_and_worker_id() {
+        let entry = NetworkEntry {
+            workers: vec![worker("01J0A", "gm-miner-1", "a")],
+            ..Default::default()
+        };
+        assert_eq!(
+            entry
+                .worker_by_app_name("gm-miner-1")
+                .expect("by app_name")
+                .worker_id,
+            "01J0A"
+        );
+        assert_eq!(
+            entry.worker_by_id("01J0A").expect("by worker_id").app_name,
+            "gm-miner-1"
+        );
+        assert!(entry.worker_by_app_name("absent").is_none());
+        assert!(entry.worker_by_id("absent").is_none());
+    }
 }

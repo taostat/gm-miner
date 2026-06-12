@@ -16,7 +16,7 @@ declaration, and price management.
 - `cli/src/config.rs` — `Config` loaded from `~/.gm-miner/config.json` (mode 0600); supports `mainnet`/`testnet` networks
 - `cli/src/deploy.rs` — `PhalaClient` trait + `RealPhalaClient`; deploy orchestration: compose rendering, `phala deploy`, `phala cvms get` hash polling, hash verification
 - `cli/src/image.rs` — miner image build/push: `docker buildx --push` to a public registry, digest resolution
-- `cli/src/node_secret.rs` — per-network node secret: generated once, persisted in config, embedded in compose env so envoy enforces it
+- `cli/src/node_secret.rs` — per-worker node secret: a fresh secret per worker (CVM), reused across re-deploys of the same `--app-name`, persisted in the worker's config record, embedded in compose env so envoy enforces it
 - `cli/src/nanodollar.rs` — USD/Mtok string → nano-dollars (u64) conversion; integer-only, no floats
 - `cli/src/types.rs` — shared types: `MinerPriceBlock`, `MinerStatus`, `Product`, `Provider`
 - `image/` — the miner container image (Dockerfile, envoy config)

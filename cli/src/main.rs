@@ -10,6 +10,9 @@
 //!   declare-product  — declare a single offer (--provider X --model Y --discount-pct N)
 //!   declare-products — fan out one discount over the whole catalog, or one provider
 //!   status           — show current registration state and per-product eligibility
+//!   worker add       — attach a new data-plane CVM under the existing hotkey
+//!   worker list      — list the hotkey's live workers
+//!   worker remove    — deregister a worker (CVM teardown is separate)
 //!
 //! Pricing follows the registry's pct-discount model: a miner declares
 //! a single `discount_bp` in `[0, 9990]` per (provider, model) offer, and
@@ -28,10 +31,10 @@ use clap::{Parser, Subcommand};
 use gm_miner_cli::{
     auth,
     client::{get_auth_config, RegistryClient},
-    config::{self, Config, ProviderKeys},
+    config::{self, Config, ProviderKeys, WorkerRecord},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
-        parse_phala_cvm_endpoint, preflight_phala_cli, prepare_deploy_target,
+        parse_phala_cvm_endpoint, parse_phala_cvm_name, preflight_phala_cli, prepare_deploy_target,
         resolve_registry_credentials, select_version, to_ratls_passthrough_endpoint, verify_hashes,
         ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
         PHALA_ENDPOINT_FIELD,
@@ -39,7 +42,7 @@ use gm_miner_cli::{
     node_secret,
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider,
-        RetailDimensions,
+        RetailDimensions, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse,
     },
 };
 
@@ -101,64 +104,8 @@ enum Command {
     /// authorization. Authentication uses a Phala Cloud API key — set
     /// `PHALA_CLOUD_API_KEY` or run `phala login` before deploying.
     Deploy {
-        /// Pre-built digest-pinned image reference (registry/repo@sha256:...).
-        ///
-        /// When set (or `GM_IMAGE_REF` is in env), the local image build is
-        /// skipped and this ref is embedded in the compose file directly.
-        /// When omitted, the miner image is built and pushed to the public
-        /// registry given by `--image-repo` and the resulting digest is
-        /// pinned automatically.
-        #[arg(long, env = "GM_IMAGE_REF")]
-        image_ref: Option<String>,
-
-        /// Pin to a specific approved version by index (1 = newest).
-        /// Defaults to the newest supported version.
-        #[arg(long)]
-        version: Option<usize>,
-
-        /// Phala Cloud CVM name.
-        #[arg(long, default_value = "gm-miner-1")]
-        app_name: String,
-
-        /// Staging directory for the rendered compose + env files (the full
-        /// path used verbatim). Defaults to `dist/<app_name>` relative to
-        /// the current directory.
-        #[arg(long)]
-        dist_dir: Option<std::path::PathBuf>,
-
-        /// Public container registry repo to build and push the miner image
-        /// to — Phala Cloud pulls the image from here. Required unless
-        /// `--image-ref` is supplied. Example: `ghcr.io/<owner>/gm-miner`.
-        #[arg(long, env = "GM_IMAGE_REPO")]
-        image_repo: Option<String>,
-
-        /// Image tag applied to the build before digest resolution.
-        #[arg(long, env = "IMAGE_TAG", default_value = "v0.1.0")]
-        image_tag: String,
-
-        /// Phala Cloud instance type for the CVM.
-        #[arg(long, env = "PHALA_INSTANCE_TYPE", default_value = "tdx.medium")]
-        instance_type: String,
-
-        /// Disk size for the CVM (with unit, e.g. `40G`).
-        #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
-        disk_size: String,
-
-        /// Production OS image for the CVM (`phala deploy --image`). The
-        /// version must match the dstack version of the Phala node the CVM
-        /// lands on — prod5/prod9 currently run dstack v0.5.7.
-        #[arg(long, env = "PHALA_OS_IMAGE", default_value = DEFAULT_OS_IMAGE)]
-        os_image: String,
-
-        /// Repository root used as the Docker build context. Defaults to
-        /// the current directory.
-        #[arg(long)]
-        repo_root: Option<std::path::PathBuf>,
-
-        /// How long to wait for the CVM to boot and report its measured
-        /// hashes via `phala cvms get --json` (seconds). Default: 300.
-        #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
-        boot_timeout_secs: u64,
+        #[command(flatten)]
+        flags: Box<DeployFlags>,
     },
 
     /// Authenticate with Taostats (device-code OAuth flow) and store
@@ -232,6 +179,108 @@ enum Command {
 
     /// Show the miner's current registration status and per-product eligibility.
     Status,
+
+    /// Manage the data-plane workers (Phala CVMs) attached to your hotkey.
+    ///
+    /// The first `gm-miner deploy` creates the hotkey identity and worker
+    /// #1 in one shot. Use `worker add` to attach further capacity under
+    /// the same hotkey, `worker list` to see every worker's status, and
+    /// `worker remove` to deregister one.
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
+}
+
+/// Deploy flags shared by `gm-miner deploy` (worker #1) and
+/// `gm-miner worker add` (further capacity). Both submit one Phala CVM via
+/// the same plumbing; they differ only in which registry endpoint records
+/// the resulting worker.
+#[derive(clap::Args)]
+struct DeployFlags {
+    /// Pre-built digest-pinned image reference (registry/repo@sha256:...).
+    ///
+    /// When set (or `GM_IMAGE_REF` is in env), the local image build is
+    /// skipped and this ref is embedded in the compose file directly.
+    /// When omitted, the miner image is built and pushed to the public
+    /// registry given by `--image-repo` and the resulting digest is
+    /// pinned automatically.
+    #[arg(long, env = "GM_IMAGE_REF")]
+    image_ref: Option<String>,
+
+    /// Pin to a specific approved version by index (1 = newest).
+    /// Defaults to the newest supported version.
+    #[arg(long)]
+    version: Option<usize>,
+
+    /// Phala Cloud CVM name. Each worker needs its own name — a second
+    /// worker must pass e.g. `--app-name gm-miner-2`.
+    #[arg(long, default_value = "gm-miner-1")]
+    app_name: String,
+
+    /// Staging directory for the rendered compose + env files (the full
+    /// path used verbatim). Defaults to `dist/<app_name>` relative to
+    /// the current directory.
+    #[arg(long)]
+    dist_dir: Option<std::path::PathBuf>,
+
+    /// Public container registry repo to build and push the miner image
+    /// to — Phala Cloud pulls the image from here. Required unless
+    /// `--image-ref` is supplied. Example: `ghcr.io/<owner>/gm-miner`.
+    #[arg(long, env = "GM_IMAGE_REPO")]
+    image_repo: Option<String>,
+
+    /// Image tag applied to the build before digest resolution.
+    #[arg(long, env = "IMAGE_TAG", default_value = "v0.1.0")]
+    image_tag: String,
+
+    /// Phala Cloud instance type for the CVM.
+    #[arg(long, env = "PHALA_INSTANCE_TYPE", default_value = "tdx.medium")]
+    instance_type: String,
+
+    /// Disk size for the CVM (with unit, e.g. `40G`).
+    #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
+    disk_size: String,
+
+    /// Production OS image for the CVM (`phala deploy --image`). The
+    /// version must match the dstack version of the Phala node the CVM
+    /// lands on — prod5/prod9 currently run dstack v0.5.7.
+    #[arg(long, env = "PHALA_OS_IMAGE", default_value = DEFAULT_OS_IMAGE)]
+    os_image: String,
+
+    /// Repository root used as the Docker build context. Defaults to
+    /// the current directory.
+    #[arg(long)]
+    repo_root: Option<std::path::PathBuf>,
+
+    /// How long to wait for the CVM to boot and report its measured
+    /// hashes via `phala cvms get --json` (seconds). Default: 300.
+    #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
+    boot_timeout_secs: u64,
+}
+
+#[derive(Subcommand)]
+enum WorkerCommand {
+    /// Deploy (or register an already-deployed) CVM as a new worker under
+    /// the existing hotkey. Same plumbing as `deploy`, routed to
+    /// `POST /miners/{hotkey}/workers`. Generates a fresh per-worker
+    /// node secret. Pass a distinct `--app-name` for each worker.
+    Add {
+        #[command(flatten)]
+        flags: Box<DeployFlags>,
+    },
+
+    /// List the hotkey's live workers with per-worker status and last
+    /// attestation (`GET /miners/{hotkey}/workers`).
+    List,
+
+    /// Deregister a worker from the registry (`DELETE
+    /// /miners/{hotkey}/workers/{worker_id}`). This does NOT tear down the
+    /// Phala CVM — `phala cvms delete <app_id>` separately.
+    Remove {
+        /// The registry `worker_id` (ULID) of the worker to remove.
+        worker_id: String,
+    },
 }
 
 #[tokio::main]
@@ -252,58 +301,44 @@ async fn main() -> Result<()> {
             openai,
             google,
         } => cmd_set_api_keys(anthropic, openai, google),
-        Command::Deploy {
-            image_ref,
-            version,
-            app_name,
-            dist_dir,
-            image_repo,
-            image_tag,
-            instance_type,
-            disk_size,
-            os_image,
-            repo_root,
-            boot_timeout_secs,
+        Command::Deploy { flags } => {
+            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            cmd_deploy_subcommand(
+                cfg,
+                deploy_args_from_flags(*flags),
+                WorkerRegistration::First,
+            )
+            .await
+        }
+        Command::Worker {
+            command: WorkerCommand::Add { flags },
         } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
-            // --dist-dir is the staging directory used verbatim. Default:
-            // dist/<app_name> relative to cwd. Resolve it once here so every
-            // deploy step shares the same path.
-            let project_dir =
-                dist_dir.unwrap_or_else(|| std::path::PathBuf::from("dist").join(&app_name));
-            cmd_deploy_subcommand(
-                cfg,
-                DeployArgs {
-                    app_name,
-                    image_ref,
-                    project_dir,
-                    image_repo,
-                    image_tag,
-                    instance_type,
-                    disk_size,
-                    os_image,
-                    repo_root,
-                    version,
-                    boot_timeout_secs,
-                },
-            )
-            .await
+            let args = deploy_args_from_flags(*flags);
+            cmd_worker_add(cfg, args).await
+        }
+        Command::Worker {
+            command: WorkerCommand::List,
+        } => {
+            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            let mut client = RegistryClient::new(cfg);
+            cmd_worker_list(&mut client).await
+        }
+        Command::Worker {
+            command: WorkerCommand::Remove { worker_id },
+        } => {
+            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            cmd_worker_remove(cfg, &worker_id).await
         }
         Command::Login { no_browser } => cmd_login(cli.testnet, cli.api_url, !no_browser).await,
         Command::RegisterImage { app_id } => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
-            // Re-send the network's persisted node secret so a standalone
-            // re-registration keeps the registry's stored copy in sync
-            // with what the deployed envoy enforces. Absent (a miner
-            // predating node-secret auth) means the registry leaves any
-            // stored secret untouched.
-            let node_secret = cfg
-                .active_network_entry()
-                .and_then(|n| n.node_secret.clone());
-            let mut client = RegistryClient::new(cfg);
-            cmd_register_image(&mut client, &app_id, node_secret.as_deref()).await
+            cmd_register_image_subcommand(cfg, &app_id).await
         }
         Command::ListProducts => {
             let cfg = load_config(cli.testnet, cli.api_url)?;
@@ -607,10 +642,48 @@ struct DeployArgs {
     boot_timeout_secs: u64,
 }
 
+/// Which registry endpoint records the worker a deploy produces.
+///
+/// `First` is `gm-miner deploy`: `POST /miners/register` creates the
+/// hotkey identity and worker #1. `Add` is `gm-miner worker add`:
+/// `POST /miners/{hotkey}/workers` attaches further capacity to the named
+/// hotkey, which `worker add` resolves and validates *before* any CVM work
+/// so an unregistered hotkey fails fast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerRegistration {
+    First,
+    Add { hotkey: String },
+}
+
+/// Resolve a [`DeployArgs`] from parsed CLI flags, computing the staging
+/// directory once (`--dist-dir` or `dist/<app_name>`).
+fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
+    let project_dir = flags
+        .dist_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("dist").join(&flags.app_name));
+    DeployArgs {
+        app_name: flags.app_name,
+        image_ref: flags.image_ref,
+        project_dir,
+        image_repo: flags.image_repo,
+        image_tag: flags.image_tag,
+        instance_type: flags.instance_type,
+        disk_size: flags.disk_size,
+        os_image: flags.os_image,
+        repo_root: flags.repo_root,
+        version: flags.version,
+        boot_timeout_secs: flags.boot_timeout_secs,
+    }
+}
+
 /// Build and run the deploy subcommand from parsed CLI arguments.
 ///
 /// Separated from `main` to keep the dispatch match arm small.
-async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
+async fn cmd_deploy_subcommand(
+    cfg: Config,
+    args: DeployArgs,
+    registration: WorkerRegistration,
+) -> Result<()> {
     let phala = gm_miner_cli::deploy::RealPhalaClient::new(
         args.app_name.clone(),
         args.project_dir.clone(),
@@ -619,7 +692,42 @@ async fn cmd_deploy_subcommand(cfg: Config, args: DeployArgs) -> Result<()> {
         args.os_image.clone(),
     );
     let mut client = RegistryClient::new(cfg.clone());
-    cmd_deploy(&cfg, &mut client, &phala, &args).await
+    cmd_deploy(&cfg, &mut client, &phala, &args, &registration).await
+}
+
+/// `gm-miner worker add` — attach a new CVM to the existing hotkey.
+///
+/// Two checks run *before* any CVM work so a misuse fails fast rather than
+/// after a multi-minute deploy:
+///   1. The `--app-name` must not already name a *registered* worker.
+///      Reusing the default `gm-miner-1` (or any registered name) would make
+///      [`node_secret::for_worker`] reuse that worker's secret and the
+///      config upsert overwrite its record — two workers sharing a secret
+///      and the original left untracked. A provisional record (one whose
+///      registration never completed, so its `worker_id` is empty) is *not*
+///      a duplicate: re-running `worker add` with that name retries it.
+///   2. The hotkey is resolved from `/miners/me` up front; `worker add`
+///      requires an already-registered hotkey, so a 404 here fails before
+///      the CVM is created (unlike `deploy`, which registers the hotkey).
+async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
+    if cfg
+        .active_network_entry()
+        .and_then(|e| e.worker_by_app_name(&args.app_name))
+        .is_some_and(|w| !w.worker_id.is_empty())
+    {
+        bail!(
+            "a worker named '{}' is already registered on this network; \
+             pass a distinct --app-name (e.g. --app-name gm-miner-2) so the \
+             new worker gets its own CVM and node secret",
+            args.app_name
+        );
+    }
+
+    let mut client = RegistryClient::new(cfg.clone());
+    client.preflight_auth().await?;
+    let hotkey = fetch_hotkey(&mut client).await?;
+
+    cmd_deploy_subcommand(cfg, args, WorkerRegistration::Add { hotkey }).await
 }
 
 /// Real [`ImageProvisioner`]: builds the miner image and pushes it to a
@@ -758,12 +866,43 @@ fn cmd_set_api_keys(
     Ok(())
 }
 
+/// Reject a plain `gm-miner deploy` aimed at a tracked *secondary* worker.
+///
+/// `deploy` registers worker #1 via `/miners/register`, which refreshes the
+/// miner's first worker. Pointed at the `--app-name` of a secondary worker it
+/// would overwrite worker #1 in the registry and corrupt the local mapping.
+/// A re-deploy of worker #1 (or a brand-new, untracked `--app-name`) is fine.
+fn reject_secondary_worker_deploy(
+    cfg: &Config,
+    registration: &WorkerRegistration,
+    app_name: &str,
+) -> Result<()> {
+    let is_secondary = *registration == WorkerRegistration::First
+        && cfg
+            .active_network_entry()
+            .and_then(|e| e.is_primary_worker_by_app_name(app_name))
+            == Some(false);
+    if is_secondary {
+        bail!(
+            "'{app_name}' is a secondary worker; `deploy` and `register-image` \
+             only (re-)register worker #1. To replace this worker, \
+             `gm-miner worker remove <worker_id>` then `gm-miner worker add \
+             --app-name {app_name}`."
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
     phala: &dyn PhalaClient,
     args: &DeployArgs,
+    registration: &WorkerRegistration,
 ) -> Result<()> {
+    // Step 0: a plain `deploy` may only target worker #1 (see guard).
+    reject_secondary_worker_deploy(cfg, registration, &args.app_name)?;
+
     // Step 1: ensure provider keys are configured.
     let keys = cfg
         .provider_keys
@@ -776,12 +915,38 @@ async fn cmd_deploy(
             )
         })?;
 
-    // Step 1b: resolve the node secret for the network this deploy
-    // targets. Generated once per network and persisted to the CLI
-    // config so the value baked into the container's env, what envoy
-    // enforces, and what the registry stores all stay in lockstep across
-    // re-deploys (Mechanism 1 of attestation-and-identity.md).
-    let node_secret = resolve_node_secret(cfg.active_network())?;
+    // Step 1b: resolve the per-worker node secret. Each worker (CVM)
+    // carries its own `x-gm-node-key` secret, never shared with a sibling
+    // — a leaked secret burns only one worker. A re-deploy of an existing
+    // worker (matched on `--app-name`) reuses the same value so what the
+    // container bakes into env, what envoy enforces, and what the registry
+    // stores all stay in lockstep (Mechanism 1 of attestation-and-identity.md).
+    // Only worker #1 (`deploy`) may inherit a pre-multi-worker legacy
+    // secret; a `worker add` must always mint its own.
+    let allow_legacy = *registration == WorkerRegistration::First;
+    let (node_secret, freshly_generated) =
+        node_secret::for_worker(cfg.active_network_entry(), &args.app_name, allow_legacy)?;
+    if freshly_generated {
+        println!(
+            "Generated a fresh node secret for worker '{}'.",
+            args.app_name
+        );
+        // Persist the secret before the CVM launches. If the deploy or the
+        // registry call later fails, the running envoy enforces this secret
+        // and a re-deploy with the same `--app-name` recovers it (matched on
+        // app_name); without this, a fresh secret would exist only in memory
+        // until step 9. The worker_id/app_id are filled in once Phala and the
+        // registry return — step 9 upserts this same record in place.
+        persist_worker_record(
+            cfg.active_network(),
+            WorkerRecord {
+                worker_id: String::new(),
+                app_id: String::new(),
+                app_name: args.app_name.clone(),
+                node_secret: node_secret.clone(),
+            },
+        )?;
+    }
 
     // Step 1c: preflight that the `phala` CLI is installed. It is the
     // runtime dependency of the deploy — catch a missing CLI now, with an
@@ -791,9 +956,8 @@ async fn cmd_deploy(
     // Step 2: auth preflight. The Phala Cloud deploy is slow and
     // irreversible for the operator (CVM created), so we refuse to start
     // the deploy unless the registry will accept the eventual
-    // `register-image` call. The preflight is a cheap `GET /miners/me` —
-    // a missing token / 401 fails fast with an actionable message before
-    // any CVM work.
+    // registration. The preflight is a cheap `GET /miners/me` — a missing
+    // token / 401 fails fast with an actionable message before any CVM work.
     client.preflight_auth().await?;
 
     // Step 3: fetch approved image versions from the registry.
@@ -846,33 +1010,100 @@ async fn cmd_deploy(
     println!("  compose_hash  : OK ({})", verified.compose_sha256);
     println!("  os_image_hash : OK ({})", verified.os_image_hash);
 
-    // Step 8: register the image, carrying the node secret so the
-    // registry stores it and serves it to the gateway, and the CVM's
-    // endpoint (the registry requires `endpoint` + `attestation_endpoint`
-    // on every registration). The hashes are already verified against the
-    // registry approval, so POST directly.
-    println!("Registering image with the registry ...");
-    post_register_image(
+    // Step 7b: stamp the Phala `app_id` onto the record *before* the fallible
+    // registration. The secret is already on disk (Step 1b for a fresh
+    // worker, or the prior record on a re-deploy); recording the `app_id` now
+    // means that if the registry POST below fails, `register-image --app-id
+    // <id>` can find this record by `app_id` and recover the secret. `upsert`
+    // keys on `app_name`, so this updates the same record in place.
+    persist_worker_record(
+        cfg.active_network(),
+        WorkerRecord {
+            worker_id: String::new(),
+            app_id: actual.app_id.clone(),
+            app_name: args.app_name.clone(),
+            node_secret: node_secret.clone(),
+        },
+    )?;
+
+    // Step 8: register the worker, carrying its node secret so the registry
+    // stores it and serves it to the gateway, plus the CVM's endpoint. A
+    // first deploy POSTs `/miners/register` (creates the hotkey identity +
+    // worker #1); `worker add` POSTs `/miners/{hotkey}/workers`.
+    println!("Registering worker with the registry ...");
+    let worker_id = register_worker(
         client,
-        &RegisterImageArgs {
+        registration,
+        &WorkerImageArgs {
             compose_hash: &verified.compose_sha256,
             os_image_hash: &verified.os_image_hash,
             endpoint: &actual.endpoint,
             node_secret: Some(&node_secret),
         },
     )
-    .await
+    .await?;
+
+    // Step 9: stamp the registry's `worker_id` and the Phala `app_id` onto
+    // the record. `upsert` keys on `app_name`, so this replaces whatever was
+    // there — a fresh secret persisted before deploy, or the prior record on
+    // a re-deploy — in place; now `worker list`/`remove` can map it back to
+    // the Phala app_id.
+    persist_worker_record(
+        cfg.active_network(),
+        WorkerRecord {
+            worker_id: worker_id.clone(),
+            app_id: actual.app_id.clone(),
+            app_name: args.app_name.clone(),
+            node_secret,
+        },
+    )?;
+
+    println!("  worker_id : {worker_id}");
+    println!("  app_id    : {}", actual.app_id);
+    Ok(())
 }
 
-/// Resolve the miner's node secret for `network`: reuse the value
-/// persisted in the CLI config, or generate a fresh one and persist it
-/// on the first deploy.
-fn resolve_node_secret(network: &str) -> Result<String> {
-    let (secret, freshly_generated) = node_secret::resolve_persisted(network)?;
-    if freshly_generated {
-        println!("Generated a node secret and saved it to the gm-miner config.");
+/// Register a freshly-deployed worker and return its registry `worker_id`.
+///
+/// `First` creates the hotkey identity + worker #1 via `/miners/register`;
+/// `Add` looks up the caller's hotkey (`GET /miners/me`) and attaches the
+/// worker via `POST /miners/{hotkey}/workers`.
+async fn register_worker(
+    client: &mut RegistryClient,
+    registration: &WorkerRegistration,
+    args: &WorkerImageArgs<'_>,
+) -> Result<String> {
+    match registration {
+        WorkerRegistration::First => post_register_image(client, args).await,
+        WorkerRegistration::Add { hotkey } => post_add_worker(client, hotkey, args).await,
     }
-    Ok(secret)
+}
+
+/// Upsert `record` into the active network's workers and save the config.
+fn persist_worker_record(network: &str, record: WorkerRecord) -> Result<()> {
+    let mut cfg = config::load().context("load gm-miner config")?;
+    cfg.active_network = Some(network.to_owned());
+    cfg.active_entry_mut().upsert_worker(record);
+    config::save(&cfg).context("persist worker record to gm-miner config")
+}
+
+/// Fetch the calling miner's hotkey from `GET /miners/me`.
+async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
+    let resp = client
+        .get(gm_miner_cli::client::ME_PATH)
+        .await
+        .context("GET /miners/me")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!(
+            "could not determine your hotkey from {} ({status}): {body}; \
+             run `gm-miner deploy` first to register your hotkey",
+            gm_miner_cli::client::ME_PATH
+        );
+    }
+    let miner: MinerStatus = resp.json().await.context("parse /miners/me response")?;
+    Ok(miner.hotkey)
 }
 
 async fn cmd_login(
@@ -915,21 +1146,57 @@ async fn cmd_login(
     Ok(())
 }
 
-/// `gm-miner register-image` — re-register the deployed miner's image with
-/// the registry without a full redeploy.
+/// `gm-miner register-image` — re-register an already-deployed worker's
+/// image with the registry without a full redeploy.
 ///
-/// Auto-discovers the deployed `compose_hash` + `os_image_hash` + public
-/// endpoint by reading `phala cvms get <app-id> --json` (the same CVM-
-/// detail read `gm-miner deploy` performs), then POSTs them — and the
-/// persisted node secret — to `/miners/register`.
-///
-/// Fails with an actionable error if the CVM is not deployed or its
-/// measured hashes / endpoint are not yet populated.
-async fn cmd_register_image(
-    client: &mut RegistryClient,
-    app_id: &str,
-    node_secret: Option<&str>,
-) -> Result<()> {
+/// Reuses the per-worker node secret persisted under the matching
+/// `app_id`, auto-discovers the deployed compose/os-image hashes and the
+/// public endpoint via `phala cvms get <app-id> --json`, re-registers
+/// worker #1 (`POST /miners/register`), then refreshes the worker record
+/// with the returned `worker_id`.
+async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> {
+    // register-image re-registers worker #1 via `POST /miners/register`
+    // (which refreshes the miner's oldest worker). The CLI's first worker
+    // record is worker #1, so a tracked CVM that is *not* that record is a
+    // worker-add worker; routing it through `/miners/register` would
+    // overwrite worker #1's endpoint/secret and corrupt the local mapping.
+    // Reject it and point the operator at `worker add` instead.
+    //
+    // Reuse the locally-tracked worker record for this CVM: its secret keeps
+    // the registry's stored copy in sync with what the deployed envoy
+    // enforces, and its `app_name` preserves the operator's original
+    // `--app-name`. A worker not tracked locally has neither — the registry
+    // then leaves any stored secret untouched.
+    let (node_secret, existing_app_name) = {
+        let entry = cfg.active_network_entry();
+        let tracked = entry.and_then(|n| n.worker_by_app_id(app_id));
+        if let Some(tracked) =
+            tracked.filter(|_| entry.and_then(|n| n.is_primary_worker(app_id)) == Some(false))
+        {
+            bail!(
+                "CVM '{app_id}' is a secondary worker (worker_id {}); \
+                 `register-image` only re-registers worker #1. To replace it, \
+                 `gm-miner worker remove {}` then `gm-miner worker add \
+                 --app-name {}`.",
+                tracked.worker_id,
+                tracked.worker_id,
+                tracked.app_name
+            );
+        }
+        // A tracked CVM re-sends its recorded secret. An untracked CVM on a
+        // pre-multi-worker config falls back to the legacy network-level
+        // secret so a resync still restores what envoy enforces; otherwise
+        // the registry leaves its stored secret untouched.
+        let node_secret = tracked.map(|w| w.node_secret.clone()).or_else(|| {
+            entry
+                .and_then(config::NetworkEntry::legacy_node_secret)
+                .map(str::to_owned)
+        });
+        (node_secret, tracked.map(|w| w.app_name.clone()))
+    };
+    let network = cfg.active_network().to_owned();
+    let mut client = RegistryClient::new(cfg);
+
     preflight_phala_cli()?;
 
     let out = std::process::Command::new("phala")
@@ -944,7 +1211,7 @@ async fn cmd_register_image(
     }
 
     let hashes = parse_phala_cvm_detail(out.status.success(), &out.stdout)
-        .context("read deployed miner hashes from phala cvms get")?
+        .context("read deployed worker hashes from phala cvms get")?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no measured hashes for CVM '{app_id}' \
@@ -960,7 +1227,7 @@ async fn cmd_register_image(
     // the registered URL is the one on which the miner's RA-TLS
     // certificate is actually presented.
     let endpoint = parse_phala_cvm_endpoint(out.status.success(), &out.stdout)
-        .context("read deployed miner endpoint from phala cvms get")?
+        .context("read deployed worker endpoint from phala cvms get")?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no public endpoint for CVM '{app_id}' \
@@ -972,40 +1239,68 @@ async fn cmd_register_image(
     let endpoint = to_ratls_passthrough_endpoint(&endpoint)
         .context("derive the RA-TLS passthrough endpoint for registration")?;
 
-    // Normalize before POST: `phala cvms get` may report a `sha256:`-prefixed
-    // hash, but the registry's `/miners/register` only accepts bare lowercase
-    // hex.
-    post_register_image(
-        client,
-        &RegisterImageArgs {
-            compose_hash: &normalize_hash(&hashes.compose_sha256),
-            os_image_hash: &normalize_hash(&hashes.os_image_hash),
+    // A register-image with no tracked secret re-registers worker #1 in
+    // place and leaves the registry's stored secret untouched (omitted from
+    // the body); a known secret is re-sent. The registry's
+    // `/miners/register` only accepts bare lowercase hex hashes, so
+    // normalize before POST.
+    let compose_hash = normalize_hash(&hashes.compose_sha256);
+    let os_image_hash = normalize_hash(&hashes.os_image_hash);
+    let worker_id = post_register_image(
+        &mut client,
+        &WorkerImageArgs {
+            compose_hash: &compose_hash,
+            os_image_hash: &os_image_hash,
             endpoint: &endpoint,
-            node_secret,
+            node_secret: node_secret.as_deref(),
         },
     )
-    .await
+    .await?;
+
+    // Refresh the worker record in place under the same `app_name` a later
+    // `deploy` would pass, so the records reconcile instead of duplicating.
+    // Prefer the locally-tracked name (the original `--app-name`); for a
+    // legacy/untracked config fall back to the CVM's own `name` from `phala
+    // cvms get`, and only as a last resort to the `app_id`.
+    let cvm_name = parse_phala_cvm_name(out.status.success(), &out.stdout)
+        .context("read deployed worker name from phala cvms get")?;
+    let app_name = existing_app_name
+        .or(cvm_name)
+        .unwrap_or_else(|| app_id.to_owned());
+    if let Some(secret) = node_secret {
+        persist_worker_record(
+            &network,
+            WorkerRecord {
+                worker_id: worker_id.clone(),
+                app_id: app_id.to_owned(),
+                app_name,
+                node_secret: secret,
+            },
+        )?;
+    }
+
+    println!("  worker_id : {worker_id}");
+    Ok(())
 }
 
-/// Fields sent to the registry's `/miners/register` endpoint.
-struct RegisterImageArgs<'a> {
+/// Fields the registry needs to register or attach a worker.
+struct WorkerImageArgs<'a> {
     compose_hash: &'a str,
     os_image_hash: &'a str,
-    /// The miner's public envoy endpoint. The registry requires this.
+    /// The worker's public envoy endpoint. The registry requires this.
     endpoint: &'a str,
-    /// The miner's node secret, or `None` for a miner predating
-    /// node-secret auth.
+    /// The worker's `x-gm-node-key` secret, or `None` to omit it so the
+    /// registry leaves any stored value untouched (a `register-image` for
+    /// a worker whose secret the CLI does not track locally).
     node_secret: Option<&'a str>,
 }
 
-/// POST verified compose + OS image hashes to `/miners/register`.
-///
-/// Shared by `cmd_register_image` (auto-discovered hashes) and `cmd_deploy`
-/// (hashes already verified against the registry approval).
+/// POST verified compose + OS image hashes to `/miners/register` (worker #1)
+/// and return the registry's `worker_id`.
 async fn post_register_image(
     client: &mut RegistryClient,
-    args: &RegisterImageArgs<'_>,
-) -> Result<()> {
+    args: &WorkerImageArgs<'_>,
+) -> Result<String> {
     // The registry requires both `endpoint` and `attestation_endpoint` as
     // non-empty strings. `attestation_endpoint` is reserved for future
     // attested-channel work and not yet consumed by the registry, so the
@@ -1016,9 +1311,9 @@ async fn post_register_image(
         "endpoint": args.endpoint,
         "attestation_endpoint": args.endpoint,
     });
-    // Include the node secret so the registry stores it and serves it to
-    // the gateway (Mechanism 1 of attestation-and-identity.md). Omitted
-    // when the miner has no secret — a miner predating node-secret auth.
+    // A present secret is stored and served to the gateway (Mechanism 1 of
+    // attestation-and-identity.md). `None` omits the field so the registry
+    // leaves any stored value untouched.
     if let Some(secret) = args.node_secret {
         body["node_secret"] = serde_json::Value::String(secret.to_owned());
     }
@@ -1032,19 +1327,149 @@ async fn post_register_image(
     let json: serde_json::Value = resp.json().await.context("parse register response")?;
 
     if !status.is_success() {
-        bail!("register-image failed ({status}): {}", error_detail(&json));
+        bail!("register failed ({status}): {}", error_detail(&json));
     }
 
-    println!("Image registered.");
-    if let Some(id) = json.get("miner_id").and_then(|v| v.as_str()) {
-        println!("  Miner ID : {id}");
-    }
+    let worker_id = json
+        .get("worker_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("register response missing worker_id: {json}"))?
+        .to_owned();
+
+    println!("Worker registered.");
     if let Some(s) = json.get("status").and_then(|v| v.as_str()) {
-        println!("  Status   : {s}");
+        println!("  status    : {s}");
     }
-    println!("  Compose  : {}", args.compose_hash);
-    println!("  OS image : {}", args.os_image_hash);
-    println!("  Endpoint : {}", args.endpoint);
+    println!("  compose   : {}", args.compose_hash);
+    println!("  os image  : {}", args.os_image_hash);
+    println!("  endpoint  : {}", args.endpoint);
+    Ok(worker_id)
+}
+
+/// POST a worker to `POST /miners/{hotkey}/workers` and return its
+/// registry `worker_id`. Used by `gm-miner worker add`.
+async fn post_add_worker(
+    client: &mut RegistryClient,
+    hotkey: &str,
+    args: &WorkerImageArgs<'_>,
+) -> Result<String> {
+    let body = serde_json::to_value(WorkerCreateRequest {
+        endpoint: args.endpoint,
+        // `attestation_endpoint` is reserved for future attested-channel
+        // work; send the envoy endpoint as a placeholder, matching the
+        // first-worker registration.
+        attestation_endpoint: args.endpoint,
+        compose_hash: args.compose_hash,
+        os_image_hash: args.os_image_hash,
+        node_secret: args.node_secret,
+    })
+    .context("serialize worker-add body")?;
+
+    let path = format!("/miners/{hotkey}/workers");
+    let resp = client
+        .post(&path, &body)
+        .await
+        .with_context(|| format!("POST {path}"))?;
+
+    let status = resp.status();
+    let json: serde_json::Value = resp.json().await.context("parse worker-add response")?;
+
+    if !status.is_success() {
+        bail!("worker add failed ({status}): {}", error_detail(&json));
+    }
+
+    let created: WorkerCreateResponse =
+        serde_json::from_value(json).context("parse worker-add response shape")?;
+
+    println!("Worker added.");
+    println!("  status    : {}", created.status);
+    println!("  hotkey    : {}", created.miner_hotkey);
+    println!("  compose   : {}", args.compose_hash);
+    println!("  os image  : {}", args.os_image_hash);
+    println!("  endpoint  : {}", args.endpoint);
+    Ok(created.worker_id)
+}
+
+/// `gm-miner worker list` — pretty-print the hotkey's live workers.
+async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
+    let hotkey = fetch_hotkey(client).await?;
+    let path = format!("/miners/{hotkey}/workers");
+    let resp = client
+        .get(&path)
+        .await
+        .with_context(|| format!("GET {path}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("worker list failed ({status}): {body}");
+    }
+    let list: WorkerListResponse = resp.json().await.context("parse worker list response")?;
+
+    if list.workers.is_empty() {
+        println!("No workers attached to {hotkey}.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<28} {:<14} {:<24} ENDPOINT",
+        "WORKER_ID", "STATUS", "LAST ATTESTATION"
+    );
+    println!("{}", "-".repeat(110));
+    for w in &list.workers {
+        println!(
+            "{:<28} {:<14} {:<24} {}",
+            w.worker_id,
+            w.status,
+            w.last_attestation_at.as_deref().unwrap_or("never"),
+            w.endpoint,
+        );
+    }
+    println!("\n{} worker(s) total.", list.workers.len());
+    Ok(())
+}
+
+/// `gm-miner worker remove <worker_id>` — deregister a worker from the
+/// registry and remind the operator to tear down the Phala CVM separately.
+async fn cmd_worker_remove(cfg: Config, worker_id: &str) -> Result<()> {
+    let network = cfg.active_network().to_owned();
+    // Resolve the local app_id (if tracked) before any network call so the
+    // operator gets the exact `phala cvms delete` target to run.
+    let app_id = cfg
+        .active_network_entry()
+        .and_then(|n| n.worker_by_id(worker_id))
+        .map(|w| w.app_id.clone());
+
+    let mut client = RegistryClient::new(cfg);
+    let hotkey = fetch_hotkey(&mut client).await?;
+    let path = format!("/miners/{hotkey}/workers/{worker_id}");
+    let resp = client
+        .delete(&path)
+        .await
+        .with_context(|| format!("DELETE {path}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("worker remove failed ({status}): {body}");
+    }
+
+    // Drop the local record so `worker list`/re-deploy don't reference a
+    // deregistered worker.
+    let mut cfg = config::load().context("load gm-miner config")?;
+    cfg.active_network = Some(network);
+    cfg.active_entry_mut().remove_worker_by_id(worker_id);
+    config::save(&cfg).context("persist worker removal to gm-miner config")?;
+
+    println!("Worker {worker_id} deregistered from the registry.");
+    let reminder = match app_id {
+        Some(app_id) => {
+            format!("Now tear down the Phala CVM separately:\n  phala cvms delete {app_id}")
+        }
+        None => "Now tear down the corresponding Phala CVM separately with \
+             `phala cvms delete <app_id>` (its app_id was not tracked locally)."
+            .to_owned(),
+    };
+    println!("{reminder}");
     Ok(())
 }
 
@@ -1352,12 +1777,14 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "tests intentionally panic on unexpected values"
 )]
 mod tests {
     use super::{
         effective_per_mtok_ndollars, effective_rate_summary, filter_catalog, format_discount_pct,
-        format_per_mtok_usd, parse_discount_pct, Cli, Command, Product, Provider, MAX_DISCOUNT_BP,
+        format_per_mtok_usd, parse_discount_pct, Cli, Command, Product, Provider, WorkerCommand,
+        MAX_DISCOUNT_BP,
     };
     use gm_miner_cli::types::{RetailDimensions, RetailPrice};
 
@@ -1373,6 +1800,187 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn worker_add_rejects_a_duplicate_app_name_before_any_deploy() {
+        use super::{cmd_worker_add, DeployArgs};
+        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                workers: vec![WorkerRecord {
+                    worker_id: "01J0A".to_owned(),
+                    app_id: "app_01J0A".to_owned(),
+                    app_name: "gm-miner-1".to_owned(),
+                    node_secret: "secret".to_owned(),
+                }],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+
+        // --app-name gm-miner-1 already exists; the guard must bail before
+        // any CVM work. No network mock is wired, so a network call would
+        // surface as a different error than the one asserted here.
+        let args = DeployArgs {
+            app_name: "gm-miner-1".to_owned(),
+            image_ref: None,
+            project_dir: std::path::PathBuf::from("dist/gm-miner-1"),
+            image_repo: None,
+            image_tag: "v0.1.0".to_owned(),
+            instance_type: "tdx.medium".to_owned(),
+            disk_size: "40G".to_owned(),
+            os_image: "dstack-0.5.7".to_owned(),
+            repo_root: None,
+            version: None,
+            boot_timeout_secs: 300,
+        };
+
+        let err = cmd_worker_add(cfg, args)
+            .await
+            .expect_err("a duplicate app name must be rejected up front");
+        assert!(
+            err.to_string().contains("already registered"),
+            "error must name the duplicate; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_add_allows_retrying_a_provisional_app_name() {
+        use super::{cmd_worker_add, DeployArgs};
+        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+
+        // A provisional record (empty worker_id) is a deploy that never
+        // finished registration. Re-running `worker add` with that name must
+        // get past the dedup guard rather than dead-end on "already
+        // registered" — so it fails later (here: no provider keys / network),
+        // not on the guard.
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                workers: vec![WorkerRecord {
+                    worker_id: String::new(),
+                    app_id: String::new(),
+                    app_name: "gm-miner-2".to_owned(),
+                    node_secret: "provisional".to_owned(),
+                }],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+        let args = DeployArgs {
+            app_name: "gm-miner-2".to_owned(),
+            image_ref: None,
+            project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
+            image_repo: None,
+            image_tag: "v0.1.0".to_owned(),
+            instance_type: "tdx.medium".to_owned(),
+            disk_size: "40G".to_owned(),
+            os_image: "dstack-0.5.7".to_owned(),
+            repo_root: None,
+            version: None,
+            boot_timeout_secs: 300,
+        };
+
+        let err = cmd_worker_add(cfg, args)
+            .await
+            .expect_err("no network is wired, so the retry fails past the guard");
+        assert!(
+            !err.to_string().contains("already registered"),
+            "a provisional record must not block a retry; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_a_secondary_worker_app_name() {
+        use super::{cmd_deploy, DeployArgs, RegistryClient, WorkerRegistration};
+        use gm_miner_cli::config::{Config, NetworkEntry, ProviderKeys, WorkerRecord};
+        use gm_miner_cli::deploy::{DeployOutcome, PhalaClient, RegistryCredentials};
+
+        struct UnusedPhala;
+        impl PhalaClient for UnusedPhala {
+            fn deploy(
+                &self,
+                _compose: &str,
+                _keys: &ProviderKeys,
+                _node_secret: &str,
+                _registry_creds: Option<&RegistryCredentials>,
+                _boot_timeout_secs: u64,
+            ) -> anyhow::Result<DeployOutcome> {
+                anyhow::bail!("the step-0 guard must bail before any CVM work")
+            }
+        }
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                workers: vec![
+                    WorkerRecord {
+                        worker_id: "01J0A".to_owned(),
+                        app_id: "app_01J0A".to_owned(),
+                        app_name: "gm-miner-1".to_owned(),
+                        node_secret: "secret-1".to_owned(),
+                    },
+                    WorkerRecord {
+                        worker_id: "01J0B".to_owned(),
+                        app_id: "app_01J0B".to_owned(),
+                        app_name: "gm-miner-2".to_owned(),
+                        node_secret: "secret-2".to_owned(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+
+        // --app-name gm-miner-2 is a secondary worker; a plain `deploy`
+        // would refresh worker #1 and corrupt the mapping. The step-0 guard
+        // must bail before provider-key checks, auth, or any CVM work.
+        let args = DeployArgs {
+            app_name: "gm-miner-2".to_owned(),
+            image_ref: None,
+            project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
+            image_repo: None,
+            image_tag: "v0.1.0".to_owned(),
+            instance_type: "tdx.medium".to_owned(),
+            disk_size: "40G".to_owned(),
+            os_image: "dstack-0.5.7".to_owned(),
+            repo_root: None,
+            version: None,
+            boot_timeout_secs: 300,
+        };
+
+        let mut client = RegistryClient::new(cfg.clone());
+        let err = cmd_deploy(
+            &cfg,
+            &mut client,
+            &UnusedPhala,
+            &args,
+            &WorkerRegistration::First,
+        )
+        .await
+        .expect_err("a secondary worker app name must be rejected by deploy");
+        assert!(
+            err.to_string().contains("secondary worker"),
+            "error must explain the secondary-worker rejection; got: {err}"
+        );
     }
 
     #[test]
@@ -1583,5 +2191,57 @@ mod tests {
         let kept = filter_catalog(&products, Some(&Provider::OpenAI));
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].provider, Provider::OpenAI);
+    }
+
+    #[test]
+    fn clap_parses_worker_add_with_app_name() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "worker",
+            "add",
+            "--app-name",
+            "gm-miner-2",
+            "--image-ref",
+            "ghcr.io/o/m@sha256:abc",
+        ])
+        .unwrap();
+        let Command::Worker {
+            command: WorkerCommand::Add { flags },
+        } = cli.command
+        else {
+            unreachable!("expected worker add");
+        };
+        assert_eq!(flags.app_name, "gm-miner-2");
+        assert_eq!(flags.image_ref.as_deref(), Some("ghcr.io/o/m@sha256:abc"));
+    }
+
+    #[test]
+    fn clap_parses_worker_list() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["gm-miner", "worker", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Worker {
+                command: WorkerCommand::List
+            }
+        ));
+    }
+
+    #[test]
+    fn clap_parses_worker_remove_with_positional_id() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["gm-miner", "worker", "remove", "01J0C"])
+            .unwrap();
+        let Command::Worker {
+            command: WorkerCommand::Remove { worker_id },
+        } = cli.command
+        else {
+            unreachable!("expected worker remove");
+        };
+        assert_eq!(worker_id, "01J0C");
+    }
+
+    #[test]
+    fn clap_worker_remove_requires_a_worker_id() {
+        let result = <Cli as clap::Parser>::try_parse_from(["gm-miner", "worker", "remove"]);
+        assert!(result.is_err(), "worker remove must require a worker_id");
     }
 }

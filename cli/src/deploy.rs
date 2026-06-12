@@ -89,6 +89,11 @@ pub struct DeployOutcome {
     /// with the registry so the gateway connects to the URL on which
     /// the miner's RA-TLS certificate is actually presented.
     pub endpoint: String,
+    /// The Phala Cloud `app_id` of the deployed CVM, read from the
+    /// CVM-detail document. Persisted in the worker's `WorkerRecord` so
+    /// `worker remove` can tell the operator which CVM to `phala cvms
+    /// delete`.
+    pub app_id: String,
 }
 
 /// Abstraction over the `phala` CLI, injectable for tests.
@@ -310,6 +315,8 @@ impl RealPhalaClient {
 /// endpoint is `endpoints[0].app`. All three are read here.
 #[derive(Debug, Deserialize)]
 struct PhalaCvmDetail {
+    app_id: Option<String>,
+    name: Option<String>,
     compose_hash: Option<String>,
     os: Option<PhalaCvmOs>,
     #[serde(default)]
@@ -342,6 +349,52 @@ pub const PHALA_COMPOSE_HASH_FIELD: &str = "compose_hash";
 pub const PHALA_OS_IMAGE_HASH_FIELD: &str = "os.os_image_hash";
 /// See [`PHALA_COMPOSE_HASH_FIELD`]; the miner endpoint field path.
 pub const PHALA_ENDPOINT_FIELD: &str = "endpoints[0].app";
+/// See [`PHALA_COMPOSE_HASH_FIELD`]; the Phala Cloud `app_id` field path.
+pub const PHALA_APP_ID_FIELD: &str = "app_id";
+
+/// Parse the CVM's Phala Cloud `app_id` out of `phala cvms get <app-id>
+/// --json` output.
+///
+/// `succeeded` is the command's exit status; `stdout` is its raw stdout.
+/// Returns `Ok(Some(..))` only when the command succeeded and `app_id` is
+/// present and non-empty; `Ok(None)` otherwise.
+///
+/// # Errors
+/// Returns an error if `succeeded` is true but `stdout` is not valid
+/// `cvms get --json` JSON.
+pub fn parse_phala_cvm_app_id(succeeded: bool, stdout: &[u8]) -> Result<Option<String>> {
+    if !succeeded {
+        return Ok(None);
+    }
+
+    let detail: PhalaCvmDetail =
+        serde_json::from_slice(stdout).context("parse phala cvms get --json output")?;
+
+    Ok(detail.app_id.filter(|id| !id.is_empty()))
+}
+
+/// Parse the CVM's operator-chosen `name` (the `phala deploy --name` value)
+/// out of `phala cvms get <app-id> --json` output.
+///
+/// `succeeded` is the command's exit status; `stdout` is its raw stdout.
+/// Returns `Ok(Some(..))` only when the command succeeded and `name` is
+/// present and non-empty; `Ok(None)` otherwise. `register-image` uses this
+/// to record the worker under the same `app_name` a later `deploy` would
+/// pass, so the records reconcile instead of duplicating.
+///
+/// # Errors
+/// Returns an error if `succeeded` is true but `stdout` is not valid
+/// `cvms get --json` JSON.
+pub fn parse_phala_cvm_name(succeeded: bool, stdout: &[u8]) -> Result<Option<String>> {
+    if !succeeded {
+        return Ok(None);
+    }
+
+    let detail: PhalaCvmDetail =
+        serde_json::from_slice(stdout).context("parse phala cvms get --json output")?;
+
+    Ok(detail.name.filter(|name| !name.is_empty()))
+}
 
 /// Parse the miner's public endpoint out of `phala cvms get <app-id>
 /// --json` output.
@@ -561,11 +614,18 @@ fn read_phala_cvm_outcome(cvm_id: &str) -> Result<Option<DeployOutcome>> {
     let Some(endpoint) = parse_phala_cvm_endpoint(succeeded, &out.stdout)? else {
         return Ok(None);
     };
+    let Some(app_id) = parse_phala_cvm_app_id(succeeded, &out.stdout)? else {
+        return Ok(None);
+    };
     // Register the TLS-passthrough form: the miner's RA-TLS cert is only
     // presented to callers on the dstack `s`-suffix URL (see
     // `to_ratls_passthrough_endpoint`).
     let endpoint = to_ratls_passthrough_endpoint(&endpoint)?;
-    Ok(Some(DeployOutcome { hashes, endpoint }))
+    Ok(Some(DeployOutcome {
+        hashes,
+        endpoint,
+        app_id,
+    }))
 }
 
 impl PhalaClient for RealPhalaClient {
@@ -1494,6 +1554,63 @@ mod tests {
     #[test]
     fn parse_phala_cvm_endpoint_invalid_json_errors() {
         assert!(parse_phala_cvm_endpoint(true, b"not json").is_err());
+    }
+
+    // ── phala cvms get app_id parsing ─────────────────────────────────────────
+
+    #[test]
+    fn parse_phala_cvm_app_id_reads_top_level_field() {
+        let stdout = br#"{"app_id":"app_abc","compose_hash":"sha256:aaa"}"#;
+        let app_id = parse_phala_cvm_app_id(true, stdout)
+            .expect("must parse")
+            .expect("app_id present");
+        assert_eq!(app_id, "app_abc");
+    }
+
+    #[test]
+    fn parse_phala_cvm_app_id_non_zero_exit_is_none() {
+        let app_id =
+            parse_phala_cvm_app_id(false, b"garbage").expect("non-zero exit must not error");
+        assert!(app_id.is_none());
+    }
+
+    #[test]
+    fn parse_phala_cvm_app_id_missing_is_none() {
+        let stdout = br#"{"compose_hash":"sha256:aaa"}"#;
+        let app_id = parse_phala_cvm_app_id(true, stdout).expect("must parse");
+        assert!(app_id.is_none(), "absent app_id must yield None");
+    }
+
+    #[test]
+    fn parse_phala_cvm_app_id_empty_is_none() {
+        let stdout = br#"{"app_id":""}"#;
+        let app_id = parse_phala_cvm_app_id(true, stdout).expect("must parse");
+        assert!(app_id.is_none(), "empty app_id must yield None");
+    }
+
+    #[test]
+    fn parse_phala_cvm_name_reads_top_level_field() {
+        let stdout = br#"{"app_id":"app_abc","name":"gm-miner-1"}"#;
+        let name = parse_phala_cvm_name(true, stdout)
+            .expect("must parse")
+            .expect("name present");
+        assert_eq!(name, "gm-miner-1");
+    }
+
+    #[test]
+    fn parse_phala_cvm_name_missing_or_empty_is_none() {
+        assert!(parse_phala_cvm_name(true, br#"{"app_id":"app_abc"}"#)
+            .expect("must parse")
+            .is_none());
+        assert!(parse_phala_cvm_name(true, br#"{"name":""}"#)
+            .expect("must parse")
+            .is_none());
+    }
+
+    #[test]
+    fn parse_phala_cvm_name_non_zero_exit_is_none() {
+        let name = parse_phala_cvm_name(false, b"garbage").expect("non-zero exit must not error");
+        assert!(name.is_none());
     }
 
     // ── phala cvms get detail parsing ─────────────────────────────────────────

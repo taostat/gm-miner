@@ -159,7 +159,8 @@ fn config_for(server: &MockServer) -> Config {
                 refresh_token: None,
                 token_expires_at: None,
             }),
-            node_secret: None,
+            workers: Vec::new(),
+            legacy_node_secret: None,
         },
     );
 

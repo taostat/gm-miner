@@ -64,6 +64,7 @@ impl PhalaClient for StubPhala {
                 os_image_hash: self.os_image_hash.clone(),
             },
             endpoint: "https://app_x-8080.dstack-prod5.phala.network".to_owned(),
+            app_id: "app_x".to_owned(),
         })
     }
 }

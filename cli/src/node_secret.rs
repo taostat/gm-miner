@@ -53,36 +53,56 @@ fn os_random_bytes() -> Result<[u8; SECRET_BYTES]> {
     anyhow::bail!("node-secret generation requires a Unix host (/dev/urandom)")
 }
 
-/// Resolve the node secret for `network` from the persisted CLI config,
-/// or generate a fresh one and persist it under that network.
+/// Resolve the `x-gm-node-key` secret for the worker named `app_name`.
 ///
-/// The secret is scoped per network (mainnet / testnet) so two
-/// deployments from the same config get distinct values. It must be
-/// stable across re-deploys — what envoy enforces, what the registry
-/// stores, and what the gateway presents all have to agree — so it is
-/// generated exactly once per network. `network` is the resolved active
-/// network name (the caller passes the same value `load_config` uses, so
-/// the secret lands under the network the deploy actually targets).
-/// Returns `(secret, freshly_generated)` so the caller can report which
-/// path ran.
+/// Each worker (Phala CVM) carries its own secret — never shared with a
+/// sibling, so a leaked secret burns only one worker. A re-deploy of an
+/// existing worker must reuse the exact same value (what envoy enforces,
+/// what the registry stores, and what the gateway presents all have to
+/// agree), so the secret stored in that worker's [`WorkerRecord`] is
+/// returned verbatim. A worker with no record yet (a first deploy or
+/// `worker add`) gets a freshly generated secret.
+///
+/// `entry` is the active network's config entry; the secret is matched on
+/// `app_name`, the stable local handle for a worker before the registry
+/// assigns its `worker_id`. Returns `(secret, freshly_generated)` so the
+/// caller can report which path ran and persist a fresh secret into a new
+/// [`WorkerRecord`] alongside the `worker_id`/`app_id` the registry and
+/// Phala return.
+///
+/// `allow_legacy` enables the pre-multi-worker fallback: when set and no
+/// `WorkerRecord` matches, the network-level [`legacy_node_secret`] is
+/// reused. Only `gm-miner deploy` (worker #1) sets it — that legacy secret
+/// belongs to worker #1, so a `worker add` must never inherit it.
+///
+/// [`legacy_node_secret`]: config::NetworkEntry::legacy_node_secret
 ///
 /// # Errors
-/// Returns an error if the config cannot be loaded, the OS random source
-/// cannot be read, or the config cannot be saved.
-pub fn resolve_persisted(network: &str) -> Result<(String, bool)> {
-    let mut cfg = config::load().context("load gm-miner config")?;
-    cfg.active_network = Some(network.to_owned());
-    if let Some(existing) = cfg
-        .active_network_entry()
-        .and_then(|n| n.node_secret.as_deref())
+/// Returns an error if a fresh secret is needed but the OS random source
+/// cannot be read.
+pub fn for_worker(
+    entry: Option<&config::NetworkEntry>,
+    app_name: &str,
+    allow_legacy: bool,
+) -> Result<(String, bool)> {
+    if let Some(existing) = entry
+        .and_then(|e| e.worker_by_app_name(app_name))
+        .map(|w| w.node_secret.as_str())
     {
         if !existing.trim().is_empty() {
             return Ok((existing.to_owned(), false));
         }
     }
+    // A pre-multi-worker config stored its single secret at the network
+    // level with no `WorkerRecord`. Re-deploying that worker #1 must reuse
+    // it so the registry's stored secret stays in lockstep with what the
+    // running envoy enforces — but a `worker add` must never inherit it.
+    if allow_legacy {
+        if let Some(legacy) = entry.and_then(config::NetworkEntry::legacy_node_secret) {
+            return Ok((legacy.to_owned(), false));
+        }
+    }
     let secret = generate().context("generate node secret")?;
-    cfg.active_entry_mut().node_secret = Some(secret.clone());
-    config::save(&cfg).context("persist node secret to gm-miner config")?;
     Ok((secret, true))
 }
 
@@ -93,6 +113,7 @@ pub fn resolve_persisted(network: &str) -> Result<(String, bool)> {
 )]
 mod tests {
     use super::*;
+    use crate::config::{NetworkEntry, WorkerRecord};
 
     #[test]
     fn generate_produces_64_hex_chars() {
@@ -109,5 +130,105 @@ mod tests {
         let a = generate().expect("first secret");
         let b = generate().expect("second secret");
         assert_ne!(a, b);
+    }
+
+    fn entry_with(workers: Vec<WorkerRecord>) -> NetworkEntry {
+        NetworkEntry {
+            workers,
+            ..Default::default()
+        }
+    }
+
+    fn worker(app_name: &str, secret: &str) -> WorkerRecord {
+        WorkerRecord {
+            worker_id: format!("id-{app_name}"),
+            app_id: format!("app-{app_name}"),
+            app_name: app_name.to_owned(),
+            node_secret: secret.to_owned(),
+        }
+    }
+
+    #[test]
+    fn for_worker_reuses_an_existing_workers_secret() {
+        let entry = entry_with(vec![worker("gm-miner-1", "stable-secret")]);
+        let (secret, fresh) =
+            for_worker(Some(&entry), "gm-miner-1", false).expect("resolve existing worker secret");
+        assert_eq!(secret, "stable-secret");
+        assert!(!fresh, "an existing worker must not be re-keyed");
+    }
+
+    #[test]
+    fn for_worker_generates_a_fresh_secret_for_a_new_worker() {
+        let entry = entry_with(vec![worker("gm-miner-1", "secret-1")]);
+        let (secret, fresh) =
+            for_worker(Some(&entry), "gm-miner-2", false).expect("generate fresh worker secret");
+        assert!(fresh, "a brand-new worker must get a fresh secret");
+        assert_eq!(secret.len(), SECRET_BYTES * 2);
+        assert_ne!(
+            secret, "secret-1",
+            "a new worker's secret must not be shared with a sibling"
+        );
+    }
+
+    #[test]
+    fn for_worker_yields_distinct_secrets_per_worker() {
+        // Two new workers (no record yet) must get independent secrets —
+        // a per-worker secret is never shared across workers.
+        let entry = entry_with(Vec::new());
+        let (a, _) = for_worker(Some(&entry), "gm-miner-1", false).expect("first new worker");
+        let (b, _) = for_worker(Some(&entry), "gm-miner-2", false).expect("second new worker");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn for_worker_with_no_entry_generates_fresh() {
+        let (secret, fresh) = for_worker(None, "gm-miner-1", true).expect("no config entry yet");
+        assert!(fresh);
+        assert_eq!(secret.len(), SECRET_BYTES * 2);
+    }
+
+    #[test]
+    fn for_worker_reuses_a_legacy_network_secret_for_worker_one() {
+        // A pre-multi-worker config with no WorkerRecord must reuse the
+        // legacy network-level secret on a worker #1 re-deploy
+        // (`allow_legacy`), keeping the registry and envoy in lockstep.
+        let entry = NetworkEntry {
+            legacy_node_secret: Some("legacy-key".to_owned()),
+            ..Default::default()
+        };
+        let (secret, fresh) =
+            for_worker(Some(&entry), "gm-miner-1", true).expect("reuse legacy secret");
+        assert_eq!(secret, "legacy-key");
+        assert!(!fresh, "a legacy worker #1 must not be re-keyed");
+    }
+
+    #[test]
+    fn for_worker_never_inherits_legacy_secret_on_worker_add() {
+        // A `worker add` (allow_legacy = false) must mint its own secret —
+        // inheriting worker #1's legacy secret would share a credential.
+        let entry = NetworkEntry {
+            legacy_node_secret: Some("legacy-key".to_owned()),
+            ..Default::default()
+        };
+        let (secret, fresh) =
+            for_worker(Some(&entry), "gm-miner-2", false).expect("fresh secret for added worker");
+        assert!(fresh);
+        assert_ne!(secret, "legacy-key");
+    }
+
+    #[test]
+    fn for_worker_ignores_legacy_secret_once_a_record_exists() {
+        // Once a WorkerRecord exists the legacy value is dead — a new worker
+        // must get its own fresh secret, never the legacy one.
+        let entry = NetworkEntry {
+            workers: vec![worker("gm-miner-1", "record-secret")],
+            legacy_node_secret: Some("legacy-key".to_owned()),
+            ..Default::default()
+        };
+        let (secret, fresh) =
+            for_worker(Some(&entry), "gm-miner-2", true).expect("fresh secret for new worker");
+        assert!(fresh);
+        assert_ne!(secret, "legacy-key");
+        assert_ne!(secret, "record-secret");
     }
 }

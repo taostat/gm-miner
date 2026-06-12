@@ -152,6 +152,32 @@ impl RegistryClient {
         Ok(resp)
     }
 
+    /// Issue an authenticated DELETE request to the registry.
+    ///
+    /// # Errors
+    /// Returns an error if the access token is missing, the request fails,
+    /// or the server returns 401.
+    pub async fn delete(&mut self, path: &str) -> Result<Response> {
+        let url = format!("{}{path}", self.api_url());
+        let token = self
+            .access_token()
+            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gm-miner login` first"))?
+            .to_owned();
+
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .with_context(|| format!("DELETE {url}"))?;
+
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            bail!("authentication expired — run `gm-miner login` again");
+        }
+        Ok(resp)
+    }
+
     /// Cheap authenticated probe used by `gm-miner deploy` before any
     /// expensive CVM work. A missing access token surfaces as "not logged
     /// in" and a 401 response surfaces as "authentication expired" — both
