@@ -143,7 +143,7 @@ fn missing_endpoint_yields_none() {
 
 /// `register-image` builds its "deploy first" error from the app id.
 /// Replicates that construction (the actual `.ok_or_else` closure lives in
-/// the binary crate's `cmd_register_image`).
+/// the binary crate's `cmd_register_image_subcommand`).
 #[test]
 fn not_deployed_error_is_actionable() {
     let app_id = "app_abc123";

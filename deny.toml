@@ -7,6 +7,11 @@ yanked = "deny"
 # dependency upstream; the gm gateway repo carries the same ignore.
 ignore = [
     "RUSTSEC-2024-0436",  # paste crate unmaintained (transitive via dstack-sdk)
+    # proc-macro-error2 is unmaintained but carries no known vulnerability.
+    # It enters the tree transitively via dstack-sdk -> alloy -> the
+    # alloy-sol-macro proc-macro chain. No fix to adopt until alloy drops
+    # the dependency upstream; the gm gateway repo carries the same ignore.
+    "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained (transitive via dstack-sdk)
 ]
 
 [licenses]
