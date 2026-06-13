@@ -145,6 +145,7 @@ mod tests {
             app_id: format!("app-{app_name}"),
             app_name: app_name.to_owned(),
             node_secret: secret.to_owned(),
+            ..Default::default()
         }
     }
 
