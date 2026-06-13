@@ -944,6 +944,16 @@ fn reject_secondary_worker_deploy(
     Ok(())
 }
 
+/// The registry `worker_id` of the record already tracked under `app_name`,
+/// or empty if none. A redeploy carries this through its provisional stubs so
+/// a mid-deploy failure can't erase a still-registered worker's id.
+fn existing_worker_id_for(cfg: &Config, app_name: &str) -> String {
+    cfg.active_network_entry()
+        .and_then(|e| e.worker_by_app_name(app_name))
+        .map(|w| w.worker_id.clone())
+        .unwrap_or_default()
+}
+
 async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
@@ -979,6 +989,12 @@ async fn cmd_deploy(
     // registration paths even before it has a worker_id; tag it so the
     // primary/secondary classifiers can tell it from a worker-#1 stub.
     let provisional_secondary = !is_first;
+    // Redeploying a worker already registered under this `--app-name` keeps
+    // its registry `worker_id`: the upcoming registration returns the same id.
+    // Carrying it into the pre-registration stubs means a deploy that fails
+    // after the CVM exists does not erase the worker_id — `worker remove` can
+    // still issue the registry DELETE for the still-registered worker.
+    let existing_worker_id = existing_worker_id_for(cfg, &args.app_name);
     let (node_secret, freshly_generated) =
         node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
     if freshly_generated {
@@ -995,7 +1011,7 @@ async fn cmd_deploy(
         persist_worker_record(
             cfg.active_network(),
             WorkerRecord {
-                worker_id: String::new(),
+                worker_id: existing_worker_id.clone(),
                 app_id: String::new(),
                 app_name: args.app_name.clone(),
                 node_secret: node_secret.clone(),
@@ -1064,12 +1080,13 @@ async fn cmd_deploy(
     // record on a re-deploy); recording the `app_id` now means that whatever
     // fails next — a hash mismatch or the registry POST — `worker remove` can
     // name the orphaned CVM and `register-image --app-id <id>` can recover the
-    // secret. `upsert` keys on `app_name`, so this updates the same record in
-    // place.
+    // secret. A redeploy carries the existing `worker_id` so a mid-deploy
+    // failure does not erase a still-registered worker's id. `upsert` keys on
+    // `app_name`, so this updates the same record in place.
     persist_worker_record(
         cfg.active_network(),
         WorkerRecord {
-            worker_id: String::new(),
+            worker_id: existing_worker_id.clone(),
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
             node_secret: node_secret.clone(),
@@ -2169,6 +2186,37 @@ mod tests {
             msg.contains("app_orphan") && msg.contains("phala cvms delete"),
             "must name the orphaned CVM and how to tear it down; got: {msg}"
         );
+    }
+
+    #[test]
+    fn existing_worker_id_carries_through_a_redeploy_stub() {
+        use super::existing_worker_id_for;
+        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                workers: vec![WorkerRecord {
+                    worker_id: "01J0A".to_owned(),
+                    app_id: "app_01J0A".to_owned(),
+                    app_name: "gm-miner-1".to_owned(),
+                    node_secret: "s".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+        // A redeploy of a registered worker carries its worker_id, so a
+        // mid-deploy failure can't erase it.
+        assert_eq!(existing_worker_id_for(&cfg, "gm-miner-1"), "01J0A");
+        // A brand-new worker has no id to carry.
+        assert_eq!(existing_worker_id_for(&cfg, "gm-miner-2"), "");
     }
 
     #[tokio::test]
