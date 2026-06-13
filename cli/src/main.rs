@@ -918,7 +918,7 @@ fn reject_secondary_worker_deploy(
     let is_secondary = *registration == WorkerRegistration::First
         && cfg
             .active_network_entry()
-            .is_some_and(|e| e.is_registered_secondary_by_app_name(app_name));
+            .is_some_and(|e| e.is_secondary_by_app_name(app_name));
     if is_secondary {
         bail!(
             "'{app_name}' is a secondary worker; `deploy` and `register-image` \
@@ -960,9 +960,13 @@ async fn cmd_deploy(
     // stores all stay in lockstep (Mechanism 1 of attestation-and-identity.md).
     // Only worker #1 (`deploy`) may inherit a pre-multi-worker legacy
     // secret; a `worker add` must always mint its own.
-    let allow_legacy = *registration == WorkerRegistration::First;
+    let is_first = *registration == WorkerRegistration::First;
+    // A provisional stub from a `worker add` must stay off the worker-#1
+    // registration paths even before it has a worker_id; tag it so the
+    // primary/secondary classifiers can tell it from a worker-#1 stub.
+    let provisional_secondary = !is_first;
     let (node_secret, freshly_generated) =
-        node_secret::for_worker(cfg.active_network_entry(), &args.app_name, allow_legacy)?;
+        node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
     if freshly_generated {
         println!(
             "Generated a fresh node secret for worker '{}'.",
@@ -981,6 +985,7 @@ async fn cmd_deploy(
                 app_id: String::new(),
                 app_name: args.app_name.clone(),
                 node_secret: node_secret.clone(),
+                provisional_secondary,
             },
         )?;
     }
@@ -1060,6 +1065,7 @@ async fn cmd_deploy(
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
             node_secret: node_secret.clone(),
+            provisional_secondary,
         },
     )?;
 
@@ -1092,6 +1098,8 @@ async fn cmd_deploy(
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
             node_secret,
+            // Registered: role is read from position, never this flag.
+            provisional_secondary: false,
         },
     )?;
 
@@ -1208,7 +1216,7 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
         let entry = cfg.active_network_entry();
         let tracked = entry.and_then(|n| n.worker_by_app_id(app_id));
         if let Some(tracked) =
-            tracked.filter(|_| entry.is_some_and(|n| n.is_registered_secondary_by_app_id(app_id)))
+            tracked.filter(|_| entry.is_some_and(|n| n.is_secondary_by_app_id(app_id)))
         {
             bail!(
                 "CVM '{app_id}' is a secondary worker (worker_id {}); \
@@ -1312,6 +1320,7 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
                 app_id: app_id.to_owned(),
                 app_name,
                 node_secret: secret,
+                provisional_secondary: false,
             },
         )?;
     }
@@ -1937,6 +1946,7 @@ mod tests {
                     app_id: "app_01J0A".to_owned(),
                     app_name: "gm-miner-1".to_owned(),
                     node_secret: "secret".to_owned(),
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -1992,6 +2002,7 @@ mod tests {
                     app_id: String::new(),
                     app_name: "gm-miner-2".to_owned(),
                     node_secret: "provisional".to_owned(),
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -2041,6 +2052,7 @@ mod tests {
                     app_id: "app_orphan".to_owned(),
                     app_name: "gm-miner-2".to_owned(),
                     node_secret: "provisional".to_owned(),
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -2104,12 +2116,14 @@ mod tests {
                         app_id: "app_01J0A".to_owned(),
                         app_name: "gm-miner-1".to_owned(),
                         node_secret: "secret-1".to_owned(),
+                        ..Default::default()
                     },
                     WorkerRecord {
                         worker_id: "01J0B".to_owned(),
                         app_id: "app_01J0B".to_owned(),
                         app_name: "gm-miner-2".to_owned(),
                         node_secret: "secret-2".to_owned(),
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -2173,12 +2187,14 @@ mod tests {
                         app_id: "app_01J0A".to_owned(),
                         app_name: "gm-miner-1".to_owned(),
                         node_secret: "secret-1".to_owned(),
+                        ..Default::default()
                     },
                     WorkerRecord {
                         worker_id: String::new(),
                         app_id: "app_new".to_owned(),
                         app_name: "gm-miner-1b".to_owned(),
                         node_secret: "provisional".to_owned(),
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -2192,6 +2208,49 @@ mod tests {
 
         reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-1b")
             .expect("a provisional primary redeploy must be retryable");
+    }
+
+    #[test]
+    fn deploy_rejects_a_provisional_worker_add_stub() {
+        use super::{reject_secondary_worker_deploy, WorkerRegistration};
+        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+
+        // A `worker add` that launched a CVM then failed to register left a
+        // provisional secondary stub. A plain `deploy --app-name` against it
+        // must still be rejected — routing it through /miners/register would
+        // overwrite worker #1 with the failed secondary's endpoint/secret.
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                workers: vec![
+                    WorkerRecord {
+                        worker_id: "01J0A".to_owned(),
+                        app_id: "app_01J0A".to_owned(),
+                        app_name: "gm-miner-1".to_owned(),
+                        node_secret: "secret-1".to_owned(),
+                        ..Default::default()
+                    },
+                    WorkerRecord {
+                        worker_id: String::new(),
+                        app_id: "app_add".to_owned(),
+                        app_name: "gm-miner-2".to_owned(),
+                        node_secret: "provisional".to_owned(),
+                        provisional_secondary: true,
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+
+        let err = reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-2")
+            .expect_err("a provisional worker-add stub must stay off the worker-#1 path");
+        assert!(err.to_string().contains("secondary worker"), "got: {err}");
     }
 
     #[test]

@@ -90,6 +90,15 @@ pub struct WorkerRecord {
     /// The worker's `x-gm-node-key` pre-shared credential (Mechanism 1 of
     /// `docs/plans/attestation-and-identity.md`).
     pub node_secret: String,
+    /// Set on a *provisional* record (empty `worker_id`) that a `worker add`
+    /// wrote before its registry POST — i.e. an in-flight or failed secondary
+    /// worker. It keeps that stub off the worker-#1 registration paths
+    /// (`deploy` / `register-image`), which would otherwise overwrite worker
+    /// #1, while still distinguishing it from a primary-redeploy stub. Cleared
+    /// once the registry assigns a `worker_id` (the record's role is then read
+    /// from its position), so it never appears on a registered record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provisional_secondary: bool,
 }
 
 /// Per-network configuration.
@@ -155,36 +164,37 @@ impl NetworkEntry {
             .filter(|s| !s.trim().is_empty())
     }
 
-    /// Whether `app_id` names a *registered* secondary worker — one with a
-    /// real `worker_id` that is not the first record. `register-image` rejects
-    /// only this case: it re-registers worker #1, and overwriting a registered
-    /// secondary would corrupt the mapping. A provisional record (empty
-    /// `worker_id`, an in-flight or failed deploy) is never secondary, so
-    /// `register-image --app-id <id>` can recover it — including a worker #1
-    /// redeploy under a new name whose stub was appended.
+    /// Whether `app_id` names a secondary worker. `register-image` rejects
+    /// only this case: it re-registers worker #1, and routing a secondary
+    /// through `/miners/register` would overwrite worker #1. See
+    /// [`is_secondary`](Self::is_secondary) for what counts as secondary.
     #[must_use]
-    pub fn is_registered_secondary_by_app_id(&self, app_id: &str) -> bool {
+    pub fn is_secondary_by_app_id(&self, app_id: &str) -> bool {
         self.worker_by_app_id(app_id)
-            .is_some_and(|tracked| self.is_registered_secondary(tracked))
+            .is_some_and(|tracked| self.is_secondary(tracked))
     }
 
-    /// Whether `app_name` names a *registered* secondary worker. See
-    /// [`is_registered_secondary_by_app_id`] — `deploy` gates on this one.
-    ///
-    /// [`is_registered_secondary_by_app_id`]: NetworkEntry::is_registered_secondary_by_app_id
+    /// Whether `app_name` names a secondary worker — `deploy` gates on this.
+    /// See [`is_secondary`](Self::is_secondary).
     #[must_use]
-    pub fn is_registered_secondary_by_app_name(&self, app_name: &str) -> bool {
+    pub fn is_secondary_by_app_name(&self, app_name: &str) -> bool {
         self.worker_by_app_name(app_name)
-            .is_some_and(|tracked| self.is_registered_secondary(tracked))
+            .is_some_and(|tracked| self.is_secondary(tracked))
     }
 
-    /// A `tracked` record is a registered secondary iff it carries a real
-    /// `worker_id` and that id differs from the first record's. A provisional
-    /// record (empty `worker_id`) is never secondary — it is an unclassified
-    /// in-flight worker that a retry/recovery must be allowed to reach.
-    fn is_registered_secondary(&self, tracked: &WorkerRecord) -> bool {
+    /// A `tracked` record is secondary iff either:
+    /// - it is registered (real `worker_id`) and that id differs from the
+    ///   first record's — a `worker add` worker; or
+    /// - it is a provisional `worker add` stub (`provisional_secondary`),
+    ///   an in-flight or failed secondary that must stay off the worker-#1
+    ///   paths even though it has no `worker_id` yet.
+    ///
+    /// A provisional *primary* stub (empty `worker_id`, flag unset — a first
+    /// deploy or a worker #1 redeploy) is not secondary, so a retry/recovery
+    /// through `deploy`/`register-image` is allowed.
+    fn is_secondary(&self, tracked: &WorkerRecord) -> bool {
         if tracked.worker_id.is_empty() {
-            return false;
+            return tracked.provisional_secondary;
         }
         self.workers
             .first()
@@ -380,6 +390,7 @@ mod tests {
             app_id: format!("app_{worker_id}"),
             app_name: app_name.to_owned(),
             node_secret: secret.to_owned(),
+            ..Default::default()
         }
     }
 
@@ -504,31 +515,46 @@ mod tests {
     }
 
     #[test]
-    fn is_registered_secondary_only_for_registered_non_first_records() {
+    fn is_secondary_classifies_registered_and_provisional_records() {
         let entry = NetworkEntry {
             workers: vec![
                 worker("01J0A", "gm-miner-1", "a"),
                 worker("01J0B", "gm-miner-2", "b"),
                 // A provisional worker #1 redeploy under a new name: appended
-                // after the primary but not yet registered.
+                // after the primary but not yet registered, flag unset.
                 WorkerRecord {
                     worker_id: String::new(),
                     app_id: "app_x".to_owned(),
                     app_name: "gm-miner-1b".to_owned(),
                     node_secret: "s".to_owned(),
+                    ..Default::default()
+                },
+                // A provisional `worker add` stub: empty worker_id but the
+                // secondary flag is set, so it must classify as secondary.
+                WorkerRecord {
+                    worker_id: String::new(),
+                    app_id: "app_y".to_owned(),
+                    app_name: "gm-miner-3".to_owned(),
+                    node_secret: "s".to_owned(),
+                    provisional_secondary: true,
                 },
             ],
             ..Default::default()
         };
         // Registered first record — not secondary.
-        assert!(!entry.is_registered_secondary_by_app_name("gm-miner-1"));
+        assert!(!entry.is_secondary_by_app_name("gm-miner-1"));
         // Registered non-first record — secondary.
-        assert!(entry.is_registered_secondary_by_app_name("gm-miner-2"));
-        // Provisional record (empty worker_id) — never secondary, so a
-        // deploy retry against it is allowed to recover.
-        assert!(!entry.is_registered_secondary_by_app_name("gm-miner-1b"));
+        assert!(entry.is_secondary_by_app_name("gm-miner-2"));
+        // Provisional primary redeploy stub — not secondary, so a deploy
+        // retry against it is allowed to recover.
+        assert!(!entry.is_secondary_by_app_name("gm-miner-1b"));
+        assert!(!entry.is_secondary_by_app_id("app_x"));
+        // Provisional worker-add stub — secondary, kept off the worker-#1
+        // paths even without a worker_id.
+        assert!(entry.is_secondary_by_app_name("gm-miner-3"));
+        assert!(entry.is_secondary_by_app_id("app_y"));
         // Untracked name — not secondary.
-        assert!(!entry.is_registered_secondary_by_app_name("gm-miner-9"));
+        assert!(!entry.is_secondary_by_app_name("gm-miner-9"));
     }
 
     #[test]
@@ -574,8 +600,8 @@ mod tests {
         assert_eq!(entry.workers[0].node_secret, "a2");
         assert_eq!(entry.workers[1].app_name, "gm-miner-2");
         // worker #1 stays primary after the rename — never seen as secondary.
-        assert!(!entry.is_registered_secondary_by_app_name("gm-miner-renamed"));
-        assert!(entry.is_registered_secondary_by_app_name("gm-miner-2"));
+        assert!(!entry.is_secondary_by_app_name("gm-miner-renamed"));
+        assert!(entry.is_secondary_by_app_name("gm-miner-2"));
     }
 
     #[test]
@@ -620,6 +646,7 @@ mod tests {
                     app_id: "app_prov".to_owned(),
                     app_name: "gm-miner-2".to_owned(),
                     node_secret: "s".to_owned(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -638,12 +665,13 @@ mod tests {
             app_id: "app_prov2".to_owned(),
             app_name: "gm-miner-3".to_owned(),
             node_secret: "s".to_owned(),
+            ..Default::default()
         });
         assert!(entry.remove_provisional_worker("gm-miner-3").is_some());
     }
 
     #[test]
-    fn is_registered_secondary_by_app_id_distinguishes_first_from_added() {
+    fn is_secondary_by_app_id_distinguishes_first_from_added() {
         // The deploy-created worker (first record) is primary; a registered
         // worker-add worker (later record) is secondary. register-image gates
         // on this.
@@ -658,15 +686,16 @@ mod tests {
                     app_id: "app_prov".to_owned(),
                     app_name: "gm-miner-1b".to_owned(),
                     node_secret: "s".to_owned(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
         };
-        assert!(!entry.is_registered_secondary_by_app_id("app_01J0A"));
-        assert!(entry.is_registered_secondary_by_app_id("app_01J0B"));
-        assert!(!entry.is_registered_secondary_by_app_id("app_prov"));
+        assert!(!entry.is_secondary_by_app_id("app_01J0A"));
+        assert!(entry.is_secondary_by_app_id("app_01J0B"));
+        assert!(!entry.is_secondary_by_app_id("app_prov"));
         // An untracked app_id is not secondary either.
-        assert!(!entry.is_registered_secondary_by_app_id("app_unknown"));
+        assert!(!entry.is_secondary_by_app_id("app_unknown"));
     }
 
     #[test]
