@@ -155,29 +155,34 @@ impl NetworkEntry {
             .filter(|s| !s.trim().is_empty())
     }
 
-    /// Whether the worker tracked for `app_id` is worker #1 (the first
-    /// record, created by `gm-miner deploy`). Used to gate `register-image`,
-    /// which only re-registers worker #1; a tracked-but-not-first CVM is a
-    /// `worker add` worker. `None` when `app_id` is not tracked — the caller
-    /// decides what an untracked CVM means.
+    /// Whether `app_id` names a *registered* secondary worker — one with a
+    /// real `worker_id` that is not the first record. `register-image` rejects
+    /// only this case: it re-registers worker #1, and overwriting a registered
+    /// secondary would corrupt the mapping. A provisional record (empty
+    /// `worker_id`, an in-flight or failed deploy) is never secondary, so
+    /// `register-image --app-id <id>` can recover it — including a worker #1
+    /// redeploy under a new name whose stub was appended.
     #[must_use]
-    pub fn is_primary_worker(&self, app_id: &str) -> Option<bool> {
-        let tracked = self.worker_by_app_id(app_id)?;
-        let first = self.workers.first()?;
-        Some(first.worker_id == tracked.worker_id)
+    pub fn is_registered_secondary_by_app_id(&self, app_id: &str) -> bool {
+        self.worker_by_app_id(app_id)
+            .is_some_and(|tracked| self.is_registered_secondary(tracked))
     }
 
-    /// Whether `app_name` names a *registered* secondary worker — one with a
-    /// real `worker_id` that is not the first record. `deploy` rejects only
-    /// this case: a provisional record (empty `worker_id`, an in-flight or
-    /// failed deploy) is never secondary, so retrying `deploy --app-name`
-    /// against it — including a worker #1 redeploy under a new name whose
-    /// stub was appended — is always allowed to recover.
+    /// Whether `app_name` names a *registered* secondary worker. See
+    /// [`is_registered_secondary_by_app_id`] — `deploy` gates on this one.
+    ///
+    /// [`is_registered_secondary_by_app_id`]: NetworkEntry::is_registered_secondary_by_app_id
     #[must_use]
     pub fn is_registered_secondary_by_app_name(&self, app_name: &str) -> bool {
-        let Some(tracked) = self.worker_by_app_name(app_name) else {
-            return false;
-        };
+        self.worker_by_app_name(app_name)
+            .is_some_and(|tracked| self.is_registered_secondary(tracked))
+    }
+
+    /// A `tracked` record is a registered secondary iff it carries a real
+    /// `worker_id` and that id differs from the first record's. A provisional
+    /// record (empty `worker_id`) is never secondary — it is an unclassified
+    /// in-flight worker that a retry/recovery must be allowed to reach.
+    fn is_registered_secondary(&self, tracked: &WorkerRecord) -> bool {
         if tracked.worker_id.is_empty() {
             return false;
         }
@@ -222,6 +227,18 @@ impl NetworkEntry {
     /// the removed record so the caller can report the freed `app_id`.
     pub fn remove_worker_by_id(&mut self, worker_id: &str) -> Option<WorkerRecord> {
         let idx = self.workers.iter().position(|w| w.worker_id == worker_id)?;
+        Some(self.workers.remove(idx))
+    }
+
+    /// Drop a *provisional* worker record (empty `worker_id`) matched by its
+    /// `app_id` or `app_name`. Used by `worker remove` to clear the local
+    /// dead-end a deploy that launched a CVM but never registered leaves
+    /// behind. Returns the removed record, or `None` if nothing matched.
+    pub fn remove_provisional_worker(&mut self, id: &str) -> Option<WorkerRecord> {
+        let idx = self
+            .workers
+            .iter()
+            .position(|w| w.worker_id.is_empty() && (w.app_id == id || w.app_name == id))?;
         Some(self.workers.remove(idx))
     }
 }
@@ -594,20 +611,62 @@ mod tests {
     }
 
     #[test]
-    fn is_primary_worker_distinguishes_first_from_added() {
-        // The deploy-created worker (first record) is primary; a worker-add
-        // worker (later record) is not. register-image gates on this.
+    fn remove_provisional_worker_matches_app_id_or_name_only() {
+        let mut entry = NetworkEntry {
+            workers: vec![
+                worker("01J0A", "gm-miner-1", "a"),
+                WorkerRecord {
+                    worker_id: String::new(),
+                    app_id: "app_prov".to_owned(),
+                    app_name: "gm-miner-2".to_owned(),
+                    node_secret: "s".to_owned(),
+                },
+            ],
+            ..Default::default()
+        };
+        // A registered worker's app_id must not match (worker_id is non-empty).
+        assert!(entry.remove_provisional_worker("app_01J0A").is_none());
+        // The provisional record matches by app_id.
+        let removed = entry
+            .remove_provisional_worker("app_prov")
+            .expect("provisional record present");
+        assert_eq!(removed.app_name, "gm-miner-2");
+        assert_eq!(entry.workers.len(), 1);
+        // And by app_name (set up a second provisional to check that path).
+        entry.workers.push(WorkerRecord {
+            worker_id: String::new(),
+            app_id: "app_prov2".to_owned(),
+            app_name: "gm-miner-3".to_owned(),
+            node_secret: "s".to_owned(),
+        });
+        assert!(entry.remove_provisional_worker("gm-miner-3").is_some());
+    }
+
+    #[test]
+    fn is_registered_secondary_by_app_id_distinguishes_first_from_added() {
+        // The deploy-created worker (first record) is primary; a registered
+        // worker-add worker (later record) is secondary. register-image gates
+        // on this.
         let entry = NetworkEntry {
             workers: vec![
                 worker("01J0A", "gm-miner-1", "a"),
                 worker("01J0B", "gm-miner-2", "b"),
+                // A provisional worker-#1 redeploy stub appended after the
+                // primary: never secondary, so register-image can recover it.
+                WorkerRecord {
+                    worker_id: String::new(),
+                    app_id: "app_prov".to_owned(),
+                    app_name: "gm-miner-1b".to_owned(),
+                    node_secret: "s".to_owned(),
+                },
             ],
             ..Default::default()
         };
-        assert_eq!(entry.is_primary_worker("app_01J0A"), Some(true));
-        assert_eq!(entry.is_primary_worker("app_01J0B"), Some(false));
-        // An untracked app_id is None — the caller treats it separately.
-        assert_eq!(entry.is_primary_worker("app_unknown"), None);
+        assert!(!entry.is_registered_secondary_by_app_id("app_01J0A"));
+        assert!(entry.is_registered_secondary_by_app_id("app_01J0B"));
+        assert!(!entry.is_registered_secondary_by_app_id("app_prov"));
+        // An untracked app_id is not secondary either.
+        assert!(!entry.is_registered_secondary_by_app_id("app_unknown"));
     }
 
     #[test]

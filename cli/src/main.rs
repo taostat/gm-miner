@@ -741,14 +741,16 @@ async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
         }
         // A provisional record with a real app_id is a CVM that launched but
         // whose registry POST never landed. Re-running `worker add` would
-        // deploy a *second* CVM and orphan the first. `register-image` only
-        // recovers worker #1, so point the operator at deleting the orphan.
+        // deploy a *second* CVM and orphan the first. Point the operator at
+        // `worker remove`, which clears the local record (and names the CVM to
+        // tear down), so the retry starts clean.
         if !existing.app_id.is_empty() {
             bail!(
                 "worker '{}' has a CVM ({}) that was deployed but never \
                  registered. `worker add` would launch a second CVM and orphan \
-                 it. Tear the existing one down first:\n  phala cvms delete {}\n\
-                 then re-run `gm-miner worker add --app-name {}`.",
+                 it. Clear the stale record first:\n  gm-miner worker remove {}\n\
+                 (it prints the `phala cvms delete` to run), then re-run \
+                 `gm-miner worker add --app-name {}`.",
                 args.app_name,
                 existing.app_id,
                 existing.app_id,
@@ -1206,7 +1208,7 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
         let entry = cfg.active_network_entry();
         let tracked = entry.and_then(|n| n.worker_by_app_id(app_id));
         if let Some(tracked) =
-            tracked.filter(|_| entry.and_then(|n| n.is_primary_worker(app_id)) == Some(false))
+            tracked.filter(|_| entry.is_some_and(|n| n.is_registered_secondary_by_app_id(app_id)))
         {
             bail!(
                 "CVM '{app_id}' is a secondary worker (worker_id {}); \
@@ -1463,16 +1465,29 @@ async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
     Ok(())
 }
 
-/// `gm-miner worker remove <worker_id>` — deregister a worker from the
-/// registry and remind the operator to tear down the Phala CVM separately.
-async fn cmd_worker_remove(cfg: Config, worker_id: &str) -> Result<()> {
+/// `gm-miner worker remove <id>` — deregister a worker and remind the
+/// operator to tear down its Phala CVM separately.
+///
+/// `id` is the registry `worker_id` for a registered worker. It also accepts
+/// the local `app_id` or `app_name` of a *provisional* record — a deploy that
+/// launched a CVM but never registered, which has no `worker_id` to pass. A
+/// provisional record is only local state, so it is dropped without a registry
+/// DELETE; this clears the dead-end that otherwise blocks re-running `worker
+/// add` for that name.
+async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
     let network = cfg.active_network().to_owned();
-    // Resolve the local app_id (if tracked) before any network call so the
-    // operator gets the exact `phala cvms delete` target to run.
-    let app_id = cfg
-        .active_network_entry()
-        .and_then(|n| n.worker_by_id(worker_id))
-        .map(|w| w.app_id.clone());
+    let tracked = cfg.active_network_entry().and_then(|n| {
+        n.worker_by_id(id)
+            .or_else(|| n.worker_by_app_id(id))
+            .or_else(|| n.worker_by_app_name(id))
+    });
+
+    if tracked.is_some_and(|w| w.worker_id.is_empty()) {
+        return remove_provisional_worker(&network, id);
+    }
+
+    let app_id = tracked.map(|w| w.app_id.clone());
+    let worker_id = tracked.map_or_else(|| id.to_owned(), |w| w.worker_id.clone());
 
     let mut client = RegistryClient::new(cfg);
     let hotkey = fetch_hotkey(&mut client).await?;
@@ -1492,7 +1507,7 @@ async fn cmd_worker_remove(cfg: Config, worker_id: &str) -> Result<()> {
     // deregistered worker.
     let mut cfg = config::load().context("load gm-miner config")?;
     cfg.active_network = Some(network);
-    cfg.active_entry_mut().remove_worker_by_id(worker_id);
+    cfg.active_entry_mut().remove_worker_by_id(&worker_id);
     config::save(&cfg).context("persist worker removal to gm-miner config")?;
 
     println!("Worker {worker_id} deregistered from the registry.");
@@ -1505,6 +1520,33 @@ async fn cmd_worker_remove(cfg: Config, worker_id: &str) -> Result<()> {
             .to_owned(),
     };
     println!("{reminder}");
+    Ok(())
+}
+
+/// Drop a provisional worker record (a deploy that never registered) from the
+/// local config. No registry DELETE: nothing was ever registered.
+fn remove_provisional_worker(network: &str, id: &str) -> Result<()> {
+    let mut cfg = config::load().context("load gm-miner config")?;
+    cfg.active_network = Some(network.to_owned());
+    let removed = cfg.active_entry_mut().remove_provisional_worker(id);
+    config::save(&cfg).context("persist worker removal to gm-miner config")?;
+
+    match removed {
+        Some(w) if !w.app_id.is_empty() => {
+            println!(
+                "Dropped the unregistered worker record for '{}'.\n\
+                 Tear down its CVM separately:\n  phala cvms delete {}",
+                w.app_name, w.app_id
+            );
+        }
+        Some(w) => {
+            println!(
+                "Dropped the unregistered worker record for '{}'.",
+                w.app_name
+            );
+        }
+        None => println!("No provisional worker matched '{id}'."),
+    }
     Ok(())
 }
 
