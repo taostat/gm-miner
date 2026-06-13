@@ -697,19 +697,36 @@ async fn cmd_deploy_subcommand(
 
 /// `gm-miner worker add` — attach a new CVM to the existing hotkey.
 ///
-/// Two checks run *before* any CVM work so a misuse fails fast rather than
+/// Three checks run *before* any CVM work so a misuse fails fast rather than
 /// after a multi-minute deploy:
-///   1. The `--app-name` must not already name a *registered* worker.
+///   1. Worker #1 must already be tracked locally. The first record in
+///      `workers` *is* worker #1 — every `is_primary_worker*` decision rests
+///      on that. If this network has no tracked workers (a fresh machine, or
+///      a legacy `node_secret` config not yet migrated by a `deploy`), the
+///      added worker would become `workers[0]` and be mistaken for worker #1;
+///      the provisional upsert would also clear the legacy secret before
+///      worker #1 was ever migrated. Require a `deploy` first.
+///   2. The `--app-name` must not already name a *registered* worker.
 ///      Reusing the default `gm-miner-1` (or any registered name) would make
 ///      [`node_secret::for_worker`] reuse that worker's secret and the
 ///      config upsert overwrite its record — two workers sharing a secret
 ///      and the original left untracked. A provisional record (one whose
 ///      registration never completed, so its `worker_id` is empty) is *not*
 ///      a duplicate: re-running `worker add` with that name retries it.
-///   2. The hotkey is resolved from `/miners/me` up front; `worker add`
+///   3. The hotkey is resolved from `/miners/me` up front; `worker add`
 ///      requires an already-registered hotkey, so a 404 here fails before
 ///      the CVM is created (unlike `deploy`, which registers the hotkey).
 async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
+    if cfg
+        .active_network_entry()
+        .is_none_or(|e| e.workers.is_empty())
+    {
+        bail!(
+            "no worker #1 is tracked on this network yet; run `gm-miner deploy` \
+             first to register (or migrate) worker #1, then `gm-miner worker \
+             add` for further capacity"
+        );
+    }
     if let Some(existing) = cfg
         .active_network_entry()
         .and_then(|e| e.worker_by_app_name(&args.app_name))
@@ -1817,6 +1834,50 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn worker_add_requires_a_tracked_worker_one() {
+        use super::{cmd_worker_add, DeployArgs};
+        use gm_miner_cli::config::{Config, NetworkEntry};
+
+        // No tracked workers (fresh machine or an unmigrated legacy config):
+        // `worker add` must refuse so the new worker can't be mistaken for
+        // worker #1. The guard fires before any network/CVM work.
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                legacy_node_secret: Some("legacy-key".to_owned()),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+        let args = DeployArgs {
+            app_name: "gm-miner-2".to_owned(),
+            image_ref: None,
+            project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
+            image_repo: None,
+            image_tag: "v0.1.0".to_owned(),
+            instance_type: "tdx.medium".to_owned(),
+            disk_size: "40G".to_owned(),
+            os_image: "dstack-0.5.7".to_owned(),
+            repo_root: None,
+            version: None,
+            boot_timeout_secs: 300,
+        };
+
+        let err = cmd_worker_add(cfg, args)
+            .await
+            .expect_err("worker add with no tracked worker #1 must be rejected");
+        assert!(
+            err.to_string().contains("no worker #1 is tracked"),
+            "must direct the operator to deploy first; got: {err}"
+        );
     }
 
     #[tokio::test]
