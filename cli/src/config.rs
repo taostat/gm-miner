@@ -167,16 +167,23 @@ impl NetworkEntry {
         Some(first.worker_id == tracked.worker_id)
     }
 
-    /// Whether the worker tracked for `app_name` is worker #1 (the first
-    /// record). `deploy` gates on this: re-running `deploy --app-name` for
-    /// worker #1 is a legitimate re-register, but for a secondary worker it
-    /// would corrupt the mapping. `None` when `app_name` is not tracked —
-    /// the caller treats that as a fresh worker #1.
+    /// Whether `app_name` names a *registered* secondary worker — one with a
+    /// real `worker_id` that is not the first record. `deploy` rejects only
+    /// this case: a provisional record (empty `worker_id`, an in-flight or
+    /// failed deploy) is never secondary, so retrying `deploy --app-name`
+    /// against it — including a worker #1 redeploy under a new name whose
+    /// stub was appended — is always allowed to recover.
     #[must_use]
-    pub fn is_primary_worker_by_app_name(&self, app_name: &str) -> Option<bool> {
-        let tracked = self.worker_by_app_name(app_name)?;
-        let first = self.workers.first()?;
-        Some(first.app_name == tracked.app_name)
+    pub fn is_registered_secondary_by_app_name(&self, app_name: &str) -> bool {
+        let Some(tracked) = self.worker_by_app_name(app_name) else {
+            return false;
+        };
+        if tracked.worker_id.is_empty() {
+            return false;
+        }
+        self.workers
+            .first()
+            .is_some_and(|first| first.worker_id != tracked.worker_id)
     }
 
     /// Insert a worker record, dropping any prior record for the same worker
@@ -185,8 +192,8 @@ impl NetworkEntry {
     /// "Same worker" is the registry `worker_id` (stable across re-deploys)
     /// when the incoming record carries one — this catches a re-deploy that
     /// changed its `--app-name`, which an app-name-only match would miss,
-    /// leaving a stale record that `is_primary_worker_by_app_name` could
-    /// later mis-read. The `app_name` is always also matched so the empty-
+    /// leaving a stale record that the primary/secondary checks could later
+    /// mis-read. The `app_name` is always also matched so the empty-
     /// `worker_id` pre-registration stub a fresh deploy writes is superseded
     /// (rather than orphaned) when the registry's `worker_id` lands.
     ///
@@ -480,23 +487,31 @@ mod tests {
     }
 
     #[test]
-    fn is_primary_worker_by_app_name_matches_first_record() {
+    fn is_registered_secondary_only_for_registered_non_first_records() {
         let entry = NetworkEntry {
             workers: vec![
                 worker("01J0A", "gm-miner-1", "a"),
                 worker("01J0B", "gm-miner-2", "b"),
+                // A provisional worker #1 redeploy under a new name: appended
+                // after the primary but not yet registered.
+                WorkerRecord {
+                    worker_id: String::new(),
+                    app_id: "app_x".to_owned(),
+                    app_name: "gm-miner-1b".to_owned(),
+                    node_secret: "s".to_owned(),
+                },
             ],
             ..Default::default()
         };
-        assert_eq!(
-            entry.is_primary_worker_by_app_name("gm-miner-1"),
-            Some(true)
-        );
-        assert_eq!(
-            entry.is_primary_worker_by_app_name("gm-miner-2"),
-            Some(false)
-        );
-        assert_eq!(entry.is_primary_worker_by_app_name("gm-miner-9"), None);
+        // Registered first record — not secondary.
+        assert!(!entry.is_registered_secondary_by_app_name("gm-miner-1"));
+        // Registered non-first record — secondary.
+        assert!(entry.is_registered_secondary_by_app_name("gm-miner-2"));
+        // Provisional record (empty worker_id) — never secondary, so a
+        // deploy retry against it is allowed to recover.
+        assert!(!entry.is_registered_secondary_by_app_name("gm-miner-1b"));
+        // Untracked name — not secondary.
+        assert!(!entry.is_registered_secondary_by_app_name("gm-miner-9"));
     }
 
     #[test]
@@ -541,11 +556,9 @@ mod tests {
         assert_eq!(entry.workers[0].app_name, "gm-miner-renamed");
         assert_eq!(entry.workers[0].node_secret, "a2");
         assert_eq!(entry.workers[1].app_name, "gm-miner-2");
-        // worker #1 stays primary after the rename.
-        assert_eq!(
-            entry.is_primary_worker_by_app_name("gm-miner-renamed"),
-            Some(true)
-        );
+        // worker #1 stays primary after the rename — never seen as secondary.
+        assert!(!entry.is_registered_secondary_by_app_name("gm-miner-renamed"));
+        assert!(entry.is_registered_secondary_by_app_name("gm-miner-2"));
     }
 
     #[test]

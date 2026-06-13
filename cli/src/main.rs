@@ -900,12 +900,14 @@ fn cmd_set_api_keys(
     Ok(())
 }
 
-/// Reject a plain `gm-miner deploy` aimed at a tracked *secondary* worker.
+/// Reject a plain `gm-miner deploy` aimed at a registered *secondary* worker.
 ///
 /// `deploy` registers worker #1 via `/miners/register`, which refreshes the
-/// miner's first worker. Pointed at the `--app-name` of a secondary worker it
-/// would overwrite worker #1 in the registry and corrupt the local mapping.
-/// A re-deploy of worker #1 (or a brand-new, untracked `--app-name`) is fine.
+/// miner's first worker. Pointed at the `--app-name` of a registered secondary
+/// worker it would overwrite worker #1 in the registry and corrupt the local
+/// mapping. A re-deploy of worker #1 (or a brand-new, untracked `--app-name`,
+/// or a provisional record from an in-flight/failed deploy being retried) is
+/// fine.
 fn reject_secondary_worker_deploy(
     cfg: &Config,
     registration: &WorkerRegistration,
@@ -914,8 +916,7 @@ fn reject_secondary_worker_deploy(
     let is_secondary = *registration == WorkerRegistration::First
         && cfg
             .active_network_entry()
-            .and_then(|e| e.is_primary_worker_by_app_name(app_name))
-            == Some(false);
+            .is_some_and(|e| e.is_registered_secondary_by_app_name(app_name));
     if is_secondary {
         bail!(
             "'{app_name}' is a secondary worker; `deploy` and `register-image` \
@@ -2109,6 +2110,46 @@ mod tests {
             err.to_string().contains("secondary worker"),
             "error must explain the secondary-worker rejection; got: {err}"
         );
+    }
+
+    #[test]
+    fn deploy_allows_retrying_a_provisional_primary_redeploy() {
+        use super::{reject_secondary_worker_deploy, WorkerRegistration};
+        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+
+        // A worker #1 redeploy under a new --app-name appended a provisional
+        // stub after the registered primary, then failed. Retrying that same
+        // deploy must NOT be rejected as secondary — the stub has no
+        // worker_id, so it's an in-flight worker #1, recoverable on retry.
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                workers: vec![
+                    WorkerRecord {
+                        worker_id: "01J0A".to_owned(),
+                        app_id: "app_01J0A".to_owned(),
+                        app_name: "gm-miner-1".to_owned(),
+                        node_secret: "secret-1".to_owned(),
+                    },
+                    WorkerRecord {
+                        worker_id: String::new(),
+                        app_id: "app_new".to_owned(),
+                        app_name: "gm-miner-1b".to_owned(),
+                        node_secret: "provisional".to_owned(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+
+        reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-1b")
+            .expect("a provisional primary redeploy must be retryable");
     }
 
     #[test]
