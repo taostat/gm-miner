@@ -757,6 +757,20 @@ async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
                 args.app_name
             );
         }
+        // An empty-app_id provisional stub that belongs to `deploy` (a primary
+        // attempt, flag unset) must not be retried through `worker add` — that
+        // would reuse worker #1's in-flight secret as a secondary. Send it back
+        // to `deploy`. Only a provisional *secondary* stub retries here.
+        if !existing.provisional_secondary {
+            bail!(
+                "'{}' is an in-flight worker #1 deploy, not a secondary worker; \
+                 retry it with `gm-miner deploy --app-name {}`, or \
+                 `gm-miner worker remove {}` to discard the stub",
+                args.app_name,
+                args.app_name,
+                args.app_name
+            );
+        }
     }
 
     let mut client = RegistryClient::new(cfg.clone());
@@ -1044,20 +1058,14 @@ async fn cmd_deploy(
         args.boot_timeout_secs,
     )?;
 
-    // Step 7: verify hashes. The returned hashes are normalized
-    // (lowercased, `sha256:` prefix stripped) so the loud check and the
-    // registration in step 8 agree on the exact value.
-    println!("Verifying hashes against registry approval ...");
-    let verified = verify_hashes(&actual.hashes, approved)?;
-    println!("  compose_hash  : OK ({})", verified.compose_sha256);
-    println!("  os_image_hash : OK ({})", verified.os_image_hash);
-
-    // Step 7b: stamp the Phala `app_id` onto the record *before* the fallible
-    // registration. The secret is already on disk (Step 1b for a fresh
-    // worker, or the prior record on a re-deploy); recording the `app_id` now
-    // means that if the registry POST below fails, `register-image --app-id
-    // <id>` can find this record by `app_id` and recover the secret. `upsert`
-    // keys on `app_name`, so this updates the same record in place.
+    // Step 6b: stamp the Phala `app_id` onto the record the instant the CVM
+    // exists — *before* the fallible hash verification and registration. The
+    // secret is already on disk (Step 1b for a fresh worker, or the prior
+    // record on a re-deploy); recording the `app_id` now means that whatever
+    // fails next — a hash mismatch or the registry POST — `worker remove` can
+    // name the orphaned CVM and `register-image --app-id <id>` can recover the
+    // secret. `upsert` keys on `app_name`, so this updates the same record in
+    // place.
     persist_worker_record(
         cfg.active_network(),
         WorkerRecord {
@@ -1068,6 +1076,14 @@ async fn cmd_deploy(
             provisional_secondary,
         },
     )?;
+
+    // Step 7: verify hashes. The returned hashes are normalized
+    // (lowercased, `sha256:` prefix stripped) so the loud check and the
+    // registration in step 8 agree on the exact value.
+    println!("Verifying hashes against registry approval ...");
+    let verified = verify_hashes(&actual.hashes, approved)?;
+    println!("  compose_hash  : OK ({})", verified.compose_sha256);
+    println!("  os_image_hash : OK ({})", verified.os_image_hash);
 
     // Step 8: register the worker, carrying its node secret so the registry
     // stores it and serves it to the gateway, plus the CVM's endpoint. A
@@ -1218,13 +1234,21 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
         if let Some(tracked) =
             tracked.filter(|_| entry.is_some_and(|n| n.is_secondary_by_app_id(app_id)))
         {
+            // A provisional secondary has no worker_id yet; point `worker
+            // remove` at the app_id, which it also accepts, so the command is
+            // runnable in every case.
+            let remove_handle = if tracked.worker_id.is_empty() {
+                app_id
+            } else {
+                &tracked.worker_id
+            };
             bail!(
-                "CVM '{app_id}' is a secondary worker (worker_id {}); \
+                "CVM '{app_id}' is a secondary worker (worker '{}'); \
                  `register-image` only re-registers worker #1. To replace it, \
                  `gm-miner worker remove {}` then `gm-miner worker add \
                  --app-name {}`.",
-                tracked.worker_id,
-                tracked.worker_id,
+                tracked.app_name,
+                remove_handle,
                 tracked.app_name
             );
         }
@@ -1988,22 +2012,30 @@ mod tests {
         use super::{cmd_worker_add, DeployArgs};
         use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
 
-        // A provisional record (empty worker_id) is a deploy that never
-        // finished registration. Re-running `worker add` with that name must
-        // get past the dedup guard rather than dead-end on "already
-        // registered" — so it fails later (here: no provider keys / network),
-        // not on the guard.
+        // A provisional *secondary* stub (empty worker_id, empty app_id, flag
+        // set) is a `worker add` that never finished registration. Re-running
+        // `worker add` with that name must get past the guards rather than
+        // dead-end — so it fails later (here: no provider keys / network).
         let mut networks = std::collections::HashMap::new();
         networks.insert(
             "testnet".to_owned(),
             NetworkEntry {
-                workers: vec![WorkerRecord {
-                    worker_id: String::new(),
-                    app_id: String::new(),
-                    app_name: "gm-miner-2".to_owned(),
-                    node_secret: "provisional".to_owned(),
-                    ..Default::default()
-                }],
+                workers: vec![
+                    WorkerRecord {
+                        worker_id: "01J0A".to_owned(),
+                        app_id: "app_01J0A".to_owned(),
+                        app_name: "gm-miner-1".to_owned(),
+                        node_secret: "secret-1".to_owned(),
+                        ..Default::default()
+                    },
+                    WorkerRecord {
+                        worker_id: String::new(),
+                        app_id: String::new(),
+                        app_name: "gm-miner-2".to_owned(),
+                        node_secret: "provisional".to_owned(),
+                        provisional_secondary: true,
+                    },
+                ],
                 ..Default::default()
             },
         );
@@ -2029,9 +2061,62 @@ mod tests {
         let err = cmd_worker_add(cfg, args)
             .await
             .expect_err("no network is wired, so the retry fails past the guard");
+        let msg = err.to_string();
         assert!(
-            !err.to_string().contains("already registered"),
-            "a provisional record must not block a retry; got: {err}"
+            !msg.contains("already registered")
+                && !msg.contains("in-flight worker #1")
+                && !msg.contains("never registered"),
+            "a provisional secondary stub must not block a retry; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_add_rejects_a_provisional_primary_stub() {
+        use super::{cmd_worker_add, DeployArgs};
+        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+
+        // A provisional primary stub (empty worker_id, empty app_id, flag
+        // unset) belongs to `deploy`. `worker add` against it must refuse and
+        // send the operator back to `deploy`, not reuse worker #1's secret.
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                workers: vec![WorkerRecord {
+                    worker_id: String::new(),
+                    app_id: String::new(),
+                    app_name: "gm-miner-1".to_owned(),
+                    node_secret: "primary-stub".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+        let args = DeployArgs {
+            app_name: "gm-miner-1".to_owned(),
+            image_ref: None,
+            project_dir: std::path::PathBuf::from("dist/gm-miner-1"),
+            image_repo: None,
+            image_tag: "v0.1.0".to_owned(),
+            instance_type: "tdx.medium".to_owned(),
+            disk_size: "40G".to_owned(),
+            os_image: "dstack-0.5.7".to_owned(),
+            repo_root: None,
+            version: None,
+            boot_timeout_secs: 300,
+        };
+
+        let err = cmd_worker_add(cfg, args)
+            .await
+            .expect_err("a provisional primary stub must be rejected by worker add");
+        assert!(
+            err.to_string().contains("in-flight worker #1"),
+            "must redirect to deploy; got: {err}"
         );
     }
 
