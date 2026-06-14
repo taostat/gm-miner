@@ -19,7 +19,7 @@
 ## (dstack-sdk -> alloy, pulled in by the attestd crate) needs rustc
 ## 1.88+, so the previous 1.87 base no longer builds.
 ## Update the pin via: docker buildx imagetools inspect rust:1.92-slim-bookworm
-FROM rust:1.96-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef4998880b9347db30684 AS builder
+FROM rust:1.96-slim-bookworm@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d AS builder
 
 ## Reproducibility: fixed build timestamp, single codegen unit.
 ENV SOURCE_DATE_EPOCH=1700000000
