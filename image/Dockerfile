@@ -63,7 +63,7 @@ RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
 ## Envoy 1.32.x pinned by digest.
 ## Update the pin via: docker manifest inspect envoyproxy/envoy:v1.32-latest
 ## Current digest as of 2026-05-17:
-FROM envoyproxy/envoy:v1.38-latest@sha256:4e3c734cbe9892a3513c97cf3974ff73cfef5d784f5cceed9ea758a2b80e0c31
+FROM envoyproxy/envoy:v1.38-latest@sha256:af7c3dfdbe10de65cb2db5839ce1adf8904ee41c9d372076d62acab43af6ec41
 
 ## ca-certificates is already present in the envoy base image; nothing
 ## else needs to be installed — the attestation server talks to the
