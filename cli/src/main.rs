@@ -979,13 +979,19 @@ async fn cmd_deploy_subcommand(
     args: DeployArgs,
     registration: WorkerRegistration,
 ) -> Result<()> {
+    // Phala gate: ensure the CLI is installed and resolve+validate the API key
+    // before building the client. The key is scoped onto the `phala`
+    // subprocesses via the client (never the global env), so it never reaches
+    // the `git`/`docker` children of the image build.
+    let phala_api_key = phala_preflight(&args).await?;
     let phala = gm_miner_cli::deploy::RealPhalaClient::new(
         args.app_name.clone(),
         args.project_dir.clone(),
         args.instance_type.clone(),
         args.disk_size.clone(),
         args.os_image.clone(),
-    );
+    )
+    .with_api_key(phala_api_key);
     let mut client = RegistryClient::new(cfg.clone());
     cmd_deploy(&cfg, &mut client, &phala, &args, &registration).await
 }
@@ -1265,21 +1271,17 @@ fn existing_worker_id_for(cfg: &Config, app_name: &str) -> String {
 /// Ensures the `phala` CLI is installed (offering to install it), then resolves
 /// the Phala Cloud API key (flag → env → config → interactive paste, persisted)
 /// and validates it — including a credit-balance check — against the Phala
-/// Cloud API. A resolved key is exported as `PHALA_CLOUD_API_KEY` so the
-/// `phala` CLI the deploy shells out to reuses it. When no explicit key is
-/// configured but the `phala` CLI already holds a login session, that session
-/// is reused and nothing is exported. Both run before any irreversible CVM
-/// work so a missing CLI, a bad key, or an empty balance fails fast.
-async fn phala_preflight(args: &DeployArgs) -> Result<()> {
+/// Cloud API. Both run before any irreversible CVM work so a missing CLI, a
+/// bad key, or an empty balance fails fast.
+///
+/// Returns the validated key so the caller can scope it onto the `phala`
+/// subprocesses only (never the global process env, which the `git`/`docker`
+/// children of the image build would inherit). `None` means the operator is
+/// already authenticated via `phala` CLI login — that session is reused and
+/// there is no key to pass.
+async fn phala_preflight(args: &DeployArgs) -> Result<Option<String>> {
     ensure_dependency(&PHALA, args.assume_yes)?;
-    // `None` means the operator is already authenticated via `phala` CLI login
-    // — the deploy reuses that session, so there is no key to export.
-    if let Some(phala_key) =
-        gm_miner_cli::phala::resolve_key(args.phala_api_key.as_deref(), args.assume_yes).await?
-    {
-        std::env::set_var("PHALA_CLOUD_API_KEY", &phala_key);
-    }
-    Ok(())
+    gm_miner_cli::phala::resolve_key(args.phala_api_key.as_deref(), args.assume_yes).await
 }
 
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
@@ -1383,9 +1385,9 @@ async fn cmd_deploy(
         )?;
     }
 
-    // Step 1c/1d: ensure the `phala` CLI is present and resolve+validate the
-    // Phala Cloud API key (balance checked) before any irreversible CVM work.
-    phala_preflight(args).await?;
+    // The Phala CLI + API-key gate already ran in `cmd_deploy_subcommand`,
+    // which scoped the validated key onto the `phala` client. The `phala`
+    // client passed in here carries it.
 
     // Step 2: auth preflight. The Phala Cloud deploy is slow and
     // irreversible for the operator (CVM created), so we refuse to start

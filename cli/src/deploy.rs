@@ -304,6 +304,12 @@ pub struct RealPhalaClient {
     /// Production OS image for the CVM (`phala deploy --image`). Must match
     /// the dstack version of the Phala node the CVM lands on.
     pub os_image: String,
+    /// The Phala Cloud API key, applied as `PHALA_CLOUD_API_KEY` on the
+    /// `phala` subprocesses only — never the global process environment — so
+    /// the secret never leaks to the `git`/`docker` children of the image
+    /// build. `None` when the operator authenticates via `phala` CLI login,
+    /// which the subprocess inherits anyway.
+    pub api_key: Option<String>,
 }
 
 impl RealPhalaClient {
@@ -322,8 +328,27 @@ impl RealPhalaClient {
             instance_type: instance_type.into(),
             disk_size: disk_size.into(),
             os_image: os_image.into(),
+            api_key: None,
         }
     }
+
+    /// Set the Phala Cloud API key to scope onto the `phala` subprocesses.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
+    }
+}
+
+/// Build a `phala` command with the API key scoped onto it (via `.env`),
+/// never the global process environment — so the secret reaches only the
+/// `phala` CLI, not the `git`/`docker` subprocesses of the image build.
+fn phala_command(api_key: Option<&str>) -> std::process::Command {
+    let mut cmd = std::process::Command::new("phala");
+    if let Some(key) = api_key {
+        cmd.env("PHALA_CLOUD_API_KEY", key);
+    }
+    cmd
 }
 
 /// The CVM detail document returned by `phala cvms get <cvm-id> --json`.
@@ -613,8 +638,8 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
 /// # Errors
 /// Returns an error only if `phala` cannot be spawned, or it exits
 /// successfully but emits output that is not valid `cvms get --json` JSON.
-fn read_phala_cvm_outcome(cvm_id: &str) -> Result<Option<DeployOutcome>> {
-    let out = std::process::Command::new("phala")
+fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<DeployOutcome>> {
+    let out = phala_command(api_key)
         .args(["cvms", "get", cvm_id, "--json"])
         .output()
         .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
@@ -692,7 +717,7 @@ impl PhalaClient for RealPhalaClient {
             prelaunch_path: &prelaunch_arg,
         });
 
-        let out = std::process::Command::new("phala")
+        let out = phala_command(self.api_key.as_deref())
             .args(&args)
             .output()
             .context("run phala deploy — is the phala CLI installed? (npm i -g phala)")?;
@@ -713,7 +738,7 @@ impl PhalaClient for RealPhalaClient {
             self.app_name
         );
 
-        poll_phala_cvm_outcome(&self.app_name, boot_timeout_secs)
+        poll_phala_cvm_outcome(&self.app_name, self.api_key.as_deref(), boot_timeout_secs)
     }
 }
 
@@ -727,7 +752,11 @@ impl PhalaClient for RealPhalaClient {
 /// # Errors
 /// Returns an error if `phala` cannot be spawned, emits unparseable JSON,
 /// or the outcome never appears before `timeout_secs` elapses.
-fn poll_phala_cvm_outcome(cvm_id: &str, timeout_secs: u64) -> Result<DeployOutcome> {
+fn poll_phala_cvm_outcome(
+    cvm_id: &str,
+    api_key: Option<&str>,
+    timeout_secs: u64,
+) -> Result<DeployOutcome> {
     use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -736,7 +765,7 @@ fn poll_phala_cvm_outcome(cvm_id: &str, timeout_secs: u64) -> Result<DeployOutco
 
     loop {
         attempt += 1;
-        if let Some(outcome) = read_phala_cvm_outcome(cvm_id)? {
+        if let Some(outcome) = read_phala_cvm_outcome(cvm_id, api_key)? {
             return Ok(outcome);
         }
 
@@ -1469,6 +1498,42 @@ mod tests {
         let versions = vec![approved("x", "x")];
         assert!(select_version(&versions, Some(2)).is_err());
         assert!(select_version(&versions, Some(0)).is_err());
+    }
+
+    // ── phala API-key scoping ─────────────────────────────────────────────────
+
+    /// The key must be scoped onto the `phala` subprocess via `.env` (so it
+    /// never leaks to the `git`/`docker` children of the image build), and
+    /// omitted entirely when there is none (CLI-session auth).
+    #[test]
+    fn phala_command_scopes_the_api_key_onto_the_subprocess() {
+        let cmd = phala_command(Some("secret-key"));
+        let scoped: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| *k == std::ffi::OsStr::new("PHALA_CLOUD_API_KEY"))
+            .collect();
+        assert_eq!(scoped.len(), 1, "the key must be set on the command env");
+        assert_eq!(
+            scoped[0].1,
+            Some(std::ffi::OsStr::new("secret-key")),
+            "the scoped value must be the resolved key"
+        );
+
+        let no_key = phala_command(None);
+        assert!(
+            no_key
+                .get_envs()
+                .all(|(k, _)| k != std::ffi::OsStr::new("PHALA_CLOUD_API_KEY")),
+            "no key means nothing is added to the command env"
+        );
+    }
+
+    /// `with_api_key` records the key the client scopes onto its subprocesses.
+    #[test]
+    fn with_api_key_sets_the_field() {
+        let client = RealPhalaClient::new("gm-miner-1", "/tmp/d".into(), "t", "40G", "os")
+            .with_api_key(Some("k".to_owned()));
+        assert_eq!(client.api_key.as_deref(), Some("k"));
     }
 
     // ── phala deploy argument wiring ──────────────────────────────────────────
