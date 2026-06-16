@@ -1934,20 +1934,39 @@ fn filter_catalog<'a>(
 
 // ── doctor ────────────────────────────────────────────────────────────────────
 
-/// One line of the `doctor` checklist: a pass/fail mark, a label, and an
-/// optional actionable fix shown only when the check fails.
+/// The state of one `doctor` checklist line.
+#[derive(PartialEq, Eq)]
+enum Status {
+    /// Ready — nothing to do.
+    Pass,
+    /// A normal pre-deploy state worth surfacing but not a failure (e.g. the
+    /// hotkey isn't registered yet — the first `deploy` registers it).
+    Info,
+    /// Needs the operator's attention before deploying.
+    Fail,
+}
+
+/// One line of the `doctor` checklist: a status mark, a label, and an
+/// optional note (the resolved detail for a pass, the actionable fix for a
+/// fail, or context for an info line).
 struct Check {
-    ok: bool,
+    status: Status,
     label: String,
-    /// Shown beneath the label when `ok` is false — names the command or env
-    /// var that fixes it. A passing check carries the resolved detail instead.
     note: String,
 }
 
 impl Check {
     fn pass(label: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
-            ok: true,
+            status: Status::Pass,
+            label: label.into(),
+            note: detail.into(),
+        }
+    }
+
+    fn info(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            status: Status::Info,
             label: label.into(),
             note: detail.into(),
         }
@@ -1955,18 +1974,25 @@ impl Check {
 
     fn fail(label: impl Into<String>, fix: impl Into<String>) -> Self {
         Self {
-            ok: false,
+            status: Status::Fail,
             label: label.into(),
             note: fix.into(),
         }
     }
 
+    fn is_failure(&self) -> bool {
+        self.status == Status::Fail
+    }
+
     fn render(&self) {
-        let mark = if self.ok { "[ok]" } else { "[!!]" };
+        let (mark, note_prefix) = match self.status {
+            Status::Pass => ("[ok]", "      "),
+            Status::Info => ("[--]", "      "),
+            Status::Fail => ("[!!]", "      → "),
+        };
         println!("  {mark} {}", self.label);
         if !self.note.is_empty() {
-            let prefix = if self.ok { "      " } else { "      → " };
-            println!("{prefix}{}", self.note);
+            println!("{note_prefix}{}", self.note);
         }
     }
 }
@@ -1984,6 +2010,14 @@ async fn cmd_doctor(cfg: Config) -> Result<()> {
         network.netuid()
     );
 
+    // Refresh an expired-but-refreshable token up front so the checklist
+    // reflects what a real deploy would see — `ensure_fresh_token` is what the
+    // deploy/status paths run before touching the registry. A refresh failure
+    // is not fatal here: keep the pre-refresh config so `login_check` /
+    // `hotkey_check` report the true state with the fix.
+    let fallback = cfg.clone();
+    let cfg = ensure_fresh_token(cfg).await.unwrap_or(fallback);
+
     let mut checks = vec![
         network_check(network, &cfg),
         login_check(&cfg),
@@ -1997,7 +2031,7 @@ async fn cmd_doctor(cfg: Config) -> Result<()> {
         check.render();
     }
 
-    let failures = checks.iter().filter(|c| !c.ok).count();
+    let failures = checks.iter().filter(|c| c.is_failure()).count();
     println!();
     if failures == 0 {
         println!("All checks passed — you're ready to `gm-miner deploy`.");
@@ -2019,9 +2053,16 @@ fn login_check(cfg: &Config) -> Check {
         Some(t) if t.access_token.is_some() && !t.is_expired_or_near() => {
             Check::pass("Logged in (token valid)", String::new())
         }
+        // An expired access token with a stored refresh token is not a
+        // failure: the next registry call refreshes it silently
+        // (`ensure_fresh_token`), so the operator does not need to log in
+        // again.
+        Some(t) if t.access_token.is_some() && t.refresh_token.is_some() => {
+            Check::pass("Logged in (token refreshes on next use)", String::new())
+        }
         Some(t) if t.access_token.is_some() => Check::fail(
             "Logged in",
-            "your access token has expired — run `gm-miner login`",
+            "your session has expired — run `gm-miner login`",
         ),
         _ => Check::fail("Logged in", "not logged in — run `gm-miner login`"),
     }
@@ -2125,29 +2166,40 @@ async fn hotkey_check(cfg: Config) -> Check {
         }
     };
 
+    let label = format!("Hotkey registered on subnet {netuid}");
     let status = resp.status();
     if status.is_success() {
         let hotkey = resp
             .json::<MinerStatus>()
             .await
             .map_or_else(|_| "<registered>".to_owned(), |m| m.hotkey);
-        Check::pass(format!("Hotkey registered on subnet {netuid}"), hotkey)
-    } else if matches!(status.as_u16(), 401 | 403 | 404) {
-        // SEAM(W2): once `register-hotkey` ships, change the fix to run it.
-        Check::fail(
-            format!("Hotkey registered on subnet {netuid}"),
-            format!(
-                "your hotkey isn't registered on subnet {netuid} — register with btcli \
-                 (or `gm-miner register-hotkey`, coming). On the wrong network? \
-                 You're on `{network}`."
-            ),
-        )
-    } else {
-        Check::fail(
-            format!("Hotkey registered on subnet {netuid}"),
-            format!("registry returned {status}"),
-        )
+        return Check::pass(label, hotkey);
     }
+    // A 404 is the expected state before the first deploy: the registry has no
+    // miner for this hotkey yet, and `gm-miner deploy` registers it. Surface
+    // it as informational, not a failure — doctor is meant to *precede* that
+    // deploy. SEAM(W2): once `register-hotkey` ships, name it here too.
+    if status.as_u16() == 404 {
+        return Check::info(
+            label,
+            format!(
+                "not registered on `{network}` yet — your first `gm-miner deploy` \
+                 registers it (or register with btcli / `gm-miner register-hotkey`, \
+                 coming). On the wrong network? Pass `--network mainnet`/`--network testnet`."
+            ),
+        );
+    }
+    // A 401/403 with a valid-looking token usually means the wrong network.
+    if matches!(status.as_u16(), 401 | 403) {
+        return Check::fail(
+            label,
+            format!(
+                "registry rejected the request ({status}). On the wrong network? \
+                 You're on `{network}` — pass `--network mainnet`/`--network testnet`."
+            ),
+        );
+    }
+    Check::fail(label, format!("registry returned {status}"))
 }
 
 // ── gm / moon ────────────────────────────────────────────────────────────────
