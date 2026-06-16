@@ -1094,9 +1094,9 @@ impl ImageProvisioner for PublicRegistryProvisioner<'_> {
 
         let args = self.args;
 
-        if let ImageSource::Prebuilt(pre_built) = &self.source {
-            println!("Using pre-built image ref (skipping local build): {pre_built}");
-            return Ok(pre_built.clone());
+        if let ImageSource::Prebuilt { image_ref, .. } = &self.source {
+            println!("Using pre-built image ref (skipping local build): {image_ref}");
+            return Ok(image_ref.clone());
         }
 
         let repo = args.image_repo.as_deref().ok_or_else(|| {
@@ -1262,39 +1262,59 @@ fn existing_worker_id_for(cfg: &Config, app_name: &str) -> String {
 
 /// The Phala prerequisite gate, run at the start of every deploy.
 ///
-/// Ensures the `phala` CLI is installed (offering to install it), then
-/// resolves the Phala Cloud API key (flag → env → config → interactive paste,
-/// persisted) and validates it — including a credit-balance check — against
-/// the Phala Cloud API. The validated key is exported as `PHALA_CLOUD_API_KEY`
-/// for this process so the `phala` CLI the deploy shells out to reuses it
-/// without re-prompting. Both run before any irreversible CVM work so a
-/// missing CLI, a bad key, or an empty balance fails fast with guidance.
+/// Ensures the `phala` CLI is installed (offering to install it), then resolves
+/// the Phala Cloud API key (flag → env → config → interactive paste, persisted)
+/// and validates it — including a credit-balance check — against the Phala
+/// Cloud API. A resolved key is exported as `PHALA_CLOUD_API_KEY` so the
+/// `phala` CLI the deploy shells out to reuses it. When no explicit key is
+/// configured but the `phala` CLI already holds a login session, that session
+/// is reused and nothing is exported. Both run before any irreversible CVM
+/// work so a missing CLI, a bad key, or an empty balance fails fast.
 async fn phala_preflight(args: &DeployArgs) -> Result<()> {
     ensure_dependency(&PHALA, args.assume_yes)?;
-    let phala_key =
-        gm_miner_cli::phala::resolve_key(args.phala_api_key.as_deref(), args.assume_yes).await?;
-    std::env::set_var("PHALA_CLOUD_API_KEY", &phala_key);
+    // `None` means the operator is already authenticated via `phala` CLI login
+    // — the deploy reuses that session, so there is no key to export.
+    if let Some(phala_key) =
+        gm_miner_cli::phala::resolve_key(args.phala_api_key.as_deref(), args.assume_yes).await?
+    {
+        std::env::set_var("PHALA_CLOUD_API_KEY", &phala_key);
+    }
     Ok(())
 }
 
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
 /// overridden by `--image-ref`, built locally for `--image-repo`), provision
 /// it, and render the compose template around the resulting digest-pinned ref.
+/// Returns the rendered [`DeployTarget`] and whether the image is the
+/// gm-published default (which Phala may pull anonymously — no operator GHCR
+/// pull credentials required).
 fn resolve_and_render_target(
     cfg: &Config,
     args: &DeployArgs,
     supported_image_ref: Option<&str>,
-) -> Result<gm_miner_cli::deploy::DeployTarget> {
+) -> Result<(gm_miner_cli::deploy::DeployTarget, bool)> {
     let source = resolve_image_source(
         args.image_ref.as_deref(),
         args.image_repo.as_deref(),
         supported_image_ref,
     )?;
-    if let ImageSource::Prebuilt(image_ref) = &source {
-        println!("Deploying the registry-supported image: {image_ref}");
-    }
-    let provisioner = PublicRegistryProvisioner { args, source };
-    prepare_deploy_target(&provisioner, cfg.active_network())
+    let public_pull = match &source {
+        ImageSource::Prebuilt {
+            image_ref,
+            gm_published,
+        } => {
+            if *gm_published {
+                println!("Deploying the registry-supported image: {image_ref}");
+            }
+            *gm_published
+        }
+        ImageSource::Build => false,
+    };
+    let target = prepare_deploy_target(
+        &PublicRegistryProvisioner { args, source },
+        cfg.active_network(),
+    )?;
+    Ok((target, public_pull))
 }
 
 async fn cmd_deploy(
@@ -1389,14 +1409,14 @@ async fn cmd_deploy(
 
     // Step 5: resolve which image to deploy (default = the gm-published ref
     // on the selected version) and render the compose around it.
-    let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
+    let (target, public_pull) =
+        resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
 
-    // Step 5b: resolve private-registry pull credentials. The miner image
-    // lives on a private GHCR repo, so the CVM's pre-launch script needs
-    // `DSTACK_DOCKER_*` env vars to `docker login` and pull. Derived from
-    // the image ref's registry host plus the operator-set
-    // GHCR_PULL_USERNAME / GHCR_PULL_TOKEN env vars.
-    let registry_creds = resolve_registry_credentials(&target.image_ref)?;
+    // Step 5b: resolve private-registry pull credentials. An operator's own
+    // private image needs `DSTACK_DOCKER_*` env vars so the CVM's pre-launch
+    // script can `docker login` and pull; the gm-published default image is
+    // public, so `public_pull` skips the credential requirement.
+    let registry_creds = resolve_registry_credentials(&target.image_ref, public_pull)?;
 
     // Step 6: submit the compose stack to Phala Cloud and poll until the
     // CVM reports its measured hashes. Phala Cloud provisions the TEEPod,
@@ -2429,10 +2449,13 @@ fn hotkey_step_done(cfg: &Config) -> bool {
     cfg.registered_hotkey().is_some() || has_valid_login(cfg)
 }
 
-/// Whether the active network already has a deployed worker tracked.
+/// Whether the active network has a *registered* worker — one the registry
+/// assigned a `worker_id`. A provisional stub (empty `worker_id`, written
+/// before registration by a deploy that then failed) does not count: its CVM
+/// may never have come up, so the wizard must still offer the deploy step.
 fn has_deployed_worker(cfg: &Config) -> bool {
     cfg.active_network_entry()
-        .is_some_and(|e| !e.workers.is_empty())
+        .is_some_and(|e| e.workers.iter().any(|w| !w.worker_id.is_empty()))
 }
 
 /// Whether any provider key is already set.
@@ -2458,6 +2481,9 @@ async fn cmd_init(explicit_network: Option<Network>, api_url: Option<String>) ->
     );
     println!("Each step shows its command and asks before running. Press Enter to run, `n` to stop, `skip` to skip.");
 
+    // Provider keys precede deploy: `cmd_deploy` refuses to start without at
+    // least one key (it bakes them into the CVM env), so the wizard must
+    // collect them first or the deploy step would fail before doing anything.
     if wizard_register_hotkey(&cfg)? == WizardFlow::Stop {
         return Ok(());
     }
@@ -2465,11 +2491,11 @@ async fn cmd_init(explicit_network: Option<Network>, api_url: Option<String>) ->
         return Ok(());
     }
     let cfg = load_config(explicit_network, api_url.clone())?;
-    if wizard_deploy(cfg).await? == WizardFlow::Stop {
+    if wizard_provider_keys(explicit_network, &cfg)? == WizardFlow::Stop {
         return Ok(());
     }
     let cfg = load_config(explicit_network, api_url.clone())?;
-    if wizard_provider_keys(explicit_network, &cfg)? == WizardFlow::Stop {
+    if wizard_deploy(cfg).await? == WizardFlow::Stop {
         return Ok(());
     }
     let cfg = load_config(explicit_network, api_url)?;
@@ -2577,7 +2603,7 @@ async fn wizard_login(
 /// Wizard step 3: deploy worker #1. A miner with a tracked worker is offered
 /// the skip (a re-deploy is fine but rarely what onboarding wants).
 async fn wizard_deploy(cfg: Config) -> Result<WizardFlow> {
-    let title = "Step 3/5 · deploy worker";
+    let title = "Step 4/5 · deploy worker";
     if has_deployed_worker(&cfg)
         && !gm_miner_cli::dependency::confirm(
             "A worker is already deployed. Deploy another?",
@@ -2598,7 +2624,7 @@ async fn wizard_deploy(cfg: Config) -> Result<WizardFlow> {
 
 /// Wizard step 4: set provider keys. Skipped when any key is already set.
 fn wizard_provider_keys(explicit_network: Option<Network>, cfg: &Config) -> Result<WizardFlow> {
-    let title = "Step 4/5 · provider keys";
+    let title = "Step 3/5 · provider keys";
     if provider_keys_done(cfg) {
         gm_miner_cli::wizard::already_done(title, "provider keys already set");
         return Ok(WizardFlow::Continue);

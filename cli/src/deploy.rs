@@ -239,18 +239,27 @@ pub fn registry_host(image_ref: &str) -> String {
 
 /// Resolve private-registry pull credentials for `image_ref`.
 ///
-/// Returns `Ok(None)` when the image lives on Docker Hub (`docker.io`),
-/// which is treated as public — no credentials are wired. For any other
-/// registry host the miner image is assumed private, so the operator-set
-/// `GHCR_PULL_USERNAME` / `GHCR_PULL_TOKEN` environment variables are
-/// required.
+/// Returns `Ok(None)` when no credentials are needed — the image is on Docker
+/// Hub (`docker.io`, public), or `public_pull` is set (the gm-published
+/// supported image, which is published for anonymous pull). For any other
+/// registry host with `public_pull == false` the miner image is assumed
+/// private, so the operator-set `GHCR_PULL_USERNAME` / `GHCR_PULL_TOKEN`
+/// environment variables are required.
+///
+/// `public_pull` is true only for the flag-less default deploy of the
+/// gm-published image; an operator's own `--image-ref` keeps the
+/// credentials-required behaviour since it may point at a private repo.
 ///
 /// # Errors
-/// Returns an actionable error if the image is on a private registry and
-/// either credential environment variable is unset or empty.
-pub fn resolve_registry_credentials(image_ref: &str) -> Result<Option<RegistryCredentials>> {
+/// Returns an actionable error if the image is on a private registry,
+/// `public_pull` is false, and either credential environment variable is
+/// unset or empty.
+pub fn resolve_registry_credentials(
+    image_ref: &str,
+    public_pull: bool,
+) -> Result<Option<RegistryCredentials>> {
     let registry = registry_host(image_ref);
-    if registry == "docker.io" {
+    if registry == "docker.io" || public_pull {
         return Ok(None);
     }
 
@@ -942,9 +951,16 @@ pub fn select_version(versions: &[ImageVersion], pin: Option<usize>) -> Result<&
 /// a local build+push (the legacy path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSource {
-    /// Use this digest-pinned ref verbatim — no build. Either the operator's
-    /// explicit `--image-ref`, or the registry-supported version's `image_ref`.
-    Prebuilt(String),
+    /// Use this digest-pinned ref verbatim — no build.
+    Prebuilt {
+        /// The digest-pinned ref to embed in the compose file.
+        image_ref: String,
+        /// True when this is the registry-supported, gm-published image (the
+        /// flag-less default). That image is published for public pull, so a
+        /// deploy of it must not demand operator GHCR pull credentials. False
+        /// for an operator's own `--image-ref`, which may be on a private repo.
+        gm_published: bool,
+    },
     /// Build the miner image locally and push it to this public repo, then
     /// pin the pushed digest. Requested explicitly via `--image-repo`.
     Build,
@@ -969,13 +985,19 @@ pub fn resolve_image_source(
     supported_image_ref: Option<&str>,
 ) -> Result<ImageSource> {
     if let Some(explicit) = image_ref_flag {
-        return Ok(ImageSource::Prebuilt(explicit.to_owned()));
+        return Ok(ImageSource::Prebuilt {
+            image_ref: explicit.to_owned(),
+            gm_published: false,
+        });
     }
     if image_repo_flag.is_some() {
         return Ok(ImageSource::Build);
     }
     if let Some(supported) = supported_image_ref {
-        return Ok(ImageSource::Prebuilt(supported.to_owned()));
+        return Ok(ImageSource::Prebuilt {
+            image_ref: supported.to_owned(),
+            gm_published: true,
+        });
     }
     bail!(
         "the registry's supported image version has no pullable image_ref, so \
@@ -1217,7 +1239,11 @@ mod tests {
             .expect("supported ref must resolve");
         assert_eq!(
             source,
-            ImageSource::Prebuilt("ghcr.io/taostat/gm-miner@sha256:abc".to_owned())
+            ImageSource::Prebuilt {
+                image_ref: "ghcr.io/taostat/gm-miner@sha256:abc".to_owned(),
+                gm_published: true,
+            },
+            "the supported default is marked gm_published (public pull)"
         );
     }
 
@@ -1232,7 +1258,11 @@ mod tests {
         .expect("explicit ref must resolve");
         assert_eq!(
             source,
-            ImageSource::Prebuilt("ghcr.io/me/gm-miner@sha256:def".to_owned())
+            ImageSource::Prebuilt {
+                image_ref: "ghcr.io/me/gm-miner@sha256:def".to_owned(),
+                gm_published: false,
+            },
+            "an explicit --image-ref is not the gm-published default"
         );
     }
 
@@ -1535,9 +1565,36 @@ mod tests {
     /// credentials are required or returned.
     #[test]
     fn resolve_registry_credentials_skips_docker_hub() {
-        let creds = resolve_registry_credentials("library/alpine:3")
+        let creds = resolve_registry_credentials("library/alpine:3", false)
             .expect("docker hub must not require creds");
         assert!(creds.is_none(), "docker hub is public — no creds");
+    }
+
+    /// The gm-published default image (`public_pull = true`) must not require
+    /// operator GHCR pull credentials even on a private-looking host.
+    #[test]
+    fn resolve_registry_credentials_skips_public_pull_default() {
+        let creds = resolve_registry_credentials("ghcr.io/taostat/gm-miner@sha256:abc", true)
+            .expect("the gm-published default must not require creds");
+        assert!(
+            creds.is_none(),
+            "public_pull must skip the private-registry credential requirement"
+        );
+    }
+
+    /// A private (non-default) GHCR image with `public_pull = false` and no
+    /// credential env vars must fail with an actionable error.
+    #[test]
+    fn resolve_registry_credentials_requires_creds_for_private_ref() {
+        // Ensure the env vars are unset for this assertion.
+        std::env::remove_var(GHCR_PULL_USERNAME_VAR);
+        std::env::remove_var(GHCR_PULL_TOKEN_VAR);
+        let err = resolve_registry_credentials("ghcr.io/me/private-miner@sha256:abc", false)
+            .expect_err("a private image without creds must fail");
+        assert!(
+            err.to_string().contains("pull credentials are not set"),
+            "got: {err}"
+        );
     }
 
     // ── env-file rendering ────────────────────────────────────────────────────

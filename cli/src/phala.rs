@@ -130,25 +130,47 @@ fn key_from_env() -> Option<String> {
 /// guidance and fails rather than blocking. A flag/env key is never persisted
 /// (it is a per-run override); a freshly-pasted key is.
 ///
+/// Returns `Ok(None)` when no explicit key is configured but the `phala` CLI
+/// already holds a login session (`phala whoami` succeeds): the deploy reuses
+/// that session, so there is no key to export or balance to pre-check here —
+/// Phala Cloud enforces the balance at deploy time. Returns `Ok(Some(key))`
+/// when an explicit key (flag/env/config/paste) was resolved and validated.
+///
 /// # Errors
-/// Returns an error when no key can be resolved in a non-interactive context,
-/// the paste is empty, or [`validate_key`] rejects the resolved key.
-pub async fn resolve_key(flag: Option<&str>, assume_yes: bool) -> Result<String> {
-    let KeySource { key, persist } = match resolve_key_source(flag)? {
+/// Returns an error when no key and no CLI session exist in a non-interactive
+/// context, the paste is empty, or [`validate_key`] rejects the resolved key.
+pub async fn resolve_key(flag: Option<&str>, assume_yes: bool) -> Result<Option<String>> {
+    let source = match resolve_key_source(flag)? {
         Some(source) => source,
+        None if phala_cli_logged_in() => {
+            println!("Using your existing `phala` CLI login session.");
+            return Ok(None);
+        }
         None => KeySource {
             key: prompt_for_key(assume_yes)?,
             persist: true,
         },
     };
 
-    validate_key(PHALA_API_BASE, &key).await?;
+    validate_key(PHALA_API_BASE, &source.key).await?;
 
-    if persist {
-        persist_key(&key)?;
+    if source.persist {
+        persist_key(&source.key)?;
         println!("Saved the Phala Cloud API key to gmcli config for next time.");
     }
-    Ok(key)
+    Ok(Some(source.key))
+}
+
+/// Whether the `phala` CLI already holds a login session. `phala whoami` exits
+/// non-zero when unauthenticated, so a zero exit means a usable session — the
+/// same probe `gmcli doctor`'s Phala check uses, kept consistent here.
+fn phala_cli_logged_in() -> bool {
+    std::process::Command::new("phala")
+        .arg("whoami")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// The non-interactive key sources, in priority order: flag, env, stored
