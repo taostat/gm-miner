@@ -5,14 +5,19 @@
 //!   deploy           — trust-correct single-shot deploy: fetch approved hashes,
 //!                      deploy via Phala Cloud, verify hashes, register image
 //!   login            — Taostats device-code OAuth flow
-//!   register-image   — re-register the deployed miner's image hashes
-//!   list-products    — show the miner's declared offers (GET /miners/me)
+//!   doctor           — preflight checklist (network, login, keys, phala, hotkey)
+//!   register-image   — re-register the deployed miner's image hashes (hidden)
 //!   declare-product  — declare a single offer (--provider X --model Y --discount-pct N)
 //!   declare-products — fan out one discount over the whole catalog, or one provider
-//!   status           — show current registration state and per-product eligibility
+//!   status           — registration state + per-product eligibility and rates
+//!                      (the hidden `list-products` alias runs the same code)
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
 //!   worker list      — list the hotkey's live workers
 //!   worker remove    — deregister a worker (CVM teardown is separate)
+//!
+//! Every command resolves a [`Network`] profile (testnet/mainnet) carrying the
+//! subnet `netuid`, chain websocket, and default registry URL. The selection
+//! is sticky: `--network` / `--testnet` persists it for later commands.
 //!
 //! Pricing follows the registry's pct-discount model: a miner declares
 //! a single `discount_bp` in `[0, 9990]` per (provider, model) offer, and
@@ -27,6 +32,7 @@
 use std::io::IsTerminal as _;
 
 use anyhow::{bail, Context, Result};
+use chrono::Timelike as _;
 use clap::{Parser, Subcommand};
 use gm_miner_cli::{
     auth,
@@ -39,6 +45,7 @@ use gm_miner_cli::{
         ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
         PHALA_ENDPOINT_FIELD,
     },
+    network::Network,
     node_secret,
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider,
@@ -55,11 +62,26 @@ const MAX_DISCOUNT_BP: u32 = 9_990;
 #[command(
     name = "gm-miner",
     version,
-    about = "gm miner CLI — manage your miner's registration, products, and prices"
+    about = "gm miner CLI — manage your miner's registration, products, and prices",
+    after_help = "Examples:\n  \
+        gm-miner login                       # authenticate (mainnet by default)\n  \
+        gm-miner --network testnet login     # authenticate against testnet\n  \
+        gm-miner doctor                      # preflight checklist before deploying\n  \
+        gm-miner status                      # registration + products\n\n\
+        The selected network is sticky: pass --network (or --testnet) once and\n\
+        every later command targets it until you pass a different one."
 )]
 struct Cli {
-    /// Use testnet registry instead of mainnet.
-    #[arg(long, global = true)]
+    /// Network to target: `testnet` or `mainnet` (default: mainnet).
+    ///
+    /// Sticky — the choice is saved and reused by later commands until you
+    /// pass a different one. `--testnet` is a shorthand for
+    /// `--network testnet`.
+    #[arg(long, global = true, value_name = "NETWORK")]
+    network: Option<Network>,
+
+    /// Shorthand for `--network testnet`.
+    #[arg(long, global = true, conflicts_with = "network")]
     testnet: bool,
 
     /// Override the registry API URL (flag only; use `GM_REGISTRY_URL` env var for
@@ -71,12 +93,24 @@ struct Cli {
     command: Command,
 }
 
+impl Cli {
+    /// The network the user explicitly selected this run, if any. `--testnet`
+    /// is folded in as `Network::Testnet`. `None` means "use the sticky stored
+    /// selection" (see [`load_config`]).
+    fn explicit_network(&self) -> Option<Network> {
+        self.network.or(self.testnet.then_some(Network::Testnet))
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Persist provider API keys to ~/.gm-miner/config.json (mode 0600).
     ///
     /// Each flag, if provided, replaces the stored value.  Omitted flags
     /// leave existing values intact.  Key values are never echoed back.
+    #[command(after_help = "Examples:\n  \
+        gm-miner set-api-keys --anthropic sk-ant-...\n  \
+        gm-miner set-api-keys --openai sk-... --google AIza...")]
     SetApiKeys {
         /// Anthropic API key (sk-ant-...).
         #[arg(long)]
@@ -103,6 +137,9 @@ enum Command {
     /// Phala Cloud manages the confidential VM, the KMS, and `app_id`
     /// authorization. Authentication uses a Phala Cloud API key — set
     /// `PHALA_CLOUD_API_KEY` or run `phala login` before deploying.
+    #[command(after_help = "Examples:\n  \
+        gm-miner deploy --image-repo ghcr.io/<owner>/gm-miner\n  \
+        gm-miner deploy --image-ref ghcr.io/<owner>/gm-miner@sha256:...")]
     Deploy {
         #[command(flatten)]
         flags: Box<DeployFlags>,
@@ -110,6 +147,10 @@ enum Command {
 
     /// Authenticate with Taostats (device-code OAuth flow) and store
     /// credentials in ~/.gm-miner/config.json.
+    #[command(after_help = "Examples:\n  \
+        gm-miner login\n  \
+        gm-miner --network testnet login\n  \
+        gm-miner login --no-browser")]
     Login {
         /// Do not automatically open the browser.
         #[arg(long)]
@@ -125,21 +166,38 @@ enum Command {
     /// The compose + OS image hashes are read automatically from the
     /// deployed CVM via `phala cvms get <app-id> --json`; the CVM must
     /// already be deployed (`gm-miner deploy`).
+    #[command(hide = true)]
     RegisterImage {
         /// Phala Cloud app id of the deployed CVM (e.g. `app_abc123`).
         #[arg(long)]
         app_id: String,
     },
 
-    /// Show the miner's declared offers (`provider`, `model`, discount percent,
-    /// `is_offered`, `is_eligible`) from `GET /miners/me`. Use `status` for
-    /// the broader miner registration view.
+    /// Alias for `status` — the product table is folded into `status`.
+    ///
+    /// Kept so existing muscle memory and scripts keep working; it runs the
+    /// same code as `status`.
+    #[command(hide = true, alias = "products")]
     ListProducts,
+
+    /// Run a preflight checklist before deploying.
+    ///
+    /// Prints a green/red checklist of everything a deploy needs: the active
+    /// network, login state, provider keys, the `phala` CLI and its API key,
+    /// and whether your hotkey is registered on the subnet. Each red line
+    /// names the command that fixes it.
+    #[command(after_help = "Examples:\n  \
+        gm-miner doctor\n  \
+        gm-miner --network testnet doctor")]
+    Doctor,
 
     /// Declare a single miner-product offer.
     ///
     /// One POST to `/miners/products`. For batch declarations against the
     /// whole catalog (or one provider's slice), use `declare-products`.
+    #[command(after_help = "Examples:\n  \
+        gm-miner declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
+        gm-miner declare-product --provider openai --model gpt-5.5 --discount-pct 10.5")]
     DeclareProduct {
         /// Provider: anthropic, openai, or gemini.
         #[arg(long)]
@@ -164,6 +222,9 @@ enum Command {
     /// by `--provider` when set, then POSTs one offer per surviving entry.
     /// Per-product failures are reported individually and do not abort the
     /// loop — the final summary lists ok/err counts.
+    #[command(after_help = "Examples:\n  \
+        gm-miner declare-products --discount-pct 5            # whole catalog\n  \
+        gm-miner declare-products --provider openai --discount-pct 10")]
     DeclareProducts {
         /// Optional provider filter. When set, only products from this
         /// provider are declared. Omit to fan out over the whole catalog.
@@ -178,7 +239,21 @@ enum Command {
     },
 
     /// Show the miner's current registration status and per-product eligibility.
+    ///
+    /// Lists each declared offer with the per-Mtok rate you actually receive
+    /// after the discount, plus whether it is offered and eligible.
+    #[command(after_help = "Examples:\n  \
+        gm-miner status\n  \
+        gm-miner --network testnet status")]
     Status,
+
+    /// gm. (prints a small sunrise and a time-of-day greeting)
+    #[command(hide = true)]
+    Gm,
+
+    /// gn. (the quiet counterpart to `gm`)
+    #[command(hide = true)]
+    Moon,
 
     /// Manage the data-plane workers (Phala CVMs) attached to your hotkey.
     ///
@@ -290,10 +365,12 @@ async fn main() -> Result<()> {
         .init();
 
     if std::env::args().len() == 1 && std::io::stdout().is_terminal() {
-        println!("{BANNER}");
+        println!("{}", banner());
     }
 
     let cli = Cli::parse();
+    let explicit_network = cli.explicit_network();
+    let api_url = cli.api_url.clone();
 
     match cli.command {
         Command::SetApiKeys {
@@ -301,8 +378,16 @@ async fn main() -> Result<()> {
             openai,
             google,
         } => cmd_set_api_keys(anthropic, openai, google),
+        Command::Gm => {
+            cmd_gm();
+            Ok(())
+        }
+        Command::Moon => {
+            cmd_moon();
+            Ok(())
+        }
         Command::Deploy { flags } => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             cmd_deploy_subcommand(
                 cfg,
@@ -314,7 +399,7 @@ async fn main() -> Result<()> {
         Command::Worker {
             command: WorkerCommand::Add { flags },
         } => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let args = deploy_args_from_flags(*flags);
             cmd_worker_add(cfg, args).await
@@ -322,7 +407,7 @@ async fn main() -> Result<()> {
         Command::Worker {
             command: WorkerCommand::List,
         } => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_worker_list(&mut client).await
@@ -330,28 +415,32 @@ async fn main() -> Result<()> {
         Command::Worker {
             command: WorkerCommand::Remove { worker_id },
         } => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             cmd_worker_remove(cfg, &worker_id).await
         }
-        Command::Login { no_browser } => cmd_login(cli.testnet, cli.api_url, !no_browser).await,
+        Command::Login { no_browser } => cmd_login(explicit_network, api_url, !no_browser).await,
+        Command::Doctor => {
+            let cfg = load_config(explicit_network, api_url)?;
+            cmd_doctor(cfg).await
+        }
         Command::RegisterImage { app_id } => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             cmd_register_image_subcommand(cfg, &app_id).await
         }
-        Command::ListProducts => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
+        Command::ListProducts | Command::Status => {
+            let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_list_products(&mut client).await
+            cmd_status(&mut client).await
         }
         Command::DeclareProduct {
             provider,
             model,
             discount_bp,
         } => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_declare_product(&mut client, &provider, &model, discount_bp).await
@@ -360,23 +449,22 @@ async fn main() -> Result<()> {
             provider,
             discount_bp,
         } => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
+            let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_declare_products(&mut client, provider.as_ref(), discount_bp).await
-        }
-        Command::Status => {
-            let cfg = load_config(cli.testnet, cli.api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
-            cmd_status(&mut client).await
         }
     }
 }
 
 // ── Banner ───────────────────────────────────────────────────────────────────
 
-const BANNER: &str = r"
+/// The gm banner, greeting line picked by local time of day. `gm` = good
+/// morning — the greeting reads "good morning/afternoon/evening/night" so a
+/// 3am deploy says `gm. gn really.` energy without changing the art.
+fn banner() -> String {
+    format!(
+        r"
  .----------------------.
  |                      |
  |    ____ __  __       |
@@ -385,26 +473,55 @@ const BANNER: &str = r"
  |  | |_| | |  | |      |
  |   \____|_|  |_|      |
  |                      |
- |   gm. wagmi.         |
+ |   {greeting:<18} |
  |                      |
  '----------------------'
         \
          \    .--.
               |o.o|
-              =(_)=
-";
+              =(_)=",
+        greeting = greeting()
+    )
+}
+
+/// A short greeting keyed off the local hour. Kept under 18 chars so it fits
+/// the banner box.
+fn greeting() -> &'static str {
+    match chrono::Local::now().hour() {
+        5..=11 => "gm. good morning.",
+        12..=17 => "gm. good afternoon",
+        18..=21 => "gm. good evening.",
+        _ => "gm. good night.",
+    }
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn load_config(testnet: bool, api_url_override: Option<String>) -> Result<Config> {
+/// Load config and resolve the active network.
+///
+/// `explicit_network` is the network the user named this run (`--network` /
+/// `--testnet`), or `None` to use the sticky stored selection. An explicit
+/// choice is persisted so later commands target it without retyping the flag;
+/// the previous default-to-mainnet-every-run behaviour was the audit's biggest
+/// day-2 footgun.
+///
+/// `--api-url` is *not* sticky: it is applied to the in-memory config for this
+/// run only (falling back to `GM_REGISTRY_URL`) and never written back here.
+fn load_config(
+    explicit_network: Option<Network>,
+    api_url_override: Option<String>,
+) -> Result<Config> {
     let mut cfg = config::load().context("load config")?;
 
-    // Always reset to the explicit choice on every invocation so the
-    // active network reflects the current flag, not whatever the last
-    // command left in the config. Without this, a single `--testnet`
-    // call sticks across every subsequent command until the operator
-    // hand-edits ~/.gm-miner/config.json.
-    cfg.active_network = Some(if testnet { "testnet" } else { "mainnet" }.to_string());
+    if let Some(network) = explicit_network {
+        // Persist the explicit choice so it sticks across later commands. An
+        // empty stored value (or a different prior selection) is overwritten.
+        let changed = cfg.resolved_network() != network || cfg.active_network.is_none();
+        cfg.set_network(network);
+        if changed {
+            config::save(&cfg).context("persist selected network")?;
+        }
+    }
 
     // Explicit --api-url flag wins; fall back to GM_REGISTRY_URL for a
     // this-run-only override that is never persisted.
@@ -618,6 +735,28 @@ fn error_detail(json: &serde_json::Value) -> String {
     json.get("detail")
         .and_then(serde_json::Value::as_str)
         .map_or_else(|| json.to_string(), str::to_owned)
+}
+
+/// Turn a failed `GET /miners/me` into an actionable error instead of dumping
+/// the raw response body.
+///
+/// A 403/404 means the caller authenticated fine but the registry has no miner
+/// for this hotkey — i.e. it isn't registered on the subnet. A 401 is handled
+/// upstream by [`RegistryClient`], but together with 404 it can also mean the
+/// command is pointed at the wrong network, so the hint names the active one.
+fn me_error(network: Network, status: reqwest::StatusCode) -> anyhow::Error {
+    let netuid = network.netuid();
+    if matches!(status.as_u16(), 401 | 403 | 404) {
+        return anyhow::anyhow!(
+            "your hotkey isn't registered on subnet {netuid} (registry returned {status}).\n\
+             Register it with btcli, then run `gm-miner deploy` to attach a worker \
+             (`gm-miner register-hotkey` is coming).\n\
+             Already registered? You're on the `{network}` network — pass \
+             `--network mainnet` / `--network testnet` if that's not where your \
+             hotkey lives."
+        );
+    }
+    anyhow::anyhow!("registry request to {network} failed ({status})")
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -912,6 +1051,7 @@ fn cmd_set_api_keys(
         for name in &set_names {
             println!("  {name}: set");
         }
+        println!("\nNext: gm-miner deploy --image-repo ghcr.io/<owner>/gm-miner");
     }
     Ok(())
 }
@@ -1136,9 +1276,19 @@ async fn cmd_deploy(
         },
     )?;
 
-    println!("  worker_id : {worker_id}");
-    println!("  app_id    : {}", actual.app_id);
+    print_deploy_summary(&worker_id, &actual.app_id, registration);
     Ok(())
+}
+
+/// Print the deploy result and, for a first deploy, the next-step hint.
+fn print_deploy_summary(worker_id: &str, app_id: &str, registration: &WorkerRegistration) {
+    println!("  worker_id : {worker_id}");
+    println!("  app_id    : {app_id}");
+    if *registration == WorkerRegistration::First {
+        println!(
+            "\nNext: gm-miner declare-products --discount-pct <pct>  (then `gm-miner status`)"
+        );
+    }
 }
 
 /// Register a freshly-deployed worker and return its registry `worker_id`.
@@ -1185,7 +1335,7 @@ async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
 }
 
 async fn cmd_login(
-    testnet: bool,
+    explicit_network: Option<Network>,
     api_url_override: Option<String>,
     open_browser: bool,
 ) -> Result<()> {
@@ -1198,9 +1348,12 @@ async fn cmd_login(
     let mut cfg = config::load()
         .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
 
-    // Reset on every login so a previous testnet session can't sticky-
-    // overwrite mainnet credentials when the operator omits --testnet.
-    cfg.active_network = Some(if testnet { "testnet" } else { "mainnet" }.to_string());
+    // An explicit --network/--testnet selects (and sticks) the network this
+    // login targets; otherwise the stored sticky selection is kept so a
+    // re-login doesn't silently switch networks.
+    if let Some(network) = explicit_network {
+        cfg.set_network(network);
+    }
 
     let api_url = api_url_override.unwrap_or_else(|| cfg.api_url());
 
@@ -1219,8 +1372,9 @@ async fn cmd_login(
 
     config::save(&cfg).context("save config")?;
 
-    println!("Login successful.");
+    println!("Login successful ({} network).", cfg.resolved_network());
     println!("Credentials saved to {}", config::config_path().display());
+    println!("\nNext: gm-miner set-api-keys --anthropic <key>  (and/or --openai / --google)");
     Ok(())
 }
 
@@ -1600,77 +1754,6 @@ fn remove_provisional_worker(network: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `gm-miner list-products` — show the miner's declared offers.
-///
-/// Calls `GET /miners/me` and tabulates each `ProductOfferStatus`. Helps the
-/// operator verify what their `declare-product[s]` calls actually persisted.
-async fn cmd_list_products(client: &mut RegistryClient) -> Result<()> {
-    let resp = client
-        .get(gm_miner_cli::client::ME_PATH)
-        .await
-        .context("GET /miners/me")?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("list-products failed ({status}): {body}");
-    }
-
-    let miner: MinerStatus = resp.json().await.context("parse miner status")?;
-
-    if miner.products.is_empty() {
-        println!("No products declared.");
-        return Ok(());
-    }
-
-    // Join against the catalog so each row can render the effective
-    // per-Mtok rate the miner actually receives. The catalog is the
-    // single source of truth for retail; doing the join here avoids
-    // adding a retail block to `/miners/me` on the registry side.
-    let catalog = fetch_catalog(client).await?;
-    let retail_by_key: std::collections::HashMap<_, _> = catalog
-        .products
-        .iter()
-        .map(|p| {
-            (
-                (p.provider.clone(), p.model.as_str()),
-                &p.retail_price.dimensions,
-            )
-        })
-        .collect();
-
-    println!(
-        "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
-        "PROVIDER", "MODEL", "DISCOUNT", "YOU RECEIVE / MTOK", "OFFERED", "ELIGIBLE"
-    );
-    println!("{}", "-".repeat(110));
-    for p in &miner.products {
-        let provider: Result<Provider, _> = p.provider.parse();
-        let (discount_label, rate_label) = match (p.discount_bp, provider) {
-            (Some(bp), Ok(prov)) => {
-                let label = format!("{}%", format_discount_pct(bp));
-                let rate = retail_by_key.get(&(prov, p.model.as_str())).map_or_else(
-                    || "(retail unknown)".to_owned(),
-                    |dims| effective_rate_summary(dims, bp),
-                );
-                (label, rate)
-            }
-            _ => ("—".to_owned(), "—".to_owned()),
-        };
-        println!(
-            "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
-            p.provider,
-            p.model,
-            discount_label,
-            rate_label,
-            if p.is_offered { "yes" } else { "no" },
-            if p.is_eligible { "yes" } else { "no" },
-        );
-    }
-    println!("\n{} offers total.", miner.products.len());
-    Ok(())
-}
-
 /// `gm-miner declare-product` — POST one (provider, model, `discount_bp`)
 /// offer to `/miners/products`. The registry treats POST as upsert, so this
 /// also handles updating an existing offer's discount.
@@ -1717,6 +1800,7 @@ async fn cmd_declare_product(
     println!("  Declared     : {}% off", format_discount_pct(discount_bp));
     println!("  You receive  : {eff_in} input / {eff_out} output per Mtok ({kept_pct}% of retail)");
     println!("  → ok");
+    println!("\nNext: gm-miner status   (confirm the offer)");
     Ok(())
 }
 
@@ -1778,6 +1862,7 @@ async fn cmd_declare_products(
     if err_count > 0 {
         bail!("{err_count} of {} declarations failed", targets.len());
     }
+    println!("Next: gm-miner status   (confirm offers + eligibility)");
     Ok(())
 }
 
@@ -1847,7 +1932,257 @@ fn filter_catalog<'a>(
         .collect()
 }
 
+// ── doctor ────────────────────────────────────────────────────────────────────
+
+/// One line of the `doctor` checklist: a pass/fail mark, a label, and an
+/// optional actionable fix shown only when the check fails.
+struct Check {
+    ok: bool,
+    label: String,
+    /// Shown beneath the label when `ok` is false — names the command or env
+    /// var that fixes it. A passing check carries the resolved detail instead.
+    note: String,
+}
+
+impl Check {
+    fn pass(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            label: label.into(),
+            note: detail.into(),
+        }
+    }
+
+    fn fail(label: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            label: label.into(),
+            note: fix.into(),
+        }
+    }
+
+    fn render(&self) {
+        let mark = if self.ok { "[ok]" } else { "[!!]" };
+        println!("  {mark} {}", self.label);
+        if !self.note.is_empty() {
+            let prefix = if self.ok { "      " } else { "      → " };
+            println!("{prefix}{}", self.note);
+        }
+    }
+}
+
+/// `gm-miner doctor` — a preflight checklist run before deploying.
+///
+/// Each check renders green/red with an actionable fix. The hotkey-
+/// registration check probes `GET /miners/me`; a 401/403/404 renders as
+/// "not registered on subnet N" rather than a raw body. `register-hotkey`
+/// (W2) plugs in where [`hotkey_check`] notes it as coming.
+async fn cmd_doctor(cfg: Config) -> Result<()> {
+    let network = cfg.resolved_network();
+    println!(
+        "gm-miner doctor — preflight for {network} (netuid {})\n",
+        network.netuid()
+    );
+
+    let mut checks = vec![
+        network_check(network, &cfg),
+        login_check(&cfg),
+        provider_keys_check(&cfg),
+        phala_cli_check(),
+        phala_api_key_check(),
+    ];
+    checks.push(hotkey_check(cfg).await);
+
+    for check in &checks {
+        check.render();
+    }
+
+    let failures = checks.iter().filter(|c| !c.ok).count();
+    println!();
+    if failures == 0 {
+        println!("All checks passed — you're ready to `gm-miner deploy`.");
+        Ok(())
+    } else {
+        bail!("{failures} check(s) need attention before deploying (see above).");
+    }
+}
+
+fn network_check(network: Network, cfg: &Config) -> Check {
+    Check::pass(
+        format!("Network: {network} (netuid {})", network.netuid()),
+        format!("registry {} · chain {}", cfg.api_url(), network.chain_ws()),
+    )
+}
+
+fn login_check(cfg: &Config) -> Check {
+    match cfg.active_tokens() {
+        Some(t) if t.access_token.is_some() && !t.is_expired_or_near() => {
+            Check::pass("Logged in (token valid)", String::new())
+        }
+        Some(t) if t.access_token.is_some() => Check::fail(
+            "Logged in",
+            "your access token has expired — run `gm-miner login`",
+        ),
+        _ => Check::fail("Logged in", "not logged in — run `gm-miner login`"),
+    }
+}
+
+fn provider_keys_check(cfg: &Config) -> Check {
+    let set: Vec<&str> = cfg.provider_keys.as_ref().map_or_else(Vec::new, |k| {
+        let mut names = Vec::new();
+        if k.anthropic.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            names.push("anthropic");
+        }
+        if k.openai.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            names.push("openai");
+        }
+        if k.google.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            names.push("google");
+        }
+        names
+    });
+    if set.is_empty() {
+        Check::fail(
+            "Provider keys set",
+            "no provider keys — run `gm-miner set-api-keys --anthropic <key>` (and/or --openai / --google)",
+        )
+    } else {
+        Check::pass(
+            format!("Provider keys set ({})", set.join(", ")),
+            String::new(),
+        )
+    }
+}
+
+fn phala_cli_check() -> Check {
+    let on_path = std::process::Command::new("phala")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if on_path {
+        Check::pass("`phala` CLI on PATH", String::new())
+    } else {
+        Check::fail(
+            "`phala` CLI on PATH",
+            "not found — install with `npm i -g phala`",
+        )
+    }
+}
+
+fn phala_api_key_check() -> Check {
+    if std::env::var("PHALA_CLOUD_API_KEY").is_ok_and(|v| !v.trim().is_empty()) {
+        return Check::pass("Phala Cloud API key (PHALA_CLOUD_API_KEY)", String::new());
+    }
+    // No env var — fall back to whether `phala` already holds a stored auth.
+    // `phala whoami` exits non-zero when not authenticated (unlike `status`,
+    // which reports state but still exits 0).
+    let phala_logged_in = std::process::Command::new("phala")
+        .arg("whoami")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if phala_logged_in {
+        Check::pass("Phala Cloud auth (via `phala` CLI)", String::new())
+    } else {
+        Check::fail(
+            "Phala Cloud API key",
+            "set PHALA_CLOUD_API_KEY or run `phala auth login` (or `phala login`)",
+        )
+    }
+}
+
+/// Probe `GET /miners/me` and classify the result for the doctor checklist.
+///
+/// A 401/403/404 means the hotkey isn't registered on the subnet — rendered
+/// as an actionable line, never the raw body. This is the seam the future
+/// `register-hotkey` (W2) plugs into: once it exists, the fix text here points
+/// at it directly.
+async fn hotkey_check(cfg: Config) -> Check {
+    let network = cfg.resolved_network();
+    let netuid = network.netuid();
+    if cfg
+        .active_tokens()
+        .and_then(|t| t.access_token.as_deref())
+        .is_none()
+    {
+        return Check::fail(
+            format!("Hotkey registered on subnet {netuid}"),
+            "can't check until you're logged in — run `gm-miner login`",
+        );
+    }
+
+    let mut client = RegistryClient::new(cfg);
+    let resp = match client.get(gm_miner_cli::client::ME_PATH).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            return Check::fail(
+                format!("Hotkey registered on subnet {netuid}"),
+                format!("couldn't reach the registry: {err}"),
+            );
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        let hotkey = resp
+            .json::<MinerStatus>()
+            .await
+            .map_or_else(|_| "<registered>".to_owned(), |m| m.hotkey);
+        Check::pass(format!("Hotkey registered on subnet {netuid}"), hotkey)
+    } else if matches!(status.as_u16(), 401 | 403 | 404) {
+        // SEAM(W2): once `register-hotkey` ships, change the fix to run it.
+        Check::fail(
+            format!("Hotkey registered on subnet {netuid}"),
+            format!(
+                "your hotkey isn't registered on subnet {netuid} — register with btcli \
+                 (or `gm-miner register-hotkey`, coming). On the wrong network? \
+                 You're on `{network}`."
+            ),
+        )
+    } else {
+        Check::fail(
+            format!("Hotkey registered on subnet {netuid}"),
+            format!("registry returned {status}"),
+        )
+    }
+}
+
+// ── gm / moon ────────────────────────────────────────────────────────────────
+
+/// `gm-miner gm` — a tiny sunrise and the time-of-day greeting.
+fn cmd_gm() {
+    println!(
+        r"        \   |   /
+         .-''-.
+   ---  (  ()  )  ---
+         `-..-'
+   ~~~~~~~~~~~~~~~~~~
+   {greeting} wagmi.",
+        greeting = greeting()
+    );
+}
+
+/// `gm-miner moon` — the quiet counterpart for the 3am deploys.
+fn cmd_moon() {
+    println!(
+        r"          _.-''-._
+        .'  .--.  `.
+        :  (    )  :    gn. the miner runs while you sleep.
+        `.  `--'  .'
+          `-....-'"
+    );
+}
+
+/// `gm-miner status` — registration state plus the per-product offer table.
+///
+/// Folds in what `list-products` used to print: each offer's discount and the
+/// per-Mtok rate the miner actually receives (joined against the public
+/// catalog), alongside the broader hotkey/attestation/compose view.
 async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
+    let network = client.config.resolved_network();
     let resp = client
         .get(gm_miner_cli::client::ME_PATH)
         .await
@@ -1855,13 +2190,13 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
 
     let status_code = resp.status();
     if !status_code.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("status failed ({status_code}): {body}");
+        return Err(me_error(network, status_code));
     }
 
     let miner: MinerStatus = resp.json().await.context("parse status response")?;
 
-    println!("Miner status");
+    println!("Miner status ({network})");
+    println!("  Network    : {network} (netuid {})", network.netuid());
     println!("  Hotkey     : {}", miner.hotkey);
     println!("  Status     : {}", miner.status);
     println!(
@@ -1874,30 +2209,60 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     );
 
     if miner.products.is_empty() {
-        println!("\nNo products declared.");
+        println!("\nNo products declared. Declare some with `gm-miner declare-products --discount-pct <pct>`.");
         return Ok(());
     }
 
+    print_product_table(client, &miner).await
+}
+
+/// Render the per-offer table joining `/miners/me` offers against the public
+/// catalog so each row shows the effective per-Mtok rate the miner receives.
+async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -> Result<()> {
+    // The catalog is the single source of truth for retail; join here rather
+    // than adding a retail block to `/miners/me` on the registry side.
+    let catalog = fetch_catalog(client).await?;
+    let retail_by_key: std::collections::HashMap<_, _> = catalog
+        .products
+        .iter()
+        .map(|p| {
+            (
+                ((p.provider.clone()), p.model.as_str()),
+                &p.retail_price.dimensions,
+            )
+        })
+        .collect();
+
     println!("\nProducts:");
     println!(
-        "{:<12} {:<40} {:<12} {:<8} {:<8}",
-        "PROVIDER", "MODEL", "DISCOUNT", "OFFERED", "ELIGIBLE"
+        "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
+        "PROVIDER", "MODEL", "DISCOUNT", "YOU RECEIVE / MTOK", "OFFERED", "ELIGIBLE"
     );
-    println!("{}", "-".repeat(84));
+    println!("{}", "-".repeat(110));
     for p in &miner.products {
-        let bp = p.discount_bp.map_or_else(
-            || "—".to_owned(),
-            |v| format!("{}%", format_discount_pct(v)),
-        );
+        let provider: Result<Provider, _> = p.provider.parse();
+        let (discount_label, rate_label) = match (p.discount_bp, provider) {
+            (Some(bp), Ok(prov)) => {
+                let label = format!("{}%", format_discount_pct(bp));
+                let rate = retail_by_key.get(&(prov, p.model.as_str())).map_or_else(
+                    || "(retail unknown)".to_owned(),
+                    |dims| effective_rate_summary(dims, bp),
+                );
+                (label, rate)
+            }
+            _ => ("—".to_owned(), "—".to_owned()),
+        };
         println!(
-            "{:<12} {:<40} {:<12} {:<8} {:<8}",
+            "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
             p.provider,
             p.model,
-            bp,
+            discount_label,
+            rate_label,
             if p.is_offered { "yes" } else { "no" },
             if p.is_eligible { "yes" } else { "no" },
         );
     }
+    println!("\n{} offer(s) total.", miner.products.len());
     Ok(())
 }
 
@@ -2646,5 +3011,61 @@ mod tests {
     fn clap_worker_remove_requires_a_worker_id() {
         let result = <Cli as clap::Parser>::try_parse_from(["gm-miner", "worker", "remove"]);
         assert!(result.is_err(), "worker remove must require a worker_id");
+    }
+
+    #[test]
+    fn explicit_network_resolves_flag_and_testnet_shorthand() {
+        use super::Network;
+
+        let cli =
+            <Cli as clap::Parser>::try_parse_from(["gm-miner", "--network", "testnet", "status"])
+                .unwrap();
+        assert_eq!(cli.explicit_network(), Some(Network::Testnet));
+
+        let cli =
+            <Cli as clap::Parser>::try_parse_from(["gm-miner", "--testnet", "status"]).unwrap();
+        assert_eq!(cli.explicit_network(), Some(Network::Testnet));
+
+        let cli = <Cli as clap::Parser>::try_parse_from(["gm-miner", "status"]).unwrap();
+        assert_eq!(
+            cli.explicit_network(),
+            None,
+            "no flag means: use the sticky stored selection"
+        );
+    }
+
+    #[test]
+    fn clap_rejects_network_and_testnet_together() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "--network",
+            "mainnet",
+            "--testnet",
+            "status",
+        ]);
+        assert!(result.is_err(), "--network and --testnet must conflict");
+    }
+
+    #[test]
+    fn clap_parses_doctor_and_gm() {
+        assert!(matches!(
+            <Cli as clap::Parser>::try_parse_from(["gm-miner", "doctor"])
+                .unwrap()
+                .command,
+            Command::Doctor
+        ));
+        assert!(matches!(
+            <Cli as clap::Parser>::try_parse_from(["gm-miner", "gm"])
+                .unwrap()
+                .command,
+            Command::Gm
+        ));
+        // `list-products` is kept as a hidden alias that runs `status`.
+        assert!(matches!(
+            <Cli as clap::Parser>::try_parse_from(["gm-miner", "list-products"])
+                .unwrap()
+                .command,
+            Command::ListProducts
+        ));
     }
 }

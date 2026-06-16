@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::network::Network;
+
 /// Default config directory.
 fn config_dir() -> PathBuf {
     std::env::var("GM_MINER_CONFIG_DIR").map_or_else(
@@ -300,6 +302,25 @@ impl Config {
         self.active_network.as_deref().unwrap_or("mainnet")
     }
 
+    /// The active network as a typed [`Network`] profile, carrying its
+    /// `netuid`, chain websocket, and default registry URL. An unrecognised
+    /// stored value (a hand-edited config) falls back to the default network
+    /// rather than panicking.
+    #[must_use]
+    pub fn resolved_network(&self) -> Network {
+        self.active_network
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist `network` as the active selection. Returns `self` for chaining
+    /// at the call site that resolves flags into the loaded config.
+    pub fn set_network(&mut self, network: Network) -> &mut Self {
+        self.active_network = Some(network.as_str().to_owned());
+        self
+    }
+
     /// Mutable reference to the active network entry (creating it if absent).
     pub fn active_entry_mut(&mut self) -> &mut NetworkEntry {
         let key = self.active_network().to_owned();
@@ -321,18 +342,15 @@ impl Config {
     }
 
     /// Registry API URL for the active network.
+    ///
+    /// A stored per-network `api_url` (set by `login` or `--api-url`) wins;
+    /// otherwise the active [`Network`]'s default registry URL is used.
     #[must_use]
     pub fn api_url(&self) -> String {
         self.networks
             .get(self.active_network())
             .and_then(|n| n.api_url.clone())
-            .unwrap_or_else(|| {
-                if self.active_network() == "testnet" {
-                    "https://test-gm-registry.taostats.io".to_string()
-                } else {
-                    "https://gm-registry.taostats.io".to_string()
-                }
-            })
+            .unwrap_or_else(|| self.resolved_network().default_registry_url().to_owned())
     }
 }
 
@@ -696,6 +714,35 @@ mod tests {
         assert!(!entry.is_secondary_by_app_id("app_prov"));
         // An untracked app_id is not secondary either.
         assert!(!entry.is_secondary_by_app_id("app_unknown"));
+    }
+
+    #[test]
+    fn api_url_falls_back_to_network_default() {
+        use crate::network::Network;
+
+        // Testnet with no stored api_url resolves the saygm.com default.
+        let cfg = Config {
+            networks: HashMap::new(),
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+        };
+        assert_eq!(cfg.resolved_network(), Network::Testnet);
+        assert_eq!(cfg.api_url(), "https://test-registry.saygm.com");
+
+        // Default (no active_network) is mainnet.
+        let cfg = Config::default();
+        assert_eq!(cfg.resolved_network(), Network::Mainnet);
+        assert_eq!(cfg.api_url(), "https://gm-registry.taostats.io");
+    }
+
+    #[test]
+    fn set_network_is_sticky_and_typed() {
+        use crate::network::Network;
+
+        let mut cfg = Config::default();
+        cfg.set_network(Network::Testnet);
+        assert_eq!(cfg.active_network(), "testnet");
+        assert_eq!(cfg.resolved_network(), Network::Testnet);
     }
 
     #[test]
