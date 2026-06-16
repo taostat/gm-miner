@@ -2,7 +2,7 @@
 //!
 //! v1 is the **chain-emission** view: it reads the miner's neuron row straight
 //! from the subnet metagraph (via the [`BtcliBridge`]) and reports uid, stake,
-//! and per-tempo emission in the subnet's own alpha token. It deliberately does
+//! and per-block emission in the subnet's own alpha token. It deliberately does
 //! not touch gm-internal accounting — the USD-spread earnings a miner keeps from
 //! the gateway are a future (v2) view, noted in the output so the distinction is
 //! explicit.
@@ -23,7 +23,7 @@ use crate::network::Network;
 /// The hotkey `earnings` will report on, plus how it was chosen.
 ///
 /// `name` is the local btcli wallet name when known (a recorded hotkey), absent
-/// for a `--hotkey-ss58` override the operator typed in.
+/// when the hotkey is derived from the login token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHotkey {
     pub ss58: String,
@@ -65,28 +65,22 @@ pub fn resolve_hotkey(cfg: &Config, network: Network) -> Result<ResolvedHotkey> 
     )
 }
 
-/// A rough per-day alpha emission estimate from a per-tempo value.
+/// A rough per-day alpha emission estimate from the per-block emission.
 ///
-/// Bittensor blocks are ~12s, so a day holds `86400 / 12 = 7200` blocks; a tempo
-/// of `tempo_blocks` blocks therefore recurs `7200 / tempo_blocks` times a day.
-/// This is an *estimate* (block time drifts and emission varies block to block),
-/// surfaced as such — `None` when the metagraph didn't carry the tempo.
-fn per_day_estimate(emission_alpha: f64, tempo_blocks: Option<u64>) -> Option<f64> {
+/// The metagraph reports emission per block, and a day holds `86400 / 12 = 7200`
+/// blocks (~12s each), so the daily figure is emission × blocks-per-day. An
+/// *estimate* — block time drifts and emission varies block to block.
+fn per_day_estimate(emission_alpha: f64) -> f64 {
     const BLOCKS_PER_DAY: f64 = 86_400.0 / 12.0;
-    // A tempo is a small block count (hundreds); a value that won't fit a u32
-    // is nonsense, so treat it as no-estimate rather than casting lossily.
-    let tempo = tempo_blocks
-        .filter(|t| *t > 0)
-        .and_then(|t| u32::try_from(t).ok())?;
-    Some(emission_alpha * (BLOCKS_PER_DAY / f64::from(tempo)))
+    emission_alpha * BLOCKS_PER_DAY
 }
 
 /// Render the chain-emission summary for a resolved hotkey.
 ///
 /// `stats: None` means the hotkey is not on this subnet's metagraph — rendered
 /// as actionable guidance (wrong network? not registered yet?) rather than a
-/// raw dump. `stats: Some` renders uid, stake, and per-tempo emission in alpha,
-/// with a clearly-labelled per-day estimate when the tempo is known.
+/// raw dump. `stats: Some` renders uid, stake, and per-block emission in alpha,
+/// with a clearly-labelled per-day estimate.
 #[must_use]
 pub fn render_earnings(
     network: Network,
@@ -112,13 +106,12 @@ pub fn render_earnings(
 
     let _ = writeln!(out, "  uid    : {}", stats.uid);
     out.push_str("\nChain emission (v1):\n");
-    let _ = write!(out, "  Emission : {:.6} α / tempo", stats.emission_alpha);
-    match per_day_estimate(stats.emission_alpha, stats.tempo_blocks) {
-        Some(per_day) => {
-            let _ = writeln!(out, "  (~{per_day:.4} α/day estimate)");
-        }
-        None => out.push('\n'),
-    }
+    let _ = writeln!(
+        out,
+        "  Emission : {:.6} α / block  (~{:.4} α/day estimate)",
+        stats.emission_alpha,
+        per_day_estimate(stats.emission_alpha)
+    );
     let _ = writeln!(out, "  Stake    : {:.6} α", stats.stake_alpha);
     let _ = writeln!(
         out,
@@ -181,7 +174,6 @@ mod tests {
             stake_alpha: 56_788.59,
             incentive: 1.0,
             dividends: 0.0,
-            tempo_blocks: Some(360),
         }
     }
 
@@ -261,8 +253,12 @@ mod tests {
         assert!(rendered.contains("netuid 482"), "{rendered}");
         assert!(rendered.contains("uid    : 0"), "{rendered}");
         assert!(rendered.contains("Chain emission (v1)"), "{rendered}");
-        assert!(rendered.contains("148.010000 α / tempo"), "{rendered}");
-        assert!(rendered.contains("α/day estimate"), "{rendered}");
+        assert!(rendered.contains("148.010000 α / block"), "{rendered}");
+        // Per-block × 7200 blocks/day: 148.01 * 7200 = 1_065_672.
+        assert!(
+            rendered.contains("1065672.0000 α/day estimate"),
+            "{rendered}"
+        );
         assert!(rendered.contains("56788.590000 α"), "{rendered}");
         // The chain standing is alpha, never mislabelled USD; the only USD
         // mention is the v2-future note.
@@ -271,16 +267,15 @@ mod tests {
     }
 
     #[test]
-    fn renders_no_per_day_when_tempo_missing() {
+    fn renders_no_local_name_placeholder() {
         let hotkey = ResolvedHotkey {
             ss58: SS58.to_owned(),
             name: None,
         };
-        let mut s = stats();
-        s.tempo_blocks = None;
-        let rendered = render_earnings(Network::Mainnet, &hotkey, Some(&s));
-        assert!(!rendered.contains("α/day estimate"), "{rendered}");
+        let rendered = render_earnings(Network::Mainnet, &hotkey, Some(&stats()));
         assert!(rendered.contains("(no local name)"), "{rendered}");
+        // The per-day estimate is always shown now (no tempo dependency).
+        assert!(rendered.contains("α/day estimate"), "{rendered}");
     }
 
     #[test]
