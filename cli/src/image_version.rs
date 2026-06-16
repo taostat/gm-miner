@@ -1,48 +1,43 @@
-//! `gmcli publish-image-version` — publish a release's measured
-//! `ImageVersion` to a network's registry.
+//! `gmcli publish-image-version` — publish a release's `ImageVersion` to a
+//! network's registry, computing both hashes offline from source.
 //!
 //! ## Why this exists
 //!
 //! The registry's attestation enforcement compares a miner CVM's measured
 //! `compose_hash` / `os_image_hash` against an allow-list of approved
-//! `ImageVersion` rows. That allow-list used to be hand-published. The
-//! CLI's rendered compose changes between releases — the digest-pinned
-//! image ref and the `GM_NETWORK` literal both feed the compose, and the
-//! compose feeds the hash — so a hand-published hash drifts from what the
-//! released CLI actually deploys, surfacing as a "HASH MISMATCH" at deploy
-//! time. This command closes that gap: the release pipeline runs it so the
-//! approved hash is always the one the released CLI produces.
+//! `ImageVersion` rows. That allow-list used to be hand-published. The CLI's
+//! rendered compose changes between releases — the digest-pinned image ref
+//! and the `GM_NETWORK` literal both feed the compose, and the compose feeds
+//! the hash — so a hand-published hash drifts from what the released CLI
+//! actually deploys, surfacing as a "HASH MISMATCH" at deploy time. This
+//! command closes that gap: the release pipeline runs it so the approved hash
+//! is always the one the released CLI produces.
 //!
-//! ## Why it deploys rather than computing offline
+//! ## Why it computes offline (not deploy-and-read)
 //!
-//! dstack's `compose_hash` is `sha256` over the *app-compose.json* manifest
-//! that Phala Cloud's backend assembles — not over the `docker-compose.yaml`
-//! the CLI renders. The backend owns that manifest's field set, its defaults
-//! (`manifest_version`, `runner`, `kms_enabled`, `gateway_enabled`,
-//! `key_provider`, the node's `default_gateway_domain`, …) and its exact
-//! JSON serialization. None of that is derivable from the CLI's inputs, and
-//! an empirical search over the plausible field/serializer space did not
-//! reproduce a known-good oracle hash. So the only trustworthy way to learn
-//! the hash a release produces is to deploy it once and read back what the
-//! platform measured.
+//! dstack's `compose_hash` is `sha256` over the canonical serialization of
+//! the CVM's `app_compose` object — re-derivable offline by design (see
+//! [`crate::compose_hash`]). The `os_image_hash` is the pinned dstack OS
+//! image's published reproducible measurement. Both are computed from the
+//! release's source with no Phala Cloud deploy and no spend — so the publish
+//! needs only a registry admin key, never a `PHALA_API_KEY`.
 //!
 //! ## Flow
 //!
 //! 1. Render the compose for the target network around the digest-pinned
-//!    `image_ref` (same render path `gmcli deploy` uses), submit a throwaway
-//!    CVM to Phala Cloud, and read back the measured `compose_hash` +
-//!    `os_image_hash`.
+//!    `image_ref`, build the `app_compose` object, and `sha256` its canonical
+//!    serialization to get `compose_hash`; read `os_image_hash` from the
+//!    pinned OS image.
 //! 2. POST the pair to that network's registry admin endpoint
 //!    (`POST /admin/image-versions`, `X-API-Key`). The endpoint is an upsert
 //!    keyed on `(compose_hash, os_image_hash)`, so re-publishing the same
 //!    release is a no-op update — the publish step is idempotent by
 //!    construction.
-//! 3. Tear the throwaway CVM down (`phala cvms delete`).
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-use crate::deploy::{normalize_hash, DeployOutcome, PhalaClient};
+use crate::deploy::normalize_hash;
 use crate::network::Network;
 
 /// The registry admin route the measured version is published to.
@@ -85,23 +80,23 @@ pub struct GitProvenance {
     pub repo: Option<String>,
 }
 
-/// Build the admin request body for a measured version.
+/// Build the admin request body for a computed version.
 ///
 /// `compose_hash` / `os_image_hash` are normalized (lowercased, `sha256:`
-/// prefix stripped) so they satisfy the registry's `^[0-9a-f]{64}$` pattern
-/// regardless of how Phala Cloud reported them. The `notes` string references
-/// the git tag + commit so an operator reading the allow-list can trace a row
-/// back to the release that produced it.
+/// prefix stripped) so they satisfy the registry's `^[0-9a-f]{64}$` pattern.
+/// The `notes` string references the git tag + commit so an operator reading
+/// the allow-list can trace a row back to the release that produced it.
 #[must_use]
 pub fn build_admin_request(
-    outcome: &DeployOutcome,
+    compose_hash: &str,
+    os_image_hash: &str,
     image_ref: &str,
     network: Network,
     provenance: &GitProvenance,
 ) -> AdminImageVersionRequest {
     AdminImageVersionRequest {
-        compose_hash: normalize_hash(&outcome.hashes.compose_sha256),
-        os_image_hash: normalize_hash(&outcome.hashes.os_image_hash),
+        compose_hash: normalize_hash(compose_hash),
+        os_image_hash: normalize_hash(os_image_hash),
         notes: Some(release_notes(network, provenance)),
         git_repo: provenance.repo.clone(),
         git_commit: provenance.commit.clone(),
@@ -146,7 +141,7 @@ pub fn registry_url_for(network: Network, override_url: Option<&str>) -> String 
     override_url.map_or_else(|| network.default_registry_url().to_owned(), str::to_owned)
 }
 
-/// POST a measured version to a network's registry admin endpoint.
+/// POST a computed version to a network's registry admin endpoint.
 ///
 /// The endpoint is an idempotent upsert keyed on `(compose_hash,
 /// os_image_hash)`: a first publish inserts, a re-publish of the same
@@ -195,71 +190,6 @@ pub async fn post_admin_image_version(
         .to_owned())
 }
 
-/// Deploy a throwaway CVM with `phala`, returning its measured hashes,
-/// endpoint, and `app_id`.
-///
-/// The deploy renders the compose for `network` around `image_ref` exactly
-/// as `gmcli deploy` would, so the measured `compose_hash` is the one the
-/// released CLI will produce for that network. Provider keys and the node
-/// secret are deploy-time env only — they are encrypted client-side into the
-/// CVM and never touch the compose, so placeholders are fine here.
-///
-/// # Errors
-/// Returns an error if the compose cannot be rendered or the Phala deploy /
-/// hash read-back fails.
-pub fn deploy_for_measurement(
-    phala: &dyn PhalaClient,
-    image_ref: &str,
-    network: Network,
-    boot_timeout_secs: u64,
-) -> Result<DeployOutcome> {
-    use crate::config::ProviderKeys;
-    use crate::deploy::{render_compose, COMPOSE_TEMPLATE};
-
-    let rendered = render_compose(COMPOSE_TEMPLATE, image_ref, network.as_str())?;
-    // No provider keys and a throwaway node secret: neither is part of the
-    // compose, so neither affects the measured compose_hash. The CVM only has
-    // to boot far enough for Phala to measure and report it.
-    let keys = ProviderKeys::default();
-    phala.deploy(
-        &rendered,
-        &keys,
-        "publish-image-version-throwaway",
-        None,
-        boot_timeout_secs,
-    )
-}
-
-/// Tear down the throwaway CVM created for measurement.
-///
-/// Best-effort: a failed teardown is logged, not fatal — the version is
-/// already published, and an operator can delete a stray CVM from the Phala
-/// dashboard. Leaving the publish to fail over a teardown blip would be worse.
-pub fn teardown_cvm(app_id: &str, api_key: Option<&str>) {
-    let out = crate::deploy::phala_command(api_key)
-        .args(["cvms", "delete", app_id, "--yes"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            tracing::info!(app_id, "throwaway CVM torn down");
-        }
-        Ok(o) => {
-            tracing::warn!(
-                app_id,
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                "could not tear down throwaway CVM — delete it from the Phala dashboard"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                app_id,
-                error = %e,
-                "could not run `phala cvms delete` — delete the CVM from the Phala dashboard"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -267,18 +197,6 @@ pub fn teardown_cvm(app_id: &str, api_key: Option<&str>) {
 )]
 mod tests {
     use super::*;
-    use crate::deploy::DstackDeployResult;
-
-    fn outcome(compose: &str, os: &str) -> DeployOutcome {
-        DeployOutcome {
-            hashes: DstackDeployResult {
-                compose_sha256: compose.to_owned(),
-                os_image_hash: os.to_owned(),
-            },
-            endpoint: "https://app-8080s.node.phala.network".to_owned(),
-            app_id: "app_throwaway".to_owned(),
-        }
-    }
 
     fn provenance() -> GitProvenance {
         GitProvenance {
@@ -309,12 +227,13 @@ mod tests {
     }
 
     /// The published hashes are normalized to bare lowercase hex so they
-    /// satisfy the registry's `^[0-9a-f]{64}$` pattern even when Phala
-    /// reports them uppercased or `sha256:`-prefixed.
+    /// satisfy the registry's `^[0-9a-f]{64}$` pattern even when passed
+    /// uppercased or `sha256:`-prefixed.
     #[test]
     fn admin_request_normalizes_hashes() {
         let req = build_admin_request(
-            &outcome("sha256:ABCDEF", "DEF456"),
+            "sha256:ABCDEF",
+            "DEF456",
             "ghcr.io/taostat/gm-miner@sha256:abc",
             Network::Testnet,
             &provenance(),
@@ -328,7 +247,8 @@ mod tests {
     #[test]
     fn admin_request_carries_provenance() {
         let req = build_admin_request(
-            &outcome("abc", "def"),
+            "abc",
+            "def",
             "ghcr.io/taostat/gm-miner@sha256:abc",
             Network::Mainnet,
             &provenance(),
@@ -347,7 +267,8 @@ mod tests {
     #[test]
     fn admin_request_omits_status_and_empty_options() {
         let req = build_admin_request(
-            &outcome("abc", "def"),
+            "abc",
+            "def",
             "ghcr.io/taostat/gm-miner@sha256:abc",
             Network::Testnet,
             &GitProvenance::default(),

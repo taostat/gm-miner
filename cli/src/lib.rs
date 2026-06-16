@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod btcli;
 pub mod client;
+pub mod compose_hash;
 pub mod config;
 pub mod dependency;
 pub mod deploy;

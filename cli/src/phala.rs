@@ -124,22 +124,6 @@ pub fn stored_key(config_key: Option<&str>) -> Option<String> {
     key_from_env().or_else(|| non_empty(config_key).map(str::to_owned))
 }
 
-/// Resolve the Phala key for a non-interactive path (no prompt, no
-/// validation) in deploy's precedence order: `--phala-api-key` flag, then
-/// env, then the stored config key. `None` when none is set — the caller
-/// then relies on an existing `phala` CLI login session, which the
-/// subprocess inherits.
-///
-/// Unlike [`stored_key`], this honours an explicit `flag` over the
-/// environment, so `--phala-api-key` wins as the operator expects.
-///
-/// # Errors
-/// Returns an error if the gmcli config cannot be loaded (to read the
-/// stored key tier).
-pub fn resolve_key_noninteractive(flag: Option<&str>) -> Result<Option<String>> {
-    Ok(resolve_key_source(flag)?.map(|s| s.key))
-}
-
 /// Read the Phala API key from the environment, preferring `PHALA_API_KEY`
 /// and falling back to `PHALA_CLOUD_API_KEY` (the var the `phala` CLI itself
 /// honours). Whitespace-only values are ignored.

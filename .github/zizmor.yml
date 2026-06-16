@@ -28,11 +28,3 @@ rules:
   unpinned-images:
     ignore:
       - release.yml
-
-  # publish-image-version.yml runs on a tag and sets up Node only to install
-  # the `phala` CLI. No `cache:` is configured, and the only build artifact
-  # (the throwaway gmcli binary) is used in-run and never published — there
-  # is no downstream consumer a poisoned cache could reach.
-  cache-poisoning:
-    ignore:
-      - publish-image-version.yml
