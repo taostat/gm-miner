@@ -180,6 +180,22 @@ enum Command {
         app_id: String,
     },
 
+    /// Measure a released image's compose/OS hashes and publish them to the
+    /// target network's registry allow-list.
+    ///
+    /// Run by the release pipeline, not operators. dstack's `compose_hash` is
+    /// computed by Phala Cloud's backend over an app-compose.json the CLI
+    /// cannot reproduce offline, so this deploys a throwaway CVM for the
+    /// target network, reads back the measured hashes, POSTs them to that
+    /// network's `POST /admin/image-versions` (idempotent upsert), and tears
+    /// the CVM down. Authenticates with the registry admin key
+    /// (`REGISTRY_ADMIN_KEY`), not the operator OAuth token.
+    #[command(hide = true)]
+    PublishImageVersion {
+        #[command(flatten)]
+        flags: Box<PublishImageVersionFlags>,
+    },
+
     /// Alias for `status` — the product table is folded into `status`.
     ///
     /// Kept so existing muscle memory and scripts keep working; it runs the
@@ -424,6 +440,70 @@ struct DeployFlags {
     yes: bool,
 }
 
+/// Flags for `gmcli publish-image-version`. The release pipeline supplies
+/// the digest-pinned image ref, the registry admin key, and the git
+/// provenance; the Phala deploy knobs mirror `deploy`'s defaults.
+#[derive(clap::Args)]
+struct PublishImageVersionFlags {
+    /// Digest-pinned released image reference (registry/repo@sha256:...).
+    /// The compose is rendered around this exactly as `deploy` would.
+    #[arg(long, env = "GM_IMAGE_REF")]
+    image_ref: String,
+
+    /// Registry admin API key (the `X-API-Key` for `/admin/image-versions`).
+    #[arg(
+        long = "registry-admin-key",
+        env = "REGISTRY_ADMIN_KEY",
+        value_name = "KEY"
+    )]
+    registry_admin_key: String,
+
+    /// Release tag recorded on the published row (e.g. `v0.1.2`).
+    #[arg(long)]
+    git_tag: Option<String>,
+
+    /// Release commit SHA (40-hex) recorded on the published row.
+    #[arg(long)]
+    git_commit: Option<String>,
+
+    /// `owner/repo` slug recorded on the published row.
+    #[arg(long, default_value = "taostat/gm-miner")]
+    git_repo: String,
+
+    /// Phala Cloud instance type for the throwaway CVM.
+    #[arg(long, env = "PHALA_INSTANCE_TYPE", default_value = "tdx.medium")]
+    instance_type: String,
+
+    /// Disk size for the throwaway CVM (with unit, e.g. `40G`).
+    #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
+    disk_size: String,
+
+    /// Production OS image for the CVM (`phala deploy --image`). Must match
+    /// the dstack version of the Phala node the CVM lands on.
+    #[arg(long, env = "PHALA_OS_IMAGE", default_value = DEFAULT_OS_IMAGE)]
+    os_image: String,
+
+    /// Staging directory for the rendered compose + env files. Defaults to
+    /// `dist/publish-<network>`.
+    #[arg(long)]
+    dist_dir: Option<std::path::PathBuf>,
+
+    /// How long to wait for the CVM to boot and report its measured hashes
+    /// (seconds).
+    #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
+    boot_timeout_secs: u64,
+
+    /// Phala Cloud API key. When omitted, uses `PHALA_API_KEY` /
+    /// `PHALA_CLOUD_API_KEY`.
+    #[arg(long = "phala-api-key", env = "PHALA_API_KEY", value_name = "KEY")]
+    phala_api_key: Option<String>,
+
+    /// Leave the throwaway CVM running after measuring (debugging). The
+    /// default tears it down once the hashes are read.
+    #[arg(long)]
+    keep_cvm: bool,
+}
+
 #[derive(Subcommand)]
 enum WorkerCommand {
     /// Deploy (or register an already-deployed) CVM as a new worker under
@@ -513,6 +593,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             cmd_register_image_subcommand(cfg, &app_id).await
+        }
+        Command::PublishImageVersion { flags } => {
+            // No OAuth: the registry admin key authenticates the publish, and
+            // the registry URL comes from the network default or --api-url.
+            let cfg = load_config(explicit_network, api_url)?;
+            cmd_publish_image_version(&cfg, *flags).await
         }
         Command::ListProducts | Command::Status => {
             let cfg = load_config(explicit_network, api_url)?;
@@ -1866,6 +1952,81 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
     }
 
     println!("  worker_id : {worker_id}");
+    Ok(())
+}
+
+/// `gmcli publish-image-version` — measure a released image on the target
+/// network and publish the resulting `ImageVersion` to that network's
+/// registry allow-list.
+///
+/// Deploys a throwaway CVM (no provider keys — they don't enter the
+/// compose), reads back the platform-measured `compose_hash` /
+/// `os_image_hash`, POSTs them to the network's `/admin/image-versions`
+/// upsert (idempotent), and — unless `--keep-cvm` — tears the CVM down.
+async fn cmd_publish_image_version(cfg: &Config, flags: PublishImageVersionFlags) -> Result<()> {
+    use gm_miner_cli::image_version::{
+        build_admin_request, deploy_for_measurement, post_admin_image_version, registry_url_for,
+        teardown_cvm, GitProvenance,
+    };
+
+    let network = cfg.resolved_network();
+    let registry_url = registry_url_for(network, cfg.api_url_override.as_deref());
+
+    // A check-only `phala` preflight (no interactive install offer): this is
+    // a CI/automation path, not the guided operator deploy.
+    preflight_phala_cli()?;
+    let phala_key = gm_miner_cli::phala::stored_key(flags.phala_api_key.as_deref());
+
+    let dist_dir = flags
+        .dist_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("dist/publish-{network}")));
+    let app_name = format!("gm-publish-{network}");
+    let phala = gm_miner_cli::deploy::RealPhalaClient::new(
+        app_name,
+        dist_dir,
+        flags.instance_type.clone(),
+        flags.disk_size.clone(),
+        flags.os_image.clone(),
+    )
+    .with_api_key(phala_key.clone());
+
+    println!(
+        "Deploying a throwaway {network} CVM to measure {} ...",
+        flags.image_ref
+    );
+    let outcome =
+        deploy_for_measurement(&phala, &flags.image_ref, network, flags.boot_timeout_secs)?;
+    println!("  compose_hash  : {}", outcome.hashes.compose_sha256);
+    println!("  os_image_hash : {}", outcome.hashes.os_image_hash);
+
+    let provenance = GitProvenance {
+        tag: flags.git_tag.clone(),
+        commit: flags.git_commit.clone(),
+        repo: Some(flags.git_repo.clone()),
+    };
+    let body = build_admin_request(&outcome, &flags.image_ref, network, &provenance);
+
+    // Publish before teardown: the version is the deliverable, the CVM is
+    // disposable. A teardown blip must not lose a published hash.
+    println!(
+        "Publishing to {registry_url}{} ...",
+        gm_miner_cli::image_version::ADMIN_IMAGE_VERSIONS_PATH
+    );
+    let action = post_admin_image_version(&registry_url, &flags.registry_admin_key, &body).await?;
+    println!(
+        "  {action}: compose_hash={} os_image_hash={}",
+        body.compose_hash, body.os_image_hash
+    );
+
+    if flags.keep_cvm {
+        println!(
+            "Leaving throwaway CVM {} running (--keep-cvm).",
+            outcome.app_id
+        );
+    } else {
+        teardown_cvm(&outcome.app_id, phala_key.as_deref());
+    }
     Ok(())
 }
 
