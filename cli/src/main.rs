@@ -1405,36 +1405,30 @@ async fn phala_preflight(args: &DeployArgs) -> Result<Option<String>> {
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
 /// overridden by `--image-ref`, built locally for `--image-repo`), provision
 /// it, and render the compose template around the resulting digest-pinned ref.
-/// Returns the rendered [`DeployTarget`] and whether the image is the
-/// gm-published default (which Phala may pull anonymously — no operator GHCR
-/// pull credentials required).
+///
+/// Whether the image needs pull credentials is decided later by an anonymous
+/// registry probe ([`resolve_registry_credentials`]), not from any flag here.
 fn resolve_and_render_target(
     cfg: &Config,
     args: &DeployArgs,
     supported_image_ref: Option<&str>,
-) -> Result<(gm_miner_cli::deploy::DeployTarget, bool)> {
+) -> Result<gm_miner_cli::deploy::DeployTarget> {
     let source = resolve_image_source(
         args.image_ref.as_deref(),
         args.image_repo.as_deref(),
         supported_image_ref,
     )?;
-    let public_pull = match &source {
-        ImageSource::Prebuilt {
-            image_ref,
-            gm_published,
-        } => {
-            if *gm_published {
-                println!("Deploying the registry-supported image: {image_ref}");
-            }
-            *gm_published
+    // The flag-less default deploys the registry-supported image; surface it
+    // so the operator sees which image a bare `deploy` is using.
+    if args.image_ref.is_none() && args.image_repo.is_none() {
+        if let ImageSource::Prebuilt { image_ref } = &source {
+            println!("Deploying the registry-supported image: {image_ref}");
         }
-        ImageSource::Build => false,
-    };
-    let target = prepare_deploy_target(
+    }
+    prepare_deploy_target(
         &PublicRegistryProvisioner { args, source },
         cfg.active_network(),
-    )?;
-    Ok((target, public_pull))
+    )
 }
 
 async fn cmd_deploy(
@@ -1529,14 +1523,15 @@ async fn cmd_deploy(
 
     // Step 5: resolve which image to deploy (default = the gm-published ref
     // on the selected version) and render the compose around it.
-    let (target, public_pull) =
-        resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
+    let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
+    println!("Resolved miner image: {}", target.image_ref);
 
-    // Step 5b: resolve private-registry pull credentials. An operator's own
-    // private image needs `DSTACK_DOCKER_*` env vars so the CVM's pre-launch
-    // script can `docker login` and pull; the gm-published default image is
-    // public, so `public_pull` skips the credential requirement.
-    let registry_creds = resolve_registry_credentials(&target.image_ref, public_pull)?;
+    // Step 5b: resolve private-registry pull credentials. An anonymous OCI
+    // manifest probe decides whether the image is genuinely private: a public
+    // image renders a clean deploy with no `DSTACK_DOCKER_*` env, while a
+    // private one requires the operator-set GHCR pull credentials so the
+    // CVM's pre-launch script can `docker login` and pull.
+    let registry_creds = resolve_registry_credentials(&target.image_ref).await?;
 
     // Step 6: submit the compose stack to Phala Cloud and poll until the
     // CVM reports its measured hashes. Phala Cloud provisions the TEEPod,
