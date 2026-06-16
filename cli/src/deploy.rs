@@ -56,6 +56,15 @@ pub struct ImageVersion {
     pub status: String,
     pub notes: Option<String>,
     pub created_at: String,
+    /// Digest-pinned, directly-pullable reference of the gm-published miner
+    /// image whose compose renders to `compose_hash`, e.g.
+    /// `ghcr.io/taostat/gm-miner@sha256:...`. `gmcli deploy` defaults to this
+    /// so a normal miner deploys the gm-supported image rather than building
+    /// one. Optional because the field post-dates the earliest rows; an entry
+    /// without it cannot be deployed by digest, so the default path fails with
+    /// guidance toward `--image-ref` / `--image-repo`.
+    #[serde(default)]
+    pub image_ref: Option<String>,
 }
 
 /// Response body from `GET /image-versions?status=supported`.
@@ -265,7 +274,8 @@ pub fn resolve_registry_credentials(image_ref: &str) -> Result<Option<RegistryCr
 
 /// Read an environment variable, returning `None` when it is unset or
 /// whitespace-only.
-fn non_empty_env(name: &str) -> Option<String> {
+#[must_use]
+pub fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -852,13 +862,9 @@ fn write_env_file(
 /// Returns an error if the registry returns 404 (endpoint not yet deployed),
 /// any other non-2xx status, or the response body cannot be parsed.
 pub async fn fetch_supported_versions(registry_url: &str) -> Result<Vec<ImageVersion>> {
-    // Build a one-shot client with a 30 s timeout — same as RegistryClient —
-    // rather than using bare `reqwest::get()` which has no timeout.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("build reqwest client for /image-versions")?;
+    // A one-shot client (30 s timeout, gmcli user-agent) — same shape as
+    // RegistryClient — rather than bare `reqwest::get()` which has no timeout.
+    let client = crate::client::build_http_client()?;
 
     let url = format!("{registry_url}/image-versions?status=supported");
     let resp = client
@@ -924,6 +930,60 @@ pub fn select_version(versions: &[ImageVersion], pin: Option<usize>) -> Result<&
             Ok(&versions[n - 1])
         }
     }
+}
+
+// ── Default image-ref resolution ──────────────────────────────────────────────
+
+/// How `gmcli deploy` resolves the miner image to deploy, in priority order.
+///
+/// A normal miner deploys the gm-published, registry-supported image — they
+/// never build. The two non-default arms exist only as explicit opt-ins:
+/// `--image-ref` pins a specific pre-built digest, and `--image-repo` requests
+/// a local build+push (the legacy path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSource {
+    /// Use this digest-pinned ref verbatim — no build. Either the operator's
+    /// explicit `--image-ref`, or the registry-supported version's `image_ref`.
+    Prebuilt(String),
+    /// Build the miner image locally and push it to this public repo, then
+    /// pin the pushed digest. Requested explicitly via `--image-repo`.
+    Build,
+}
+
+/// Resolve which image a deploy should use from the operator's flags and the
+/// registry-selected supported version.
+///
+/// Precedence:
+///   1. `--image-ref` (explicit pre-built digest) — always wins.
+///   2. `--image-repo` (explicit local build opt-in) — build + push.
+///   3. The registry-supported version's `image_ref` — the default, so a
+///      normal miner deploys the gm-published image without building.
+///
+/// # Errors
+/// Returns an error when neither flag is set and the supported version carries
+/// no `image_ref` — there is then no image to deploy, and the message points
+/// at `--image-ref` / `--image-repo`.
+pub fn resolve_image_source(
+    image_ref_flag: Option<&str>,
+    image_repo_flag: Option<&str>,
+    supported_image_ref: Option<&str>,
+) -> Result<ImageSource> {
+    if let Some(explicit) = image_ref_flag {
+        return Ok(ImageSource::Prebuilt(explicit.to_owned()));
+    }
+    if image_repo_flag.is_some() {
+        return Ok(ImageSource::Build);
+    }
+    if let Some(supported) = supported_image_ref {
+        return Ok(ImageSource::Prebuilt(supported.to_owned()));
+    }
+    bail!(
+        "the registry's supported image version has no pullable image_ref, so \
+         there is no gm-published image to deploy by default.\n  \
+         pass --image-ref <registry/repo@sha256:...> to deploy a specific \
+         pre-built image, or --image-repo <registry/owner/gm-miner> to build \
+         and push one yourself"
+    )
 }
 
 // ── Compose template rendering ────────────────────────────────────────────────
@@ -1123,6 +1183,8 @@ pub struct ImageVersionOut {
     pub status: String,
     pub notes: Option<String>,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
 }
 
 #[cfg(test)]
@@ -1141,7 +1203,61 @@ mod tests {
             status: "supported".to_owned(),
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
+            image_ref: None,
         }
+    }
+
+    // ── default image-ref resolution ──────────────────────────────────────────
+
+    /// With no flags, the registry-supported version's `image_ref` is the
+    /// default — a normal miner deploys the gm-published image, never building.
+    #[test]
+    fn resolve_image_source_defaults_to_supported_ref() {
+        let source = resolve_image_source(None, None, Some("ghcr.io/taostat/gm-miner@sha256:abc"))
+            .expect("supported ref must resolve");
+        assert_eq!(
+            source,
+            ImageSource::Prebuilt("ghcr.io/taostat/gm-miner@sha256:abc".to_owned())
+        );
+    }
+
+    /// `--image-ref` wins over both the supported default and `--image-repo`.
+    #[test]
+    fn resolve_image_source_image_ref_flag_overrides() {
+        let source = resolve_image_source(
+            Some("ghcr.io/me/gm-miner@sha256:def"),
+            Some("ghcr.io/me/gm-miner"),
+            Some("ghcr.io/taostat/gm-miner@sha256:abc"),
+        )
+        .expect("explicit ref must resolve");
+        assert_eq!(
+            source,
+            ImageSource::Prebuilt("ghcr.io/me/gm-miner@sha256:def".to_owned())
+        );
+    }
+
+    /// `--image-repo` (without `--image-ref`) opts into a local build even when
+    /// a supported ref exists.
+    #[test]
+    fn resolve_image_source_image_repo_opts_into_build() {
+        let source = resolve_image_source(
+            None,
+            Some("ghcr.io/me/gm-miner"),
+            Some("ghcr.io/taostat/gm-miner@sha256:abc"),
+        )
+        .expect("build opt-in must resolve");
+        assert_eq!(source, ImageSource::Build);
+    }
+
+    /// No flags and no supported `image_ref` is an error — there is nothing to
+    /// deploy — and the message points at both escape hatches.
+    #[test]
+    fn resolve_image_source_errors_when_no_ref_available() {
+        let err = resolve_image_source(None, None, None)
+            .expect_err("missing image must abort the default path");
+        let msg = err.to_string();
+        assert!(msg.contains("--image-ref"), "got: {msg}");
+        assert!(msg.contains("--image-repo"), "got: {msg}");
     }
 
     #[test]

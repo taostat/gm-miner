@@ -52,6 +52,7 @@ fn config_with_expiry(api_url: &str, token: Option<&str>, expires_at: Option<Str
         networks,
         active_network: Some("mainnet".to_owned()),
         provider_keys: None,
+        phala_api_key: None,
     }
 }
 

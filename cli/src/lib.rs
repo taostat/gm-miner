@@ -10,5 +10,7 @@ pub mod earnings;
 pub mod image;
 pub mod network;
 pub mod node_secret;
+pub mod phala;
 pub mod register_hotkey;
 pub mod types;
+pub mod wizard;

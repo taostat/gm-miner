@@ -337,6 +337,13 @@ pub struct Config {
     /// Provider API keys set by `gmcli set-api-keys`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_keys: Option<ProviderKeys>,
+    /// Phala Cloud API key, persisted the first time a deploy resolves it
+    /// (interactive paste) so later deploys never re-ask. Network-independent:
+    /// one Phala account funds every network's CVMs. A `--phala-api-key` flag
+    /// or the `PHALA_API_KEY` / `PHALA_CLOUD_API_KEY` env var overrides it for
+    /// a single run without persisting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phala_api_key: Option<String>,
 }
 
 impl Config {
@@ -485,6 +492,7 @@ mod tests {
             networks,
             active_network: Some(network.to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         }
     }
 
@@ -785,6 +793,7 @@ mod tests {
             networks: HashMap::new(),
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
         assert_eq!(cfg.resolved_network(), Network::Testnet);
         assert_eq!(cfg.api_url(), "https://test-registry.saygm.com");
