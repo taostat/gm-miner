@@ -619,37 +619,28 @@ async fn dispatch_worker(
 
 // ── Banner ───────────────────────────────────────────────────────────────────
 
-/// The gm banner, greeting line picked by local time of day. `gm` = good
-/// morning — the greeting reads "good morning/afternoon/evening/night" so a
-/// 3am deploy says `gm. gn really.` energy without changing the art.
+/// The gm banner: block-letter GM art, version, and a time-of-day greeting.
 fn banner() -> String {
     format!(
-        r"
- .----------------------.
- |                      |
- |    ____ __  __       |
- |   / ___|  \/  |      |
- |  | |  _| |\/| |      |
- |  | |_| | |  | |      |
- |   \____|_|  |_|      |
- |                      |
- |   {greeting:<18} |
- |                      |
- '----------------------'
-        \
-         \    .--.
-              |o.o|
-              =(_)=",
+        "██████╗ ███╗   ███╗\n\
+         ██╔════╝ ████╗ ████║\n\
+         ██║  ███╗██╔████╔██║\n\
+         ██║   ██║██║╚██╔╝██║\n\
+         ╚██████╔╝██║ ╚═╝ ██║\n\
+          ╚═════╝ ╚═╝     ╚═╝\n\
+         ───────────────────\n\
+         gmcli v{version}\n\
+         {greeting}",
+        version = env!("CARGO_PKG_VERSION"),
         greeting = greeting()
     )
 }
 
-/// A short greeting keyed off the local hour. Kept under 18 chars so it fits
-/// the banner box.
+/// A short greeting keyed off the local hour.
 fn greeting() -> &'static str {
     match chrono::Local::now().hour() {
         5..=11 => "gm. good morning.",
-        12..=17 => "gm. good afternoon",
+        12..=17 => "gm. good afternoon.",
         18..=21 => "gm. good evening.",
         _ => "gm. good night.",
     }
