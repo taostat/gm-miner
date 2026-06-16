@@ -1,13 +1,5 @@
 # gm miner terms (acceptable use)
 
-**Version: 2026-06-16**
-
-> **DRAFT — NOT LEGAL-FINAL.** This document is a plain-language draft of the
-> acceptable-use representation a miner makes when onboarding. It has not been
-> reviewed by counsel and is not a binding agreement in its current form. The
-> wording will be reviewed before it is made binding. Do not rely on it as
-> legal advice.
-
 `gmcli deploy` shows a summary of these terms and records your acceptance once,
 before your provider keys are first baked into your TEE. Acceptance is recorded
 locally in `~/.gmcli/config.json` and on the gm registry's miner record (keyed
