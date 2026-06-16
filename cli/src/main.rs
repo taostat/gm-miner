@@ -142,7 +142,8 @@ enum Command {
     ///
     /// Phala Cloud manages the confidential VM, the KMS, and `app_id`
     /// authorization. Authentication uses a Phala Cloud API key — set
-    /// `PHALA_CLOUD_API_KEY` or run `phala login` before deploying.
+    /// `PHALA_API_KEY` / `PHALA_CLOUD_API_KEY`, pass `--phala-api-key`, or
+    /// run `phala auth login` before deploying.
     #[command(after_help = "Examples:\n  \
         gmcli deploy --image-repo ghcr.io/<owner>/gm-miner\n  \
         gmcli deploy --image-ref ghcr.io/<owner>/gm-miner@sha256:...")]
@@ -1003,8 +1004,8 @@ fn me_error(network: Network, status: reqwest::StatusCode) -> anyhow::Error {
     if matches!(status.as_u16(), 401 | 403 | 404) {
         return anyhow::anyhow!(
             "your hotkey isn't registered on subnet {netuid} (registry returned {status}).\n\
-             Register it with btcli, then run `gmcli deploy` to attach a worker \
-             (`gmcli register-hotkey` is coming).\n\
+             Run `gmcli register-hotkey` to record your hotkey, then `gmcli deploy` \
+             to attach a worker.\n\
              Already registered? You're on the `{network}` network — pass \
              `--network mainnet` / `--network testnet` if that's not where your \
              hotkey lives."
