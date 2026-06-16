@@ -332,6 +332,20 @@ impl ProviderKeys {
     }
 }
 
+/// Record of the operator's one-time acceptance of the gm miner terms.
+///
+/// Written by the `gmcli deploy` terms gate to suppress re-prompts. The
+/// authoritative, tamper-resistant copy lives on the registry's miner record
+/// (keyed to hotkey); this local copy is convenience only — a `version` that
+/// no longer matches the CLI's current terms re-prompts.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedTerms {
+    /// The terms version the operator accepted (`crate::terms::CURRENT_TERMS_VERSION`).
+    pub version: String,
+    /// RFC 3339 timestamp the acceptance was recorded.
+    pub timestamp: String,
+}
+
 /// Root config structure.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -339,6 +353,11 @@ pub struct Config {
     pub networks: std::collections::HashMap<String, NetworkEntry>,
     /// Which network is currently active.
     pub active_network: Option<String>,
+    /// The operator's one-time terms acceptance, recorded at first deploy.
+    /// Account-wide (not per-network): the representation is about the
+    /// operator's provider accounts, not a single subnet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_terms: Option<AcceptedTerms>,
     /// Provider API keys set by `gmcli set-api-keys`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_keys: Option<ProviderKeys>,
@@ -591,6 +610,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         }
     }
 
@@ -893,6 +913,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
         assert_eq!(cfg.resolved_network(), Network::Testnet);
         assert_eq!(cfg.api_url(), "https://test-registry.saygm.com");
@@ -1001,6 +1022,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         }
     }
 

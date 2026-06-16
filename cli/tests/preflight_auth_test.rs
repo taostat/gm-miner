@@ -54,6 +54,7 @@ fn config_with_expiry(api_url: &str, token: Option<&str>, expires_at: Option<Str
         provider_keys: None,
         phala_api_key: None,
         api_url_override: None,
+        accepted_terms: None,
     }
 }
 

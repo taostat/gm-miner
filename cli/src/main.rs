@@ -40,7 +40,7 @@ use gm_miner_cli::{
     auth,
     btcli::{BtcliBridge, RealBtcli, Registration},
     client::{get_auth_config, RegistryClient},
-    config::{self, Config, HotkeyRecord, ProviderKeys, WorkerRecord},
+    config::{self, AcceptedTerms, Config, HotkeyRecord, ProviderKeys, WorkerRecord},
     dependency::{ensure_dependency, BTCLI, PHALA},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
@@ -53,6 +53,7 @@ use gm_miner_cli::{
     network::Network,
     node_secret,
     register_hotkey::{confirm_registered, record_byo},
+    terms,
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider,
         RetailDimensions, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse,
@@ -439,6 +440,13 @@ struct DeployFlags {
     /// instead prints guidance and exits.
     #[arg(long)]
     yes: bool,
+
+    /// Record acceptance of the gm miner terms without an interactive prompt.
+    /// Equivalent to setting `GMCLI_ACCEPT_TERMS=1`. Lets scripted deploys
+    /// proceed while still recording the accepted terms version locally and
+    /// on the registry's miner record.
+    #[arg(long)]
+    accept_terms: bool,
 }
 
 /// Flags for `gmcli publish-image-version`. The release pipeline supplies
@@ -1093,6 +1101,8 @@ struct DeployArgs {
     /// Suppress interactive prompts (`--yes`): the Phala key paste and the
     /// `phala` install offer.
     assume_yes: bool,
+    /// Record terms acceptance non-interactively (`--accept-terms`).
+    accept_terms: bool,
 }
 
 /// Which registry endpoint records the worker a deploy produces.
@@ -1143,6 +1153,7 @@ fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
         boot_timeout_secs: flags.boot_timeout_secs,
         phala_api_key: flags.phala_api_key,
         assume_yes: flags.yes,
+        accept_terms: flags.accept_terms,
     }
 }
 
@@ -1495,6 +1506,17 @@ async fn cmd_deploy(
     // Step 0: a plain `deploy` may only target worker #1 (see guard).
     reject_secondary_worker_deploy(cfg, registration, &args.app_name)?;
 
+    // Step 0b: the one-time provider-ToS acceptable-use gate. Only the first
+    // deploy gates — it is the registration that creates the hotkey identity
+    // and carries the accepted version onto the registry's miner row. A
+    // `worker add` runs only after a first deploy already accepted, so
+    // re-gating it would persist a local acceptance the worker-add body never
+    // sends to the registry, drifting the two records apart. The gate runs
+    // before any provider key is read or baked into the CVM.
+    if *registration == WorkerRegistration::First {
+        ensure_terms_accepted(cfg, args)?;
+    }
+
     // Step 1: ensure provider keys are configured.
     let keys = cfg
         .provider_keys
@@ -1644,6 +1666,7 @@ async fn cmd_deploy(
             os_image_hash: &verified.os_image_hash,
             endpoint: &actual.endpoint,
             node_secret: Some(&node_secret),
+            accepted_terms_version: Some(terms::CURRENT_TERMS_VERSION),
         },
     )
     .await?;
@@ -1676,6 +1699,34 @@ fn print_deploy_summary(worker_id: &str, app_id: &str, registration: &WorkerRegi
     if *registration == WorkerRegistration::First {
         println!("\nNext: gmcli declare-products --discount-pct <pct>  (then `gmcli status`)");
     }
+}
+
+/// Run the one-time terms-acceptance gate and persist a fresh acceptance.
+///
+/// A current acceptance already on record returns immediately. Otherwise the
+/// operator accepts (interactively, or non-interactively via `--accept-terms`
+/// / `GMCLI_ACCEPT_TERMS`) and the acceptance is written to the local config
+/// so later deploys do not re-prompt. The registry-side record is sent
+/// separately on the first-worker registration body.
+fn ensure_terms_accepted(cfg: &Config, args: &DeployArgs) -> Result<()> {
+    let stored = cfg.accepted_terms.as_ref().map(|a| a.version.as_str());
+    match terms::gate(stored, args.accept_terms)? {
+        terms::Gate::AlreadyAccepted => Ok(()),
+        terms::Gate::AcceptedNow => persist_accepted_terms(),
+    }
+}
+
+/// Persist a fresh terms acceptance to the local config under the config lock,
+/// stamping the current version and an RFC 3339 timestamp.
+fn persist_accepted_terms() -> Result<()> {
+    config::with_config_lock(|| {
+        let mut cfg = config::load().context("load gmcli config")?;
+        cfg.accepted_terms = Some(AcceptedTerms {
+            version: terms::CURRENT_TERMS_VERSION.to_owned(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        });
+        config::save(&cfg).context("persist terms acceptance to gmcli config")
+    })
 }
 
 /// Register a freshly-deployed worker and return its registry `worker_id`.
@@ -1892,6 +1943,9 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
             os_image_hash: &os_image_hash,
             endpoint: &endpoint,
             node_secret: node_secret.as_deref(),
+            // A register-image resync re-asserts the image, not the terms; the
+            // registry keeps whatever acceptance the first deploy recorded.
+            accepted_terms_version: None,
         },
     )
     .await?;
@@ -1984,6 +2038,11 @@ struct WorkerImageArgs<'a> {
     /// registry leaves any stored value untouched (a `register-image` for
     /// a worker whose secret the CLI does not track locally).
     node_secret: Option<&'a str>,
+    /// The gm-miner-terms version the operator accepted, sent on the
+    /// first-worker registration so the registry records it on the miner row.
+    /// `None` omits the field — the registry leaves any stored value untouched
+    /// (a `worker add` or a `register-image` resync that does not re-accept).
+    accepted_terms_version: Option<&'a str>,
 }
 
 /// POST verified compose + OS image hashes to `/miners/register` (worker #1)
@@ -2007,6 +2066,12 @@ async fn post_register_image(
     // leaves any stored value untouched.
     if let Some(secret) = args.node_secret {
         body["node_secret"] = serde_json::Value::String(secret.to_owned());
+    }
+    // The accepted terms version, recorded on the miner row keyed to hotkey —
+    // the tamper-resistant copy of the local config acceptance. `None` (a
+    // register-image resync) leaves any stored value untouched.
+    if let Some(version) = args.accepted_terms_version {
+        body["accepted_terms_version"] = serde_json::Value::String(version.to_owned());
     }
 
     let resp = client
@@ -3384,6 +3449,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -3399,6 +3465,7 @@ mod tests {
             boot_timeout_secs: 300,
             phala_api_key: None,
             assume_yes: false,
+            accept_terms: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -3435,6 +3502,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
 
         // --app-name gm-miner-1 already exists; the guard must bail before
@@ -3454,6 +3522,7 @@ mod tests {
             boot_timeout_secs: 300,
             phala_api_key: None,
             assume_yes: false,
+            accept_terms: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -3503,6 +3572,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -3518,6 +3588,7 @@ mod tests {
             boot_timeout_secs: 300,
             phala_api_key: None,
             assume_yes: false,
+            accept_terms: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -3560,6 +3631,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-1".to_owned(),
@@ -3575,6 +3647,7 @@ mod tests {
             boot_timeout_secs: 300,
             phala_api_key: None,
             assume_yes: false,
+            accept_terms: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -3614,6 +3687,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -3629,6 +3703,7 @@ mod tests {
             boot_timeout_secs: 300,
             phala_api_key: None,
             assume_yes: false,
+            accept_terms: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -3666,6 +3741,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
         // A redeploy of a registered worker carries its worker_id, so a
         // mid-deploy failure can't erase it.
@@ -3723,6 +3799,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
 
         // --app-name gm-miner-2 is a secondary worker; a plain `deploy`
@@ -3742,6 +3819,7 @@ mod tests {
             boot_timeout_secs: 300,
             phala_api_key: None,
             assume_yes: false,
+            accept_terms: false,
         };
 
         let mut client = RegistryClient::new(cfg.clone());
@@ -3798,6 +3876,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
 
         reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-1b")
@@ -3842,6 +3921,7 @@ mod tests {
             provider_keys: None,
             phala_api_key: None,
             api_url_override: None,
+            accepted_terms: None,
         };
 
         let err = reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-2")
@@ -4261,6 +4341,7 @@ mod tests {
                 provider_keys: None,
                 phala_api_key: None,
                 api_url_override: None,
+                accepted_terms: None,
             }
         }
 
