@@ -170,6 +170,7 @@ fn config_for(server: &MockServer) -> Config {
         provider_keys: None,
         phala_api_key: None,
         api_url_override: None,
+        accepted_terms: None,
         networks,
     }
 }

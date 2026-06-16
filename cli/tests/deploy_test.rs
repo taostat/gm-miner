@@ -313,6 +313,7 @@ fn deploy_errors_when_no_provider_keys_set() {
         provider_keys: None, // no keys configured
         phala_api_key: None,
         api_url_override: None,
+        accepted_terms: None,
     };
 
     // Replicate the exact check from `cmd_deploy`.
@@ -344,6 +345,7 @@ fn deploy_errors_when_provider_keys_all_none() {
         }),
         phala_api_key: None,
         api_url_override: None,
+        accepted_terms: None,
     };
 
     let result = cfg

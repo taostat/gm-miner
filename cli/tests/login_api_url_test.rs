@@ -28,6 +28,7 @@ fn config_with_api_url(network: Network, url: &str) -> Config {
         provider_keys: None,
         phala_api_key: None,
         api_url_override: None,
+        accepted_terms: None,
     }
 }
 
@@ -38,6 +39,7 @@ fn config_for(network: Network) -> Config {
         provider_keys: None,
         phala_api_key: None,
         api_url_override: None,
+        accepted_terms: None,
     }
 }
 
