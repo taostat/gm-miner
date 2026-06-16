@@ -67,6 +67,26 @@ impl TokenEntry {
     }
 }
 
+/// The hotkey the miner registers and serves under, recorded by
+/// `gm-miner register-hotkey`.
+///
+/// `ss58` is the on-chain account address — the stable identity every later
+/// command (login, deploy, doctor, earnings) references. `name` is the
+/// btcli `--wallet.hotkey` name, present only when the hotkey was registered
+/// (or named) through the assisted btcli flow; a bring-your-own ss58 has no
+/// local wallet name. `verified` records whether registration on the subnet
+/// metagraph was confirmed locally — a bring-your-own ss58 entered without
+/// btcli present is recorded unverified and confirmed later by the
+/// registry/gateway on first deploy.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyRecord {
+    pub ss58: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
+}
+
 /// One deployed data-plane worker (Phala CVM) under the active hotkey.
 ///
 /// The CLI tracks the operator's deployed CVMs so `worker list` can map
@@ -116,6 +136,11 @@ pub struct NetworkEntry {
     /// `gm-miner worker add` (further capacity).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workers: Vec<WorkerRecord>,
+    /// The hotkey this miner registers and serves under, recorded by
+    /// `gm-miner register-hotkey`. Scoped per network so a testnet and a
+    /// mainnet hotkey from the same config stay distinct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_hotkey: Option<HotkeyRecord>,
     /// Secret persisted by a pre-multi-worker CLI under the network-level
     /// `node_secret` key. It lets an upgraded CLI recover the `x-gm-node-key`
     /// the operator's already-deployed worker #1 enforces. It is round-tripped
@@ -134,6 +159,13 @@ pub struct NetworkEntry {
 }
 
 impl NetworkEntry {
+    /// Record the registered hotkey, replacing any prior one. `register-hotkey`
+    /// routes through here rather than poking the field so the persistence
+    /// shape stays in one place.
+    pub fn set_registered_hotkey(&mut self, record: HotkeyRecord) {
+        self.registered_hotkey = Some(record);
+    }
+
     /// The worker record whose `app_name` matches, if any.
     #[must_use]
     pub fn worker_by_app_name(&self, app_name: &str) -> Option<&WorkerRecord> {
@@ -340,6 +372,14 @@ impl Config {
         self.networks.get(self.active_network())
     }
 
+    /// The hotkey recorded for the active network by `register-hotkey`, if any.
+    /// The stable identity login/deploy/doctor/earnings reference.
+    #[must_use]
+    pub fn registered_hotkey(&self) -> Option<&HotkeyRecord> {
+        self.active_network_entry()
+            .and_then(|n| n.registered_hotkey.as_ref())
+    }
+
     /// Registry API URL for the active network.
     ///
     /// A stored per-network `api_url` (set by `login` or `--api-url`) wins;
@@ -398,7 +438,7 @@ pub fn save(cfg: &Config) -> Result<()> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{Config, NetworkEntry, WorkerRecord};
+    use super::{Config, HotkeyRecord, NetworkEntry, WorkerRecord};
     use std::collections::HashMap;
 
     fn worker(worker_id: &str, app_name: &str, secret: &str) -> WorkerRecord {
@@ -742,6 +782,37 @@ mod tests {
         cfg.set_network(Network::Testnet);
         assert_eq!(cfg.active_network(), "testnet");
         assert_eq!(cfg.resolved_network(), Network::Testnet);
+    }
+
+    #[test]
+    fn registered_hotkey_round_trips_and_is_network_scoped() {
+        let mut cfg = config_with_workers("testnet", Vec::new());
+        cfg.active_entry_mut().set_registered_hotkey(HotkeyRecord {
+            ss58: "5Test".to_owned(),
+            name: Some("miner".to_owned()),
+            verified: true,
+        });
+
+        let bytes = serde_json::to_vec(&cfg).expect("serialize config");
+        let back: Config = serde_json::from_slice(&bytes).expect("deserialize config");
+        let record = back.registered_hotkey().expect("hotkey recorded");
+        assert_eq!(record.ss58, "5Test");
+        assert_eq!(record.name.as_deref(), Some("miner"));
+        assert!(record.verified);
+        // A different active network sees no hotkey.
+        let mut other = back;
+        other.set_network(crate::network::Network::Mainnet);
+        assert!(other.registered_hotkey().is_none());
+    }
+
+    #[test]
+    fn absent_registered_hotkey_is_omitted_from_json() {
+        let cfg = config_with_workers("mainnet", Vec::new());
+        let json = serde_json::to_string(&cfg).expect("serialize config");
+        assert!(
+            !json.contains("registered_hotkey"),
+            "absent hotkey must be skipped: {json}"
+        );
     }
 
     #[test]
