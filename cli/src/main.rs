@@ -2400,17 +2400,34 @@ fn register_hotkey_assisted(
     let btcli = RealBtcli;
 
     // Resolve the ss58 up front — it is both proof the local wallet/hotkey
-    // exists and the address we record afterwards. A `None` here means btcli's
-    // wallet store has no such pair (a typoed `--wallet`/`--hotkey`), so we
-    // refuse to spend TAO rather than register blind and persist an empty
-    // address. The lookup also feeds the already-registered pre-check below, so
-    // the wallet store is read exactly once.
+    // exists and the address we record afterwards. When the hotkey is absent
+    // from the local wallet store (not yet created, or a typoed name), we
+    // print the exact btcli commands for the operator to run and ask them to
+    // paste the resulting ss58 back. We never shell out to key-generation or
+    // signing commands — those stay with the operator.
     let Some(ss58) = btcli.hotkey_ss58(&wallet, &hotkey)? else {
-        bail!(
-            "btcli has no hotkey `{hotkey}` under wallet `{wallet}`.\n  \
-             check the names with: btcli wallet list\n  \
-             create one with: btcli wallet new-hotkey --wallet.name {wallet} --wallet.hotkey {hotkey}"
+        let netuid = network.netuid();
+        let chain = gm_miner_cli::btcli::btcli_network(network);
+        println!(
+            "Hotkey `{hotkey}` not found under wallet `{wallet}`.\n\
+             Run these commands in your terminal, then paste the ss58 below:\n\
+             \n\
+               btcli wallet new-hotkey --wallet.name {wallet} --wallet.hotkey {hotkey}\n\
+               btcli subnet register --wallet.name {wallet} --wallet.hotkey {hotkey} \
+             --netuid {netuid} --network {chain}\n"
         );
+        let Some(ss58) = gm_miner_cli::wizard::prompt_line(
+            "Hotkey ss58 address (from `btcli wallet list` after the above):",
+            yes,
+        )?
+        else {
+            bail!(
+                "No ss58 provided. Run the commands above, then re-run \
+                 `gmcli register-hotkey --wallet {wallet} --hotkey {hotkey}`."
+            );
+        };
+        // Switch to the BYO read-only path: verify on the metagraph and record.
+        return register_hotkey_byo(network, &ss58);
     };
 
     if let Registration::Registered { uid } = btcli.registration_of(network, &ss58)? {
@@ -2646,9 +2663,9 @@ async fn cmd_init(
 ///
 /// Skipped when a hotkey is already recorded locally or a valid login token
 /// exists (the token proves on-chain registration). Otherwise the miner is
-/// asked whether they already registered a hotkey elsewhere — if so the step
-/// is skipped (login handles it); if not, the assisted/bring-your-own
-/// `register-hotkey` runs with prompted inputs.
+/// asked whether they already registered a hotkey elsewhere:
+/// - Yes → prompt for their ss58; use the bring-your-own path.
+/// - No  → prompt for wallet/hotkey name; use the assisted path.
 fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> {
     let title = "Step 1/5 · register hotkey";
     if hotkey_step_done(cfg) {
@@ -2662,25 +2679,35 @@ fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> 
 
     let network = cfg.resolved_network();
     if registered_elsewhere(network, assume_yes)? {
-        println!("  Skipping registration — login will use your existing hotkey.");
-        return Ok(WizardFlow::Continue);
+        // Miner has a hotkey registered elsewhere — collect the ss58 and record it.
+        let Some(ss58) = prompt_byo_ss58(assume_yes)? else {
+            println!("  Run `gmcli register-hotkey --hotkey-ss58 <addr>` when ready.");
+            return Ok(WizardFlow::Continue);
+        };
+        let command = describe_register_command(Some(&ss58), None, None);
+        return run_wizard_step!(
+            title,
+            &command,
+            assume_yes,
+            cmd_register_hotkey(cfg, Some(ss58), None, None, assume_yes)
+        );
     }
 
     // No recorded hotkey and nothing to go on non-interactively — register
-    // needs the operator's wallet/hotkey or ss58, which only a prompt supplies.
-    let Some((ss58, wallet, hotkey)) = prompt_register_inputs(assume_yes)? else {
+    // needs the operator's wallet/hotkey, which only a prompt supplies.
+    let Some((wallet, hotkey)) = prompt_fresh_inputs(assume_yes)? else {
         gm_miner_cli::wizard::already_done(
             title,
             "skipped (no input) — run `gmcli register-hotkey` when ready",
         );
         return Ok(WizardFlow::Continue);
     };
-    let command = describe_register_command(ss58.as_deref(), wallet.as_deref(), hotkey.as_deref());
+    let command = describe_register_command(None, Some(&wallet), hotkey.as_deref());
     run_wizard_step!(
         title,
         &command,
         assume_yes,
-        cmd_register_hotkey(cfg, ss58, wallet, hotkey, assume_yes)
+        cmd_register_hotkey(cfg, None, Some(wallet), hotkey, assume_yes)
     )
 }
 
@@ -2690,7 +2717,8 @@ fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> 
 fn registered_elsewhere(network: Network, assume_yes: bool) -> Result<bool> {
     gm_miner_cli::dependency::confirm(
         &format!(
-            "Already have a hotkey registered on subnet {} (e.g. a browser wallet)?",
+            "Already registered a hotkey on subnet {} — via btcli, another machine, \
+             or a Bittensor wallet app?",
             network.netuid()
         ),
         false,
@@ -2698,26 +2726,21 @@ fn registered_elsewhere(network: Network, assume_yes: bool) -> Result<bool> {
     )
 }
 
-/// The inputs `register-hotkey` accepts: `(ss58, wallet, hotkey)` — a
-/// bring-your-own ss58, or a btcli wallet/hotkey pair for the assisted flow.
-type RegisterInputs = (Option<String>, Option<String>, Option<String>);
+/// Prompt for the ss58 of a hotkey the miner registered elsewhere.
+/// Returns `None` in non-interactive mode or when the miner leaves it blank.
+fn prompt_byo_ss58(assume_yes: bool) -> Result<Option<String>> {
+    prompt_line("ss58 address of your registered hotkey:", assume_yes)
+}
 
-/// Collect the inputs `register-hotkey` needs. Returns `None` when no input is
-/// available (non-interactive run, or a blank wallet answer) so the caller
-/// skips the step rather than registering blind.
-fn prompt_register_inputs(assume_yes: bool) -> Result<Option<RegisterInputs>> {
-    let ss58 = prompt_line(
-        "ss58 of a hotkey you registered elsewhere (blank to register a fresh one):",
-        assume_yes,
-    )?;
-    if ss58.is_some() {
-        return Ok(Some((ss58, None, None)));
-    }
+/// Prompt for a wallet name and optional hotkey name for the assisted flow.
+/// Returns `None` in non-interactive mode or when the wallet name is blank.
+/// The hotkey defaults to `"default"` when left blank.
+fn prompt_fresh_inputs(assume_yes: bool) -> Result<Option<(String, Option<String>)>> {
     let Some(wallet) = prompt_line("btcli wallet (coldkey) name:", assume_yes)? else {
         return Ok(None);
     };
-    let hotkey = prompt_line("btcli hotkey name:", assume_yes)?;
-    Ok(Some((None, Some(wallet), hotkey)))
+    let hotkey = prompt_line("btcli hotkey name (blank for \"default\"):", assume_yes)?;
+    Ok(Some((wallet, hotkey)))
 }
 
 /// Render the `register-hotkey` command the wizard will run, for display.
