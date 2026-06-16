@@ -56,13 +56,19 @@ const STORAGE_FS: &str = "zfs";
 /// CVM. A literal in the measured object, so it is pinned here.
 const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 
-/// The env-var names a gm release deploy declares, in deploy order. This is
-/// the canonical, public-image key set the registry's approved baseline is
-/// keyed on: the two supported provider keys plus the node secret, with no
-/// private-registry pull credentials (the gm image is public). A miner who
-/// sets a different key combination produces a different `compose_hash`; the
-/// published baseline is this canonical set.
-const CANONICAL_ALLOWED_ENVS: [&str; 3] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GM_NODE_SECRET"];
+/// The env-var names a gm release deploy declares, in deploy order. Lists
+/// every supported provider key name plus the node secret, regardless of
+/// which keys an individual miner has configured. Hash covers names only,
+/// not values, so every miner produces the same `compose_hash`. The order
+/// matches `render_env_file`: Anthropic, `OpenAI`, Google, node secret.
+/// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
+/// gm image is public and those vars do not appear in `allowed_envs`.
+const CANONICAL_ALLOWED_ENVS: [&str; 4] = [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GM_NODE_SECRET",
+];
 
 /// The pinned dstack OS image's published reproducible `os_image_hash`.
 ///
@@ -187,17 +193,23 @@ mod tests {
     const TESTNET_IMAGE_REF: &str =
         "ghcr.io/taostat/gm-miner@sha256:ac9292e9bfa21100885768db4a84ab191e8ba4ac48859a9905c5867a1c59dc53";
 
-    /// HARD ACCEPTANCE GATE. The real, registry-approved testnet
-    /// `compose_hash` (the 2026-06-16 public-image row from
-    /// `GET /image-versions` on the testnet registry) and the on-CVM
-    /// attestation TCB info of the live `gm-testnet-miner` CVM (Phala app
-    /// `0cf7a425ac68f66984faf1608e7fd31c8a8e342b`, prod5), which carries the
-    /// exact `app_compose` string that hashes to it. Our offline computation
-    /// must reproduce this byte-for-byte. A regression here means a release
-    /// would publish a hash that no real miner CVM produces — a
-    /// HASH-MISMATCH that bricks every deploy.
+    /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
+    /// this image ref + `CANONICAL_ALLOWED_ENVS` (all four provider key names).
+    ///
+    /// This supersedes the pre-canonicalization hash
+    /// `e47562cd6e1f663817371745399eb92b234f6adb0049df21248f9392249f8fbc`,
+    /// which was computed with only the three-name set
+    /// `["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GM_NODE_SECRET"]` and
+    /// therefore varied by which keys a miner had configured. The old hash is
+    /// retired: the registry row it anchors must be replaced with the new
+    /// canonical row before existing miners redeploy.
+    ///
+    /// Rollout: publish a new `ImageVersion` with this hash to the testnet
+    /// registry (`gmcli publish-image-version`), redeploy the live testnet
+    /// miners so their measured hash becomes this value, confirm attestation
+    /// matches, then retire the old `e47562cd` row.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "e47562cd6e1f663817371745399eb92b234f6adb0049df21248f9392249f8fbc";
+        "9a0f459450e3ada3fee959392aef16adb0c66467a50458db587fcabbe48acc42";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
@@ -205,7 +217,9 @@ mod tests {
             .expect("offline compose hash must compute");
         assert_eq!(
             computed, REGISTRY_TESTNET_COMPOSE_HASH,
-            "offline compose_hash must reproduce the registry-approved testnet hash byte-for-byte"
+            "offline compose_hash must reproduce the canonical testnet hash byte-for-byte; \
+             if this fails after a compose/env change, update REGISTRY_TESTNET_COMPOSE_HASH \
+             and publish a new ImageVersion to the registry"
         );
     }
 
@@ -254,8 +268,8 @@ mod tests {
                 .get("allowed_envs")
                 .and_then(|v| v.as_array())
                 .map(Vec::len),
-            Some(3),
-            "allowed_envs must be the canonical 3-name set"
+            Some(4),
+            "allowed_envs must be the canonical 4-name set"
         );
     }
 
