@@ -8,6 +8,7 @@ pub mod dependency;
 pub mod deploy;
 pub mod earnings;
 pub mod image;
+pub mod image_version;
 pub mod network;
 pub mod node_secret;
 pub mod phala;
