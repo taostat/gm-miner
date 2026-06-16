@@ -314,7 +314,14 @@ enum Command {
     #[command(after_help = "Examples:\n  \
         gmcli init\n  \
         gmcli --network testnet init")]
-    Init,
+    Init {
+        /// Run non-interactively: never prompt. Each step runs if its inputs
+        /// are already configured (stored keys, env, flags) and is skipped
+        /// when it would otherwise need a prompt. Useful for a returning
+        /// miner re-checking setup, or a scripted run.
+        #[arg(long)]
+        yes: bool,
+    },
 
     /// gm. (prints a small sunrise and a time-of-day greeting)
     #[command(hide = true)]
@@ -467,7 +474,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             openai,
             google,
         } => cmd_set_api_keys(explicit_network, anthropic, openai, google),
-        Command::Init => cmd_init(explicit_network, api_url).await,
+        Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
         Command::Gm => {
             cmd_gm();
             Ok(())
@@ -2428,8 +2435,8 @@ enum WizardFlow {
 /// wizard. Collapses the identical three-arm match every step would otherwise
 /// repeat. `$body` is `Result<_>` — the `?` propagates a step failure.
 macro_rules! run_wizard_step {
-    ($title:expr, $command:expr, $body:expr) => {
-        match ask_step($title, $command, false)? {
+    ($title:expr, $command:expr, $assume_yes:expr, $body:expr) => {
+        match ask_step($title, $command, $assume_yes)? {
             StepChoice::Run => {
                 $body?;
                 Ok(WizardFlow::Continue)
@@ -2478,34 +2485,44 @@ fn provider_keys_done(cfg: &Config) -> bool {
 /// gated on a `[Y/n/skip]` prompt and detect-and-skipped when already done.
 /// Config is reloaded between steps because each underlying command persists to
 /// disk; the wizard is a pure orchestrator over the existing `cmd_*` functions.
-async fn cmd_init(explicit_network: Option<Network>, api_url: Option<String>) -> Result<()> {
+async fn cmd_init(
+    explicit_network: Option<Network>,
+    api_url: Option<String>,
+    assume_yes: bool,
+) -> Result<()> {
     let cfg = load_config(explicit_network, api_url.clone())?;
     let network = cfg.resolved_network();
     println!(
         "gmcli init — onboarding for {network} (netuid {})",
         network.netuid()
     );
-    println!("Each step shows its command and asks before running. Press Enter to run, `n` to stop, `skip` to skip.");
+    if assume_yes {
+        println!(
+            "Running non-interactively (--yes): steps run when already configured, else skip."
+        );
+    } else {
+        println!("Each step shows its command and asks before running. Press Enter to run, `n` to stop, `skip` to skip.");
+    }
 
     // Provider keys precede deploy: `cmd_deploy` refuses to start without at
     // least one key (it bakes them into the CVM env), so the wizard must
     // collect them first or the deploy step would fail before doing anything.
-    if wizard_register_hotkey(&cfg)? == WizardFlow::Stop {
+    if wizard_register_hotkey(&cfg, assume_yes)? == WizardFlow::Stop {
         return Ok(());
     }
-    if wizard_login(explicit_network, api_url.clone()).await? == WizardFlow::Stop {
-        return Ok(());
-    }
-    let cfg = load_config(explicit_network, api_url.clone())?;
-    if wizard_provider_keys(explicit_network, &cfg)? == WizardFlow::Stop {
+    if wizard_login(explicit_network, api_url.clone(), assume_yes).await? == WizardFlow::Stop {
         return Ok(());
     }
     let cfg = load_config(explicit_network, api_url.clone())?;
-    if wizard_deploy(cfg).await? == WizardFlow::Stop {
+    if wizard_provider_keys(explicit_network, &cfg, assume_yes)? == WizardFlow::Stop {
+        return Ok(());
+    }
+    let cfg = load_config(explicit_network, api_url.clone())?;
+    if wizard_deploy(cfg, assume_yes).await? == WizardFlow::Stop {
         return Ok(());
     }
     let cfg = load_config(explicit_network, api_url)?;
-    if wizard_declare_products(cfg).await? == WizardFlow::Stop {
+    if wizard_declare_products(cfg, assume_yes).await? == WizardFlow::Stop {
         return Ok(());
     }
 
@@ -2522,7 +2539,7 @@ async fn cmd_init(explicit_network: Option<Network>, api_url: Option<String>) ->
 /// asked whether they already registered a hotkey elsewhere — if so the step
 /// is skipped (login handles it); if not, the assisted/bring-your-own
 /// `register-hotkey` runs with prompted inputs.
-fn wizard_register_hotkey(cfg: &Config) -> Result<WizardFlow> {
+fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> {
     let title = "Step 1/5 · register hotkey";
     if hotkey_step_done(cfg) {
         let detail = cfg.registered_hotkey().map_or_else(
@@ -2534,46 +2551,63 @@ fn wizard_register_hotkey(cfg: &Config) -> Result<WizardFlow> {
     }
 
     let network = cfg.resolved_network();
-    if registered_elsewhere(network)? {
+    if registered_elsewhere(network, assume_yes)? {
         println!("  Skipping registration — login will use your existing hotkey.");
         return Ok(WizardFlow::Continue);
     }
 
-    let (ss58, wallet, hotkey) = prompt_register_inputs()?;
+    // No recorded hotkey and nothing to go on non-interactively — register
+    // needs the operator's wallet/hotkey or ss58, which only a prompt supplies.
+    let Some((ss58, wallet, hotkey)) = prompt_register_inputs(assume_yes)? else {
+        gm_miner_cli::wizard::already_done(
+            title,
+            "skipped (no input) — run `gmcli register-hotkey` when ready",
+        );
+        return Ok(WizardFlow::Continue);
+    };
     let command = describe_register_command(ss58.as_deref(), wallet.as_deref(), hotkey.as_deref());
     run_wizard_step!(
         title,
         &command,
-        cmd_register_hotkey(cfg.clone(), ss58, wallet, hotkey, false)
+        assume_yes,
+        cmd_register_hotkey(cfg.clone(), ss58, wallet, hotkey, assume_yes)
     )
 }
 
-/// Ask whether the miner already has a hotkey registered on `network`. A
-/// non-TTY answers "no" so a piped `init` falls through to the register step.
-fn registered_elsewhere(network: Network) -> Result<bool> {
+/// Ask whether the miner already has a hotkey registered on `network`.
+/// `assume_yes` and a non-TTY answer "no" so a scripted `init` falls through
+/// to the register step (which then skips when it has no inputs).
+fn registered_elsewhere(network: Network, assume_yes: bool) -> Result<bool> {
     gm_miner_cli::dependency::confirm(
         &format!(
             "Already have a hotkey registered on subnet {} (e.g. a browser wallet)?",
             network.netuid()
         ),
         false,
-        false,
+        assume_yes,
     )
 }
 
-/// Collect the inputs `register-hotkey` needs: a bring-your-own ss58, or a
-/// btcli wallet/hotkey pair for the assisted flow.
-fn prompt_register_inputs() -> Result<(Option<String>, Option<String>, Option<String>)> {
+/// The inputs `register-hotkey` accepts: `(ss58, wallet, hotkey)` — a
+/// bring-your-own ss58, or a btcli wallet/hotkey pair for the assisted flow.
+type RegisterInputs = (Option<String>, Option<String>, Option<String>);
+
+/// Collect the inputs `register-hotkey` needs. Returns `None` when no input is
+/// available (non-interactive run, or a blank wallet answer) so the caller
+/// skips the step rather than registering blind.
+fn prompt_register_inputs(assume_yes: bool) -> Result<Option<RegisterInputs>> {
     let ss58 = prompt_line(
         "ss58 of a hotkey you registered elsewhere (blank to register a fresh one):",
-        false,
+        assume_yes,
     )?;
     if ss58.is_some() {
-        return Ok((ss58, None, None));
+        return Ok(Some((ss58, None, None)));
     }
-    let wallet = prompt_line("btcli wallet (coldkey) name:", false)?;
-    let hotkey = prompt_line("btcli hotkey name:", false)?;
-    Ok((None, wallet, hotkey))
+    let Some(wallet) = prompt_line("btcli wallet (coldkey) name:", assume_yes)? else {
+        return Ok(None);
+    };
+    let hotkey = prompt_line("btcli hotkey name:", assume_yes)?;
+    Ok(Some((None, Some(wallet), hotkey)))
 }
 
 /// Render the `register-hotkey` command the wizard will run, for display.
@@ -2594,6 +2628,7 @@ fn describe_register_command(
 async fn wizard_login(
     explicit_network: Option<Network>,
     api_url: Option<String>,
+    assume_yes: bool,
 ) -> Result<WizardFlow> {
     let title = "Step 2/5 · login";
     let cfg = load_config(explicit_network, api_url.clone())?;
@@ -2601,9 +2636,16 @@ async fn wizard_login(
         gm_miner_cli::wizard::already_done(title, "a valid login token is stored");
         return Ok(WizardFlow::Continue);
     }
+    // Login is a browser device-code flow — it cannot run unattended, so a
+    // non-interactive run skips it with guidance rather than hanging.
+    if assume_yes {
+        gm_miner_cli::wizard::already_done(title, "skipped — run `gmcli login` interactively");
+        return Ok(WizardFlow::Continue);
+    }
     run_wizard_step!(
         title,
         "gmcli login",
+        assume_yes,
         cmd_login(explicit_network, api_url, true).await
     )
 }
@@ -2614,7 +2656,7 @@ async fn wizard_login(
 /// with a pointer to `gmcli worker add` (the correct command for more
 /// capacity); the wizard never re-runs `deploy` over a registered worker #1,
 /// which would replace its registry endpoint.
-async fn wizard_deploy(cfg: Config) -> Result<WizardFlow> {
+async fn wizard_deploy(cfg: Config, assume_yes: bool) -> Result<WizardFlow> {
     let title = "Step 4/5 · deploy worker";
     if has_deployed_worker(&cfg) {
         gm_miner_cli::wizard::already_done(
@@ -2633,22 +2675,29 @@ async fn wizard_deploy(cfg: Config) -> Result<WizardFlow> {
         );
         return Ok(WizardFlow::Continue);
     }
-    let args = deploy_args_from_flags(default_deploy_flags());
+    let mut flags = default_deploy_flags();
+    flags.yes = assume_yes;
+    let args = deploy_args_from_flags(flags);
     run_wizard_step!(
         title,
         "gmcli deploy",
+        assume_yes,
         cmd_deploy_subcommand(cfg, args, WorkerRegistration::First).await
     )
 }
 
-/// Wizard step 4: set provider keys. Skipped when any key is already set.
-fn wizard_provider_keys(explicit_network: Option<Network>, cfg: &Config) -> Result<WizardFlow> {
+/// Wizard step 3: set provider keys. Skipped when any key is already set.
+fn wizard_provider_keys(
+    explicit_network: Option<Network>,
+    cfg: &Config,
+    assume_yes: bool,
+) -> Result<WizardFlow> {
     let title = "Step 3/5 · provider keys";
     if provider_keys_done(cfg) {
         gm_miner_cli::wizard::already_done(title, "provider keys already set");
         return Ok(WizardFlow::Continue);
     }
-    let (anthropic, openai, google) = prompt_provider_keys()?;
+    let (anthropic, openai, google) = prompt_provider_keys(assume_yes)?;
     if anthropic.is_none() && openai.is_none() && google.is_none() {
         println!("  No keys entered — skipping. Set them later with `gmcli set-api-keys`.");
         return Ok(WizardFlow::Continue);
@@ -2657,15 +2706,18 @@ fn wizard_provider_keys(explicit_network: Option<Network>, cfg: &Config) -> Resu
     run_wizard_step!(
         title,
         &command,
+        assume_yes,
         cmd_set_api_keys(explicit_network, anthropic, openai, google)
     )
 }
 
 /// Prompt for each provider key in turn (blank to skip a provider).
-fn prompt_provider_keys() -> Result<(Option<String>, Option<String>, Option<String>)> {
-    let anthropic = prompt_line("Anthropic API key (blank to skip):", false)?;
-    let openai = prompt_line("OpenAI API key (blank to skip):", false)?;
-    let google = prompt_line("Google API key (blank to skip):", false)?;
+fn prompt_provider_keys(
+    assume_yes: bool,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let anthropic = prompt_line("Anthropic API key (blank to skip):", assume_yes)?;
+    let openai = prompt_line("OpenAI API key (blank to skip):", assume_yes)?;
+    let google = prompt_line("Google API key (blank to skip):", assume_yes)?;
     Ok((anthropic, openai, google))
 }
 
@@ -2690,9 +2742,9 @@ fn describe_keys_command(
 }
 
 /// Wizard step 5: declare products across the catalog at one discount.
-async fn wizard_declare_products(cfg: Config) -> Result<WizardFlow> {
+async fn wizard_declare_products(cfg: Config, assume_yes: bool) -> Result<WizardFlow> {
     let title = "Step 5/5 · declare products";
-    let Some(discount_bp) = prompt_discount()? else {
+    let Some(discount_bp) = prompt_discount(assume_yes)? else {
         println!("  No discount entered — skipping. Declare later with `gmcli declare-products --discount-pct <pct>`.");
         return Ok(WizardFlow::Continue);
     };
@@ -2701,6 +2753,7 @@ async fn wizard_declare_products(cfg: Config) -> Result<WizardFlow> {
     run_wizard_step!(
         title,
         &command,
+        assume_yes,
         declare_all_products(cfg, discount_bp).await
     )
 }
@@ -2715,11 +2768,11 @@ async fn declare_all_products(cfg: Config, discount_bp: u32) -> Result<()> {
 }
 
 /// Prompt for the catalog-wide discount percent, parsed into basis points.
-/// A blank answer (or a non-TTY) returns `None` so the step is skipped.
-fn prompt_discount() -> Result<Option<u32>> {
+/// A blank answer (or a non-TTY / `--yes`) returns `None` so the step skips.
+fn prompt_discount(assume_yes: bool) -> Result<Option<u32>> {
     let Some(raw) = prompt_line(
         "Percent off retail to offer on every product (e.g. 5):",
-        false,
+        assume_yes,
     )?
     else {
         return Ok(None);
