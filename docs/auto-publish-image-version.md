@@ -43,8 +43,8 @@ CVM down.
 - `--registry-admin-key <key>` / `REGISTRY_ADMIN_KEY` — the registry admin
   `X-API-Key`.
 - `--api-url <url>` overrides the network's default registry URL.
-- `--git-tag`, `--git-commit`, `--git-repo`, `--notes` — provenance stamped
-  onto the row (the notes reference the tag + commit).
+- `--git-tag`, `--git-commit`, `--git-repo` — provenance stamped onto the
+  row; the auto-generated notes reference the tag + commit.
 - Phala deploy knobs reuse `deploy`'s defaults (`--instance-type`,
   `--disk-size`, `--os-image`, `--boot-timeout-secs`, `--phala-api-key`).
 - `--keep-cvm` leaves the throwaway CVM running (debugging); the default

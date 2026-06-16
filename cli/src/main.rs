@@ -1986,7 +1986,7 @@ async fn cmd_publish_image_version(cfg: &Config, flags: PublishImageVersionFlags
         .unwrap_or_else(|| std::path::PathBuf::from(format!("dist/publish-{network}")));
     let app_name = format!("gm-publish-{network}");
     let phala = gm_miner_cli::deploy::RealPhalaClient::new(
-        app_name,
+        app_name.clone(),
         dist_dir,
         flags.instance_type.clone(),
         flags.disk_size.clone(),
@@ -1999,7 +1999,19 @@ async fn cmd_publish_image_version(cfg: &Config, flags: PublishImageVersionFlags
         flags.image_ref
     );
     let outcome =
-        deploy_for_measurement(&phala, &flags.image_ref, network, flags.boot_timeout_secs)?;
+        match deploy_for_measurement(&phala, &flags.image_ref, network, flags.boot_timeout_secs) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // `phala deploy` may have created the CVM before the hash/endpoint
+                // readback failed (a boot timeout). `phala cvms delete` accepts the
+                // `--name`, so tear it down best-effort by name before propagating —
+                // otherwise a leaked CVM collides with the next publish's app name.
+                if !flags.keep_cvm {
+                    teardown_cvm(&app_name, phala_key.as_deref());
+                }
+                return Err(e);
+            }
+        };
     println!("  compose_hash  : {}", outcome.hashes.compose_sha256);
     println!("  os_image_hash : {}", outcome.hashes.os_image_hash);
 

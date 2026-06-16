@@ -70,7 +70,11 @@ jobs:
           file: image/Dockerfile
           push: true
           provenance: false
-          tags: ghcr.io/taostat/gm-miner:${{ github.ref_name }}
+          # Tag from the commit SHA, not github.ref_name: the cargo-dist tag
+          # pattern accepts refs (`releases/v1.2.3`, `+build` metadata) with
+          # characters Docker tags reject. The published version pins the
+          # digest, so the human-readable tag is incidental.
+          tags: ghcr.io/taostat/gm-miner:sha-${{ github.sha }}
 
       - name: Resolve digest-pinned image ref
         id: ref
