@@ -1,6 +1,4 @@
 //! CLI configuration persisted to `~/.gmcli/config.json`.
-//!
-//! Pattern mirrors blockmachine's `auth_config.py`, adapted for Rust.
 
 use anyhow::{Context, Result};
 use base64::Engine as _;

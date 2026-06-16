@@ -1,11 +1,10 @@
 //! Registry API client with JWT bearer auth.
 //!
-//! Mirrors the pattern in blockmachine's client.py. The access token is kept
-//! fresh before the client is built: `main::ensure_fresh_token` refreshes an
-//! expired token via the OAuth `refresh_token` grant (falling back to the
-//! device flow), so by the time a `RegistryClient` issues a request the token
-//! is valid. A 401 here is a backstop and still surfaces as "authentication
-//! expired".
+//! The access token is kept fresh before the client is built:
+//! `main::ensure_fresh_token` refreshes an expired token via the OAuth
+//! `refresh_token` grant (falling back to the device flow), so by the time a
+//! `RegistryClient` issues a request the token is valid. A 401 here is a
+//! backstop and still surfaces as "authentication expired".
 
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Response, StatusCode};

@@ -19,27 +19,15 @@ lifecycle from your laptop.
 
 ## Install
 
-`gmcli` runs operator-side from a laptop. Prebuilt binaries for macOS (Apple Silicon + Intel),
-Linux (x86-64 + aarch64), and Windows (x86-64) are published on the
+`gmcli` runs operator-side from a laptop. Prebuilt binaries for macOS (Apple Silicon + Intel)
+and Linux (x86-64 + aarch64) are published on the
 [GitHub Releases page](https://github.com/taostat/gm-miner/releases).
 
-Install the latest release with the one-line installer (macOS / Linux):
+Install the latest release with the one-line installer:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/taostat/gm-miner/releases/latest/download/gmcli-installer.sh | sh
-```
-
-On Windows, use the PowerShell installer:
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/taostat/gm-miner/releases/latest/download/gmcli-installer.ps1 | iex"
-```
-
-On macOS / Linux with Homebrew:
-
-```sh
-brew install taostat/gmcli/gmcli
 ```
 
 The installer places the binary in `~/.cargo/bin` (or `CARGO_HOME`) and ensures that directory
