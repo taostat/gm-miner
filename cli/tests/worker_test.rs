@@ -119,6 +119,7 @@ fn config_for(server: &MockServer) -> Config {
             }),
             workers: Vec::new(),
             legacy_node_secret: None,
+            registered_hotkey: None,
         },
     );
     Config {

@@ -6,6 +6,8 @@
 //!                      deploy via Phala Cloud, verify hashes, register image
 //!   login            — Taostats device-code OAuth flow
 //!   doctor           — preflight checklist (network, login, keys, phala, hotkey)
+//!   register-hotkey  — record the serving hotkey (bring-your-own ss58, or
+//!                      register a fresh one via the btcli bridge)
 //!   register-image   — re-register the deployed miner's image hashes (hidden)
 //!   declare-product  — declare a single offer (--provider X --model Y --discount-pct N)
 //!   declare-products — fan out one discount over the whole catalog, or one provider
@@ -36,8 +38,10 @@ use chrono::Timelike as _;
 use clap::{Parser, Subcommand};
 use gm_miner_cli::{
     auth,
+    btcli::{BtcliBridge, RealBtcli, Registration},
     client::{get_auth_config, RegistryClient},
-    config::{self, Config, ProviderKeys, WorkerRecord},
+    config::{self, Config, HotkeyRecord, ProviderKeys, WorkerRecord},
+    dependency::{ensure_dependency, BTCLI},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
         parse_phala_cvm_endpoint, parse_phala_cvm_name, preflight_phala_cli, prepare_deploy_target,
@@ -47,6 +51,7 @@ use gm_miner_cli::{
     },
     network::Network,
     node_secret,
+    register_hotkey::{confirm_registered, record_byo},
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider,
         RetailDimensions, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse,
@@ -190,6 +195,39 @@ enum Command {
         gm-miner doctor\n  \
         gm-miner --network testnet doctor")]
     Doctor,
+
+    /// Record (and optionally register) the hotkey your miner serves under.
+    ///
+    /// Two flows. If you already registered a hotkey elsewhere (a browser
+    /// wallet, another machine), pass `--hotkey-ss58 <addr>` and gm-miner just
+    /// records it — no btcli needed. If you have not, omit `--hotkey-ss58` and
+    /// pass `--wallet`/`--hotkey`: gm-miner offers to register a fresh hotkey
+    /// through btcli (which owns your wallet keys — gm-miner never sees them).
+    #[command(after_help = "Examples:\n  \
+        gm-miner register-hotkey --hotkey-ss58 5GrwvaEF...     # already registered elsewhere\n  \
+        gm-miner --network testnet register-hotkey --wallet miner --hotkey default\n  \
+        gm-miner register-hotkey --wallet miner --hotkey default --yes  # non-interactive")]
+    RegisterHotkey {
+        /// The ss58 address of a hotkey you already registered elsewhere.
+        /// When set, gm-miner records it (verifying via btcli if present) and
+        /// never registers anything. When omitted, gm-miner offers to register
+        /// a fresh hotkey via btcli using `--wallet`/`--hotkey`.
+        #[arg(long = "hotkey-ss58", value_name = "SS58")]
+        hotkey_ss58: Option<String>,
+
+        /// btcli coldkey (wallet) name. Required for the assisted flow.
+        #[arg(long)]
+        wallet: Option<String>,
+
+        /// btcli hotkey name under the wallet. Required for the assisted flow.
+        #[arg(long)]
+        hotkey: Option<String>,
+
+        /// Skip confirmation prompts (install offers, the spend gate) for
+        /// non-interactive use.
+        #[arg(long)]
+        yes: bool,
+    },
 
     /// Declare a single miner-product offer.
     ///
@@ -369,6 +407,13 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    dispatch(cli).await
+}
+
+/// Resolve the global flags and run the selected subcommand. Split from
+/// [`main`] so the startup banner/tracing setup stays separate from the
+/// per-command routing.
+async fn dispatch(cli: Cli) -> Result<()> {
     let explicit_network = cli.explicit_network();
     let api_url = cli.api_url.clone();
 
@@ -423,6 +468,15 @@ async fn main() -> Result<()> {
         Command::Doctor => {
             let cfg = load_config(explicit_network, api_url)?;
             cmd_doctor(cfg).await
+        }
+        Command::RegisterHotkey {
+            hotkey_ss58,
+            wallet,
+            hotkey,
+            yes,
+        } => {
+            let cfg = load_config(explicit_network, api_url)?;
+            cmd_register_hotkey(cfg, hotkey_ss58, wallet, hotkey, yes)
         }
         Command::RegisterImage { app_id } => {
             let cfg = load_config(explicit_network, api_url)?;
@@ -2041,12 +2095,175 @@ impl Check {
     }
 }
 
+// ── register-hotkey ──────────────────────────────────────────────────────────
+
+/// `gm-miner register-hotkey` — record the hotkey the miner serves under.
+///
+/// Dispatches on `--hotkey-ss58`: present means bring-your-own (just record,
+/// verify via btcli only if it happens to be installed); absent means the
+/// assisted btcli flow (offer to install btcli, then register a fresh hotkey).
+/// Either way the resulting [`HotkeyRecord`] is persisted to the active
+/// network's config so login/deploy/doctor/earnings can reference it.
+fn cmd_register_hotkey(
+    cfg: Config,
+    hotkey_ss58: Option<String>,
+    wallet: Option<String>,
+    hotkey: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let network = cfg.resolved_network();
+    match hotkey_ss58 {
+        Some(ss58) => register_hotkey_byo(cfg, network, &ss58),
+        None => register_hotkey_assisted(cfg, network, wallet, hotkey, yes),
+    }
+}
+
+/// Bring-your-own: record an ss58 the operator registered elsewhere. Verifies
+/// against the metagraph only when btcli is already on PATH — never installs it.
+fn register_hotkey_byo(mut cfg: Config, network: Network, ss58: &str) -> Result<()> {
+    let btcli = RealBtcli;
+    let bridge: Option<&dyn BtcliBridge> =
+        gm_miner_cli::dependency::on_path("btcli").then_some(&btcli);
+    let outcome = record_byo(bridge, network, ss58)?;
+
+    cfg.active_entry_mut()
+        .set_registered_hotkey(outcome.record.clone());
+    config::save(&cfg).context("persist registered hotkey")?;
+
+    println!("Recorded hotkey {} for {network}.", outcome.record.ss58);
+    println!("{}", outcome.note);
+    println!("Next: `gm-miner deploy` to launch a worker under this hotkey.");
+    Ok(())
+}
+
+/// Assisted: register a fresh hotkey through btcli. The only flow that needs
+/// btcli — so it (and only it) runs [`ensure_dependency`] for it.
+fn register_hotkey_assisted(
+    cfg: Config,
+    network: Network,
+    wallet: Option<String>,
+    hotkey: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let (wallet, hotkey) = require_wallet_and_hotkey(wallet, hotkey)?;
+    ensure_dependency(&BTCLI, yes)?;
+    let btcli = RealBtcli;
+
+    // Resolve the ss58 up front — it is both proof the local wallet/hotkey
+    // exists and the address we record afterwards. A `None` here means btcli's
+    // wallet store has no such pair (a typoed `--wallet`/`--hotkey`), so we
+    // refuse to spend TAO rather than register blind and persist an empty
+    // address. The lookup also feeds the already-registered pre-check below, so
+    // the wallet store is read exactly once.
+    let Some(ss58) = btcli.hotkey_ss58(&wallet, &hotkey)? else {
+        bail!(
+            "btcli has no hotkey `{hotkey}` under wallet `{wallet}`.\n  \
+             check the names with: btcli wallet list\n  \
+             create one with: btcli wallet new-hotkey --wallet.name {wallet} --wallet.hotkey {hotkey}"
+        );
+    };
+
+    if let Registration::Registered { uid } = btcli.registration_of(network, &ss58)? {
+        return persist_already_registered(cfg, network, &wallet, &hotkey, &ss58, uid);
+    }
+
+    confirm_spend(network, &wallet, &hotkey, yes)?;
+    btcli.register(network, &wallet, &hotkey, yes)?;
+    finish_assisted(cfg, network, &btcli, &wallet, &hotkey, &ss58)
+}
+
+/// Both `--wallet` and `--hotkey` are required for the assisted flow; a missing
+/// one points the operator at the bring-your-own escape hatch.
+fn require_wallet_and_hotkey(
+    wallet: Option<String>,
+    hotkey: Option<String>,
+) -> Result<(String, String)> {
+    match (wallet, hotkey) {
+        (Some(w), Some(h)) => Ok((w, h)),
+        _ => bail!(
+            "to register a new hotkey, pass both `--wallet <coldkey>` and `--hotkey <name>`.\n  \
+             list your btcli wallets with: btcli wallet list\n  \
+             already registered elsewhere? pass `--hotkey-ss58 <addr>` instead."
+        ),
+    }
+}
+
+/// Idempotent assisted path: the hotkey is already on the subnet, so record it
+/// and exit 0 without spending TAO.
+fn persist_already_registered(
+    mut cfg: Config,
+    network: Network,
+    wallet: &str,
+    hotkey: &str,
+    ss58: &str,
+    uid: u64,
+) -> Result<()> {
+    let record = HotkeyRecord {
+        ss58: ss58.to_owned(),
+        name: Some(hotkey.to_owned()),
+        verified: true,
+    };
+    cfg.active_entry_mut().set_registered_hotkey(record);
+    config::save(&cfg).context("persist registered hotkey")?;
+    println!(
+        "{wallet}/{hotkey} ({ss58}) is already registered on {network} — uid {uid}. \
+         Nothing to do."
+    );
+    Ok(())
+}
+
+/// After a successful `btcli subnet register`, confirm the new uid and persist.
+/// `ss58` is the address resolved (and validated to exist) before registering.
+fn finish_assisted(
+    mut cfg: Config,
+    network: Network,
+    btcli: &RealBtcli,
+    wallet: &str,
+    hotkey: &str,
+    ss58: &str,
+) -> Result<()> {
+    let outcome = confirm_registered(btcli, network, ss58, hotkey)?;
+    cfg.active_entry_mut().set_registered_hotkey(outcome.record);
+    config::save(&cfg).context("persist registered hotkey")?;
+    match outcome.uid {
+        Some(uid) => {
+            println!("Registered {wallet}/{hotkey} ({ss58}) on {network} — uid {uid}.");
+            println!("Next: `gm-miner deploy` to launch a worker under this hotkey.");
+        }
+        None => {
+            // btcli succeeded but the metagraph hasn't caught up — the hotkey
+            // is recorded; the uid lands within a block.
+            println!(
+                "Registered {wallet}/{hotkey} ({ss58}) on {network}. The metagraph is still \
+                 catching up — run `gm-miner status` shortly to see the uid."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Show the spend and gate on the operator's confirmation. `assume_yes` and a
+/// non-TTY both skip the prompt. btcli prints the exact burn cost and prompts
+/// again itself, so this is the gm-level "are you sure" before handing off.
+fn confirm_spend(network: Network, wallet: &str, hotkey: &str, assume_yes: bool) -> Result<()> {
+    println!("About to register a hotkey on-chain — this burns TAO:");
+    println!("  network : {network} (netuid {})", network.netuid());
+    println!("  wallet  : {wallet}");
+    println!("  hotkey  : {hotkey}");
+    println!("btcli will show the exact burn cost and ask for your wallet password.");
+    if gm_miner_cli::dependency::confirm("Proceed?", false, assume_yes)? {
+        Ok(())
+    } else {
+        bail!("aborted — no hotkey was registered.");
+    }
+}
+
 /// `gm-miner doctor` — a preflight checklist run before deploying.
 ///
 /// Each check renders green/red with an actionable fix. The hotkey-
 /// registration check probes `GET /miners/me`; a 401/403/404 renders as
-/// "not registered on subnet N" rather than a raw body. `register-hotkey`
-/// (W2) plugs in where [`hotkey_check`] notes it as coming.
+/// "not registered on subnet N" rather than a raw body, and its remedy names
+/// `register-hotkey`.
 async fn cmd_doctor(cfg: Config) -> Result<()> {
     let network = cfg.resolved_network();
     println!(
@@ -2182,9 +2399,8 @@ fn phala_api_key_check() -> Check {
 /// Probe `GET /miners/me` and classify the result for the doctor checklist.
 ///
 /// A 401/403/404 means the hotkey isn't registered on the subnet — rendered
-/// as an actionable line, never the raw body. This is the seam the future
-/// `register-hotkey` (W2) plugs into: once it exists, the fix text here points
-/// at it directly.
+/// as an actionable line, never the raw body. The 404 remedy names
+/// `register-hotkey` (and its `--hotkey-ss58` bring-your-own escape hatch).
 async fn hotkey_check(cfg: Config) -> Check {
     let network = cfg.resolved_network();
     let netuid = network.netuid();
@@ -2220,16 +2436,19 @@ async fn hotkey_check(cfg: Config) -> Check {
         return Check::pass(label, hotkey);
     }
     // A 404 is the expected state before the first deploy: the registry has no
-    // miner for this hotkey yet, and `gm-miner deploy` registers it. Surface
-    // it as informational, not a failure — doctor is meant to *precede* that
-    // deploy. SEAM(W2): once `register-hotkey` ships, name it here too.
+    // miner record for this hotkey yet. Two steps clear it, in order: register
+    // the hotkey on-chain (`register-hotkey`), then `deploy`, which posts
+    // `/miners/register` and is what actually creates the record this probe
+    // reads. Surface it as informational, not a failure — doctor *precedes*
+    // both steps.
     if status.as_u16() == 404 {
         return Check::info(
             label,
             format!(
-                "not registered on `{network}` yet — your first `gm-miner deploy` \
-                 registers it (or register with btcli / `gm-miner register-hotkey`, \
-                 coming). On the wrong network? Pass `--network mainnet`/`--network testnet`."
+                "no miner record on `{network}` yet. First register your hotkey on-chain: \
+                 `gm-miner register-hotkey` (via btcli, or `--hotkey-ss58 <addr>` if you \
+                 registered elsewhere). Then `gm-miner deploy` creates the registry record. \
+                 On the wrong network? Pass `--network mainnet`/`--network testnet`."
             ),
         );
     }
@@ -3162,6 +3381,50 @@ mod tests {
                 .unwrap()
                 .command,
             Command::ListProducts
+        ));
+    }
+
+    #[test]
+    fn clap_parses_register_hotkey_both_flows() {
+        // Bring-your-own: just the ss58.
+        let byo = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "register-hotkey",
+            "--hotkey-ss58",
+            "5Grw",
+        ])
+        .unwrap()
+        .command;
+        assert!(matches!(
+            byo,
+            Command::RegisterHotkey {
+                hotkey_ss58: Some(s),
+                wallet: None,
+                hotkey: None,
+                yes: false,
+            } if s == "5Grw"
+        ));
+
+        // Assisted: wallet + hotkey + --yes, no ss58.
+        let assisted = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "register-hotkey",
+            "--wallet",
+            "miner",
+            "--hotkey",
+            "default",
+            "--yes",
+        ])
+        .unwrap()
+        .command;
+        assert!(matches!(
+            assisted,
+            Command::RegisterHotkey {
+                hotkey_ss58: None,
+                wallet: Some(w),
+                hotkey: Some(h),
+                yes: true,
+            } if w == "miner" && h == "default"
         ));
     }
 }

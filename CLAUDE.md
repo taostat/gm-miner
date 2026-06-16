@@ -15,6 +15,9 @@ declaration, and price management.
 - `cli/src/client.rs` — `RegistryClient`: typed HTTP wrappers for registry endpoints
 - `cli/src/config.rs` — `Config` loaded from `~/.gm-miner/config.json` (mode 0600); supports `mainnet`/`testnet` networks
 - `cli/src/network.rs` — `Network` enum (testnet/mainnet) carrying `netuid`, chain websocket, and default registry URL; the seam later work (register-hotkey, earnings) reads coordinates from
+- `cli/src/btcli.rs` — `BtcliBridge` trait + `RealBtcli`: bridge to `btcli` (bittensor-cli) for hotkey registration/metagraph queries; `gm-miner` never touches wallet keys. `btcli_network()` maps `Network`→`test`/`finney`
+- `cli/src/dependency.rs` — `ensure_dependency(&Dependency, assume_yes)`: reusable PATH-detect-and-offer-to-install primitive (e.g. `BTCLI`); `register-hotkey`'s assisted flow uses it, `deploy`/future init-wizard can adopt it
+- `cli/src/register_hotkey.rs` — pure decision logic for `register-hotkey` (ss58 validation, bring-your-own vs assisted), testable against a stubbed `BtcliBridge`
 - `cli/src/deploy.rs` — `PhalaClient` trait + `RealPhalaClient`; deploy orchestration: compose rendering, `phala deploy`, `phala cvms get` hash polling, hash verification
 - `cli/src/image.rs` — miner image build/push: `docker buildx --push` to a public registry, digest resolution
 - `cli/src/node_secret.rs` — per-worker node secret: a fresh secret per worker (CVM), reused across re-deploys of the same `--app-name`, persisted in the worker's config record, embedded in compose env so envoy enforces it
@@ -48,6 +51,7 @@ cargo test -p gm-miner-cli
 | `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google) to `~/.gm-miner/config.json` |
 | `deploy` | Full trust-correct deploy: build/push image + Phala Cloud deploy + hash verification + image registration |
 | `login` | Device-code OAuth flow; stores access token in config |
+| `register-hotkey` | Record the serving hotkey: `--hotkey-ss58` records one registered elsewhere; otherwise registers a fresh hotkey via the `btcli` bridge (`--wallet`/`--hotkey`) |
 | `doctor` | Preflight checklist (network, login, provider keys, `phala` CLI + API key, hotkey registration) with actionable fixes |
 | `register-image` | Re-register an already-deployed image (debugging / registry resync; hidden from default help) |
 | `declare-product` | Register a single miner-product offer with a pct discount |
