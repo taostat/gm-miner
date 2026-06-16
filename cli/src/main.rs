@@ -1975,7 +1975,10 @@ async fn cmd_publish_image_version(cfg: &Config, flags: PublishImageVersionFlags
     // A check-only `phala` preflight (no interactive install offer): this is
     // a CI/automation path, not the guided operator deploy.
     preflight_phala_cli()?;
-    let phala_key = gm_miner_cli::phala::stored_key(flags.phala_api_key.as_deref());
+    // Flag > env > stored config — `--phala-api-key` must win over the
+    // ambient PHALA_API_KEY a CI runner may also carry.
+    let phala_key =
+        gm_miner_cli::phala::resolve_key_noninteractive(flags.phala_api_key.as_deref())?;
 
     let dist_dir = flags
         .dist_dir
@@ -2013,12 +2016,11 @@ async fn cmd_publish_image_version(cfg: &Config, flags: PublishImageVersionFlags
         "Publishing to {registry_url}{} ...",
         gm_miner_cli::image_version::ADMIN_IMAGE_VERSIONS_PATH
     );
-    let action = post_admin_image_version(&registry_url, &flags.registry_admin_key, &body).await?;
-    println!(
-        "  {action}: compose_hash={} os_image_hash={}",
-        body.compose_hash, body.os_image_hash
-    );
+    let published = post_admin_image_version(&registry_url, &flags.registry_admin_key, &body).await;
 
+    // The CVM exists regardless of whether the publish succeeded; tear it
+    // down on both paths (unless --keep-cvm) so a failed publish never leaks
+    // a paid CVM, then surface the publish error.
     if flags.keep_cvm {
         println!(
             "Leaving throwaway CVM {} running (--keep-cvm).",
@@ -2027,6 +2029,12 @@ async fn cmd_publish_image_version(cfg: &Config, flags: PublishImageVersionFlags
     } else {
         teardown_cvm(&outcome.app_id, phala_key.as_deref());
     }
+
+    let action = published?;
+    println!(
+        "  {action}: compose_hash={} os_image_hash={}",
+        body.compose_hash, body.os_image_hash
+    );
     Ok(())
 }
 
