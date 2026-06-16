@@ -2323,7 +2323,7 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
         .iter()
         .map(|p| {
             (
-                ((p.provider.clone()), p.model.as_str()),
+                (p.provider.clone(), p.model.as_str()),
                 &p.retail_price.dimensions,
             )
         })

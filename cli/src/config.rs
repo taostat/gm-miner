@@ -314,11 +314,10 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Persist `network` as the active selection. Returns `self` for chaining
-    /// at the call site that resolves flags into the loaded config.
-    pub fn set_network(&mut self, network: Network) -> &mut Self {
+    /// Set `network` as the active selection in memory. Callers persist it
+    /// with [`save`] when the choice should stick across later commands.
+    pub fn set_network(&mut self, network: Network) {
         self.active_network = Some(network.as_str().to_owned());
-        self
     }
 
     /// Mutable reference to the active network entry (creating it if absent).

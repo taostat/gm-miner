@@ -18,7 +18,7 @@ declaration, and price management.
 - `cli/src/deploy.rs` — `PhalaClient` trait + `RealPhalaClient`; deploy orchestration: compose rendering, `phala deploy`, `phala cvms get` hash polling, hash verification
 - `cli/src/image.rs` — miner image build/push: `docker buildx --push` to a public registry, digest resolution
 - `cli/src/node_secret.rs` — per-worker node secret: a fresh secret per worker (CVM), reused across re-deploys of the same `--app-name`, persisted in the worker's config record, embedded in compose env so envoy enforces it
-- `cli/src/nanodollar.rs` — USD/Mtok string → nano-dollars (u64) conversion; integer-only, no floats
+- discount/price conversion lives in `cli/src/main.rs` (`parse_discount_pct`, `format_per_mtok_usd`) — decimal-string → nano-dollars (u64), integer-only, no floats
 - `cli/src/types.rs` — shared types: `MinerPriceBlock`, `MinerStatus`, `Product`, `Provider`
 - `image/` — the miner container image (Dockerfile, envoy config)
 - `dstack/` — the compose template `gm-miner deploy` renders and submits to Phala Cloud
