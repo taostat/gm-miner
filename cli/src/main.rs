@@ -49,6 +49,7 @@ use gm_miner_cli::{
         ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
         PHALA_ENDPOINT_FIELD,
     },
+    earnings::{render_earnings, resolve_hotkey},
     network::Network,
     node_secret,
     register_hotkey::{confirm_registered, record_byo},
@@ -285,6 +286,24 @@ enum Command {
         gm-miner --network testnet status")]
     Status,
 
+    /// Show your miner's current chain emission on the subnet.
+    ///
+    /// Reads your hotkey's neuron row straight from the subnet metagraph (via
+    /// btcli) and reports uid, stake, and per-tempo emission in the subnet's
+    /// alpha token. Reports on your own hotkey — taken from your login token,
+    /// or the one recorded by `register-hotkey` — so there's nothing to pass.
+    ///
+    /// This is the on-chain emission view (v1). Your gm USD-spread earnings are
+    /// a future (v2) view.
+    #[command(after_help = "Examples:\n  \
+        gm-miner earnings\n  \
+        gm-miner --network testnet earnings")]
+    Earnings {
+        /// Skip the btcli install prompt for non-interactive use.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// gm. (prints a small sunrise and a time-of-day greeting)
     #[command(hide = true)]
     Gm,
@@ -488,6 +507,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_status(&mut client).await
+        }
+        Command::Earnings { yes } => {
+            let cfg = load_config(explicit_network, api_url)?;
+            cmd_earnings(&cfg, yes)
         }
         Command::DeclareProduct {
             provider,
@@ -2258,6 +2281,27 @@ fn confirm_spend(network: Network, wallet: &str, hotkey: &str, assume_yes: bool)
     }
 }
 
+// ── earnings ─────────────────────────────────────────────────────────────────
+
+/// `gm-miner earnings` — the miner's current chain emission on the subnet (v1).
+///
+/// Resolves the hotkey (`--hotkey-ss58` override, else the recorded one), then
+/// reads its neuron row from the subnet metagraph via btcli. btcli is genuinely
+/// required here (the chain read goes through it), so it is ensured lazily — the
+/// command is the only place that pays the install cost. The summary is rendered
+/// by [`render_earnings`]; a hotkey absent from the metagraph yields actionable
+/// guidance, not a raw dump.
+fn cmd_earnings(cfg: &Config, yes: bool) -> Result<()> {
+    let network = cfg.resolved_network();
+    let hotkey = resolve_hotkey(cfg, network)?;
+
+    ensure_dependency(&BTCLI, yes)?;
+    let stats = RealBtcli.neuron_stats(network, &hotkey.ss58)?;
+
+    print!("{}", render_earnings(network, &hotkey, stats.as_ref()));
+    Ok(())
+}
+
 /// `gm-miner doctor` — a preflight checklist run before deploying.
 ///
 /// Each check renders green/red with an actionable fix. The hotkey-
@@ -3426,5 +3470,35 @@ mod tests {
                 yes: true,
             } if w == "miner" && h == "default"
         ));
+    }
+
+    #[test]
+    fn clap_parses_earnings_and_rejects_a_hotkey_arg() {
+        use super::Network;
+
+        let bare = <Cli as clap::Parser>::try_parse_from(["gm-miner", "earnings"])
+            .unwrap()
+            .command;
+        assert!(matches!(bare, Command::Earnings { yes: false }));
+
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "--network",
+            "testnet",
+            "earnings",
+            "--yes",
+        ])
+        .unwrap();
+        assert_eq!(cli.explicit_network(), Some(Network::Testnet));
+        assert!(matches!(cli.command, Command::Earnings { yes: true }));
+
+        // The hotkey is derived (login token / register-hotkey), never passed.
+        assert!(<Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "earnings",
+            "--hotkey-ss58",
+            "5Grw"
+        ])
+        .is_err());
     }
 }

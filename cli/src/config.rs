@@ -3,10 +3,22 @@
 //! Pattern mirrors blockmachine's `auth_config.py`, adapted for Rust.
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::network::Network;
+
+/// The `sub` claim of a JWT, read without verifying the signature — the gm
+/// registry verifies the token; the CLI only needs the identity it asserts.
+fn jwt_sub(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("sub")?.as_str().map(str::to_owned)
+}
 
 /// Default config directory.
 fn config_dir() -> PathBuf {
@@ -378,6 +390,15 @@ impl Config {
     pub fn registered_hotkey(&self) -> Option<&HotkeyRecord> {
         self.active_network_entry()
             .and_then(|n| n.registered_hotkey.as_ref())
+    }
+
+    /// The miner's hotkey ss58, derived from the active login token's `sub`
+    /// claim — the identity the registry keys miners on. Preferred over
+    /// [`Self::registered_hotkey`]: once logged in the token *is* the hotkey,
+    /// so no command needs to ask for it.
+    #[must_use]
+    pub fn token_hotkey(&self) -> Option<String> {
+        jwt_sub(self.active_tokens()?.access_token.as_deref()?)
     }
 
     /// Registry API URL for the active network.

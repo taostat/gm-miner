@@ -196,6 +196,13 @@ mod tests {
         fn hotkey_ss58(&self, _wallet: &str, _hotkey: &str) -> Result<Option<String>> {
             Ok(None)
         }
+        fn neuron_stats(
+            &self,
+            _network: Network,
+            _ss58: &str,
+        ) -> Result<Option<crate::btcli::NeuronStats>> {
+            Ok(None)
+        }
     }
 
     #[test]

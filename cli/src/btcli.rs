@@ -37,6 +37,29 @@ pub enum Registration {
     Absent,
 }
 
+/// A miner's chain-side standing on a subnet, read from one metagraph row.
+///
+/// Every field is what `btcli subnet metagraph --json-output` emits verbatim
+/// (bittensor-cli 9.20.x): `emission`/`stake` are in the subnet's own alpha
+/// token (not TAO, not USD); `incentive`/`dividends` are the normalised
+/// `[0, 1]` shares. `earnings` renders these as the v1 chain-emission view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeuronStats {
+    /// The neuron's uid on the subnet.
+    pub uid: u64,
+    /// Per-tempo emission to this neuron, in alpha.
+    pub emission_alpha: f64,
+    /// Total stake on this neuron, in alpha.
+    pub stake_alpha: f64,
+    /// Normalised incentive share `[0, 1]` — the mining component.
+    pub incentive: f64,
+    /// Normalised dividend share `[0, 1]` — the validating component.
+    pub dividends: f64,
+    /// Blocks per tempo, used to turn per-tempo emission into a per-day
+    /// estimate. `None` when the metagraph omits it.
+    pub tempo_blocks: Option<u64>,
+}
+
 /// The on-chain primitives `register-hotkey` needs. Real impl shells out to
 /// `btcli`; tests inject a stub returning canned values.
 pub trait BtcliBridge {
@@ -45,6 +68,15 @@ pub trait BtcliBridge {
     /// # Errors
     /// Returns an error if btcli can't be run or its output can't be parsed.
     fn registration_of(&self, network: Network, ss58: &str) -> Result<Registration>;
+
+    /// The neuron's chain standing on `network`'s subnet, by ss58 address, or
+    /// `None` when the hotkey is absent from the metagraph (not registered, or
+    /// the wrong network). Reads the same `subnet metagraph` JSON as
+    /// [`registration_of`](Self::registration_of), surfacing the full row.
+    ///
+    /// # Errors
+    /// Returns an error if btcli can't be run or its output can't be parsed.
+    fn neuron_stats(&self, network: Network, ss58: &str) -> Result<Option<NeuronStats>>;
 
     /// Register `wallet`/`hotkey` on `network`'s subnet, streaming btcli's
     /// output (including its own cost confirmation) through. `assume_yes`
@@ -71,21 +103,40 @@ pub trait BtcliBridge {
 }
 
 /// One neuron row from `btcli subnet metagraph --json-output --no-prompt`.
-/// Only the fields `register-hotkey` reads are modelled; btcli emits many more.
-/// Verified against bittensor-cli 9.20.x, which keys the row's address `hotkey`.
+/// Only the fields gm-miner reads are modelled; btcli emits many more.
+/// Verified against bittensor-cli 9.20.x, which keys the row's address `hotkey`,
+/// its per-tempo emission `emissions` (plural), and `stake` in alpha.
 #[derive(Debug, Deserialize)]
 struct MetagraphNeuron {
     #[serde(alias = "hotkey_ss58")]
     hotkey: String,
     uid: u64,
+    #[serde(default)]
+    emissions: f64,
+    #[serde(default)]
+    stake: f64,
+    #[serde(default)]
+    incentive: f64,
+    #[serde(default)]
+    dividends: f64,
+}
+
+/// The subnet `tempo` block from `btcli subnet metagraph --json-output`:
+/// bittensor-cli 9.20.x nests `tempo` (blocks per epoch) under a `tempo` object.
+#[derive(Debug, Deserialize)]
+struct MetagraphTempo {
+    tempo: u64,
 }
 
 /// The slice of `btcli subnet metagraph --json-output --no-prompt` we parse:
-/// the neuron rows, which bittensor-cli 9.20.x emits under the `uids` key.
+/// the neuron rows (under the `uids` key in bittensor-cli 9.20.x) plus the
+/// subnet `tempo`, used to turn per-tempo emission into a per-day estimate.
 #[derive(Debug, Deserialize)]
 struct MetagraphOutput {
     #[serde(alias = "neurons", default)]
     uids: Vec<MetagraphNeuron>,
+    #[serde(default)]
+    tempo: Option<MetagraphTempo>,
 }
 
 /// Find a hotkey's uid in `btcli subnet metagraph --json-output --no-prompt`.
@@ -100,6 +151,27 @@ fn parse_registration(json: &[u8], ss58: &str) -> Result<Registration> {
         Some(neuron) => Ok(Registration::Registered { uid: neuron.uid }),
         None => Ok(Registration::Absent),
     }
+}
+
+/// Read a hotkey's [`NeuronStats`] from `btcli subnet metagraph --json-output
+/// --no-prompt`, or `None` when the row is absent. Same `uids`/`tempo` shape as
+/// [`parse_registration`]; isolated here so the JSON contract lives in one place.
+fn parse_neuron_stats(json: &[u8], ss58: &str) -> Result<Option<NeuronStats>> {
+    let parsed: MetagraphOutput = serde_json::from_slice(json)
+        .context("parse `btcli subnet metagraph --json-output --no-prompt`")?;
+    let tempo_blocks = parsed.tempo.map(|t| t.tempo);
+    Ok(parsed
+        .uids
+        .into_iter()
+        .find(|n| n.hotkey == ss58)
+        .map(|n| NeuronStats {
+            uid: n.uid,
+            emission_alpha: n.emissions,
+            stake_alpha: n.stake,
+            incentive: n.incentive,
+            dividends: n.dividends,
+            tempo_blocks,
+        }))
 }
 
 /// One hotkey row under a wallet in `btcli wallet list --json-output`.
@@ -165,15 +237,15 @@ impl RealBtcli {
         }
         Ok(out.stdout)
     }
-}
 
-impl BtcliBridge for RealBtcli {
-    fn registration_of(&self, network: Network, ss58: &str) -> Result<Registration> {
+    /// The metagraph JSON for `network`'s subnet. `--json-output` requires
+    /// `--no-prompt`; without it bittensor-cli 9.20.x errors instead of emitting
+    /// JSON. Shared by [`registration_of`](Self::registration_of) and
+    /// [`neuron_stats`](Self::neuron_stats) so the args live in one place.
+    fn metagraph_json(network: Network) -> Result<Vec<u8>> {
         let netuid = network.netuid().to_string();
         let chain = btcli_network(network);
-        // `--json-output` requires `--no-prompt`; without it bittensor-cli
-        // 9.20.x errors out instead of emitting the JSON.
-        let stdout = Self::run(&[
+        Self::run(&[
             "subnet",
             "metagraph",
             "--netuid",
@@ -182,8 +254,17 @@ impl BtcliBridge for RealBtcli {
             chain,
             "--json-output",
             "--no-prompt",
-        ])?;
-        parse_registration(&stdout, ss58)
+        ])
+    }
+}
+
+impl BtcliBridge for RealBtcli {
+    fn registration_of(&self, network: Network, ss58: &str) -> Result<Registration> {
+        parse_registration(&Self::metagraph_json(network)?, ss58)
+    }
+
+    fn neuron_stats(&self, network: Network, ss58: &str) -> Result<Option<NeuronStats>> {
+        parse_neuron_stats(&Self::metagraph_json(network)?, ss58)
     }
 
     fn register(
@@ -238,7 +319,9 @@ impl BtcliBridge for RealBtcli {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{btcli_network, parse_hotkey_ss58, parse_registration, Registration};
+    use super::{
+        btcli_network, parse_hotkey_ss58, parse_neuron_stats, parse_registration, Registration,
+    };
     use crate::network::Network;
 
     #[test]
@@ -249,11 +332,15 @@ mod tests {
 
     // Trimmed real output of `btcli subnet metagraph --netuid 482 --network
     // test --json-output --no-prompt` (bittensor-cli 9.20.x): neuron rows under
-    // `uids`, each keyed `uid`/`hotkey`.
+    // `uids`, each keyed `uid`/`hotkey`/`emissions`/`stake`/`incentive`/
+    // `dividends`, plus the nested `tempo` object.
     const METAGRAPH_JSON: &[u8] = br#"{"netuid":482,"registration_cost":0.0005,
+        "tempo":{"block_since_last_step":50,"tempo":360},
         "uids":[
-          {"uid":0,"hotkey":"5AAA","coldkey":"5CK"},
-          {"uid":7,"hotkey":"5BBB","coldkey":"5CK"}]}"#;
+          {"uid":0,"hotkey":"5AAA","coldkey":"5CK","stake":56788.59,
+           "incentive":1.0,"dividends":0.0,"emissions":148.01},
+          {"uid":7,"hotkey":"5BBB","coldkey":"5CK","stake":0.0,
+           "incentive":0.0,"dividends":0.5,"emissions":12.5}]}"#;
 
     #[test]
     fn parses_registered_hotkey_uid_from_real_shape() {
@@ -277,6 +364,44 @@ mod tests {
     #[test]
     fn rejects_unparseable_output() {
         let err = parse_registration(b"not json", "5AAA").expect_err("must fail");
+        assert!(format!("{err}").contains("btcli subnet metagraph"));
+    }
+
+    #[test]
+    fn parses_neuron_stats_from_real_shape() {
+        let stats = parse_neuron_stats(METAGRAPH_JSON, "5AAA")
+            .expect("parse stats")
+            .expect("hotkey present");
+        assert_eq!(stats.uid, 0);
+        assert!((stats.emission_alpha - 148.01).abs() < 1e-9);
+        assert!((stats.stake_alpha - 56788.59).abs() < 1e-9);
+        assert!((stats.incentive - 1.0).abs() < 1e-9);
+        assert!((stats.dividends - 0.0).abs() < 1e-9);
+        assert_eq!(stats.tempo_blocks, Some(360));
+    }
+
+    #[test]
+    fn neuron_stats_absent_hotkey_is_none() {
+        let stats = parse_neuron_stats(METAGRAPH_JSON, "5ZZZ").expect("parse stats");
+        assert!(stats.is_none());
+    }
+
+    #[test]
+    fn neuron_stats_tolerate_missing_tempo() {
+        // A metagraph without the tempo object still parses; the per-day
+        // estimate is simply unavailable.
+        let json = br#"{"netuid":482,"uids":[{"uid":3,"hotkey":"5CCC","emissions":1.0}]}"#;
+        let stats = parse_neuron_stats(json, "5CCC")
+            .expect("parse stats")
+            .expect("hotkey present");
+        assert_eq!(stats.uid, 3);
+        assert_eq!(stats.tempo_blocks, None);
+        assert!((stats.stake_alpha - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn neuron_stats_rejects_unparseable_output() {
+        let err = parse_neuron_stats(b"not json", "5AAA").expect_err("must fail");
         assert!(format!("{err}").contains("btcli subnet metagraph"));
     }
 
