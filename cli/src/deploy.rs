@@ -343,7 +343,8 @@ impl RealPhalaClient {
 /// Build a `phala` command with the API key scoped onto it (via `.env`),
 /// never the global process environment — so the secret reaches only the
 /// `phala` CLI, not the `git`/`docker` subprocesses of the image build.
-fn phala_command(api_key: Option<&str>) -> std::process::Command {
+#[must_use]
+pub fn phala_command(api_key: Option<&str>) -> std::process::Command {
     let mut cmd = std::process::Command::new("phala");
     if let Some(key) = api_key {
         cmd.env("PHALA_CLOUD_API_KEY", key);

@@ -1655,6 +1655,10 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
         (node_secret, tracked.map(|w| w.app_name.clone()))
     };
     let network = cfg.active_network().to_owned();
+    // Scope the same Phala key deploy would use (env or saved config key) onto
+    // register-image's `phala cvms get`, so a recovery run works off the key
+    // the deploy prompt persisted — not only a separate CLI login / env var.
+    let phala_key = gm_miner_cli::phala::stored_key(cfg.phala_api_key.as_deref());
     let mut client = RegistryClient::new(cfg);
 
     // register-image is a hidden re-registration path (debug / registry
@@ -1663,7 +1667,7 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
     // `ensure_dependency(&PHALA, ...)`.
     preflight_phala_cli()?;
 
-    let out = std::process::Command::new("phala")
+    let out = gm_miner_cli::deploy::phala_command(phala_key.as_deref())
         .args(["cvms", "get", app_id, "--json"])
         .output()
         .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
@@ -2616,6 +2620,16 @@ async fn wizard_deploy(cfg: Config) -> Result<WizardFlow> {
         gm_miner_cli::wizard::already_done(
             title,
             "worker #1 is already deployed (add more with `gmcli worker add`)",
+        );
+        return Ok(WizardFlow::Continue);
+    }
+    // `cmd_deploy` refuses without a provider key (it bakes them into the CVM
+    // env). If the keys step was skipped, a deploy would fail immediately —
+    // skip it here with guidance rather than running a doomed command.
+    if !provider_keys_done(&cfg) {
+        gm_miner_cli::wizard::already_done(
+            title,
+            "skipped — deploy needs a provider key first (`gmcli set-api-keys`)",
         );
         return Ok(WizardFlow::Continue);
     }

@@ -113,6 +113,17 @@ pub async fn validate_key(api_base: &str, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// The Phala API key already configured non-interactively (env var, else the
+/// `stored_key` saved in gmcli config) — no prompt, no validation. Returned so
+/// a recovery path like `register-image` can scope the same key onto its
+/// `phala` subprocess that `deploy` uses, without re-running the full
+/// interactive resolution. `None` when only a `phala` CLI session exists (the
+/// subprocess inherits that anyway).
+#[must_use]
+pub fn stored_key(config_key: Option<&str>) -> Option<String> {
+    key_from_env().or_else(|| non_empty(config_key).map(str::to_owned))
+}
+
 /// Read the Phala API key from the environment, preferring `PHALA_API_KEY`
 /// and falling back to `PHALA_CLOUD_API_KEY` (the var the `phala` CLI itself
 /// honours). Whitespace-only values are ignored.
