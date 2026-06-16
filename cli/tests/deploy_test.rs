@@ -312,6 +312,7 @@ fn deploy_errors_when_no_provider_keys_set() {
         active_network: Some("mainnet".to_string()),
         provider_keys: None, // no keys configured
         phala_api_key: None,
+        api_url_override: None,
     };
 
     // Replicate the exact check from `cmd_deploy`.
@@ -342,6 +343,7 @@ fn deploy_errors_when_provider_keys_all_none() {
             google: None,
         }),
         phala_api_key: None,
+        api_url_override: None,
     };
 
     let result = cfg

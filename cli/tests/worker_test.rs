@@ -126,6 +126,7 @@ fn config_for(server: &MockServer) -> Config {
         active_network: Some("testnet".to_owned()),
         provider_keys: None,
         phala_api_key: None,
+        api_url_override: None,
         networks,
     }
 }

@@ -27,6 +27,7 @@ fn config_with_api_url(network: Network, url: &str) -> Config {
         active_network: Some(network.as_str().to_string()),
         provider_keys: None,
         phala_api_key: None,
+        api_url_override: None,
     }
 }
 
@@ -36,6 +37,7 @@ fn config_for(network: Network) -> Config {
         active_network: Some(network.as_str().to_string()),
         provider_keys: None,
         phala_api_key: None,
+        api_url_override: None,
     }
 }
 
