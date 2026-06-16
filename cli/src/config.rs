@@ -38,6 +38,11 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+/// Path to the advisory lockfile guarding read-modify-write sequences.
+fn lock_path() -> PathBuf {
+    config_dir().join(".lock")
+}
+
 /// Per-network token set.
 ///
 /// `refresh_token` is captured from the device-code flow and used to mint a
@@ -344,6 +349,13 @@ pub struct Config {
     /// a single run without persisting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phala_api_key: Option<String>,
+    /// This-run-only registry URL from `--api-url` / `GM_REGISTRY_URL`. Never
+    /// serialized (`#[serde(skip)]`), so a [`save`] triggered mid-run — e.g. a
+    /// token refresh — can't leak the throwaway URL into the persisted
+    /// per-network `api_url`. [`Self::api_url`] consults it ahead of the stored
+    /// value; everything else reads through that one accessor.
+    #[serde(skip)]
+    pub api_url_override: Option<String>,
 }
 
 impl Config {
@@ -410,10 +422,15 @@ impl Config {
 
     /// Registry API URL for the active network.
     ///
-    /// A stored per-network `api_url` (set by `login` or `--api-url`) wins;
-    /// otherwise the active [`Network`]'s default registry URL is used.
+    /// A this-run-only [`api_url_override`](Self::api_url_override) wins (so a
+    /// `--api-url` / `GM_REGISTRY_URL` override takes effect without being
+    /// persisted); then a stored per-network `api_url` (set by `login`);
+    /// otherwise the active [`Network`]'s default registry URL.
     #[must_use]
     pub fn api_url(&self) -> String {
+        if let Some(url) = self.api_url_override.as_ref() {
+            return url.clone();
+        }
         self.networks
             .get(self.active_network())
             .and_then(|n| n.api_url.clone())
@@ -436,28 +453,108 @@ pub fn load() -> Result<Config> {
 
 /// Persist config to disk, creating the directory if needed.
 ///
+/// Writes a sibling temp file at mode 0600, fsyncs it, then atomically renames
+/// it over `config.json`, so a crash, SIGINT, or full disk mid-write can never
+/// leave the file empty or partial — it holds the only on-disk copy of each
+/// worker's `node_secret`. The 0600 mode is set on the temp before the rename,
+/// so there is no window where the final file is world-readable.
+///
 /// # Errors
-/// Returns an error if the directory cannot be created, the file cannot be
-/// written, or (on Unix) the permissions cannot be set.
+/// Returns an error if the directory cannot be created, the temp file cannot be
+/// written, or the rename fails.
 pub fn save(cfg: &Config) -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create config dir {}", dir.display()))?;
 
     let path = config_path();
+    let tmp_path = dir.join("config.json.tmp");
     let bytes = serde_json::to_vec_pretty(cfg).context("serialize config")?;
-    std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
 
-    // Restrict permissions on Unix so the file is not world-readable.
+    if let Err(e) = write_tmp_then_rename(&tmp_path, &path, &bytes) {
+        // Never leave a partial temp behind to be mistaken for valid state.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `tmp_path` at mode 0600, fsync, then atomically rename it
+/// over `final_path`. Split out so [`save`] can clean up the temp on any error.
+fn write_tmp_then_rename(
+    tmp_path: &std::path::Path,
+    final_path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    let mut file = opts
+        .open(tmp_path)
+        .with_context(|| format!("open {}", tmp_path.display()))?;
+    // Set 0600 on the open fd (not just OpenOptions::mode, which is ignored when
+    // a looser-permissioned temp already exists) so the renamed-over config can
+    // never inherit world/group-readable bits for the only on-disk secret copy.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&path, perms)
-            .with_context(|| format!("chmod 600 {}", path.display()))?;
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", tmp_path.display()))?;
     }
+    file.write_all(bytes)
+        .with_context(|| format!("write {}", tmp_path.display()))?;
+    // sync_all (not flush) forces bytes to storage and surfaces a deferred
+    // ENOSPC before the rename, so a full disk can't publish a truncated config.
+    file.sync_all()
+        .with_context(|| format!("sync {}", tmp_path.display()))?;
+    drop(file);
 
+    std::fs::rename(tmp_path, final_path)
+        .with_context(|| format!("rename {} -> {}", tmp_path.display(), final_path.display()))?;
+
+    // The rename's durability is a directory-entry change, which sync_all on the
+    // file does not cover — fsync the parent so a power loss right after a
+    // success return can't roll back a freshly written node_secret.
+    #[cfg(unix)]
+    if let Some(parent) = final_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
+}
+
+/// Run a load-modify-save sequence while holding an exclusive advisory file
+/// lock, so two concurrent `gmcli` runs can't interleave reads and writes and
+/// silently drop one side's change. `deploy` persists the worker record three
+/// times over several minutes; any other command running in that window would
+/// otherwise race it.
+///
+/// The lock is held only for the brief `f` body (load → mutate → save) and is
+/// released when this returns. Callers must never await a network call inside
+/// `f`.
+///
+/// # Errors
+/// Returns an error if the lockfile cannot be created or locked, or if `f`
+/// itself fails.
+pub fn with_config_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create config dir {}", dir.display()))?;
+
+    let path = lock_path();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open lockfile {}", path.display()))?;
+    let mut guard = fd_lock::RwLock::new(file);
+    let _write = guard
+        .write()
+        .with_context(|| format!("acquire lock on {}", path.display()))?;
+    f()
 }
 
 #[cfg(test)]
@@ -466,7 +563,7 @@ pub fn save(cfg: &Config) -> Result<()> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{Config, HotkeyRecord, NetworkEntry, WorkerRecord};
+    use super::{Config, HotkeyRecord, NetworkEntry, TokenEntry, WorkerRecord};
     use std::collections::HashMap;
 
     fn worker(worker_id: &str, app_name: &str, secret: &str) -> WorkerRecord {
@@ -493,6 +590,7 @@ mod tests {
             active_network: Some(network.to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         }
     }
 
@@ -794,6 +892,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
         assert_eq!(cfg.resolved_network(), Network::Testnet);
         assert_eq!(cfg.api_url(), "https://test-registry.saygm.com");
@@ -864,5 +963,177 @@ mod tests {
         );
         assert!(entry.worker_by_app_name("absent").is_none());
         assert!(entry.worker_by_id("absent").is_none());
+    }
+
+    // ── On-disk save/load round-trips ────────────────────────────────────────
+    //
+    // These drive the real [`save`]/[`load`] against a tempdir via
+    // `GMCLI_CONFIG_DIR`. That env var is process-global, so a single mutex
+    // serialises every test that points the config dir at its own tempdir —
+    // otherwise parallel tests would clobber each other's `GMCLI_CONFIG_DIR`.
+
+    use std::sync::{Mutex, MutexGuard};
+
+    static CONFIG_DIR_ENV: Mutex<()> = Mutex::new(());
+
+    /// Point `GMCLI_CONFIG_DIR` at a fresh tempdir for the duration of the
+    /// returned guard's scope. Holds the env mutex so concurrent on-disk tests
+    /// don't fight over the variable.
+    fn with_temp_config_dir() -> (tempfile::TempDir, MutexGuard<'static, ()>) {
+        let guard = CONFIG_DIR_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // SAFETY: writes are serialised by `guard`; no other thread reads the
+        // var concurrently while a test holds it.
+        unsafe { std::env::set_var("GMCLI_CONFIG_DIR", dir.path()) };
+        (dir, guard)
+    }
+
+    fn sample_config() -> Config {
+        let mut entry = NetworkEntry::default();
+        entry.upsert_worker(worker("01J0A", "gm-miner-1", "node-secret-xyz"));
+        let mut networks = HashMap::new();
+        networks.insert("testnet".to_owned(), entry);
+        Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+            phala_api_key: None,
+            api_url_override: None,
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_on_disk() {
+        let (dir, _guard) = with_temp_config_dir();
+        super::save(&sample_config()).expect("save config");
+
+        let back = super::load().expect("load config");
+        let secret = &back.networks.get("testnet").expect("testnet entry").workers[0].node_secret;
+        assert_eq!(secret, "node-secret-xyz");
+        // The atomic rename must leave no temp sibling behind.
+        assert!(
+            !dir.path().join("config.json.tmp").exists(),
+            "temp file must not survive a successful save"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_mode_0600_even_over_a_loose_stale_temp() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, _guard) = with_temp_config_dir();
+        std::fs::create_dir_all(dir.path()).expect("mkdir");
+        // A leftover world-readable temp from a crashed prior run must not let
+        // the renamed-over config inherit loose bits.
+        let stale = dir.path().join("config.json.tmp");
+        std::fs::write(&stale, b"stale").expect("seed stale temp");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen stale temp");
+
+        super::save(&sample_config()).expect("save config");
+
+        let mode = std::fs::metadata(super::config_path())
+            .expect("stat config")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "node_secret file must never be group/world readable"
+        );
+    }
+
+    #[test]
+    fn refresh_save_does_not_persist_the_api_url_override() {
+        // FIX 2: a this-run-only --api-url override lives in `api_url_override`
+        // (`#[serde(skip)]`), so a save triggered by a token refresh writes the
+        // stored per-network api_url, never the throwaway override.
+        let (_dir, _guard) = with_temp_config_dir();
+        let mut cfg = sample_config();
+        cfg.active_entry_mut().api_url = Some("https://stored.example.com".to_owned());
+        super::save(&cfg).expect("seed config");
+
+        // Simulate `load_config` injecting an override, then a refresh save.
+        let mut loaded = super::load().expect("reload config");
+        loaded.api_url_override = Some("https://throwaway.example.com".to_owned());
+        assert_eq!(loaded.api_url(), "https://throwaway.example.com");
+        super::save(&loaded).expect("save after refresh");
+
+        let back = super::load().expect("reload after refresh");
+        assert_eq!(back.api_url_override, None, "override is never serialized");
+        assert_eq!(
+            back.networks
+                .get("testnet")
+                .expect("entry")
+                .api_url
+                .as_deref(),
+            Some("https://stored.example.com"),
+            "the stored api_url must be untouched by the override"
+        );
+        assert_eq!(back.api_url(), "https://stored.example.com");
+    }
+
+    #[test]
+    fn locked_save_round_trips_without_corruption() {
+        // FIX 3: a load → mutate → save under `with_config_lock` is a no-deadlock
+        // path (the lock and `save` use independent file handles) and leaves a
+        // well-formed config that reloads cleanly.
+        let (_dir, _guard) = with_temp_config_dir();
+        super::save(&sample_config()).expect("seed config");
+
+        super::with_config_lock(|| {
+            let mut cfg = super::load()?;
+            cfg.active_entry_mut()
+                .upsert_worker(worker("01J0B", "gm-miner-2", "second-secret"));
+            super::save(&cfg)
+        })
+        .expect("locked load-modify-save");
+
+        let back = super::load().expect("reload after locked save");
+        let workers = &back.networks.get("testnet").expect("entry").workers;
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[1].node_secret, "second-secret");
+    }
+
+    #[test]
+    fn refresh_token_only_merge_preserves_access_token() {
+        // The override-run refresh path persists only the rotated refresh token,
+        // leaving the stored access token and api_url untouched. Exercise the
+        // same load → field-merge → save primitive on disk.
+        let (_dir, _guard) = with_temp_config_dir();
+        let mut cfg = sample_config();
+        cfg.active_entry_mut().tokens = Some(TokenEntry {
+            access_token: Some("stored-access".to_owned()),
+            token_expires_at: Some("2099-01-01T00:00:00Z".to_owned()),
+            refresh_token: Some("old-refresh".to_owned()),
+        });
+        super::save(&cfg).expect("seed config");
+
+        super::with_config_lock(|| {
+            let mut on_disk = super::load()?;
+            on_disk
+                .networks
+                .entry("testnet".to_owned())
+                .or_default()
+                .tokens
+                .get_or_insert_with(Default::default)
+                .refresh_token = Some("rotated-refresh".to_owned());
+            super::save(&on_disk)
+        })
+        .expect("merge rotated refresh");
+
+        let tokens = super::load()
+            .expect("reload")
+            .networks
+            .get("testnet")
+            .expect("entry")
+            .tokens
+            .clone()
+            .expect("tokens present");
+        assert_eq!(tokens.access_token.as_deref(), Some("stored-access"));
+        assert_eq!(tokens.refresh_token.as_deref(), Some("rotated-refresh"));
     }
 }

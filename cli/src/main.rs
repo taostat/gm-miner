@@ -506,7 +506,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             yes,
         } => {
             let cfg = load_config(explicit_network, api_url)?;
-            cmd_register_hotkey(cfg, hotkey_ss58, wallet, hotkey, yes)
+            cmd_register_hotkey(&cfg, hotkey_ss58, wallet, hotkey, yes)
         }
         Command::RegisterImage { app_id } => {
             let cfg = load_config(explicit_network, api_url)?;
@@ -624,16 +624,15 @@ fn load_config(
         let changed = cfg.resolved_network() != network || cfg.active_network.is_none();
         cfg.set_network(network);
         if changed {
-            config::save(&cfg).context("persist selected network")?;
+            persist_active_network(network).context("persist selected network")?;
         }
     }
 
     // Explicit --api-url flag wins; fall back to GM_REGISTRY_URL for a
-    // this-run-only override that is never persisted.
-    let effective = api_url_override.or_else(|| std::env::var("GM_REGISTRY_URL").ok());
-    if let Some(url) = effective {
-        cfg.active_entry_mut().api_url = Some(url);
-    }
+    // this-run-only override. Stored in `api_url_override` (which `save` never
+    // serializes), so a token refresh mid-run can't persist the throwaway URL
+    // as the sticky per-network `api_url`.
+    cfg.api_url_override = api_url_override.or_else(|| std::env::var("GM_REGISTRY_URL").ok());
 
     Ok(cfg)
 }
@@ -669,15 +668,119 @@ async fn ensure_fresh_token(mut cfg: Config) -> Result<Config> {
         .await
         .with_context(|| format!("fetch auth config from {api_url}/auth/config"))?;
 
-    let token = obtain_fresh_token(&cfg, &auth_cfg).await?;
+    let (token, from_refresh_grant) = obtain_fresh_token(&cfg, &auth_cfg).await?;
 
     // A refresh response may omit `refresh_token` when the auth-gateway
     // chooses not to rotate it — keep the previously stored value so the
     // next refresh still has something to present.
     let previous_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
-    cfg.active_entry_mut().tokens = Some(token.to_entry_keeping(previous_refresh));
-    config::save(&cfg).context("save refreshed token")?;
+    let entry = token.to_entry_keeping(previous_refresh);
+    let network = cfg.active_network().to_owned();
+    let override_active = cfg.api_url_override.is_some();
+    cfg.active_entry_mut().tokens = Some(entry.clone());
+    persist_refreshed_tokens(network, entry, override_active, from_refresh_grant)
+        .context("save refreshed token")?;
     Ok(cfg)
+}
+
+/// Persist the result of a token refresh.
+///
+/// Without an `--api-url` override the whole token entry is written. With an
+/// override active the access token was minted against a this-run-only registry,
+/// so it must never become the stored entry's token. Only when the token came
+/// from a genuine refresh *grant* (`from_refresh_grant`) — which rotates and
+/// consumes the stored refresh token — is the rotated refresh token merged back,
+/// keeping the stored refresh chain alive for the next non-override run. A
+/// device-login fallback against the override registry persists nothing. Every
+/// path touches only the named network's `tokens` under the lock, re-loading so
+/// a concurrent `deploy` write survives.
+fn persist_refreshed_tokens(
+    network: String,
+    entry: config::TokenEntry,
+    override_active: bool,
+    from_refresh_grant: bool,
+) -> Result<()> {
+    if override_active {
+        if !from_refresh_grant {
+            return Ok(());
+        }
+        let Some(rotated) = entry.refresh_token else {
+            return Ok(());
+        };
+        return persist_rotated_refresh_token(network, rotated);
+    }
+    persist_active_tokens(network, entry)
+}
+
+/// Merge only a rotated `refresh_token` into `network`'s stored tokens, leaving
+/// the persisted access token and expiry untouched. Used on override runs so a
+/// token minted against the override registry never becomes the stored token.
+fn persist_rotated_refresh_token(network: String, rotated: String) -> Result<()> {
+    config::with_config_lock(|| {
+        let mut on_disk = config::load().context("load gmcli config")?;
+        on_disk
+            .networks
+            .entry(network)
+            .or_default()
+            .tokens
+            .get_or_insert_with(Default::default)
+            .refresh_token = Some(rotated);
+        config::save(&on_disk)
+    })
+}
+
+/// Persist a refreshed token onto `network`'s entry under the config lock,
+/// re-loading from disk so a token refresh can't clobber a worker record a
+/// concurrent `deploy` wrote since this command's config was first loaded. Only
+/// that network's `tokens` field is touched — `active_network` is left as it is
+/// on disk, so a concurrent `--network` selection survives the refresh.
+fn persist_active_tokens(network: String, tokens: config::TokenEntry) -> Result<()> {
+    config::with_config_lock(|| {
+        let mut on_disk = config::load().context("load gmcli config")?;
+        on_disk.networks.entry(network).or_default().tokens = Some(tokens);
+        config::save(&on_disk)
+    })
+}
+
+/// Persist the sticky active-network selection under the config lock: re-load
+/// from disk and write only `active_network`, leaving every network's tokens,
+/// workers, and keys as they are on disk.
+fn persist_active_network(network: Network) -> Result<()> {
+    config::with_config_lock(|| {
+        let mut on_disk = config::load().context("load gmcli config")?;
+        on_disk.set_network(network);
+        config::save(&on_disk)
+    })
+}
+
+/// Persist a successful `login` under the config lock: re-load from disk and
+/// write only `network`'s `api_url` + `tokens`, plus the sticky `active_network`
+/// (login is the user's explicit network selection). Re-loading means the slow
+/// device-code flow can't clobber a worker record a concurrent `deploy` wrote.
+fn persist_login(network: &str, api_url: String, tokens: config::TokenEntry) -> Result<()> {
+    config::with_config_lock(|| {
+        let mut on_disk = config::load().context("load gmcli config")?;
+        let entry = on_disk.networks.entry(network.to_owned()).or_default();
+        entry.api_url = Some(api_url);
+        entry.tokens = Some(tokens);
+        on_disk.active_network = Some(network.to_owned());
+        config::save(&on_disk)
+    })
+}
+
+/// Persist a `register-hotkey` result under the config lock: re-load and write
+/// only `network`'s `registered_hotkey`, so concurrent worker/token writes
+/// survive.
+fn persist_registered_hotkey(network: &str, record: config::HotkeyRecord) -> Result<()> {
+    config::with_config_lock(|| {
+        let mut on_disk = config::load().context("load gmcli config")?;
+        on_disk
+            .networks
+            .entry(network.to_owned())
+            .or_default()
+            .set_registered_hotkey(record);
+        config::save(&on_disk)
+    })
 }
 
 /// Non-interactively refresh the active token if it is expired and a
@@ -711,35 +814,45 @@ async fn try_refresh_token(mut cfg: Config) -> Config {
     };
 
     let previous_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
-    cfg.active_entry_mut().tokens = Some(token.to_entry_keeping(previous_refresh));
-    let _ = config::save(&cfg);
+    let entry = token.to_entry_keeping(previous_refresh);
+    let network = cfg.active_network().to_owned();
+    let override_active = cfg.api_url_override.is_some();
+    cfg.active_entry_mut().tokens = Some(entry.clone());
+    // try_refresh_token only ever reaches here via a successful refresh grant.
+    let _ = persist_refreshed_tokens(network, entry, override_active, true);
     cfg
 }
 
 /// Obtain a fresh access token: try the stored `refresh_token` first, fall
 /// back to the device-code flow when there is none or it is rejected.
 ///
+/// The returned flag is true only when the token came from a successful refresh
+/// grant (a rotation of the stored refresh token), false when it came from a
+/// device login. On an `--api-url` override run the caller persists a rotated
+/// refresh token only in the true case — a device-login token is minted against
+/// the override registry and must not touch the stored entry.
+///
 /// Split out of [`ensure_fresh_token`] so the refresh-vs-device decision is a
 /// single linear function with no config mutation.
 async fn obtain_fresh_token(
     cfg: &Config,
     auth_cfg: &gm_miner_cli::client::AuthConfig,
-) -> Result<auth::TokenResponse> {
+) -> Result<(auth::TokenResponse, bool)> {
     let stored_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
 
     let Some(refresh) = stored_refresh else {
         eprintln!("Access token expired — re-authenticating.");
-        return device_login_from(auth_cfg, true).await;
+        return Ok((device_login_from(auth_cfg, true).await?, false));
     };
 
     match auth::refresh_token(&auth_cfg.token_url, &auth_cfg.client_id, &refresh).await? {
         auth::RefreshOutcome::Refreshed(token) => {
             eprintln!("Access token refreshed.");
-            Ok(token)
+            Ok((token, true))
         }
         auth::RefreshOutcome::Rejected => {
             eprintln!("Stored credentials have expired — re-authenticating.");
-            device_login_from(auth_cfg, true).await
+            Ok((device_login_from(auth_cfg, true).await?, false))
         }
     }
 }
@@ -1174,17 +1287,20 @@ fn cmd_set_api_keys(
         validate_key("google", k)?;
     }
 
-    let mut cfg =
-        config::load().context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
+    // Load → mutate → save under the lock so a concurrent `deploy` save can't
+    // be clobbered, and re-read fresh inside the lock so we merge onto the
+    // latest on-disk state rather than a snapshot taken before the lock.
+    let (has_anthropic, has_openai, has_google) = config::with_config_lock(|| {
+        let mut cfg = config::load()
+            .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
 
-    // Provider keys are network-independent, but an explicit --network here
-    // is still the user's sticky selection — persist it so the promise holds
-    // even when set-api-keys is the command that carries the flag.
-    if let Some(network) = explicit_network {
-        cfg.set_network(network);
-    }
+        // Provider keys are network-independent, but an explicit --network here
+        // is still the user's sticky selection — persist it so the promise holds
+        // even when set-api-keys is the command that carries the flag.
+        if let Some(network) = explicit_network {
+            cfg.set_network(network);
+        }
 
-    {
         let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
         if let Some(k) = anthropic {
             keys.anthropic = Some(k);
@@ -1195,21 +1311,15 @@ fn cmd_set_api_keys(
         if let Some(k) = google {
             keys.google = Some(k);
         }
-    }
+        let snapshot = (
+            keys.anthropic.is_some(),
+            keys.openai.is_some(),
+            keys.google.is_some(),
+        );
 
-    // Snapshot which keys are set before saving (only immutable borrow needed).
-    let (has_anthropic, has_openai, has_google) =
-        cfg.provider_keys
-            .as_ref()
-            .map_or((false, false, false), |k| {
-                (
-                    k.anthropic.is_some(),
-                    k.openai.is_some(),
-                    k.google.is_some(),
-                )
-            });
-
-    config::save(&cfg).context("save config")?;
+        config::save(&cfg).context("save config")?;
+        Ok(snapshot)
+    })?;
 
     let mut set_names: Vec<&str> = Vec::new();
     if has_anthropic {
@@ -1535,11 +1645,18 @@ async fn register_worker(
 }
 
 /// Upsert `record` into the active network's workers and save the config.
+///
+/// The load → mutate → save runs under [`config::with_config_lock`] so a
+/// concurrent `gmcli` command can't read the old config, mutate its own copy,
+/// and clobber this write — `deploy` lands three worker records over several
+/// minutes, the widest race window in the CLI.
 fn persist_worker_record(network: &str, record: WorkerRecord) -> Result<()> {
-    let mut cfg = config::load().context("load gmcli config")?;
-    cfg.active_network = Some(network.to_owned());
-    cfg.active_entry_mut().upsert_worker(record);
-    config::save(&cfg).context("persist worker record to gmcli config")
+    config::with_config_lock(|| {
+        let mut cfg = config::load().context("load gmcli config")?;
+        cfg.active_network = Some(network.to_owned());
+        cfg.active_entry_mut().upsert_worker(record);
+        config::save(&cfg).context("persist worker record to gmcli config")
+    })
 }
 
 /// Fetch the calling miner's hotkey from `GET /miners/me`.
@@ -1593,11 +1710,8 @@ async fn cmd_login(
 
     let token = device_login_from(&auth_cfg, open_browser).await?;
 
-    let entry = cfg.active_entry_mut();
-    entry.api_url = Some(api_url);
-    entry.tokens = Some(token.to_entry());
-
-    config::save(&cfg).context("save config")?;
+    let network = cfg.active_network().to_owned();
+    persist_login(&network, api_url, token.to_entry()).context("save config")?;
 
     println!("Login successful ({} network).", cfg.resolved_network());
     println!("Credentials saved to {}", config::config_path().display());
@@ -1943,11 +2057,13 @@ async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
     }
 
     // Drop the local record so `worker list`/re-deploy don't reference a
-    // deregistered worker.
-    let mut cfg = config::load().context("load gmcli config")?;
-    cfg.active_network = Some(network);
-    cfg.active_entry_mut().remove_worker_by_id(&worker_id);
-    config::save(&cfg).context("persist worker removal to gmcli config")?;
+    // deregistered worker. Locked so a concurrent deploy save can't resurrect it.
+    config::with_config_lock(|| {
+        let mut cfg = config::load().context("load gmcli config")?;
+        cfg.active_network = Some(network);
+        cfg.active_entry_mut().remove_worker_by_id(&worker_id);
+        config::save(&cfg).context("persist worker removal to gmcli config")
+    })?;
 
     println!("Worker {worker_id} deregistered from the registry.");
     let reminder = match app_id {
@@ -1965,10 +2081,13 @@ async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
 /// Drop a provisional worker record (a deploy that never registered) from the
 /// local config. No registry DELETE: nothing was ever registered.
 fn remove_provisional_worker(network: &str, id: &str) -> Result<()> {
-    let mut cfg = config::load().context("load gmcli config")?;
-    cfg.active_network = Some(network.to_owned());
-    let removed = cfg.active_entry_mut().remove_provisional_worker(id);
-    config::save(&cfg).context("persist worker removal to gmcli config")?;
+    let removed = config::with_config_lock(|| {
+        let mut cfg = config::load().context("load gmcli config")?;
+        cfg.active_network = Some(network.to_owned());
+        let removed = cfg.active_entry_mut().remove_provisional_worker(id);
+        config::save(&cfg).context("persist worker removal to gmcli config")?;
+        Ok(removed)
+    })?;
 
     match removed {
         Some(w) if !w.app_id.is_empty() => {
@@ -2242,7 +2361,7 @@ impl Check {
 /// Either way the resulting [`HotkeyRecord`] is persisted to the active
 /// network's config so login/deploy/doctor/earnings can reference it.
 fn cmd_register_hotkey(
-    cfg: Config,
+    cfg: &Config,
     hotkey_ss58: Option<String>,
     wallet: Option<String>,
     hotkey: Option<String>,
@@ -2250,22 +2369,21 @@ fn cmd_register_hotkey(
 ) -> Result<()> {
     let network = cfg.resolved_network();
     match hotkey_ss58 {
-        Some(ss58) => register_hotkey_byo(cfg, network, &ss58),
-        None => register_hotkey_assisted(cfg, network, wallet, hotkey, yes),
+        Some(ss58) => register_hotkey_byo(network, &ss58),
+        None => register_hotkey_assisted(network, wallet, hotkey, yes),
     }
 }
 
 /// Bring-your-own: record an ss58 the operator registered elsewhere. Verifies
 /// against the metagraph only when btcli is already on PATH — never installs it.
-fn register_hotkey_byo(mut cfg: Config, network: Network, ss58: &str) -> Result<()> {
+fn register_hotkey_byo(network: Network, ss58: &str) -> Result<()> {
     let btcli = RealBtcli;
     let bridge: Option<&dyn BtcliBridge> =
         gm_miner_cli::dependency::on_path("btcli").then_some(&btcli);
     let outcome = record_byo(bridge, network, ss58)?;
 
-    cfg.active_entry_mut()
-        .set_registered_hotkey(outcome.record.clone());
-    config::save(&cfg).context("persist registered hotkey")?;
+    persist_registered_hotkey(network.as_str(), outcome.record.clone())
+        .context("persist registered hotkey")?;
 
     println!("Recorded hotkey {} for {network}.", outcome.record.ss58);
     println!("{}", outcome.note);
@@ -2276,7 +2394,6 @@ fn register_hotkey_byo(mut cfg: Config, network: Network, ss58: &str) -> Result<
 /// Assisted: register a fresh hotkey through btcli. The only flow that needs
 /// btcli — so it (and only it) runs [`ensure_dependency`] for it.
 fn register_hotkey_assisted(
-    cfg: Config,
     network: Network,
     wallet: Option<String>,
     hotkey: Option<String>,
@@ -2301,12 +2418,12 @@ fn register_hotkey_assisted(
     };
 
     if let Registration::Registered { uid } = btcli.registration_of(network, &ss58)? {
-        return persist_already_registered(cfg, network, &wallet, &hotkey, &ss58, uid);
+        return persist_already_registered(network, &wallet, &hotkey, &ss58, uid);
     }
 
     confirm_spend(network, &wallet, &hotkey, yes)?;
     btcli.register(network, &wallet, &hotkey, yes)?;
-    finish_assisted(cfg, network, &btcli, &wallet, &hotkey, &ss58)
+    finish_assisted(network, &btcli, &wallet, &hotkey, &ss58)
 }
 
 /// Both `--wallet` and `--hotkey` are required for the assisted flow; a missing
@@ -2328,7 +2445,6 @@ fn require_wallet_and_hotkey(
 /// Idempotent assisted path: the hotkey is already on the subnet, so record it
 /// and exit 0 without spending TAO.
 fn persist_already_registered(
-    mut cfg: Config,
     network: Network,
     wallet: &str,
     hotkey: &str,
@@ -2340,8 +2456,7 @@ fn persist_already_registered(
         name: Some(hotkey.to_owned()),
         verified: true,
     };
-    cfg.active_entry_mut().set_registered_hotkey(record);
-    config::save(&cfg).context("persist registered hotkey")?;
+    persist_registered_hotkey(network.as_str(), record).context("persist registered hotkey")?;
     println!(
         "{wallet}/{hotkey} ({ss58}) is already registered on {network} — uid {uid}. \
          Nothing to do."
@@ -2352,7 +2467,6 @@ fn persist_already_registered(
 /// After a successful `btcli subnet register`, confirm the new uid and persist.
 /// `ss58` is the address resolved (and validated to exist) before registering.
 fn finish_assisted(
-    mut cfg: Config,
     network: Network,
     btcli: &RealBtcli,
     wallet: &str,
@@ -2360,8 +2474,8 @@ fn finish_assisted(
     ss58: &str,
 ) -> Result<()> {
     let outcome = confirm_registered(btcli, network, ss58, hotkey)?;
-    cfg.active_entry_mut().set_registered_hotkey(outcome.record);
-    config::save(&cfg).context("persist registered hotkey")?;
+    persist_registered_hotkey(network.as_str(), outcome.record)
+        .context("persist registered hotkey")?;
     match outcome.uid {
         Some(uid) => {
             println!("Registered {wallet}/{hotkey} ({ss58}) on {network} — uid {uid}.");
@@ -2570,7 +2684,7 @@ fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> 
         title,
         &command,
         assume_yes,
-        cmd_register_hotkey(cfg.clone(), ss58, wallet, hotkey, assume_yes)
+        cmd_register_hotkey(cfg, ss58, wallet, hotkey, assume_yes)
     )
 }
 
@@ -3144,6 +3258,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -3194,6 +3309,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
 
         // --app-name gm-miner-1 already exists; the guard must bail before
@@ -3261,6 +3377,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -3317,6 +3434,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-1".to_owned(),
@@ -3370,6 +3488,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -3421,6 +3540,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
         // A redeploy of a registered worker carries its worker_id, so a
         // mid-deploy failure can't erase it.
@@ -3477,6 +3597,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
 
         // --app-name gm-miner-2 is a secondary worker; a plain `deploy`
@@ -3551,6 +3672,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
 
         reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-1b")
@@ -3594,6 +3716,7 @@ mod tests {
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
             phala_api_key: None,
+            api_url_override: None,
         };
 
         let err = reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-2")
@@ -4012,6 +4135,7 @@ mod tests {
                 active_network: Some("testnet".to_owned()),
                 provider_keys: None,
                 phala_api_key: None,
+                api_url_override: None,
             }
         }
 
