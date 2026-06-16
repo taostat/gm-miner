@@ -3057,23 +3057,23 @@ async fn hotkey_check(cfg: Config) -> Check {
         .is_none()
     {
         return Check::fail(
-            format!("Hotkey registered on subnet {netuid}"),
+            format!("Registered with gm on subnet {netuid}"),
             "can't check until you're logged in — run `gmcli login`",
         );
     }
 
-    let mut client = RegistryClient::new(cfg);
+    let mut client = RegistryClient::new(cfg.clone());
     let resp = match client.get(gm_miner_cli::client::ME_PATH).await {
         Ok(resp) => resp,
         Err(err) => {
             return Check::fail(
-                format!("Hotkey registered on subnet {netuid}"),
+                format!("Registered with gm on subnet {netuid}"),
                 format!("couldn't reach the registry: {err}"),
             );
         }
     };
 
-    let label = format!("Hotkey registered on subnet {netuid}");
+    let label = format!("Registered with gm on subnet {netuid}");
     let status = resp.status();
     if status.is_success() {
         let hotkey = resp
@@ -3083,19 +3083,20 @@ async fn hotkey_check(cfg: Config) -> Check {
         return Check::pass(label, hotkey);
     }
     // A 404 is the expected state before the first deploy: the registry has no
-    // miner record for this hotkey yet. Two steps clear it, in order: register
-    // the hotkey on-chain (`register-hotkey`), then `deploy`, which posts
-    // `/miners/register` and is what actually creates the record this probe
-    // reads. Surface it as informational, not a failure — doctor *precedes*
-    // both steps.
+    // miner record for this hotkey yet. This branch is only reached once logged
+    // in, so the hotkey identity is already known — the only step left is
+    // `deploy`, which posts `/miners/register` and creates the record this probe
+    // reads. Surface it as informational, not a failure — doctor *precedes* it.
     if status.as_u16() == 404 {
+        let who = cfg
+            .token_hotkey()
+            .map_or_else(|| "your hotkey".to_owned(), |hk| format!("hotkey {hk}"));
         return Check::info(
             label,
             format!(
-                "no miner record on `{network}` yet. First register your hotkey on-chain: \
-                 `gmcli register-hotkey` (via btcli, or `--hotkey-ss58 <addr>` if you \
-                 registered elsewhere). Then `gmcli deploy` creates the registry record. \
-                 On the wrong network? Pass `--network mainnet`/`--network testnet`."
+                "no registry record for {who} on `{network}` yet — your first \
+                 `gmcli deploy` creates it. On the wrong network? Pass \
+                 `--network mainnet`/`--network testnet`."
             ),
         );
     }
