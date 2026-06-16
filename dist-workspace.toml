@@ -7,18 +7,20 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app. Homebrew is deferred to go-public:
-# the tap repo does not exist yet and a formula pointing at private release
-# URLs is not installable anonymously. Re-add "homebrew" + the publish-job when
-# the repo flips public and the tap is created.
-installers = ["shell", "powershell"]
-# Target platforms to build apps for (Rust target-triple syntax)
+# Only the shell installer ships. Windows is unsupported: gmcli talks to Phala
+# dstack TEEs over Unix domain sockets (http-client-unix-domain-socket →
+# tokio::net::UnixStream), which does not exist on Windows, so the msvc target
+# cannot compile. The powershell installer is dropped with it. Homebrew is
+# deferred to go-public (tap repo doesn't exist yet); re-add "homebrew" + its
+# publish-job when the repo flips public and the tap is created.
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax). Unix only —
+# see the Windows note above.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
-    "x86_64-pc-windows-msvc",
 ]
 # Homebrew tap target, reinstated at go-public alongside the "homebrew"
 # installer and a ["homebrew"] publish-jobs entry. The tap repo
