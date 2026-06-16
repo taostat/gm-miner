@@ -6,6 +6,7 @@ pub mod client;
 pub mod config;
 pub mod dependency;
 pub mod deploy;
+pub mod earnings;
 pub mod image;
 pub mod network;
 pub mod node_secret;
