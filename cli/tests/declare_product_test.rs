@@ -1,6 +1,6 @@
 //! Tests for the pct-discount declare-product wire shape and the
-//! `RegistryClient` POST path used by `gm-miner declare-product` and
-//! `gm-miner declare-products`.
+//! `RegistryClient` POST path used by `gmcli declare-product` and
+//! `gmcli declare-products`.
 //!
 //! Covers:
 //!   * `ProductDeclarationRequest` serialises to the exact

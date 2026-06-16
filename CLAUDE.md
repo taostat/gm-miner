@@ -1,6 +1,6 @@
-# gm-miner
+# gmcli
 
-A Rust CLI (`gm-miner`) that operators use to deploy and manage a gm subnet
+A Rust CLI (`gmcli`) that operators use to deploy and manage a gm subnet
 miner. The miner itself is a containerized workload running inside an Intel TDX
 TEE managed by Phala Cloud. This CLI handles the full operator lifecycle:
 authentication, miner image build/push, Phala Cloud deployment, hash
@@ -13,9 +13,9 @@ declaration, and price management.
 - `cli/src/lib.rs` — module declarations; re-exports for binary and tests
 - `cli/src/auth.rs` — Taostats device-code OAuth2 flow
 - `cli/src/client.rs` — `RegistryClient`: typed HTTP wrappers for registry endpoints
-- `cli/src/config.rs` — `Config` loaded from `~/.gm-miner/config.json` (mode 0600); supports `mainnet`/`testnet` networks
+- `cli/src/config.rs` — `Config` loaded from `~/.gmcli/config.json` (mode 0600); supports `mainnet`/`testnet` networks
 - `cli/src/network.rs` — `Network` enum (testnet/mainnet) carrying `netuid`, chain websocket, and default registry URL; the seam later work (register-hotkey, earnings) reads coordinates from
-- `cli/src/btcli.rs` — `BtcliBridge` trait + `RealBtcli`: bridge to `btcli` (bittensor-cli) for hotkey registration/metagraph queries; `gm-miner` never touches wallet keys. `btcli_network()` maps `Network`→`test`/`finney`
+- `cli/src/btcli.rs` — `BtcliBridge` trait + `RealBtcli`: bridge to `btcli` (bittensor-cli) for hotkey registration/metagraph queries; `gmcli` never touches wallet keys. `btcli_network()` maps `Network`→`test`/`finney`
 - `cli/src/dependency.rs` — `ensure_dependency(&Dependency, assume_yes)`: reusable PATH-detect-and-offer-to-install primitive (e.g. `BTCLI`); `register-hotkey`'s assisted flow uses it, `deploy`/future init-wizard can adopt it
 - `cli/src/register_hotkey.rs` — pure decision logic for `register-hotkey` (ss58 validation, bring-your-own vs assisted), testable against a stubbed `BtcliBridge`
 - `cli/src/deploy.rs` — `PhalaClient` trait + `RealPhalaClient`; deploy orchestration: compose rendering, `phala deploy`, `phala cvms get` hash polling, hash verification
@@ -24,7 +24,7 @@ declaration, and price management.
 - discount/price conversion lives in `cli/src/main.rs` (`parse_discount_pct`, `format_per_mtok_usd`) — decimal-string → nano-dollars (u64), integer-only, no floats
 - `cli/src/types.rs` — shared types: `MinerPriceBlock`, `MinerStatus`, `Product`, `Provider`
 - `image/` — the miner container image (Dockerfile, envoy config)
-- `dstack/` — the compose template `gm-miner deploy` renders and submits to Phala Cloud
+- `dstack/` — the compose template `gmcli deploy` renders and submits to Phala Cloud
 
 ## Build / lint / test
 
@@ -48,7 +48,7 @@ cargo test -p gm-miner-cli
 
 | Command | Purpose |
 |---|---|
-| `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google) to `~/.gm-miner/config.json` |
+| `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google) to `~/.gmcli/config.json` |
 | `deploy` | Full trust-correct deploy: build/push image + Phala Cloud deploy + hash verification + image registration |
 | `login` | Device-code OAuth flow; stores access token in config |
 | `register-hotkey` | Record the serving hotkey: `--hotkey-ss58` records one registered elsewhere; otherwise registers a fresh hotkey via the `btcli` bridge (`--wallet`/`--hotkey`) |
@@ -66,9 +66,9 @@ carries each network's `netuid`, chain websocket, and default registry URL.
 ## Key conventions
 
 - All prices are accepted by the CLI as USD per million tokens (e.g. `"3.00"`) and converted to nano-dollars/Mtok (u64) before being sent to the registry. Conversion is decimal-string-only — no floats — so every nano-dollar of a sub-cent price is preserved exactly.
-- The node secret is generated once per network (`mainnet`/`testnet`) and persisted to `~/.gm-miner/config.json`. It is embedded in the container's compose env, enforced by envoy, and stored in the registry — all three must stay in lockstep across re-deploys.
+- The node secret is generated once per network (`mainnet`/`testnet`) and persisted to `~/.gmcli/config.json`. It is embedded in the container's compose env, enforced by envoy, and stored in the registry — all three must stay in lockstep across re-deploys.
 - `--network` / `--testnet` are sticky: an explicit choice is persisted as `active_network`, so later commands target it until a different one is passed. `--api-url` is *not* sticky — it overrides the registry URL for a single run only (as does `GM_REGISTRY_URL`).
 - `deploy` is the happy path: it verifies that the deployed compose hash and OS image hash exactly match the registry's approved version before registering the image. `register-image` exists only for re-registration without redeploying.
-- Config file is at `~/.gm-miner/config.json` (mode 0600). The `GM_REGISTRY_URL` env var can override the API URL for a single run without persisting.
+- Config file is at `~/.gmcli/config.json` (mode 0600). The `GM_REGISTRY_URL` env var can override the API URL for a single run without persisting.
 - `deploy` and `register-image` shell out to the `phala` CLI (npm package `phala`, install with `npm i -g phala`). Phala Cloud auth is a Phala Cloud API key — set `PHALA_CLOUD_API_KEY` or run `phala login` before deploying. The `phala` CLI is preflighted at the start of `deploy` with an install hint.
 - Supply-chain: workspace `deny.toml` governs advisory/license/ban checks (`cargo deny check`).

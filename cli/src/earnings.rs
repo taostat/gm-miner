@@ -1,4 +1,4 @@
-//! `gm-miner earnings` — the miner's current standing on the subnet.
+//! `gmcli earnings` — the miner's current standing on the subnet.
 //!
 //! v1 is the **chain-emission** view: it reads the miner's neuron row straight
 //! from the subnet metagraph (via the [`BtcliBridge`]) and reports uid, stake,
@@ -43,7 +43,7 @@ impl ResolvedHotkey {
 /// the login token's `sub` claim, else the recorded `register-hotkey` identity.
 ///
 /// A single-hotkey operator never needs to type their ss58: logging in (or
-/// registering) already tells gm-miner who they are.
+/// registering) already tells gmcli who they are.
 ///
 /// # Errors
 /// Returns an error when neither a login token nor a recorded hotkey is
@@ -58,8 +58,8 @@ pub fn resolve_hotkey(cfg: &Config, network: Network) -> Result<ResolvedHotkey> 
     }
     bail!(
         "no hotkey to report on for {network} (netuid {}).\n  \
-         set up your miner first: `gm-miner register-hotkey`, then `gm-miner login`\n  \
-         (already registered on the subnet? just `gm-miner login`).\n  \
+         set up your miner first: `gmcli register-hotkey`, then `gmcli login`\n  \
+         (already registered on the subnet? just `gmcli login`).\n  \
          on the wrong network? pass `--network mainnet`/`--network testnet`.",
         network.netuid()
     )
@@ -99,7 +99,7 @@ pub fn render_earnings(
     let mut out = String::new();
     let name = hotkey.name.as_deref().unwrap_or("(no local name)");
     let netuid = network.netuid();
-    let _ = writeln!(out, "gm-miner earnings — {network} (netuid {netuid})\n");
+    let _ = writeln!(out, "gmcli earnings — {network} (netuid {netuid})\n");
     let _ = writeln!(out, "  Hotkey : {} ({name})", hotkey.ss58);
 
     let Some(stats) = stats else {
@@ -107,7 +107,7 @@ pub fn render_earnings(
             out,
             "\n  {} is not on the {network} subnet (netuid {netuid}).\n  \
              On the wrong network? Pass `--network mainnet`/`--network testnet`.\n  \
-             Not registered yet? Run `gm-miner register-hotkey`.\n",
+             Not registered yet? Run `gmcli register-hotkey`.\n",
             hotkey.ss58
         );
         return out;

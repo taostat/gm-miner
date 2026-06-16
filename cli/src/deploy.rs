@@ -1,7 +1,7 @@
-//! `gm-miner deploy` — single-shot trust-correct deploy flow.
+//! `gmcli deploy` — single-shot trust-correct deploy flow.
 //!
 //! This module and `crate::image` together are the whole operator deploy
-//! pipeline: the `gm-miner deploy` subcommand builds the miner image,
+//! pipeline: the `gmcli deploy` subcommand builds the miner image,
 //! submits the compose stack to Phala Cloud, verifies the resulting CVM's
 //! measured hashes against the registry allow-list, and registers the
 //! image.
@@ -15,7 +15,7 @@
 //! Steps (orchestrated from `main::cmd_deploy`):
 //!   1. Read provider API keys from config; error early if none set.
 //!   2. Auth preflight (`GET /miners/me`) — fail fast if the operator
-//!      forgot `gm-miner login` or has a stale token, before any CVM work.
+//!      forgot `gmcli login` or has a stale token, before any CVM work.
 //!   3. Fetch the approved `ImageVersion` list from the registry.
 //!   4. Select the newest supported version (or a pinned one if `--version`
 //!      given).
@@ -76,7 +76,7 @@ pub struct DstackDeployResult {
     pub os_image_hash: String,
 }
 
-/// Everything `gm-miner deploy` needs back from a Phala Cloud deploy: the
+/// Everything `gmcli deploy` needs back from a Phala Cloud deploy: the
 /// CVM's measured hashes (verified against the registry allow-list) and
 /// the CVM's public endpoint (sent to the registry on registration).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,7 +585,7 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
 /// endpoint — from the single CVM-detail document.
 ///
 /// `cvm_id` is any identifier `phala cvms get` accepts: an `app_id`, a
-/// UUID, or the CVM *name*. `gm-miner deploy` passes the name it set with
+/// UUID, or the CVM *name*. `gmcli deploy` passes the name it set with
 /// `phala deploy --name`.
 ///
 /// Returns `Ok(None)` when the command exited non-zero (the CVM is not
@@ -702,7 +702,7 @@ impl PhalaClient for RealPhalaClient {
 /// seconds until the measured hashes and the public endpoint are all
 /// non-empty, or until `timeout_secs` elapses.
 ///
-/// `cvm_id` is any identifier `phala cvms get` accepts — `gm-miner deploy`
+/// `cvm_id` is any identifier `phala cvms get` accepts — `gmcli deploy`
 /// passes the CVM name it set with `phala deploy --name`.
 ///
 /// # Errors
@@ -856,7 +856,7 @@ pub async fn fetch_supported_versions(registry_url: &str) -> Result<Vec<ImageVer
     // rather than using bare `reqwest::get()` which has no timeout.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!("gm-miner/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build reqwest client for /image-versions")?;
 
@@ -870,7 +870,7 @@ pub async fn fetch_supported_versions(registry_url: &str) -> Result<Vec<ImageVer
     let http_status = resp.status();
     if http_status == reqwest::StatusCode::NOT_FOUND {
         bail!(
-            "registry returned 404 for /image-versions — your gm-miner build is newer than \
+            "registry returned 404 for /image-versions — your gmcli build is newer than \
              the registry deployment; wait for the registry to be updated and retry"
         );
     }
@@ -1073,7 +1073,7 @@ pub fn format_created_at(ts: &str) -> String {
 
 /// Preflight that the `phala` CLI is on `PATH`.
 ///
-/// `phala` is the runtime dependency of `gm-miner deploy`: it submits the
+/// `phala` is the runtime dependency of `gmcli deploy`: it submits the
 /// compose stack to Phala Cloud and reports the measured CVM hashes. A
 /// missing CLI is caught here with an actionable install hint before any
 /// image build runs.
@@ -1089,7 +1089,7 @@ pub fn preflight_phala_cli() -> Result<()> {
         .is_ok_and(|s| s.success());
     if !on_path {
         bail!(
-            "the `phala` CLI is required for `gm-miner deploy` but was not found on PATH.\n  \
+            "the `phala` CLI is required for `gmcli deploy` but was not found on PATH.\n  \
              install it with: npm i -g phala"
         );
     }
@@ -1107,7 +1107,7 @@ pub const COMPOSE_TEMPLATE: &str = include_str!("../../dstack/docker-compose.yam
 ///
 /// Phala Cloud auto-injects a pre-launch script (v0.0.14) whose GHCR
 /// pull-verification block mis-parses digest-pinned image refs and aborts
-/// the boot with a 404. `gm-miner deploy` always pins images by digest, so
+/// the boot with a 404. `gmcli deploy` always pins images by digest, so
 /// it always passes this corrected, digest-aware script via
 /// `phala deploy --pre-launch-script`.
 pub const PRELAUNCH_SCRIPT: &str = include_str!("../../dstack/prelaunch.sh");

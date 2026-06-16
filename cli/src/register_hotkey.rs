@@ -1,15 +1,15 @@
-//! `gm-miner register-hotkey` — record (and optionally register) the hotkey
+//! `gmcli register-hotkey` — record (and optionally register) the hotkey
 //! the miner serves under.
 //!
 //! Two flows, dispatched on whether the operator passed `--hotkey-ss58`:
 //!
 //! - **Bring-your-own** (`--hotkey-ss58 <addr>`): the operator already
 //!   registered the hotkey elsewhere (a browser wallet, another machine).
-//!   gm-miner just records the ss58. If `btcli` happens to be present we
+//!   gmcli just records the ss58. If `btcli` happens to be present we
 //!   confirm the hotkey is on the subnet and capture its uid; if not, we
 //!   accept the address and defer verification to the first deploy/login,
 //!   which the registry/gateway probe anyway.
-//! - **Assisted** (no `--hotkey-ss58`): gm-miner offers to register a fresh
+//! - **Assisted** (no `--hotkey-ss58`): gmcli offers to register a fresh
 //!   hotkey through `btcli`. This is the only flow that requires `btcli`.
 //!
 //! The pure decision logic lives here behind the [`BtcliBridge`] trait so it

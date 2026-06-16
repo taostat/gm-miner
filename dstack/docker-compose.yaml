@@ -1,12 +1,12 @@
 ## gm miner compose template.
 ##
-## Usage: `gm-miner deploy` renders this file, substituting GM_IMAGE_REF
+## Usage: `gmcli deploy` renders this file, substituting GM_IMAGE_REF
 ## with the digest-pinned image reference and GM_NETWORK with the active
 ## network name (`testnet` / `mainnet`), then submits it to Phala Cloud
 ## via `phala deploy`. Phala Cloud provisions the TDX CVM and runs the KMS.
 ##
 ## GM_NETWORK is a rendered literal, NOT an operator env var: its value
-## comes from the `--testnet` / mainnet (default) selection on `gm-miner
+## comes from the `--testnet` / mainnet (default) selection on `gmcli
 ## deploy` and is substituted into the compose source before the file is
 ## submitted. That makes it part of the attestation-measured compose_hash,
 ## so a miner cannot change the targeted network (and the per-network
@@ -16,12 +16,12 @@
 ##
 ## Provider keys (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY)
 ## are NOT rendered into this file — `phala deploy` encrypts them client-
-## side to the CVM key from the .env file written by `gm-miner deploy`.
+## side to the CVM key from the .env file written by `gmcli deploy`.
 ## Set only the keys you have; an unset key makes the upstream return 401,
 ## which the registry surfaces as a "key not configured" capability failure.
 ##
 ## GM_NODE_SECRET is the node secret (Mechanism 1 of
-## attestation-and-identity.md): `gm-miner deploy` generates it, writes
+## attestation-and-identity.md): `gmcli deploy` generates it, writes
 ## it into the same Phala-Cloud-encrypted .env, and registers it with the
 ## registry. Envoy's inbound Lua filter enforces it as the `x-gm-node-key`
 ## header. It is declared here so it is part of the attestation-measured
@@ -40,7 +40,7 @@
 ## `https://<app-id>-8080s.<node>.phala.network`. The default `-8080`
 ## (no suffix) URL has the dstack gateway terminate TLS at the edge with
 ## its own ACME certificate, which would hide the miner's RA-TLS cert.
-## `gm-miner deploy` registers the `-8080s` passthrough URL with the
+## `gmcli deploy` registers the `-8080s` passthrough URL with the
 ## registry for exactly this reason.
 ##
 ## dstack guest-agent socket: attestd calls the dstack guest agent's
@@ -52,7 +52,7 @@
 
 services:
   gm-miner:
-    image: ${GM_IMAGE_REF:?GM_IMAGE_REF must be set (gm-miner deploy renders this with the pinned image digest)}
+    image: ${GM_IMAGE_REF:?GM_IMAGE_REF must be set (gmcli deploy renders this with the pinned image digest)}
     ports:
       ## Envoy data plane — receives gateway inference traffic, the
       ## registry's `x-gm-provider` capability probes, and the
@@ -77,7 +77,7 @@ services:
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
       ## Active network — `testnet` or `mainnet`. Rendered as a literal
-      ## by `gm-miner deploy` (not an operator env var), so the value is
+      ## by `gmcli deploy` (not an operator env var), so the value is
       ## part of the attestation-measured compose_hash. The image's
       ## `start.sh` maps it to the matching benchmark upstream URL —
       ## both URLs are hardcoded in the image, so a miner cannot point

@@ -9,11 +9,11 @@
 # digest-pinned image refs (`ghcr.io/owner/repo@sha256:...`). It treats the
 # whole `repo@sha256:...` as the repository path and `latest` as the tag,
 # builds a malformed manifest URL, gets a 404, and aborts before the
-# container starts. `gm-miner deploy` always pins images by digest, so it
+# container starts. `gmcli deploy` always pins images by digest, so it
 # always hits this. The block below splits `@`-pinned refs into the bare
 # repo and the `sha256:...` digest and verifies the manifest by digest.
 #
-# `gm-miner deploy` bundles this file (`include_str!`), writes it to the
+# `gmcli deploy` bundles this file (`include_str!`), writes it to the
 # deploy staging dir, and passes it to `phala deploy --pre-launch-script`.
 echo "----------------------------------------------"
 echo "Running Phala Cloud Pre-Launch Script v0.0.14"

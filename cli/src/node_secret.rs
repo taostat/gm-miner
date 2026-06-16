@@ -4,7 +4,7 @@
 //! sets a secret for its node, hands it to the registry at registration,
 //! and bakes it into the container's env where envoy enforces it as the
 //! `x-gm-node-key` header. The secret is generated once on the first
-//! `gm-miner deploy` and persisted in the CLI config so re-deploys reuse
+//! `gmcli deploy` and persisted in the CLI config so re-deploys reuse
 //! the same value.
 
 use std::fmt::Write as _;
@@ -72,7 +72,7 @@ fn os_random_bytes() -> Result<[u8; SECRET_BYTES]> {
 ///
 /// `allow_legacy` enables the pre-multi-worker fallback: when set and no
 /// `WorkerRecord` matches, the network-level [`legacy_node_secret`] is
-/// reused. Only `gm-miner deploy` (worker #1) sets it — that legacy secret
+/// reused. Only `gmcli deploy` (worker #1) sets it — that legacy secret
 /// belongs to worker #1, so a `worker add` must never inherit it.
 ///
 /// [`legacy_node_secret`]: config::NetworkEntry::legacy_node_secret

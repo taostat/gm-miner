@@ -1,4 +1,4 @@
-//! Miner image build + push for `gm-miner deploy`.
+//! Miner image build + push for `gmcli deploy`.
 //!
 //! Phala Cloud pulls the miner image from a public container registry, so
 //! the deploy flow builds the image and pushes it to a registry the
@@ -112,7 +112,7 @@ fn tool_on_path(tool: &str) -> bool {
 pub fn preflight_tools() -> Result<()> {
     if !tool_on_path("docker") {
         bail!(
-            "missing required host tool for `gm-miner deploy`:\n  \
+            "missing required host tool for `gmcli deploy`:\n  \
              - docker: install: https://docs.docker.com/get-docker/"
         );
     }

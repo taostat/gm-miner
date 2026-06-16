@@ -1,4 +1,4 @@
-//! Tests for the `gm-miner worker add/list/remove` wire shapes and the
+//! Tests for the `gmcli worker add/list/remove` wire shapes and the
 //! `RegistryClient` paths they use.
 //!
 //! Covers:
