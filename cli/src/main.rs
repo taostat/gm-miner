@@ -2499,7 +2499,9 @@ async fn cmd_init(explicit_network: Option<Network>, api_url: Option<String>) ->
         return Ok(());
     }
     let cfg = load_config(explicit_network, api_url)?;
-    wizard_declare_products(cfg).await?;
+    if wizard_declare_products(cfg).await? == WizardFlow::Stop {
+        return Ok(());
+    }
 
     println!("\nAll set. Check your miner anytime:");
     println!("  $ gmcli status     # registration + product table");
