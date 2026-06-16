@@ -62,6 +62,24 @@ pub const BTCLI: Dependency = Dependency {
     },
 };
 
+/// `phala` (Phala Cloud CLI) — submits the compose stack to Phala Cloud and
+/// reports the CVM's measured hashes. The runtime dependency of `gmcli deploy`.
+pub const PHALA: Dependency = Dependency {
+    name: "phala",
+    purpose: "the phala CLI submits your miner to Phala Cloud and reports the \
+              CVM's measured hashes that gmcli verifies against the registry",
+    installer: InstallCommand {
+        program: "npm",
+        args: &["install", "-g", "phala"],
+        display: "npm install -g phala",
+    },
+    prereq: Prerequisite {
+        name: "npm",
+        hint: "install Node.js and npm first (https://nodejs.org), \
+               then re-run — or install phala yourself: npm install -g phala",
+    },
+};
+
 /// Whether `tool` resolves to a runnable executable on PATH. Probed by
 /// `tool --version`, the convention every CLI gmcli bridges to supports.
 #[must_use]

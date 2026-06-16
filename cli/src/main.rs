@@ -41,13 +41,13 @@ use gm_miner_cli::{
     btcli::{BtcliBridge, RealBtcli, Registration},
     client::{get_auth_config, RegistryClient},
     config::{self, Config, HotkeyRecord, ProviderKeys, WorkerRecord},
-    dependency::{ensure_dependency, BTCLI},
+    dependency::{ensure_dependency, BTCLI, PHALA},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
         parse_phala_cvm_endpoint, parse_phala_cvm_name, preflight_phala_cli, prepare_deploy_target,
-        resolve_registry_credentials, select_version, to_ratls_passthrough_endpoint, verify_hashes,
-        ImageProvisioner, PhalaClient, DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE,
-        PHALA_ENDPOINT_FIELD,
+        resolve_image_source, resolve_registry_credentials, select_version,
+        to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, PhalaClient,
+        DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE, PHALA_ENDPOINT_FIELD,
     },
     earnings::{render_earnings, resolve_hotkey},
     network::Network,
@@ -304,6 +304,25 @@ enum Command {
         yes: bool,
     },
 
+    /// Guided onboarding: walk a new miner through the whole setup in order.
+    ///
+    /// Runs the lifecycle one step at a time — register your hotkey, log in,
+    /// deploy a worker, set provider keys, declare products — showing the
+    /// exact command for each and asking before it runs. Steps already done
+    /// (a recorded hotkey, a valid login, a deployed worker, set keys) are
+    /// detected and skipped, so a returning miner breezes through.
+    #[command(after_help = "Examples:\n  \
+        gmcli init\n  \
+        gmcli --network testnet init")]
+    Init {
+        /// Run non-interactively: never prompt. Each step runs if its inputs
+        /// are already configured (stored keys, env, flags) and is skipped
+        /// when it would otherwise need a prompt. Useful for a returning
+        /// miner re-checking setup, or a scripted run.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// gm. (prints a small sunrise and a time-of-day greeting)
     #[command(hide = true)]
     Gm,
@@ -332,11 +351,11 @@ enum Command {
 struct DeployFlags {
     /// Pre-built digest-pinned image reference (registry/repo@sha256:...).
     ///
-    /// When set (or `GM_IMAGE_REF` is in env), the local image build is
-    /// skipped and this ref is embedded in the compose file directly.
-    /// When omitted, the miner image is built and pushed to the public
-    /// registry given by `--image-repo` and the resulting digest is
-    /// pinned automatically.
+    /// Overrides the default. When set (or `GM_IMAGE_REF` is in env), this
+    /// ref is embedded in the compose file directly with no build. When
+    /// omitted, `gmcli deploy` defaults to the registry's latest supported
+    /// image — a normal miner deploys the gm-published image and never
+    /// builds. Pass `--image-repo` instead to build and push your own.
     #[arg(long, env = "GM_IMAGE_REF")]
     image_ref: Option<String>,
 
@@ -356,9 +375,10 @@ struct DeployFlags {
     #[arg(long)]
     dist_dir: Option<std::path::PathBuf>,
 
-    /// Public container registry repo to build and push the miner image
-    /// to — Phala Cloud pulls the image from here. Required unless
-    /// `--image-ref` is supplied. Example: `ghcr.io/<owner>/gm-miner`.
+    /// Opt into building the miner image yourself: the public container
+    /// registry repo to build and push to — Phala Cloud pulls the image from
+    /// here. Most miners omit this and deploy the gm-published image. Example:
+    /// `ghcr.io/<owner>/gm-miner`.
     #[arg(long, env = "GM_IMAGE_REPO")]
     image_repo: Option<String>,
 
@@ -389,6 +409,18 @@ struct DeployFlags {
     /// hashes via `phala cvms get --json` (seconds). Default: 300.
     #[arg(long, default_value_t = DEFAULT_BOOT_TIMEOUT_SECS)]
     boot_timeout_secs: u64,
+
+    /// Phala Cloud API key. Overrides the stored key for this run only (not
+    /// persisted). When omitted, gmcli uses `PHALA_API_KEY` /
+    /// `PHALA_CLOUD_API_KEY`, then the key saved in config, then prompts.
+    #[arg(long = "phala-api-key", value_name = "KEY")]
+    phala_api_key: Option<String>,
+
+    /// Skip interactive prompts (the Phala key paste, the `phala` install
+    /// offer) for non-interactive use. A deploy that would need to prompt
+    /// instead prints guidance and exits.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Subcommand)]
@@ -442,6 +474,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             openai,
             google,
         } => cmd_set_api_keys(explicit_network, anthropic, openai, google),
+        Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
         Command::Gm => {
             cmd_gm();
             Ok(())
@@ -460,29 +493,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Command::Worker {
-            command: WorkerCommand::Add { flags },
-        } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let args = deploy_args_from_flags(*flags);
-            cmd_worker_add(cfg, args).await
-        }
-        Command::Worker {
-            command: WorkerCommand::List,
-        } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
-            cmd_worker_list(&mut client).await
-        }
-        Command::Worker {
-            command: WorkerCommand::Remove { worker_id },
-        } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            cmd_worker_remove(cfg, &worker_id).await
-        }
+        Command::Worker { command } => dispatch_worker(command, explicit_network, api_url).await,
         Command::Login { no_browser } => cmd_login(explicit_network, api_url, !no_browser).await,
         Command::Doctor => {
             let cfg = load_config(explicit_network, api_url)?;
@@ -531,6 +542,23 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let mut client = RegistryClient::new(cfg);
             cmd_declare_products(&mut client, provider.as_ref(), discount_bp).await
         }
+    }
+}
+
+/// Route the `worker` subcommands. Each loads config, refreshes the token,
+/// then hands off to the matching `cmd_worker_*`. Split from [`dispatch`] so
+/// the top-level router stays under the line limit.
+async fn dispatch_worker(
+    command: WorkerCommand,
+    explicit_network: Option<Network>,
+    api_url: Option<String>,
+) -> Result<()> {
+    let cfg = load_config(explicit_network, api_url)?;
+    let cfg = ensure_fresh_token(cfg).await?;
+    match command {
+        WorkerCommand::Add { flags } => cmd_worker_add(cfg, deploy_args_from_flags(*flags)).await,
+        WorkerCommand::List => cmd_worker_list(&mut RegistryClient::new(cfg)).await,
+        WorkerCommand::Remove { worker_id } => cmd_worker_remove(cfg, &worker_id).await,
     }
 }
 
@@ -892,6 +920,11 @@ struct DeployArgs {
     repo_root: Option<std::path::PathBuf>,
     version: Option<usize>,
     boot_timeout_secs: u64,
+    /// Phala Cloud API key override (`--phala-api-key`), not persisted.
+    phala_api_key: Option<String>,
+    /// Suppress interactive prompts (`--yes`): the Phala key paste and the
+    /// `phala` install offer.
+    assume_yes: bool,
 }
 
 /// Which registry endpoint records the worker a deploy produces.
@@ -905,6 +938,21 @@ struct DeployArgs {
 enum WorkerRegistration {
     First,
     Add { hotkey: String },
+}
+
+/// A throwaway [`Parser`] used to materialise [`DeployFlags`] with all its
+/// clap defaults applied — the wizard's `deploy` step reuses the exact same
+/// defaults a bare `gmcli deploy` would, with no flags passed.
+#[derive(Parser)]
+struct DeployFlagsDefaults {
+    #[command(flatten)]
+    flags: DeployFlags,
+}
+
+/// Build a [`DeployFlags`] carrying clap's defaults, for the `init` wizard's
+/// `deploy` step (equivalent to a bare `gmcli deploy`).
+fn default_deploy_flags() -> DeployFlags {
+    DeployFlagsDefaults::parse_from(["gmcli deploy"]).flags
 }
 
 /// Resolve a [`DeployArgs`] from parsed CLI flags, computing the staging
@@ -925,6 +973,8 @@ fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
         repo_root: flags.repo_root,
         version: flags.version,
         boot_timeout_secs: flags.boot_timeout_secs,
+        phala_api_key: flags.phala_api_key,
+        assume_yes: flags.yes,
     }
 }
 
@@ -936,13 +986,19 @@ async fn cmd_deploy_subcommand(
     args: DeployArgs,
     registration: WorkerRegistration,
 ) -> Result<()> {
+    // Phala gate: ensure the CLI is installed and resolve+validate the API key
+    // before building the client. The key is scoped onto the `phala`
+    // subprocesses via the client (never the global env), so it never reaches
+    // the `git`/`docker` children of the image build.
+    let phala_api_key = phala_preflight(&args).await?;
     let phala = gm_miner_cli::deploy::RealPhalaClient::new(
         args.app_name.clone(),
         args.project_dir.clone(),
         args.instance_type.clone(),
         args.disk_size.clone(),
         args.os_image.clone(),
-    );
+    )
+    .with_api_key(phala_api_key);
     let mut client = RegistryClient::new(cfg.clone());
     cmd_deploy(&cfg, &mut client, &phala, &args, &registration).await
 }
@@ -1032,15 +1088,17 @@ async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
     cmd_deploy_subcommand(cfg, args, WorkerRegistration::Add { hotkey }).await
 }
 
-/// Real [`ImageProvisioner`]: builds the miner image and pushes it to a
-/// public container registry, returning the digest-pinned ref.
+/// Real [`ImageProvisioner`]: resolves the digest-pinned image ref a deploy
+/// renders into its compose file.
 ///
-/// When `args.image_ref` is supplied the build is skipped entirely and the
-/// pre-built ref is returned as-is. Without it, `--image-repo` must be set:
-/// the image is built with `docker buildx --push` to that public repo
-/// (Phala Cloud pulls from there) and the pushed digest is pinned.
+/// The default (`source` = [`ImageSource::Prebuilt`]) returns the gm-published,
+/// registry-supported ref as-is — a normal miner never builds. The build arm
+/// (`source` = [`ImageSource::Build`]) is the explicit `--image-repo` opt-in:
+/// the image is built with `docker buildx --push` to that public repo (Phala
+/// Cloud pulls from there) and the pushed digest is pinned.
 struct PublicRegistryProvisioner<'a> {
     args: &'a DeployArgs,
+    source: ImageSource,
 }
 
 impl ImageProvisioner for PublicRegistryProvisioner<'_> {
@@ -1049,9 +1107,9 @@ impl ImageProvisioner for PublicRegistryProvisioner<'_> {
 
         let args = self.args;
 
-        if let Some(pre_built) = &args.image_ref {
-            println!("Using pre-built image ref (skipping local build): {pre_built}");
-            return Ok(pre_built.clone());
+        if let ImageSource::Prebuilt { image_ref, .. } = &self.source {
+            println!("Using pre-built image ref (skipping local build): {image_ref}");
+            return Ok(image_ref.clone());
         }
 
         let repo = args.image_repo.as_deref().ok_or_else(|| {
@@ -1215,6 +1273,59 @@ fn existing_worker_id_for(cfg: &Config, app_name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The Phala prerequisite gate, run at the start of every deploy.
+///
+/// Ensures the `phala` CLI is installed (offering to install it), then resolves
+/// the Phala Cloud API key (flag → env → config → interactive paste, persisted)
+/// and validates it — including a credit-balance check — against the Phala
+/// Cloud API. Both run before any irreversible CVM work so a missing CLI, a
+/// bad key, or an empty balance fails fast.
+///
+/// Returns the validated key so the caller can scope it onto the `phala`
+/// subprocesses only (never the global process env, which the `git`/`docker`
+/// children of the image build would inherit). `None` means the operator is
+/// already authenticated via `phala` CLI login — that session is reused and
+/// there is no key to pass.
+async fn phala_preflight(args: &DeployArgs) -> Result<Option<String>> {
+    ensure_dependency(&PHALA, args.assume_yes)?;
+    gm_miner_cli::phala::resolve_key(args.phala_api_key.as_deref(), args.assume_yes).await
+}
+
+/// Resolve the image source (default = the gm-published `supported_image_ref`,
+/// overridden by `--image-ref`, built locally for `--image-repo`), provision
+/// it, and render the compose template around the resulting digest-pinned ref.
+/// Returns the rendered [`DeployTarget`] and whether the image is the
+/// gm-published default (which Phala may pull anonymously — no operator GHCR
+/// pull credentials required).
+fn resolve_and_render_target(
+    cfg: &Config,
+    args: &DeployArgs,
+    supported_image_ref: Option<&str>,
+) -> Result<(gm_miner_cli::deploy::DeployTarget, bool)> {
+    let source = resolve_image_source(
+        args.image_ref.as_deref(),
+        args.image_repo.as_deref(),
+        supported_image_ref,
+    )?;
+    let public_pull = match &source {
+        ImageSource::Prebuilt {
+            image_ref,
+            gm_published,
+        } => {
+            if *gm_published {
+                println!("Deploying the registry-supported image: {image_ref}");
+            }
+            *gm_published
+        }
+        ImageSource::Build => false,
+    };
+    let target = prepare_deploy_target(
+        &PublicRegistryProvisioner { args, source },
+        cfg.active_network(),
+    )?;
+    Ok((target, public_pull))
+}
+
 async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
@@ -1281,10 +1392,9 @@ async fn cmd_deploy(
         )?;
     }
 
-    // Step 1c: preflight that the `phala` CLI is installed. It is the
-    // runtime dependency of the deploy — catch a missing CLI now, with an
-    // install hint, before the multi-minute image build.
-    preflight_phala_cli()?;
+    // The Phala CLI + API-key gate already ran in `cmd_deploy_subcommand`,
+    // which scoped the validated key onto the `phala` client. The `phala`
+    // client passed in here carries it.
 
     // Step 2: auth preflight. The Phala Cloud deploy is slow and
     // irreversible for the operator (CVM created), so we refuse to start
@@ -1306,18 +1416,16 @@ async fn cmd_deploy(
         format_created_at(&approved.created_at),
     );
 
-    // Step 5: prepare the deploy target — build and push the miner image
-    // to the registry (or accept a pre-built `--image-ref`) and render the
-    // compose template with the digest-pinned ref and the active network.
-    let provisioner = PublicRegistryProvisioner { args };
-    let target = prepare_deploy_target(&provisioner, cfg.active_network())?;
+    // Step 5: resolve which image to deploy (default = the gm-published ref
+    // on the selected version) and render the compose around it.
+    let (target, public_pull) =
+        resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
 
-    // Step 5b: resolve private-registry pull credentials. The miner image
-    // lives on a private GHCR repo, so the CVM's pre-launch script needs
-    // `DSTACK_DOCKER_*` env vars to `docker login` and pull. Derived from
-    // the image ref's registry host plus the operator-set
-    // GHCR_PULL_USERNAME / GHCR_PULL_TOKEN env vars.
-    let registry_creds = resolve_registry_credentials(&target.image_ref)?;
+    // Step 5b: resolve private-registry pull credentials. An operator's own
+    // private image needs `DSTACK_DOCKER_*` env vars so the CVM's pre-launch
+    // script can `docker login` and pull; the gm-published default image is
+    // public, so `public_pull` skips the credential requirement.
+    let registry_creds = resolve_registry_credentials(&target.image_ref, public_pull)?;
 
     // Step 6: submit the compose stack to Phala Cloud and poll until the
     // CVM reports its measured hashes. Phala Cloud provisions the TEEPod,
@@ -1554,11 +1662,19 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
         (node_secret, tracked.map(|w| w.app_name.clone()))
     };
     let network = cfg.active_network().to_owned();
+    // Scope the same Phala key deploy would use (env or saved config key) onto
+    // register-image's `phala cvms get`, so a recovery run works off the key
+    // the deploy prompt persisted — not only a separate CLI login / env var.
+    let phala_key = gm_miner_cli::phala::stored_key(cfg.phala_api_key.as_deref());
     let mut client = RegistryClient::new(cfg);
 
+    // register-image is a hidden re-registration path (debug / registry
+    // resync), not the guided deploy: a check-only preflight with an install
+    // hint, never the interactive install offer `deploy` uses via
+    // `ensure_dependency(&PHALA, ...)`.
     preflight_phala_cli()?;
 
-    let out = std::process::Command::new("phala")
+    let out = gm_miner_cli::deploy::phala_command(phala_key.as_deref())
         .args(["cvms", "get", app_id, "--json"])
         .output()
         .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
@@ -2300,6 +2416,372 @@ fn cmd_earnings(cfg: &Config, yes: bool) -> Result<()> {
     Ok(())
 }
 
+// ── init wizard ───────────────────────────────────────────────────────────────
+
+use gm_miner_cli::wizard::{ask_step, prompt_line, StepChoice};
+
+/// Whether the wizard should keep going (`Continue`) or stop here (`Stop`).
+///
+/// A step returns `Stop` only when the miner answered `n` to its prompt; a
+/// `skip` answer and a successful run both `Continue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardFlow {
+    Continue,
+    Stop,
+}
+
+/// Drive a wizard step from a `[Y/n/skip]` prompt: on `Run` evaluate `$body`
+/// (which may `.await`) and continue; on `Skip` continue; on `Stop` stop the
+/// wizard. Collapses the identical three-arm match every step would otherwise
+/// repeat. `$body` is `Result<_>` — the `?` propagates a step failure.
+macro_rules! run_wizard_step {
+    ($title:expr, $command:expr, $assume_yes:expr, $body:expr) => {
+        match ask_step($title, $command, $assume_yes)? {
+            StepChoice::Run => {
+                $body?;
+                Ok(WizardFlow::Continue)
+            }
+            StepChoice::Skip => Ok(WizardFlow::Continue),
+            StepChoice::Stop => Ok(WizardFlow::Stop),
+        }
+    };
+}
+
+/// Whether the active network has a usable (non-expired) login token. A valid
+/// token both lets the login step skip itself and proves the hotkey is already
+/// registered on-chain (the auth-gateway only mints one for a registered
+/// Owner), so the register step can skip too.
+fn has_valid_login(cfg: &Config) -> bool {
+    cfg.active_tokens()
+        .is_some_and(|t| t.access_token.is_some() && !t.is_expired_or_near())
+}
+
+/// Whether the register-hotkey step is already satisfied: a hotkey is recorded
+/// locally, or a valid login proves on-chain registration.
+fn hotkey_step_done(cfg: &Config) -> bool {
+    cfg.registered_hotkey().is_some() || has_valid_login(cfg)
+}
+
+/// Whether the active network has a *registered* worker — one the registry
+/// assigned a `worker_id`. A provisional stub (empty `worker_id`, written
+/// before registration by a deploy that then failed) does not count: its CVM
+/// may never have come up, so the wizard must still offer the deploy step.
+fn has_deployed_worker(cfg: &Config) -> bool {
+    cfg.active_network_entry()
+        .is_some_and(|e| e.workers.iter().any(|w| !w.worker_id.is_empty()))
+}
+
+/// Whether any provider key is already set.
+fn provider_keys_done(cfg: &Config) -> bool {
+    cfg.provider_keys
+        .as_ref()
+        .is_some_and(ProviderKeys::any_set)
+}
+
+/// `gmcli init` — guided onboarding through the full miner lifecycle.
+///
+/// Walks the steps in dependency order (register-hotkey precedes login because
+/// the auth-gateway only mints a token for an on-chain-registered Owner), each
+/// gated on a `[Y/n/skip]` prompt and detect-and-skipped when already done.
+/// Config is reloaded between steps because each underlying command persists to
+/// disk; the wizard is a pure orchestrator over the existing `cmd_*` functions.
+async fn cmd_init(
+    explicit_network: Option<Network>,
+    api_url: Option<String>,
+    assume_yes: bool,
+) -> Result<()> {
+    let cfg = load_config(explicit_network, api_url.clone())?;
+    let network = cfg.resolved_network();
+    println!(
+        "gmcli init — onboarding for {network} (netuid {})",
+        network.netuid()
+    );
+    if assume_yes {
+        println!(
+            "Running non-interactively (--yes): steps run when already configured, else skip."
+        );
+    } else {
+        println!("Each step shows its command and asks before running. Press Enter to run, `n` to stop, `skip` to skip.");
+    }
+
+    // Provider keys precede deploy: `cmd_deploy` refuses to start without at
+    // least one key (it bakes them into the CVM env), so the wizard must
+    // collect them first or the deploy step would fail before doing anything.
+    if wizard_register_hotkey(&cfg, assume_yes)? == WizardFlow::Stop {
+        return Ok(());
+    }
+    if wizard_login(explicit_network, api_url.clone(), assume_yes).await? == WizardFlow::Stop {
+        return Ok(());
+    }
+    let cfg = load_config(explicit_network, api_url.clone())?;
+    if wizard_provider_keys(explicit_network, &cfg, assume_yes)? == WizardFlow::Stop {
+        return Ok(());
+    }
+    let cfg = load_config(explicit_network, api_url.clone())?;
+    if wizard_deploy(cfg, assume_yes).await? == WizardFlow::Stop {
+        return Ok(());
+    }
+    let cfg = load_config(explicit_network, api_url)?;
+    if wizard_declare_products(cfg, assume_yes).await? == WizardFlow::Stop {
+        return Ok(());
+    }
+
+    println!("\nAll set. Check your miner anytime:");
+    println!("  $ gmcli status     # registration + product table");
+    println!("  $ gmcli earnings   # on-chain emission");
+    Ok(())
+}
+
+/// Wizard step 1: register the serving hotkey.
+///
+/// Skipped when a hotkey is already recorded locally or a valid login token
+/// exists (the token proves on-chain registration). Otherwise the miner is
+/// asked whether they already registered a hotkey elsewhere — if so the step
+/// is skipped (login handles it); if not, the assisted/bring-your-own
+/// `register-hotkey` runs with prompted inputs.
+fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> {
+    let title = "Step 1/5 · register hotkey";
+    if hotkey_step_done(cfg) {
+        let detail = cfg.registered_hotkey().map_or_else(
+            || "logged in (hotkey already registered)".to_owned(),
+            |record| format!("hotkey {} recorded", record.ss58),
+        );
+        gm_miner_cli::wizard::already_done(title, &detail);
+        return Ok(WizardFlow::Continue);
+    }
+
+    let network = cfg.resolved_network();
+    if registered_elsewhere(network, assume_yes)? {
+        println!("  Skipping registration — login will use your existing hotkey.");
+        return Ok(WizardFlow::Continue);
+    }
+
+    // No recorded hotkey and nothing to go on non-interactively — register
+    // needs the operator's wallet/hotkey or ss58, which only a prompt supplies.
+    let Some((ss58, wallet, hotkey)) = prompt_register_inputs(assume_yes)? else {
+        gm_miner_cli::wizard::already_done(
+            title,
+            "skipped (no input) — run `gmcli register-hotkey` when ready",
+        );
+        return Ok(WizardFlow::Continue);
+    };
+    let command = describe_register_command(ss58.as_deref(), wallet.as_deref(), hotkey.as_deref());
+    run_wizard_step!(
+        title,
+        &command,
+        assume_yes,
+        cmd_register_hotkey(cfg.clone(), ss58, wallet, hotkey, assume_yes)
+    )
+}
+
+/// Ask whether the miner already has a hotkey registered on `network`.
+/// `assume_yes` and a non-TTY answer "no" so a scripted `init` falls through
+/// to the register step (which then skips when it has no inputs).
+fn registered_elsewhere(network: Network, assume_yes: bool) -> Result<bool> {
+    gm_miner_cli::dependency::confirm(
+        &format!(
+            "Already have a hotkey registered on subnet {} (e.g. a browser wallet)?",
+            network.netuid()
+        ),
+        false,
+        assume_yes,
+    )
+}
+
+/// The inputs `register-hotkey` accepts: `(ss58, wallet, hotkey)` — a
+/// bring-your-own ss58, or a btcli wallet/hotkey pair for the assisted flow.
+type RegisterInputs = (Option<String>, Option<String>, Option<String>);
+
+/// Collect the inputs `register-hotkey` needs. Returns `None` when no input is
+/// available (non-interactive run, or a blank wallet answer) so the caller
+/// skips the step rather than registering blind.
+fn prompt_register_inputs(assume_yes: bool) -> Result<Option<RegisterInputs>> {
+    let ss58 = prompt_line(
+        "ss58 of a hotkey you registered elsewhere (blank to register a fresh one):",
+        assume_yes,
+    )?;
+    if ss58.is_some() {
+        return Ok(Some((ss58, None, None)));
+    }
+    let Some(wallet) = prompt_line("btcli wallet (coldkey) name:", assume_yes)? else {
+        return Ok(None);
+    };
+    let hotkey = prompt_line("btcli hotkey name:", assume_yes)?;
+    Ok(Some((None, Some(wallet), hotkey)))
+}
+
+/// Render the `register-hotkey` command the wizard will run, for display.
+fn describe_register_command(
+    ss58: Option<&str>,
+    wallet: Option<&str>,
+    hotkey: Option<&str>,
+) -> String {
+    if let Some(ss58) = ss58 {
+        return format!("gmcli register-hotkey --hotkey-ss58 {ss58}");
+    }
+    let wallet = wallet.unwrap_or("<wallet>");
+    let hotkey = hotkey.unwrap_or("<hotkey>");
+    format!("gmcli register-hotkey --wallet {wallet} --hotkey {hotkey}")
+}
+
+/// Wizard step 2: log in. Skipped when a non-expired token already exists.
+async fn wizard_login(
+    explicit_network: Option<Network>,
+    api_url: Option<String>,
+    assume_yes: bool,
+) -> Result<WizardFlow> {
+    let title = "Step 2/5 · login";
+    let cfg = load_config(explicit_network, api_url.clone())?;
+    if has_valid_login(&cfg) {
+        gm_miner_cli::wizard::already_done(title, "a valid login token is stored");
+        return Ok(WizardFlow::Continue);
+    }
+    // Login is a browser device-code flow — it cannot run unattended, so a
+    // non-interactive run skips it with guidance rather than hanging.
+    if assume_yes {
+        gm_miner_cli::wizard::already_done(title, "skipped — run `gmcli login` interactively");
+        return Ok(WizardFlow::Continue);
+    }
+    run_wizard_step!(
+        title,
+        "gmcli login",
+        assume_yes,
+        cmd_login(explicit_network, api_url, true).await
+    )
+}
+
+/// Wizard step 4: deploy worker #1. This step is worker #1 onboarding only —
+/// `gmcli deploy` registers `WorkerRegistration::First`. A miner who already
+/// has a registered worker has finished onboarding, so the step is skipped
+/// with a pointer to `gmcli worker add` (the correct command for more
+/// capacity); the wizard never re-runs `deploy` over a registered worker #1,
+/// which would replace its registry endpoint.
+async fn wizard_deploy(cfg: Config, assume_yes: bool) -> Result<WizardFlow> {
+    let title = "Step 4/5 · deploy worker";
+    if has_deployed_worker(&cfg) {
+        gm_miner_cli::wizard::already_done(
+            title,
+            "worker #1 is already deployed (add more with `gmcli worker add`)",
+        );
+        return Ok(WizardFlow::Continue);
+    }
+    // `cmd_deploy` refuses without a provider key (it bakes them into the CVM
+    // env). If the keys step was skipped, a deploy would fail immediately —
+    // skip it here with guidance rather than running a doomed command.
+    if !provider_keys_done(&cfg) {
+        gm_miner_cli::wizard::already_done(
+            title,
+            "skipped — deploy needs a provider key first (`gmcli set-api-keys`)",
+        );
+        return Ok(WizardFlow::Continue);
+    }
+    let mut flags = default_deploy_flags();
+    flags.yes = assume_yes;
+    let args = deploy_args_from_flags(flags);
+    run_wizard_step!(
+        title,
+        "gmcli deploy",
+        assume_yes,
+        cmd_deploy_subcommand(cfg, args, WorkerRegistration::First).await
+    )
+}
+
+/// Wizard step 3: set provider keys. Skipped when any key is already set.
+fn wizard_provider_keys(
+    explicit_network: Option<Network>,
+    cfg: &Config,
+    assume_yes: bool,
+) -> Result<WizardFlow> {
+    let title = "Step 3/5 · provider keys";
+    if provider_keys_done(cfg) {
+        gm_miner_cli::wizard::already_done(title, "provider keys already set");
+        return Ok(WizardFlow::Continue);
+    }
+    let (anthropic, openai, google) = prompt_provider_keys(assume_yes)?;
+    if anthropic.is_none() && openai.is_none() && google.is_none() {
+        println!("  No keys entered — skipping. Set them later with `gmcli set-api-keys`.");
+        return Ok(WizardFlow::Continue);
+    }
+    let command = describe_keys_command(anthropic.as_deref(), openai.as_deref(), google.as_deref());
+    run_wizard_step!(
+        title,
+        &command,
+        assume_yes,
+        cmd_set_api_keys(explicit_network, anthropic, openai, google)
+    )
+}
+
+/// Prompt for each provider key in turn (blank to skip a provider).
+fn prompt_provider_keys(
+    assume_yes: bool,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let anthropic = prompt_line("Anthropic API key (blank to skip):", assume_yes)?;
+    let openai = prompt_line("OpenAI API key (blank to skip):", assume_yes)?;
+    let google = prompt_line("Google API key (blank to skip):", assume_yes)?;
+    Ok((anthropic, openai, google))
+}
+
+/// Render the `set-api-keys` command for display, naming only the providers
+/// the miner supplied (never echoing the secret values).
+fn describe_keys_command(
+    anthropic: Option<&str>,
+    openai: Option<&str>,
+    google: Option<&str>,
+) -> String {
+    let mut cmd = String::from("gmcli set-api-keys");
+    if anthropic.is_some() {
+        cmd.push_str(" --anthropic <key>");
+    }
+    if openai.is_some() {
+        cmd.push_str(" --openai <key>");
+    }
+    if google.is_some() {
+        cmd.push_str(" --google <key>");
+    }
+    cmd
+}
+
+/// Wizard step 5: declare products across the catalog at one discount.
+async fn wizard_declare_products(cfg: Config, assume_yes: bool) -> Result<WizardFlow> {
+    let title = "Step 5/5 · declare products";
+    let Some(discount_bp) = prompt_discount(assume_yes)? else {
+        println!("  No discount entered — skipping. Declare later with `gmcli declare-products --discount-pct <pct>`.");
+        return Ok(WizardFlow::Continue);
+    };
+    let pct = format_discount_pct(discount_bp);
+    let command = format!("gmcli declare-products --discount-pct {pct}");
+    run_wizard_step!(
+        title,
+        &command,
+        assume_yes,
+        declare_all_products(cfg, discount_bp).await
+    )
+}
+
+/// Refresh the token, then fan the discount across the catalog. The token
+/// refresh is folded in here (the wizard's other steps go through `dispatch`,
+/// which refreshes before the command; the declare step calls the command
+/// directly, so it does its own refresh).
+async fn declare_all_products(cfg: Config, discount_bp: u32) -> Result<()> {
+    let mut client = RegistryClient::new(ensure_fresh_token(cfg).await?);
+    cmd_declare_products(&mut client, None, discount_bp).await
+}
+
+/// Prompt for the catalog-wide discount percent, parsed into basis points.
+/// A blank answer (or a non-TTY / `--yes`) returns `None` so the step skips.
+fn prompt_discount(assume_yes: bool) -> Result<Option<u32>> {
+    let Some(raw) = prompt_line(
+        "Percent off retail to offer on every product (e.g. 5):",
+        assume_yes,
+    )?
+    else {
+        return Ok(None);
+    };
+    parse_discount_pct(&raw)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 /// `gmcli doctor` — a preflight checklist run before deploying.
 ///
 /// Each check renders green/red with an actionable fix. The hotkey-
@@ -2326,7 +2808,7 @@ async fn cmd_doctor(cfg: Config) -> Result<()> {
         login_check(&cfg),
         provider_keys_check(&cfg),
         phala_cli_check(),
-        phala_api_key_check(),
+        phala_api_key_check(&cfg),
     ];
     checks.push(hotkey_check(cfg).await);
 
@@ -2414,26 +2896,17 @@ fn phala_cli_check() -> Check {
     }
 }
 
-fn phala_api_key_check() -> Check {
-    if std::env::var("PHALA_CLOUD_API_KEY").is_ok_and(|v| !v.trim().is_empty()) {
-        return Check::pass("Phala Cloud API key (PHALA_CLOUD_API_KEY)", String::new());
-    }
-    // No env var — fall back to whether `phala` already holds a stored auth.
-    // `phala whoami` exits non-zero when not authenticated (unlike `status`,
-    // which reports state but still exits 0).
-    let phala_logged_in = std::process::Command::new("phala")
-        .arg("whoami")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if phala_logged_in {
-        Check::pass("Phala Cloud auth (via `phala` CLI)", String::new())
-    } else {
-        Check::fail(
+fn phala_api_key_check(cfg: &Config) -> Check {
+    // Accept exactly the sources `deploy` resolves a Phala credential from
+    // (env var, saved gmcli config key, or an existing `phala` CLI session),
+    // so doctor never reports a deploy that can authenticate as not ready.
+    match gm_miner_cli::phala::credential_source(cfg.phala_api_key.as_deref()) {
+        Some(source) => Check::pass(format!("Phala Cloud credential ({source})"), String::new()),
+        None => Check::fail(
             "Phala Cloud API key",
-            "set PHALA_CLOUD_API_KEY or run `phala auth login` (or `phala login`)",
-        )
+            "no Phala credential — set PHALA_API_KEY, run `phala auth login`, \
+             or paste a key when `gmcli deploy` prompts (it is then saved)",
+        ),
     }
 }
 
@@ -2670,6 +3143,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -2683,6 +3157,8 @@ mod tests {
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
+            phala_api_key: None,
+            assume_yes: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -2717,6 +3193,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
 
         // --app-name gm-miner-1 already exists; the guard must bail before
@@ -2734,6 +3211,8 @@ mod tests {
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
+            phala_api_key: None,
+            assume_yes: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -2781,6 +3260,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -2794,6 +3274,8 @@ mod tests {
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
+            phala_api_key: None,
+            assume_yes: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -2834,6 +3316,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-1".to_owned(),
@@ -2847,6 +3330,8 @@ mod tests {
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
+            phala_api_key: None,
+            assume_yes: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -2884,6 +3369,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
@@ -2897,6 +3383,8 @@ mod tests {
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
+            phala_api_key: None,
+            assume_yes: false,
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -2932,6 +3420,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
         // A redeploy of a registered worker carries its worker_id, so a
         // mid-deploy failure can't erase it.
@@ -2987,6 +3476,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
 
         // --app-name gm-miner-2 is a secondary worker; a plain `deploy`
@@ -3004,6 +3494,8 @@ mod tests {
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
+            phala_api_key: None,
+            assume_yes: false,
         };
 
         let mut client = RegistryClient::new(cfg.clone());
@@ -3058,6 +3550,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
 
         reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-1b")
@@ -3100,6 +3593,7 @@ mod tests {
             networks,
             active_network: Some("testnet".to_owned()),
             provider_keys: None,
+            phala_api_key: None,
         };
 
         let err = reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-2")
@@ -3496,5 +3990,129 @@ mod tests {
             "5Grw"
         ])
         .is_err());
+    }
+
+    // ── init wizard: detect-and-skip predicates ───────────────────────────────
+
+    mod wizard {
+        use super::super::{
+            has_deployed_worker, has_valid_login, hotkey_step_done, provider_keys_done,
+        };
+        use gm_miner_cli::config::{
+            Config, HotkeyRecord, NetworkEntry, ProviderKeys, TokenEntry, WorkerRecord,
+        };
+        use std::collections::HashMap;
+
+        /// A config for `testnet` carrying the given network entry.
+        fn cfg_with(entry: NetworkEntry) -> Config {
+            let mut networks = HashMap::new();
+            networks.insert("testnet".to_owned(), entry);
+            Config {
+                networks,
+                active_network: Some("testnet".to_owned()),
+                provider_keys: None,
+                phala_api_key: None,
+            }
+        }
+
+        /// A non-expired token (expiry far in the future).
+        fn fresh_token() -> TokenEntry {
+            TokenEntry {
+                access_token: Some("tok".to_owned()),
+                token_expires_at: Some("2999-01-01T00:00:00Z".to_owned()),
+                refresh_token: None,
+            }
+        }
+
+        #[test]
+        fn login_skipped_only_with_a_fresh_token() {
+            assert!(
+                !has_valid_login(&Config::default()),
+                "no token → must log in"
+            );
+            let expired = cfg_with(NetworkEntry {
+                tokens: Some(TokenEntry {
+                    access_token: Some("tok".to_owned()),
+                    token_expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
+                    refresh_token: None,
+                }),
+                ..Default::default()
+            });
+            assert!(!has_valid_login(&expired), "expired token → must log in");
+            let fresh = cfg_with(NetworkEntry {
+                tokens: Some(fresh_token()),
+                ..Default::default()
+            });
+            assert!(has_valid_login(&fresh), "fresh token → login step skipped");
+        }
+
+        #[test]
+        fn register_skipped_when_recorded_or_logged_in() {
+            assert!(
+                !hotkey_step_done(&Config::default()),
+                "no hotkey, no login → register step runs"
+            );
+            // A recorded hotkey skips register even without a login.
+            let recorded = cfg_with(NetworkEntry {
+                registered_hotkey: Some(HotkeyRecord {
+                    ss58: "5Test".to_owned(),
+                    name: None,
+                    verified: false,
+                }),
+                ..Default::default()
+            });
+            assert!(hotkey_step_done(&recorded));
+            // A valid login alone proves on-chain registration.
+            let logged_in = cfg_with(NetworkEntry {
+                tokens: Some(fresh_token()),
+                ..Default::default()
+            });
+            assert!(hotkey_step_done(&logged_in));
+        }
+
+        #[test]
+        fn deploy_skip_offered_only_with_a_tracked_worker() {
+            assert!(
+                !has_deployed_worker(&Config::default()),
+                "no workers → deploy step runs"
+            );
+            let deployed = cfg_with(NetworkEntry {
+                workers: vec![WorkerRecord {
+                    worker_id: "01J0A".to_owned(),
+                    app_id: "app_01J0A".to_owned(),
+                    app_name: "gm-miner-1".to_owned(),
+                    node_secret: "s".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            assert!(has_deployed_worker(&deployed));
+        }
+
+        /// A config with `provider_keys.anthropic` set to `value`.
+        fn cfg_with_anthropic(value: &str) -> Config {
+            Config {
+                provider_keys: Some(ProviderKeys {
+                    anthropic: Some(value.to_owned()),
+                    openai: None,
+                    google: None,
+                }),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn provider_keys_skipped_when_any_set() {
+            assert!(
+                !provider_keys_done(&Config::default()),
+                "no keys → set-api-keys step runs"
+            );
+            assert!(provider_keys_done(&cfg_with_anthropic("sk-ant")));
+            // A blank key does not count as set.
+            assert!(
+                !provider_keys_done(&cfg_with_anthropic("   ")),
+                "whitespace key is not set"
+            );
+        }
     }
 }

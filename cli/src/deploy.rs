@@ -56,6 +56,15 @@ pub struct ImageVersion {
     pub status: String,
     pub notes: Option<String>,
     pub created_at: String,
+    /// Digest-pinned, directly-pullable reference of the gm-published miner
+    /// image whose compose renders to `compose_hash`, e.g.
+    /// `ghcr.io/taostat/gm-miner@sha256:...`. `gmcli deploy` defaults to this
+    /// so a normal miner deploys the gm-supported image rather than building
+    /// one. Optional because the field post-dates the earliest rows; an entry
+    /// without it cannot be deployed by digest, so the default path fails with
+    /// guidance toward `--image-ref` / `--image-repo`.
+    #[serde(default)]
+    pub image_ref: Option<String>,
 }
 
 /// Response body from `GET /image-versions?status=supported`.
@@ -230,18 +239,27 @@ pub fn registry_host(image_ref: &str) -> String {
 
 /// Resolve private-registry pull credentials for `image_ref`.
 ///
-/// Returns `Ok(None)` when the image lives on Docker Hub (`docker.io`),
-/// which is treated as public — no credentials are wired. For any other
-/// registry host the miner image is assumed private, so the operator-set
-/// `GHCR_PULL_USERNAME` / `GHCR_PULL_TOKEN` environment variables are
-/// required.
+/// Returns `Ok(None)` when no credentials are needed — the image is on Docker
+/// Hub (`docker.io`, public), or `public_pull` is set (the gm-published
+/// supported image, which is published for anonymous pull). For any other
+/// registry host with `public_pull == false` the miner image is assumed
+/// private, so the operator-set `GHCR_PULL_USERNAME` / `GHCR_PULL_TOKEN`
+/// environment variables are required.
+///
+/// `public_pull` is true only for the flag-less default deploy of the
+/// gm-published image; an operator's own `--image-ref` keeps the
+/// credentials-required behaviour since it may point at a private repo.
 ///
 /// # Errors
-/// Returns an actionable error if the image is on a private registry and
-/// either credential environment variable is unset or empty.
-pub fn resolve_registry_credentials(image_ref: &str) -> Result<Option<RegistryCredentials>> {
+/// Returns an actionable error if the image is on a private registry,
+/// `public_pull` is false, and either credential environment variable is
+/// unset or empty.
+pub fn resolve_registry_credentials(
+    image_ref: &str,
+    public_pull: bool,
+) -> Result<Option<RegistryCredentials>> {
     let registry = registry_host(image_ref);
-    if registry == "docker.io" {
+    if registry == "docker.io" || public_pull {
         return Ok(None);
     }
 
@@ -265,7 +283,8 @@ pub fn resolve_registry_credentials(image_ref: &str) -> Result<Option<RegistryCr
 
 /// Read an environment variable, returning `None` when it is unset or
 /// whitespace-only.
-fn non_empty_env(name: &str) -> Option<String> {
+#[must_use]
+pub fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -285,6 +304,12 @@ pub struct RealPhalaClient {
     /// Production OS image for the CVM (`phala deploy --image`). Must match
     /// the dstack version of the Phala node the CVM lands on.
     pub os_image: String,
+    /// The Phala Cloud API key, applied as `PHALA_CLOUD_API_KEY` on the
+    /// `phala` subprocesses only — never the global process environment — so
+    /// the secret never leaks to the `git`/`docker` children of the image
+    /// build. `None` when the operator authenticates via `phala` CLI login,
+    /// which the subprocess inherits anyway.
+    pub api_key: Option<String>,
 }
 
 impl RealPhalaClient {
@@ -303,8 +328,28 @@ impl RealPhalaClient {
             instance_type: instance_type.into(),
             disk_size: disk_size.into(),
             os_image: os_image.into(),
+            api_key: None,
         }
     }
+
+    /// Set the Phala Cloud API key to scope onto the `phala` subprocesses.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
+    }
+}
+
+/// Build a `phala` command with the API key scoped onto it (via `.env`),
+/// never the global process environment — so the secret reaches only the
+/// `phala` CLI, not the `git`/`docker` subprocesses of the image build.
+#[must_use]
+pub fn phala_command(api_key: Option<&str>) -> std::process::Command {
+    let mut cmd = std::process::Command::new("phala");
+    if let Some(key) = api_key {
+        cmd.env("PHALA_CLOUD_API_KEY", key);
+    }
+    cmd
 }
 
 /// The CVM detail document returned by `phala cvms get <cvm-id> --json`.
@@ -594,8 +639,8 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
 /// # Errors
 /// Returns an error only if `phala` cannot be spawned, or it exits
 /// successfully but emits output that is not valid `cvms get --json` JSON.
-fn read_phala_cvm_outcome(cvm_id: &str) -> Result<Option<DeployOutcome>> {
-    let out = std::process::Command::new("phala")
+fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<DeployOutcome>> {
+    let out = phala_command(api_key)
         .args(["cvms", "get", cvm_id, "--json"])
         .output()
         .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
@@ -673,7 +718,7 @@ impl PhalaClient for RealPhalaClient {
             prelaunch_path: &prelaunch_arg,
         });
 
-        let out = std::process::Command::new("phala")
+        let out = phala_command(self.api_key.as_deref())
             .args(&args)
             .output()
             .context("run phala deploy — is the phala CLI installed? (npm i -g phala)")?;
@@ -694,7 +739,7 @@ impl PhalaClient for RealPhalaClient {
             self.app_name
         );
 
-        poll_phala_cvm_outcome(&self.app_name, boot_timeout_secs)
+        poll_phala_cvm_outcome(&self.app_name, self.api_key.as_deref(), boot_timeout_secs)
     }
 }
 
@@ -708,7 +753,11 @@ impl PhalaClient for RealPhalaClient {
 /// # Errors
 /// Returns an error if `phala` cannot be spawned, emits unparseable JSON,
 /// or the outcome never appears before `timeout_secs` elapses.
-fn poll_phala_cvm_outcome(cvm_id: &str, timeout_secs: u64) -> Result<DeployOutcome> {
+fn poll_phala_cvm_outcome(
+    cvm_id: &str,
+    api_key: Option<&str>,
+    timeout_secs: u64,
+) -> Result<DeployOutcome> {
     use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -717,7 +766,7 @@ fn poll_phala_cvm_outcome(cvm_id: &str, timeout_secs: u64) -> Result<DeployOutco
 
     loop {
         attempt += 1;
-        if let Some(outcome) = read_phala_cvm_outcome(cvm_id)? {
+        if let Some(outcome) = read_phala_cvm_outcome(cvm_id, api_key)? {
             return Ok(outcome);
         }
 
@@ -852,13 +901,9 @@ fn write_env_file(
 /// Returns an error if the registry returns 404 (endpoint not yet deployed),
 /// any other non-2xx status, or the response body cannot be parsed.
 pub async fn fetch_supported_versions(registry_url: &str) -> Result<Vec<ImageVersion>> {
-    // Build a one-shot client with a 30 s timeout — same as RegistryClient —
-    // rather than using bare `reqwest::get()` which has no timeout.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("build reqwest client for /image-versions")?;
+    // A one-shot client (30 s timeout, gmcli user-agent) — same shape as
+    // RegistryClient — rather than bare `reqwest::get()` which has no timeout.
+    let client = crate::client::build_http_client()?;
 
     let url = format!("{registry_url}/image-versions?status=supported");
     let resp = client
@@ -924,6 +969,73 @@ pub fn select_version(versions: &[ImageVersion], pin: Option<usize>) -> Result<&
             Ok(&versions[n - 1])
         }
     }
+}
+
+// ── Default image-ref resolution ──────────────────────────────────────────────
+
+/// How `gmcli deploy` resolves the miner image to deploy, in priority order.
+///
+/// A normal miner deploys the gm-published, registry-supported image — they
+/// never build. The two non-default arms exist only as explicit opt-ins:
+/// `--image-ref` pins a specific pre-built digest, and `--image-repo` requests
+/// a local build+push (the legacy path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSource {
+    /// Use this digest-pinned ref verbatim — no build.
+    Prebuilt {
+        /// The digest-pinned ref to embed in the compose file.
+        image_ref: String,
+        /// True when this is the registry-supported, gm-published image (the
+        /// flag-less default). That image is published for public pull, so a
+        /// deploy of it must not demand operator GHCR pull credentials. False
+        /// for an operator's own `--image-ref`, which may be on a private repo.
+        gm_published: bool,
+    },
+    /// Build the miner image locally and push it to this public repo, then
+    /// pin the pushed digest. Requested explicitly via `--image-repo`.
+    Build,
+}
+
+/// Resolve which image a deploy should use from the operator's flags and the
+/// registry-selected supported version.
+///
+/// Precedence:
+///   1. `--image-ref` (explicit pre-built digest) — always wins.
+///   2. `--image-repo` (explicit local build opt-in) — build + push.
+///   3. The registry-supported version's `image_ref` — the default, so a
+///      normal miner deploys the gm-published image without building.
+///
+/// # Errors
+/// Returns an error when neither flag is set and the supported version carries
+/// no `image_ref` — there is then no image to deploy, and the message points
+/// at `--image-ref` / `--image-repo`.
+pub fn resolve_image_source(
+    image_ref_flag: Option<&str>,
+    image_repo_flag: Option<&str>,
+    supported_image_ref: Option<&str>,
+) -> Result<ImageSource> {
+    if let Some(explicit) = image_ref_flag {
+        return Ok(ImageSource::Prebuilt {
+            image_ref: explicit.to_owned(),
+            gm_published: false,
+        });
+    }
+    if image_repo_flag.is_some() {
+        return Ok(ImageSource::Build);
+    }
+    if let Some(supported) = supported_image_ref {
+        return Ok(ImageSource::Prebuilt {
+            image_ref: supported.to_owned(),
+            gm_published: true,
+        });
+    }
+    bail!(
+        "the registry's supported image version has no pullable image_ref, so \
+         there is no gm-published image to deploy by default.\n  \
+         pass --image-ref <registry/repo@sha256:...> to deploy a specific \
+         pre-built image, or --image-repo <registry/owner/gm-miner> to build \
+         and push one yourself"
+    )
 }
 
 // ── Compose template rendering ────────────────────────────────────────────────
@@ -1123,6 +1235,8 @@ pub struct ImageVersionOut {
     pub status: String,
     pub notes: Option<String>,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
 }
 
 #[cfg(test)]
@@ -1141,7 +1255,69 @@ mod tests {
             status: "supported".to_owned(),
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
+            image_ref: None,
         }
+    }
+
+    // ── default image-ref resolution ──────────────────────────────────────────
+
+    /// With no flags, the registry-supported version's `image_ref` is the
+    /// default — a normal miner deploys the gm-published image, never building.
+    #[test]
+    fn resolve_image_source_defaults_to_supported_ref() {
+        let source = resolve_image_source(None, None, Some("ghcr.io/taostat/gm-miner@sha256:abc"))
+            .expect("supported ref must resolve");
+        assert_eq!(
+            source,
+            ImageSource::Prebuilt {
+                image_ref: "ghcr.io/taostat/gm-miner@sha256:abc".to_owned(),
+                gm_published: true,
+            },
+            "the supported default is marked gm_published (public pull)"
+        );
+    }
+
+    /// `--image-ref` wins over both the supported default and `--image-repo`.
+    #[test]
+    fn resolve_image_source_image_ref_flag_overrides() {
+        let source = resolve_image_source(
+            Some("ghcr.io/me/gm-miner@sha256:def"),
+            Some("ghcr.io/me/gm-miner"),
+            Some("ghcr.io/taostat/gm-miner@sha256:abc"),
+        )
+        .expect("explicit ref must resolve");
+        assert_eq!(
+            source,
+            ImageSource::Prebuilt {
+                image_ref: "ghcr.io/me/gm-miner@sha256:def".to_owned(),
+                gm_published: false,
+            },
+            "an explicit --image-ref is not the gm-published default"
+        );
+    }
+
+    /// `--image-repo` (without `--image-ref`) opts into a local build even when
+    /// a supported ref exists.
+    #[test]
+    fn resolve_image_source_image_repo_opts_into_build() {
+        let source = resolve_image_source(
+            None,
+            Some("ghcr.io/me/gm-miner"),
+            Some("ghcr.io/taostat/gm-miner@sha256:abc"),
+        )
+        .expect("build opt-in must resolve");
+        assert_eq!(source, ImageSource::Build);
+    }
+
+    /// No flags and no supported `image_ref` is an error — there is nothing to
+    /// deploy — and the message points at both escape hatches.
+    #[test]
+    fn resolve_image_source_errors_when_no_ref_available() {
+        let err = resolve_image_source(None, None, None)
+            .expect_err("missing image must abort the default path");
+        let msg = err.to_string();
+        assert!(msg.contains("--image-ref"), "got: {msg}");
+        assert!(msg.contains("--image-repo"), "got: {msg}");
     }
 
     #[test]
@@ -1325,6 +1501,42 @@ mod tests {
         assert!(select_version(&versions, Some(0)).is_err());
     }
 
+    // ── phala API-key scoping ─────────────────────────────────────────────────
+
+    /// The key must be scoped onto the `phala` subprocess via `.env` (so it
+    /// never leaks to the `git`/`docker` children of the image build), and
+    /// omitted entirely when there is none (CLI-session auth).
+    #[test]
+    fn phala_command_scopes_the_api_key_onto_the_subprocess() {
+        let cmd = phala_command(Some("secret-key"));
+        let scoped: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| *k == std::ffi::OsStr::new("PHALA_CLOUD_API_KEY"))
+            .collect();
+        assert_eq!(scoped.len(), 1, "the key must be set on the command env");
+        assert_eq!(
+            scoped[0].1,
+            Some(std::ffi::OsStr::new("secret-key")),
+            "the scoped value must be the resolved key"
+        );
+
+        let no_key = phala_command(None);
+        assert!(
+            no_key
+                .get_envs()
+                .all(|(k, _)| k != std::ffi::OsStr::new("PHALA_CLOUD_API_KEY")),
+            "no key means nothing is added to the command env"
+        );
+    }
+
+    /// `with_api_key` records the key the client scopes onto its subprocesses.
+    #[test]
+    fn with_api_key_sets_the_field() {
+        let client = RealPhalaClient::new("gm-miner-1", "/tmp/d".into(), "t", "40G", "os")
+            .with_api_key(Some("k".to_owned()));
+        assert_eq!(client.api_key.as_deref(), Some("k"));
+    }
+
     // ── phala deploy argument wiring ──────────────────────────────────────────
 
     fn deploy_args() -> PhalaDeployArgs<'static> {
@@ -1419,9 +1631,36 @@ mod tests {
     /// credentials are required or returned.
     #[test]
     fn resolve_registry_credentials_skips_docker_hub() {
-        let creds = resolve_registry_credentials("library/alpine:3")
+        let creds = resolve_registry_credentials("library/alpine:3", false)
             .expect("docker hub must not require creds");
         assert!(creds.is_none(), "docker hub is public — no creds");
+    }
+
+    /// The gm-published default image (`public_pull = true`) must not require
+    /// operator GHCR pull credentials even on a private-looking host.
+    #[test]
+    fn resolve_registry_credentials_skips_public_pull_default() {
+        let creds = resolve_registry_credentials("ghcr.io/taostat/gm-miner@sha256:abc", true)
+            .expect("the gm-published default must not require creds");
+        assert!(
+            creds.is_none(),
+            "public_pull must skip the private-registry credential requirement"
+        );
+    }
+
+    /// A private (non-default) GHCR image with `public_pull = false` and no
+    /// credential env vars must fail with an actionable error.
+    #[test]
+    fn resolve_registry_credentials_requires_creds_for_private_ref() {
+        // Ensure the env vars are unset for this assertion.
+        std::env::remove_var(GHCR_PULL_USERNAME_VAR);
+        std::env::remove_var(GHCR_PULL_TOKEN_VAR);
+        let err = resolve_registry_credentials("ghcr.io/me/private-miner@sha256:abc", false)
+            .expect_err("a private image without creds must fail");
+        assert!(
+            err.to_string().contains("pull credentials are not set"),
+            "got: {err}"
+        );
     }
 
     // ── env-file rendering ────────────────────────────────────────────────────

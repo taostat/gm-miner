@@ -16,9 +16,9 @@
 use gm_miner_cli::{
     config::{Config, ProviderKeys},
     deploy::{
-        fetch_supported_versions, prepare_deploy_target, render_compose, select_version,
-        verify_hashes, DeployOutcome, DstackDeployResult, ImageProvisioner, ImageVersion,
-        PhalaClient, RegistryCredentials, COMPOSE_TEMPLATE,
+        fetch_supported_versions, prepare_deploy_target, render_compose, resolve_image_source,
+        select_version, verify_hashes, DeployOutcome, DstackDeployResult, ImageProvisioner,
+        ImageSource, ImageVersion, PhalaClient, RegistryCredentials, COMPOSE_TEMPLATE,
     },
 };
 use std::collections::HashMap;
@@ -106,7 +106,8 @@ impl PhalaClient for FailingPhala {
     }
 }
 
-/// Build an `ImageVersionsResponse` JSON body with one version.
+/// Build an `ImageVersionsResponse` JSON body with one version carrying a
+/// digest-pinned `image_ref` (the gm-published image deploy defaults to).
 fn versions_body(compose_hash: &str, os_image_hash: &str) -> serde_json::Value {
     serde_json::json!({
         "versions": [{
@@ -114,7 +115,8 @@ fn versions_body(compose_hash: &str, os_image_hash: &str) -> serde_json::Value {
             "os_image_hash": os_image_hash,
             "status": "supported",
             "notes": "test version",
-            "created_at": "2025-05-01T12:00:00Z"
+            "created_at": "2025-05-01T12:00:00Z",
+            "image_ref": "ghcr.io/taostat/gm-miner@sha256:supported"
         }]
     })
 }
@@ -132,6 +134,7 @@ fn mismatched_hashes_produce_error() {
         status: "supported".to_owned(),
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
+        image_ref: None,
     };
 
     // Phala Cloud returns DIFFERENT hashes (simulates a tampered deploy).
@@ -169,6 +172,7 @@ fn compose_mismatch_error_is_specific() {
         status: "supported".to_owned(),
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
+        image_ref: None,
     };
     let actual = DstackDeployResult {
         compose_sha256: "wrong-compose".to_owned(),
@@ -193,6 +197,7 @@ fn os_hash_mismatch_error_is_specific() {
         status: "supported".to_owned(),
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
+        image_ref: None,
     };
     let actual = DstackDeployResult {
         compose_sha256: "correct-compose".to_owned(),
@@ -217,6 +222,7 @@ fn matched_hashes_succeed() {
         status: "supported".to_owned(),
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
+        image_ref: None,
     };
     let actual = DstackDeployResult {
         compose_sha256: "abc123".to_owned(),
@@ -305,6 +311,7 @@ fn deploy_errors_when_no_provider_keys_set() {
         networks: HashMap::new(),
         active_network: Some("mainnet".to_string()),
         provider_keys: None, // no keys configured
+        phala_api_key: None,
     };
 
     // Replicate the exact check from `cmd_deploy`.
@@ -334,6 +341,7 @@ fn deploy_errors_when_provider_keys_all_none() {
             openai: None,
             google: None,
         }),
+        phala_api_key: None,
     };
 
     let result = cfg
@@ -455,6 +463,68 @@ async fn newest_version_selected_by_default() {
         selected.compose_hash, "new-compose",
         "newest must be selected by default"
     );
+}
+
+/// End-to-end of the default image source: the selected supported version's
+/// `image_ref` (carried through `fetch_supported_versions`) is what a flag-less
+/// deploy resolves to — a normal miner deploys the gm-published image.
+#[tokio::test]
+async fn deploy_defaults_to_supported_image_ref() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/image-versions"))
+        .and(query_param("status", "supported"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(versions_body("compose", "os")))
+        .mount(&server)
+        .await;
+
+    let versions = fetch_supported_versions(&server.uri()).await.unwrap();
+    let approved = select_version(&versions, None).unwrap();
+    assert_eq!(
+        approved.image_ref.as_deref(),
+        Some("ghcr.io/taostat/gm-miner@sha256:supported"),
+        "the supported image_ref must survive the fetch"
+    );
+
+    // No flags → the supported ref is the default source (no build), marked
+    // gm_published so the deploy pulls it anonymously (no GHCR creds).
+    let source = resolve_image_source(None, None, approved.image_ref.as_deref()).unwrap();
+    assert_eq!(
+        source,
+        ImageSource::Prebuilt {
+            image_ref: "ghcr.io/taostat/gm-miner@sha256:supported".to_owned(),
+            gm_published: true,
+        }
+    );
+}
+
+/// A supported version without an `image_ref` and no flags is an error — there
+/// is no gm-published image to deploy by default.
+#[tokio::test]
+async fn deploy_errors_when_supported_version_lacks_image_ref() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!({
+        "versions": [{
+            "compose_hash": "compose",
+            "os_image_hash": "os",
+            "status": "supported",
+            "notes": "no image_ref",
+            "created_at": "2025-05-01T12:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/image-versions"))
+        .and(query_param("status", "supported"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let versions = fetch_supported_versions(&server.uri()).await.unwrap();
+    let approved = select_version(&versions, None).unwrap();
+    assert!(approved.image_ref.is_none());
+    let err = resolve_image_source(None, None, approved.image_ref.as_deref())
+        .expect_err("no image_ref and no flags must fail");
+    assert!(err.to_string().contains("--image-ref"), "got: {err}");
 }
 
 #[tokio::test]

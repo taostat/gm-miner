@@ -26,6 +26,7 @@ fn config_with_api_url(network: Network, url: &str) -> Config {
         networks,
         active_network: Some(network.as_str().to_string()),
         provider_keys: None,
+        phala_api_key: None,
     }
 }
 
@@ -34,6 +35,7 @@ fn config_for(network: Network) -> Config {
         networks: HashMap::new(),
         active_network: Some(network.as_str().to_string()),
         provider_keys: None,
+        phala_api_key: None,
     }
 }
 

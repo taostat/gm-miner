@@ -27,6 +27,20 @@ pub struct AuthConfig {
     pub scopes: Vec<String>,
 }
 
+/// Build a one-shot HTTP client with the gmcli user-agent and a 30 s timeout —
+/// the shared shape for every direct (non-[`RegistryClient`]) request, so the
+/// timeout and user-agent are set in exactly one place.
+///
+/// # Errors
+/// Returns an error if the TLS stack cannot be initialised.
+pub fn build_http_client() -> Result<Client> {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("build http client")
+}
+
 /// Fetch OAuth configuration from the registry.
 ///
 /// Unauthenticated `GET {api_url}/auth/config`. Called by `gmcli login`
@@ -35,10 +49,7 @@ pub struct AuthConfig {
 /// # Errors
 /// Returns an error if the request fails or the response cannot be parsed.
 pub async fn get_auth_config(api_url: &str) -> Result<AuthConfig> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("build http client")?;
+    let client = build_http_client()?;
 
     let url = format!("{api_url}/auth/config");
     let resp = client
