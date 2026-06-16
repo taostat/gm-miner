@@ -10,7 +10,7 @@
 ## The benchmark route (`x-gm-provider: benchmark`) proxies to a
 ## synthetic benchmark upstream. The upstream URL is hardcoded per
 ## network in `start.sh` and keyed off GM_NETWORK (rendered into the
-## compose by `gm-miner deploy`); `start.sh` substitutes the host/port
+## compose by `gmcli deploy`); `start.sh` substitutes the host/port
 ## into this config's `__GM_BENCHMARK_HOST__` / `__GM_BENCHMARK_PORT__`
 ## placeholders at container start, and keeps or drops the
 ## `gm:benchmark-tls` sentinel block on the benchmark cluster depending
@@ -69,7 +69,7 @@
 ## passthrough means the dstack gateway forwards the raw TLS stream so
 ## the RA-TLS certificate Envoy serves is the one the caller receives.
 ## The default `-8080` URL would have the dstack gateway terminate TLS
-## at its edge and hide this cert — `gm-miner deploy` registers the
+## at its edge and hide this cert — `gmcli deploy` registers the
 ## `-8080s` form for that reason.
 ##
 ## `/attestation/info` stays reachable over this same TLS listener — the

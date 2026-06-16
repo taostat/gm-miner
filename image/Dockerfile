@@ -56,7 +56,7 @@ COPY attestd/ ./attestd/
 RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
     attestd/src/bin/ratls.rs \
   && cargo build --release --workspace \
-  && strip target/release/gm-miner target/release/gm-miner-attestd \
+  && strip target/release/gmcli target/release/gm-miner-attestd \
     target/release/gm-miner-ratls
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
@@ -76,8 +76,8 @@ ENV GM_IMAGE_VERSION=${GM_IMAGE_VERSION}
 
 ## Copy the operator-side CLI binary. The CLI is included in the image
 ## for one-shot ops tasks (config dump, key rotation) executed via
-## `docker run --entrypoint gm-miner ...`.
-COPY --from=builder /build/target/release/gm-miner /usr/local/bin/gm-miner
+## `docker run --entrypoint gmcli ...`.
+COPY --from=builder /build/target/release/gmcli /usr/local/bin/gmcli
 
 ## Copy the attestation server. start.sh launches it alongside envoy;
 ## envoy routes GET /attestation/info to it on loopback.

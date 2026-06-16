@@ -68,7 +68,7 @@ fi
 # from a runtime env var: a miner cannot redirect the `x-gm-provider:
 # benchmark` route to a colluding service without editing this file,
 # which moves the compose_hash and is rejected by the registry's
-# attestation enforcement. GM_NETWORK is set by `gm-miner deploy` as a
+# attestation enforcement. GM_NETWORK is set by `gmcli deploy` as a
 # rendered literal in dstack/docker-compose.yaml — part of the
 # attestation-measured compose source — so its value is fixed at deploy
 # time and equally tamper-evident.
@@ -80,7 +80,7 @@ fi
 # whether the cluster carries an upstream TLS context — envoy.yaml's
 # `gm:benchmark-tls` sentinel block is kept when the URL is https and
 # dropped when it is http.
-case "${GM_NETWORK:?GM_NETWORK must be set (rendered into dstack/docker-compose.yaml by gm-miner deploy)}" in
+case "${GM_NETWORK:?GM_NETWORK must be set (rendered into dstack/docker-compose.yaml by gmcli deploy)}" in
   testnet) BENCHMARK_URL="https://test-benchmark.saygm.com" ;;
   mainnet) BENCHMARK_URL="https://benchmark.saygm.com" ;;
   *)
