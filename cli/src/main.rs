@@ -1,7 +1,7 @@
-//! gm-miner CLI.
+//! gmcli CLI.
 //!
 //! Subcommands:
-//!   set-api-keys     — persist provider API keys to ~/.gm-miner/config.json
+//!   set-api-keys     — persist provider API keys to ~/.gmcli/config.json
 //!   deploy           — trust-correct single-shot deploy: fetch approved hashes,
 //!                      deploy via Phala Cloud, verify hashes, register image
 //!   login            — Taostats device-code OAuth flow
@@ -66,14 +66,14 @@ const MAX_DISCOUNT_BP: u32 = 9_990;
 
 #[derive(Parser)]
 #[command(
-    name = "gm-miner",
+    name = "gmcli",
     version,
     about = "gm miner CLI — manage your miner's registration, products, and prices",
     after_help = "Examples:\n  \
-        gm-miner login                       # authenticate (mainnet by default)\n  \
-        gm-miner --network testnet login     # authenticate against testnet\n  \
-        gm-miner doctor                      # preflight checklist before deploying\n  \
-        gm-miner status                      # registration + products\n\n\
+        gmcli login                       # authenticate (mainnet by default)\n  \
+        gmcli --network testnet login     # authenticate against testnet\n  \
+        gmcli doctor                      # preflight checklist before deploying\n  \
+        gmcli status                      # registration + products\n\n\
         The selected network is sticky: pass --network (or --testnet) once and\n\
         every later command targets it until you pass a different one."
 )]
@@ -110,13 +110,13 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Persist provider API keys to ~/.gm-miner/config.json (mode 0600).
+    /// Persist provider API keys to ~/.gmcli/config.json (mode 0600).
     ///
     /// Each flag, if provided, replaces the stored value.  Omitted flags
     /// leave existing values intact.  Key values are never echoed back.
     #[command(after_help = "Examples:\n  \
-        gm-miner set-api-keys --anthropic sk-ant-...\n  \
-        gm-miner set-api-keys --openai sk-... --google AIza...")]
+        gmcli set-api-keys --anthropic sk-ant-...\n  \
+        gmcli set-api-keys --openai sk-... --google AIza...")]
     SetApiKeys {
         /// Anthropic API key (sk-ant-...).
         #[arg(long)]
@@ -133,8 +133,8 @@ enum Command {
 
     /// Deploy the miner to Phala Cloud with trust-correct hash verification.
     ///
-    /// Reads provider API keys from ~/.gm-miner/config.json (set them first
-    /// with `gm-miner set-api-keys`), fetches the registry-approved image
+    /// Reads provider API keys from ~/.gmcli/config.json (set them first
+    /// with `gmcli set-api-keys`), fetches the registry-approved image
     /// version, builds and pushes the miner image to a public registry,
     /// submits the compose stack to Phala Cloud, verifies the deployed CVM's
     /// measured hashes match the registry approval, then registers the
@@ -144,19 +144,19 @@ enum Command {
     /// authorization. Authentication uses a Phala Cloud API key — set
     /// `PHALA_CLOUD_API_KEY` or run `phala login` before deploying.
     #[command(after_help = "Examples:\n  \
-        gm-miner deploy --image-repo ghcr.io/<owner>/gm-miner\n  \
-        gm-miner deploy --image-ref ghcr.io/<owner>/gm-miner@sha256:...")]
+        gmcli deploy --image-repo ghcr.io/<owner>/gm-miner\n  \
+        gmcli deploy --image-ref ghcr.io/<owner>/gm-miner@sha256:...")]
     Deploy {
         #[command(flatten)]
         flags: Box<DeployFlags>,
     },
 
     /// Authenticate with Taostats (device-code OAuth flow) and store
-    /// credentials in ~/.gm-miner/config.json.
+    /// credentials in ~/.gmcli/config.json.
     #[command(after_help = "Examples:\n  \
-        gm-miner login\n  \
-        gm-miner --network testnet login\n  \
-        gm-miner login --no-browser")]
+        gmcli login\n  \
+        gmcli --network testnet login\n  \
+        gmcli login --no-browser")]
     Login {
         /// Do not automatically open the browser.
         #[arg(long)]
@@ -165,13 +165,13 @@ enum Command {
 
     /// Register this miner's image compose hash + capabilities with the registry.
     ///
-    /// The normal operator flow uses `gm-miner deploy` which verifies and
+    /// The normal operator flow uses `gmcli deploy` which verifies and
     /// registers in one step.  Use this subcommand only for re-registering
     /// without redeploying (e.g. after a registry resync or for debugging).
     ///
     /// The compose + OS image hashes are read automatically from the
     /// deployed CVM via `phala cvms get <app-id> --json`; the CVM must
-    /// already be deployed (`gm-miner deploy`).
+    /// already be deployed (`gmcli deploy`).
     #[command(hide = true)]
     RegisterImage {
         /// Phala Cloud app id of the deployed CVM (e.g. `app_abc123`).
@@ -193,25 +193,25 @@ enum Command {
     /// and whether your hotkey is registered on the subnet. Each red line
     /// names the command that fixes it.
     #[command(after_help = "Examples:\n  \
-        gm-miner doctor\n  \
-        gm-miner --network testnet doctor")]
+        gmcli doctor\n  \
+        gmcli --network testnet doctor")]
     Doctor,
 
     /// Record (and optionally register) the hotkey your miner serves under.
     ///
     /// Two flows. If you already registered a hotkey elsewhere (a browser
-    /// wallet, another machine), pass `--hotkey-ss58 <addr>` and gm-miner just
+    /// wallet, another machine), pass `--hotkey-ss58 <addr>` and gmcli just
     /// records it — no btcli needed. If you have not, omit `--hotkey-ss58` and
-    /// pass `--wallet`/`--hotkey`: gm-miner offers to register a fresh hotkey
-    /// through btcli (which owns your wallet keys — gm-miner never sees them).
+    /// pass `--wallet`/`--hotkey`: gmcli offers to register a fresh hotkey
+    /// through btcli (which owns your wallet keys — gmcli never sees them).
     #[command(after_help = "Examples:\n  \
-        gm-miner register-hotkey --hotkey-ss58 5GrwvaEF...     # already registered elsewhere\n  \
-        gm-miner --network testnet register-hotkey --wallet miner --hotkey default\n  \
-        gm-miner register-hotkey --wallet miner --hotkey default --yes  # non-interactive")]
+        gmcli register-hotkey --hotkey-ss58 5GrwvaEF...     # already registered elsewhere\n  \
+        gmcli --network testnet register-hotkey --wallet miner --hotkey default\n  \
+        gmcli register-hotkey --wallet miner --hotkey default --yes  # non-interactive")]
     RegisterHotkey {
         /// The ss58 address of a hotkey you already registered elsewhere.
-        /// When set, gm-miner records it (verifying via btcli if present) and
-        /// never registers anything. When omitted, gm-miner offers to register
+        /// When set, gmcli records it (verifying via btcli if present) and
+        /// never registers anything. When omitted, gmcli offers to register
         /// a fresh hotkey via btcli using `--wallet`/`--hotkey`.
         #[arg(long = "hotkey-ss58", value_name = "SS58")]
         hotkey_ss58: Option<String>,
@@ -235,8 +235,8 @@ enum Command {
     /// One POST to `/miners/products`. For batch declarations against the
     /// whole catalog (or one provider's slice), use `declare-products`.
     #[command(after_help = "Examples:\n  \
-        gm-miner declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
-        gm-miner declare-product --provider openai --model gpt-5.5 --discount-pct 10.5")]
+        gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
+        gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5")]
     DeclareProduct {
         /// Provider: anthropic, openai, or gemini.
         #[arg(long)]
@@ -262,8 +262,8 @@ enum Command {
     /// Per-product failures are reported individually and do not abort the
     /// loop — the final summary lists ok/err counts.
     #[command(after_help = "Examples:\n  \
-        gm-miner declare-products --discount-pct 5            # whole catalog\n  \
-        gm-miner declare-products --provider openai --discount-pct 10")]
+        gmcli declare-products --discount-pct 5            # whole catalog\n  \
+        gmcli declare-products --provider openai --discount-pct 10")]
     DeclareProducts {
         /// Optional provider filter. When set, only products from this
         /// provider are declared. Omit to fan out over the whole catalog.
@@ -282,8 +282,8 @@ enum Command {
     /// Lists each declared offer with the per-Mtok rate you actually receive
     /// after the discount, plus whether it is offered and eligible.
     #[command(after_help = "Examples:\n  \
-        gm-miner status\n  \
-        gm-miner --network testnet status")]
+        gmcli status\n  \
+        gmcli --network testnet status")]
     Status,
 
     /// Show your miner's current chain emission on the subnet.
@@ -296,8 +296,8 @@ enum Command {
     /// This is the on-chain emission view (v1). Your gm USD-spread earnings are
     /// a future (v2) view.
     #[command(after_help = "Examples:\n  \
-        gm-miner earnings\n  \
-        gm-miner --network testnet earnings")]
+        gmcli earnings\n  \
+        gmcli --network testnet earnings")]
     Earnings {
         /// Skip the btcli install prompt for non-interactive use.
         #[arg(long)]
@@ -314,7 +314,7 @@ enum Command {
 
     /// Manage the data-plane workers (Phala CVMs) attached to your hotkey.
     ///
-    /// The first `gm-miner deploy` creates the hotkey identity and worker
+    /// The first `gmcli deploy` creates the hotkey identity and worker
     /// #1 in one shot. Use `worker add` to attach further capacity under
     /// the same hotkey, `worker list` to see every worker's status, and
     /// `worker remove` to deregister one.
@@ -324,8 +324,8 @@ enum Command {
     },
 }
 
-/// Deploy flags shared by `gm-miner deploy` (worker #1) and
-/// `gm-miner worker add` (further capacity). Both submit one Phala CVM via
+/// Deploy flags shared by `gmcli deploy` (worker #1) and
+/// `gmcli worker add` (further capacity). Both submit one Phala CVM via
 /// the same plumbing; they differ only in which registry endpoint records
 /// the resulting worker.
 #[derive(clap::Args)]
@@ -862,8 +862,8 @@ fn me_error(network: Network, status: reqwest::StatusCode) -> anyhow::Error {
     if matches!(status.as_u16(), 401 | 403 | 404) {
         return anyhow::anyhow!(
             "your hotkey isn't registered on subnet {netuid} (registry returned {status}).\n\
-             Register it with btcli, then run `gm-miner deploy` to attach a worker \
-             (`gm-miner register-hotkey` is coming).\n\
+             Register it with btcli, then run `gmcli deploy` to attach a worker \
+             (`gmcli register-hotkey` is coming).\n\
              Already registered? You're on the `{network}` network — pass \
              `--network mainnet` / `--network testnet` if that's not where your \
              hotkey lives."
@@ -874,7 +874,7 @@ fn me_error(network: Network, status: reqwest::StatusCode) -> anyhow::Error {
 
 // ── Commands ────────────────────────────────────────────────────────────────
 
-/// Parsed `gm-miner deploy` arguments, grouped so the dispatch match arm
+/// Parsed `gmcli deploy` arguments, grouped so the dispatch match arm
 /// and the subcommand entry point do not need a long positional list.
 struct DeployArgs {
     app_name: String,
@@ -896,8 +896,8 @@ struct DeployArgs {
 
 /// Which registry endpoint records the worker a deploy produces.
 ///
-/// `First` is `gm-miner deploy`: `POST /miners/register` creates the
-/// hotkey identity and worker #1. `Add` is `gm-miner worker add`:
+/// `First` is `gmcli deploy`: `POST /miners/register` creates the
+/// hotkey identity and worker #1. `Add` is `gmcli worker add`:
 /// `POST /miners/{hotkey}/workers` attaches further capacity to the named
 /// hotkey, which `worker add` resolves and validates *before* any CVM work
 /// so an unregistered hotkey fails fast.
@@ -947,7 +947,7 @@ async fn cmd_deploy_subcommand(
     cmd_deploy(&cfg, &mut client, &phala, &args, &registration).await
 }
 
-/// `gm-miner worker add` — attach a new CVM to the existing hotkey.
+/// `gmcli worker add` — attach a new CVM to the existing hotkey.
 ///
 /// Three checks run *before* any CVM work so a misuse fails fast rather than
 /// after a multi-minute deploy:
@@ -974,8 +974,8 @@ async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
         .is_none_or(|e| e.workers.is_empty())
     {
         bail!(
-            "no worker #1 is tracked on this network yet; run `gm-miner deploy` \
-             first to register (or migrate) worker #1, then `gm-miner worker \
+            "no worker #1 is tracked on this network yet; run `gmcli deploy` \
+             first to register (or migrate) worker #1, then `gmcli worker \
              add` for further capacity"
         );
     }
@@ -1000,9 +1000,9 @@ async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
             bail!(
                 "worker '{}' has a CVM ({}) that was deployed but never \
                  registered. `worker add` would launch a second CVM and orphan \
-                 it. Clear the stale record first:\n  gm-miner worker remove {}\n\
+                 it. Clear the stale record first:\n  gmcli worker remove {}\n\
                  (it prints the `phala cvms delete` to run), then re-run \
-                 `gm-miner worker add --app-name {}`.",
+                 `gmcli worker add --app-name {}`.",
                 args.app_name,
                 existing.app_id,
                 existing.app_id,
@@ -1016,8 +1016,8 @@ async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> {
         if !existing.provisional_secondary {
             bail!(
                 "'{}' is an in-flight worker #1 deploy, not a secondary worker; \
-                 retry it with `gm-miner deploy --app-name {}`, or \
-                 `gm-miner worker remove {}` to discard the stub",
+                 retry it with `gmcli deploy --app-name {}`, or \
+                 `gmcli worker remove {}` to discard the stub",
                 args.app_name,
                 args.app_name,
                 args.app_name
@@ -1116,8 +1116,8 @@ fn cmd_set_api_keys(
         validate_key("google", k)?;
     }
 
-    let mut cfg = config::load()
-        .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
+    let mut cfg =
+        config::load().context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
 
     // Provider keys are network-independent, but an explicit --network here
     // is still the user's sticky selection — persist it so the promise holds
@@ -1172,12 +1172,12 @@ fn cmd_set_api_keys(
         for name in &set_names {
             println!("  {name}: set");
         }
-        println!("\nNext: gm-miner deploy --image-repo ghcr.io/<owner>/gm-miner");
+        println!("\nNext: gmcli deploy --image-repo ghcr.io/<owner>/gm-miner");
     }
     Ok(())
 }
 
-/// Reject a plain `gm-miner deploy` aimed at a registered *secondary* worker.
+/// Reject a plain `gmcli deploy` aimed at a registered *secondary* worker.
 ///
 /// `deploy` registers worker #1 via `/miners/register`, which refreshes the
 /// miner's first worker. Pointed at the `--app-name` of a registered secondary
@@ -1198,7 +1198,7 @@ fn reject_secondary_worker_deploy(
         bail!(
             "'{app_name}' is a secondary worker; `deploy` and `register-image` \
              only (re-)register worker #1. To replace this worker, \
-             `gm-miner worker remove <worker_id>` then `gm-miner worker add \
+             `gmcli worker remove <worker_id>` then `gmcli worker add \
              --app-name {app_name}`."
         );
     }
@@ -1232,7 +1232,7 @@ async fn cmd_deploy(
         .filter(|k| k.any_set())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no provider keys; run `gm-miner set-api-keys \
+                "no provider keys; run `gmcli set-api-keys \
                  --anthropic <key>` (and/or --openai / --google) first"
             )
         })?;
@@ -1406,9 +1406,7 @@ fn print_deploy_summary(worker_id: &str, app_id: &str, registration: &WorkerRegi
     println!("  worker_id : {worker_id}");
     println!("  app_id    : {app_id}");
     if *registration == WorkerRegistration::First {
-        println!(
-            "\nNext: gm-miner declare-products --discount-pct <pct>  (then `gm-miner status`)"
-        );
+        println!("\nNext: gmcli declare-products --discount-pct <pct>  (then `gmcli status`)");
     }
 }
 
@@ -1430,10 +1428,10 @@ async fn register_worker(
 
 /// Upsert `record` into the active network's workers and save the config.
 fn persist_worker_record(network: &str, record: WorkerRecord) -> Result<()> {
-    let mut cfg = config::load().context("load gm-miner config")?;
+    let mut cfg = config::load().context("load gmcli config")?;
     cfg.active_network = Some(network.to_owned());
     cfg.active_entry_mut().upsert_worker(record);
-    config::save(&cfg).context("persist worker record to gm-miner config")
+    config::save(&cfg).context("persist worker record to gmcli config")
 }
 
 /// Fetch the calling miner's hotkey from `GET /miners/me`.
@@ -1447,7 +1445,7 @@ async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
         let body = resp.text().await.unwrap_or_default();
         bail!(
             "could not determine your hotkey from {} ({status}): {body}; \
-             run `gm-miner deploy` first to register your hotkey",
+             run `gmcli deploy` first to register your hotkey",
             gm_miner_cli::client::ME_PATH
         );
     }
@@ -1466,8 +1464,8 @@ async fn cmd_login(
     // hard error matches the other commands' behaviour and prevents
     // a normal re-login from silently wiping an operator's existing
     // mainnet/testnet tokens.
-    let mut cfg = config::load()
-        .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
+    let mut cfg =
+        config::load().context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
 
     // An explicit --network/--testnet selects (and sticks) the network this
     // login targets; otherwise the stored sticky selection is kept so a
@@ -1495,11 +1493,11 @@ async fn cmd_login(
 
     println!("Login successful ({} network).", cfg.resolved_network());
     println!("Credentials saved to {}", config::config_path().display());
-    println!("\nNext: gm-miner set-api-keys --anthropic <key>  (and/or --openai / --google)");
+    println!("\nNext: gmcli set-api-keys --anthropic <key>  (and/or --openai / --google)");
     Ok(())
 }
 
-/// `gm-miner register-image` — re-register an already-deployed worker's
+/// `gmcli register-image` — re-register an already-deployed worker's
 /// image with the registry without a full redeploy.
 ///
 /// Reuses the per-worker node secret persisted under the matching
@@ -1537,7 +1535,7 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
             bail!(
                 "CVM '{app_id}' is a secondary worker (worker '{}'); \
                  `register-image` only re-registers worker #1. To replace it, \
-                 `gm-miner worker remove {}` then `gm-miner worker add \
+                 `gmcli worker remove {}` then `gmcli worker add \
                  --app-name {}`.",
                 tracked.app_name,
                 remove_handle,
@@ -1578,7 +1576,7 @@ async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> 
                 "no measured hashes for CVM '{app_id}' \
                  (compose_hash/os_image_hash not present in \
                  `phala cvms get {app_id} --json`); \
-                 deploy first with `gm-miner deploy`"
+                 deploy first with `gmcli deploy`"
             )
         })?;
 
@@ -1709,7 +1707,7 @@ async fn post_register_image(
 }
 
 /// POST a worker to `POST /miners/{hotkey}/workers` and return its
-/// registry `worker_id`. Used by `gm-miner worker add`.
+/// registry `worker_id`. Used by `gmcli worker add`.
 async fn post_add_worker(
     client: &mut RegistryClient,
     hotkey: &str,
@@ -1752,7 +1750,7 @@ async fn post_add_worker(
     Ok(created.worker_id)
 }
 
-/// `gm-miner worker list` — pretty-print the hotkey's live workers.
+/// `gmcli worker list` — pretty-print the hotkey's live workers.
 async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
     let hotkey = fetch_hotkey(client).await?;
     let path = format!("/miners/{hotkey}/workers");
@@ -1790,7 +1788,7 @@ async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
     Ok(())
 }
 
-/// `gm-miner worker remove <id>` — deregister a worker and remind the
+/// `gmcli worker remove <id>` — deregister a worker and remind the
 /// operator to tear down its Phala CVM separately.
 ///
 /// `id` is the registry `worker_id` for a registered worker. It also accepts
@@ -1830,10 +1828,10 @@ async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
 
     // Drop the local record so `worker list`/re-deploy don't reference a
     // deregistered worker.
-    let mut cfg = config::load().context("load gm-miner config")?;
+    let mut cfg = config::load().context("load gmcli config")?;
     cfg.active_network = Some(network);
     cfg.active_entry_mut().remove_worker_by_id(&worker_id);
-    config::save(&cfg).context("persist worker removal to gm-miner config")?;
+    config::save(&cfg).context("persist worker removal to gmcli config")?;
 
     println!("Worker {worker_id} deregistered from the registry.");
     let reminder = match app_id {
@@ -1851,10 +1849,10 @@ async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
 /// Drop a provisional worker record (a deploy that never registered) from the
 /// local config. No registry DELETE: nothing was ever registered.
 fn remove_provisional_worker(network: &str, id: &str) -> Result<()> {
-    let mut cfg = config::load().context("load gm-miner config")?;
+    let mut cfg = config::load().context("load gmcli config")?;
     cfg.active_network = Some(network.to_owned());
     let removed = cfg.active_entry_mut().remove_provisional_worker(id);
-    config::save(&cfg).context("persist worker removal to gm-miner config")?;
+    config::save(&cfg).context("persist worker removal to gmcli config")?;
 
     match removed {
         Some(w) if !w.app_id.is_empty() => {
@@ -1875,7 +1873,7 @@ fn remove_provisional_worker(network: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `gm-miner declare-product` — POST one (provider, model, `discount_bp`)
+/// `gmcli declare-product` — POST one (provider, model, `discount_bp`)
 /// offer to `/miners/products`. The registry treats POST as upsert, so this
 /// also handles updating an existing offer's discount.
 ///
@@ -1921,11 +1919,11 @@ async fn cmd_declare_product(
     println!("  Declared     : {}% off", format_discount_pct(discount_bp));
     println!("  You receive  : {eff_in} input / {eff_out} output per Mtok ({kept_pct}% of retail)");
     println!("  → ok");
-    println!("\nNext: gm-miner status   (confirm the offer)");
+    println!("\nNext: gmcli status   (confirm the offer)");
     Ok(())
 }
 
-/// `gm-miner declare-products` — fan a single discount out over the catalog.
+/// `gmcli declare-products` — fan a single discount out over the catalog.
 ///
 /// 1. Public `GET /products` discovers every active product.
 /// 2. If `provider_filter` is set, drops products from other providers.
@@ -1983,7 +1981,7 @@ async fn cmd_declare_products(
     if err_count > 0 {
         bail!("{err_count} of {} declarations failed", targets.len());
     }
-    println!("Next: gm-miner status   (confirm offers + eligibility)");
+    println!("Next: gmcli status   (confirm offers + eligibility)");
     Ok(())
 }
 
@@ -2120,7 +2118,7 @@ impl Check {
 
 // ── register-hotkey ──────────────────────────────────────────────────────────
 
-/// `gm-miner register-hotkey` — record the hotkey the miner serves under.
+/// `gmcli register-hotkey` — record the hotkey the miner serves under.
 ///
 /// Dispatches on `--hotkey-ss58`: present means bring-your-own (just record,
 /// verify via btcli only if it happens to be installed); absent means the
@@ -2155,7 +2153,7 @@ fn register_hotkey_byo(mut cfg: Config, network: Network, ss58: &str) -> Result<
 
     println!("Recorded hotkey {} for {network}.", outcome.record.ss58);
     println!("{}", outcome.note);
-    println!("Next: `gm-miner deploy` to launch a worker under this hotkey.");
+    println!("Next: `gmcli deploy` to launch a worker under this hotkey.");
     Ok(())
 }
 
@@ -2251,14 +2249,14 @@ fn finish_assisted(
     match outcome.uid {
         Some(uid) => {
             println!("Registered {wallet}/{hotkey} ({ss58}) on {network} — uid {uid}.");
-            println!("Next: `gm-miner deploy` to launch a worker under this hotkey.");
+            println!("Next: `gmcli deploy` to launch a worker under this hotkey.");
         }
         None => {
             // btcli succeeded but the metagraph hasn't caught up — the hotkey
             // is recorded; the uid lands within a block.
             println!(
                 "Registered {wallet}/{hotkey} ({ss58}) on {network}. The metagraph is still \
-                 catching up — run `gm-miner status` shortly to see the uid."
+                 catching up — run `gmcli status` shortly to see the uid."
             );
         }
     }
@@ -2283,7 +2281,7 @@ fn confirm_spend(network: Network, wallet: &str, hotkey: &str, assume_yes: bool)
 
 // ── earnings ─────────────────────────────────────────────────────────────────
 
-/// `gm-miner earnings` — the miner's current chain emission on the subnet (v1).
+/// `gmcli earnings` — the miner's current chain emission on the subnet (v1).
 ///
 /// Resolves the hotkey (`--hotkey-ss58` override, else the recorded one), then
 /// reads its neuron row from the subnet metagraph via btcli. btcli is genuinely
@@ -2302,7 +2300,7 @@ fn cmd_earnings(cfg: &Config, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// `gm-miner doctor` — a preflight checklist run before deploying.
+/// `gmcli doctor` — a preflight checklist run before deploying.
 ///
 /// Each check renders green/red with an actionable fix. The hotkey-
 /// registration check probes `GET /miners/me`; a 401/403/404 renders as
@@ -2311,7 +2309,7 @@ fn cmd_earnings(cfg: &Config, yes: bool) -> Result<()> {
 async fn cmd_doctor(cfg: Config) -> Result<()> {
     let network = cfg.resolved_network();
     println!(
-        "gm-miner doctor — preflight for {network} (netuid {})\n",
+        "gmcli doctor — preflight for {network} (netuid {})\n",
         network.netuid()
     );
 
@@ -2339,7 +2337,7 @@ async fn cmd_doctor(cfg: Config) -> Result<()> {
     let failures = checks.iter().filter(|c| c.is_failure()).count();
     println!();
     if failures == 0 {
-        println!("All checks passed — you're ready to `gm-miner deploy`.");
+        println!("All checks passed — you're ready to `gmcli deploy`.");
         Ok(())
     } else {
         bail!("{failures} check(s) need attention before deploying (see above).");
@@ -2365,11 +2363,10 @@ fn login_check(cfg: &Config) -> Check {
         Some(t) if t.access_token.is_some() && t.refresh_token.is_some() => {
             Check::pass("Logged in (token refreshes on next use)", String::new())
         }
-        Some(t) if t.access_token.is_some() => Check::fail(
-            "Logged in",
-            "your session has expired — run `gm-miner login`",
-        ),
-        _ => Check::fail("Logged in", "not logged in — run `gm-miner login`"),
+        Some(t) if t.access_token.is_some() => {
+            Check::fail("Logged in", "your session has expired — run `gmcli login`")
+        }
+        _ => Check::fail("Logged in", "not logged in — run `gmcli login`"),
     }
 }
 
@@ -2390,7 +2387,7 @@ fn provider_keys_check(cfg: &Config) -> Check {
     if set.is_empty() {
         Check::fail(
             "Provider keys set",
-            "no provider keys — run `gm-miner set-api-keys --anthropic <key>` (and/or --openai / --google)",
+            "no provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google)",
         )
     } else {
         Check::pass(
@@ -2455,7 +2452,7 @@ async fn hotkey_check(cfg: Config) -> Check {
     {
         return Check::fail(
             format!("Hotkey registered on subnet {netuid}"),
-            "can't check until you're logged in — run `gm-miner login`",
+            "can't check until you're logged in — run `gmcli login`",
         );
     }
 
@@ -2490,8 +2487,8 @@ async fn hotkey_check(cfg: Config) -> Check {
             label,
             format!(
                 "no miner record on `{network}` yet. First register your hotkey on-chain: \
-                 `gm-miner register-hotkey` (via btcli, or `--hotkey-ss58 <addr>` if you \
-                 registered elsewhere). Then `gm-miner deploy` creates the registry record. \
+                 `gmcli register-hotkey` (via btcli, or `--hotkey-ss58 <addr>` if you \
+                 registered elsewhere). Then `gmcli deploy` creates the registry record. \
                  On the wrong network? Pass `--network mainnet`/`--network testnet`."
             ),
         );
@@ -2511,7 +2508,7 @@ async fn hotkey_check(cfg: Config) -> Check {
 
 // ── gm / moon ────────────────────────────────────────────────────────────────
 
-/// `gm-miner gm` — a tiny sunrise and the time-of-day greeting.
+/// `gmcli gm` — a tiny sunrise and the time-of-day greeting.
 fn cmd_gm() {
     println!(
         r"        \   |   /
@@ -2524,7 +2521,7 @@ fn cmd_gm() {
     );
 }
 
-/// `gm-miner moon` — the quiet counterpart for the 3am deploys.
+/// `gmcli moon` — the quiet counterpart for the 3am deploys.
 fn cmd_moon() {
     println!(
         r"          _.-''-._
@@ -2535,7 +2532,7 @@ fn cmd_moon() {
     );
 }
 
-/// `gm-miner status` — registration state plus the per-product offer table.
+/// `gmcli status` — registration state plus the per-product offer table.
 ///
 /// Folds in what `list-products` used to print: each offer's discount and the
 /// per-Mtok rate the miner actually receives (joined against the public
@@ -2568,7 +2565,7 @@ async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     );
 
     if miner.products.is_empty() {
-        println!("\nNo products declared. Declare some with `gm-miner declare-products --discount-pct <pct>`.");
+        println!("\nNo products declared. Declare some with `gmcli declare-products --discount-pct <pct>`.");
         return Ok(());
     }
 
@@ -3213,7 +3210,7 @@ mod tests {
     #[test]
     fn clap_accepts_discount_pct_for_single_declare() {
         let cli = <Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "declare-product",
             "--provider",
             "anthropic",
@@ -3236,7 +3233,7 @@ mod tests {
     #[test]
     fn clap_accepts_discount_pct_for_fan_out_declare() {
         let cli = <Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "declare-products",
             "--provider",
             "openai",
@@ -3257,7 +3254,7 @@ mod tests {
     #[test]
     fn clap_rejects_removed_discount_bp_flag() {
         let result = <Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "declare-product",
             "--provider",
             "anthropic",
@@ -3323,7 +3320,7 @@ mod tests {
     #[test]
     fn clap_parses_worker_add_with_app_name() {
         let cli = <Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "worker",
             "add",
             "--app-name",
@@ -3344,7 +3341,7 @@ mod tests {
 
     #[test]
     fn clap_parses_worker_list() {
-        let cli = <Cli as clap::Parser>::try_parse_from(["gm-miner", "worker", "list"]).unwrap();
+        let cli = <Cli as clap::Parser>::try_parse_from(["gmcli", "worker", "list"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Worker {
@@ -3355,8 +3352,8 @@ mod tests {
 
     #[test]
     fn clap_parses_worker_remove_with_positional_id() {
-        let cli = <Cli as clap::Parser>::try_parse_from(["gm-miner", "worker", "remove", "01J0C"])
-            .unwrap();
+        let cli =
+            <Cli as clap::Parser>::try_parse_from(["gmcli", "worker", "remove", "01J0C"]).unwrap();
         let Command::Worker {
             command: WorkerCommand::Remove { worker_id },
         } = cli.command
@@ -3368,7 +3365,7 @@ mod tests {
 
     #[test]
     fn clap_worker_remove_requires_a_worker_id() {
-        let result = <Cli as clap::Parser>::try_parse_from(["gm-miner", "worker", "remove"]);
+        let result = <Cli as clap::Parser>::try_parse_from(["gmcli", "worker", "remove"]);
         assert!(result.is_err(), "worker remove must require a worker_id");
     }
 
@@ -3377,15 +3374,14 @@ mod tests {
         use super::Network;
 
         let cli =
-            <Cli as clap::Parser>::try_parse_from(["gm-miner", "--network", "testnet", "status"])
+            <Cli as clap::Parser>::try_parse_from(["gmcli", "--network", "testnet", "status"])
                 .unwrap();
         assert_eq!(cli.explicit_network(), Some(Network::Testnet));
 
-        let cli =
-            <Cli as clap::Parser>::try_parse_from(["gm-miner", "--testnet", "status"]).unwrap();
+        let cli = <Cli as clap::Parser>::try_parse_from(["gmcli", "--testnet", "status"]).unwrap();
         assert_eq!(cli.explicit_network(), Some(Network::Testnet));
 
-        let cli = <Cli as clap::Parser>::try_parse_from(["gm-miner", "status"]).unwrap();
+        let cli = <Cli as clap::Parser>::try_parse_from(["gmcli", "status"]).unwrap();
         assert_eq!(
             cli.explicit_network(),
             None,
@@ -3396,7 +3392,7 @@ mod tests {
     #[test]
     fn clap_rejects_network_and_testnet_together() {
         let result = <Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "--network",
             "mainnet",
             "--testnet",
@@ -3408,20 +3404,20 @@ mod tests {
     #[test]
     fn clap_parses_doctor_and_gm() {
         assert!(matches!(
-            <Cli as clap::Parser>::try_parse_from(["gm-miner", "doctor"])
+            <Cli as clap::Parser>::try_parse_from(["gmcli", "doctor"])
                 .unwrap()
                 .command,
             Command::Doctor
         ));
         assert!(matches!(
-            <Cli as clap::Parser>::try_parse_from(["gm-miner", "gm"])
+            <Cli as clap::Parser>::try_parse_from(["gmcli", "gm"])
                 .unwrap()
                 .command,
             Command::Gm
         ));
         // `list-products` is kept as a hidden alias that runs `status`.
         assert!(matches!(
-            <Cli as clap::Parser>::try_parse_from(["gm-miner", "list-products"])
+            <Cli as clap::Parser>::try_parse_from(["gmcli", "list-products"])
                 .unwrap()
                 .command,
             Command::ListProducts
@@ -3432,7 +3428,7 @@ mod tests {
     fn clap_parses_register_hotkey_both_flows() {
         // Bring-your-own: just the ss58.
         let byo = <Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "register-hotkey",
             "--hotkey-ss58",
             "5Grw",
@@ -3451,7 +3447,7 @@ mod tests {
 
         // Assisted: wallet + hotkey + --yes, no ss58.
         let assisted = <Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "register-hotkey",
             "--wallet",
             "miner",
@@ -3476,13 +3472,13 @@ mod tests {
     fn clap_parses_earnings_and_rejects_a_hotkey_arg() {
         use super::Network;
 
-        let bare = <Cli as clap::Parser>::try_parse_from(["gm-miner", "earnings"])
+        let bare = <Cli as clap::Parser>::try_parse_from(["gmcli", "earnings"])
             .unwrap()
             .command;
         assert!(matches!(bare, Command::Earnings { yes: false }));
 
         let cli = <Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "--network",
             "testnet",
             "earnings",
@@ -3494,7 +3490,7 @@ mod tests {
 
         // The hotkey is derived (login token / register-hotkey), never passed.
         assert!(<Cli as clap::Parser>::try_parse_from([
-            "gm-miner",
+            "gmcli",
             "earnings",
             "--hotkey-ss58",
             "5Grw"

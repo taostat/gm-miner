@@ -1,4 +1,4 @@
-//! CLI configuration persisted to `~/.gm-miner/config.json`.
+//! CLI configuration persisted to `~/.gmcli/config.json`.
 //!
 //! Pattern mirrors blockmachine's `auth_config.py`, adapted for Rust.
 
@@ -22,11 +22,11 @@ fn jwt_sub(token: &str) -> Option<String> {
 
 /// Default config directory.
 fn config_dir() -> PathBuf {
-    std::env::var("GM_MINER_CONFIG_DIR").map_or_else(
+    std::env::var("GMCLI_CONFIG_DIR").map_or_else(
         |_| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join(".gm-miner")
+                .join(".gmcli")
         },
         PathBuf::from,
     )
@@ -43,7 +43,7 @@ pub fn config_path() -> PathBuf {
 /// `refresh_token` is captured from the device-code flow and used to mint a
 /// fresh access token silently when the stored one expires, avoiding a full
 /// browser re-login. Absent for a config written before refresh support
-/// existed — the operator simply re-runs `gm-miner login` in that case.
+/// existed — the operator simply re-runs `gmcli login` in that case.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TokenEntry {
     pub access_token: Option<String>,
@@ -53,7 +53,7 @@ pub struct TokenEntry {
 }
 
 /// Margin treated as "about to expire": a token within this window of its
-/// stated expiry is rejected up front. A `gm-miner deploy` does many
+/// stated expiry is rejected up front. A `gmcli deploy` does many
 /// minutes of CVM work before its trailing `register-image` call, so a
 /// token that is merely "still valid right now" is not good enough.
 pub const TOKEN_EXPIRY_MARGIN_SECS: i64 = 300;
@@ -80,7 +80,7 @@ impl TokenEntry {
 }
 
 /// The hotkey the miner registers and serves under, recorded by
-/// `gm-miner register-hotkey`.
+/// `gmcli register-hotkey`.
 ///
 /// `ss58` is the on-chain account address — the stable identity every later
 /// command (login, deploy, doctor, earnings) references. `name` is the
@@ -144,12 +144,12 @@ pub struct NetworkEntry {
     /// The miner's deployed workers for this network. Scoped per network
     /// so a mainnet and a testnet deployment from the same config get
     /// distinct workers (and distinct per-worker `x-gm-node-key` values).
-    /// Populated as the operator runs `gm-miner deploy` (worker #1) and
-    /// `gm-miner worker add` (further capacity).
+    /// Populated as the operator runs `gmcli deploy` (worker #1) and
+    /// `gmcli worker add` (further capacity).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workers: Vec<WorkerRecord>,
     /// The hotkey this miner registers and serves under, recorded by
-    /// `gm-miner register-hotkey`. Scoped per network so a testnet and a
+    /// `gmcli register-hotkey`. Scoped per network so a testnet and a
     /// mainnet hotkey from the same config stay distinct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered_hotkey: Option<HotkeyRecord>,
@@ -299,9 +299,9 @@ impl NetworkEntry {
     }
 }
 
-/// Provider API keys persisted by `gm-miner set-api-keys`.
+/// Provider API keys persisted by `gmcli set-api-keys`.
 ///
-/// Values are stored in `~/.gm-miner/config.json` (mode 0600).
+/// Values are stored in `~/.gmcli/config.json` (mode 0600).
 /// Missing fields mean "not configured" — the deploy command treats
 /// a completely absent `provider_keys` section the same as all-None.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -334,7 +334,7 @@ pub struct Config {
     pub networks: std::collections::HashMap<String, NetworkEntry>,
     /// Which network is currently active.
     pub active_network: Option<String>,
-    /// Provider API keys set by `gm-miner set-api-keys`.
+    /// Provider API keys set by `gmcli set-api-keys`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_keys: Option<ProviderKeys>,
 }

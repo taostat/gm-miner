@@ -1,5 +1,5 @@
 //! Tests for `RegistryClient::preflight_auth`, the cheap auth probe that
-//! `gm-miner deploy` runs before any CVM work.
+//! `gmcli deploy` runs before any CVM work.
 //!
 //! Failure paths verified:
 //!   - access token absent → "not logged in" (no HTTP call)
@@ -8,7 +8,7 @@
 //! Pass paths verified:
 //!   - 200 OK
 //!   - 404 (miner not yet registered) — auth itself works, this is not
-//!     a preflight failure since `gm-miner deploy` is about to register.
+//!     a preflight failure since `gmcli deploy` is about to register.
 //!
 //! These guard against a regression where the deploy command runs the
 //! whole pipeline and only fails at the trailing `register-image` call.
@@ -69,7 +69,7 @@ fn full_chain(err: &anyhow::Error) -> String {
     out
 }
 
-/// Forgetting `gm-miner login` is the most common operator mistake. The
+/// Forgetting `gmcli login` is the most common operator mistake. The
 /// preflight must surface a clear "not logged in" before any CVM bytes
 /// move.
 #[tokio::test]
@@ -84,7 +84,7 @@ async fn preflight_errors_when_token_absent() {
     let chain = full_chain(&err);
     assert!(
         chain.contains("not logged in") || chain.to_lowercase().contains("login"),
-        "error chain must direct operator to run `gm-miner login`; got: {chain}"
+        "error chain must direct operator to run `gmcli login`; got: {chain}"
     );
 }
 
@@ -128,7 +128,7 @@ async fn preflight_passes_on_200() {
 }
 
 /// 404 means the token works but the miner has never registered — that's
-/// the normal state on the very first `gm-miner deploy`. Preflight must
+/// the normal state on the very first `gmcli deploy`. Preflight must
 /// allow this through so the deploy can proceed and register the miner.
 #[tokio::test]
 async fn preflight_passes_on_404() {
@@ -150,7 +150,7 @@ async fn preflight_passes_on_404() {
 
 // ── Token-expiry preflight ───────────────────────────────────────────────────
 //
-// A `gm-miner deploy` does many minutes of CVM work before its trailing
+// A `gmcli deploy` does many minutes of CVM work before its trailing
 // `register-image` call. A token that is valid at preflight but expires
 // mid-deploy must be caught up front, not after the irreversible CVM work.
 
@@ -171,7 +171,7 @@ async fn preflight_errors_when_token_already_expired() {
     let chain = full_chain(&err);
     assert!(
         chain.contains("expired") && chain.to_lowercase().contains("login"),
-        "error must say the token expired and direct to `gm-miner login`; got: {chain}"
+        "error must say the token expired and direct to `gmcli login`; got: {chain}"
     );
 }
 

@@ -29,7 +29,7 @@ pub struct AuthConfig {
 
 /// Fetch OAuth configuration from the registry.
 ///
-/// Unauthenticated `GET {api_url}/auth/config`. Called by `gm-miner login`
+/// Unauthenticated `GET {api_url}/auth/config`. Called by `gmcli login`
 /// before the device-code flow starts.
 ///
 /// # Errors
@@ -61,7 +61,7 @@ pub async fn get_auth_config(api_url: &str) -> Result<AuthConfig> {
 /// Cheapest authenticated endpoint on the registry — used by the deploy
 /// command's auth preflight. Returns the caller's current miner block
 /// (or 404 if the miner has never registered). Exposed as a constant so
-/// the preflight and `gm-miner status` agree on the URL.
+/// the preflight and `gmcli status` agree on the URL.
 pub const ME_PATH: &str = "/miners/me";
 
 pub struct RegistryClient {
@@ -83,7 +83,7 @@ impl RegistryClient {
     pub fn new(config: Config) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .user_agent(concat!("gm-miner/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("build reqwest client — system TLS must be available");
         Self { config, client }
@@ -108,7 +108,7 @@ impl RegistryClient {
         let url = format!("{}{path}", self.api_url());
         let token = self
             .access_token()
-            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gm-miner login` first"))?
+            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gmcli login` first"))?
             .to_owned();
 
         let resp = self
@@ -120,7 +120,7 @@ impl RegistryClient {
             .with_context(|| format!("GET {url}"))?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
-            bail!("authentication expired — run `gm-miner login` again");
+            bail!("authentication expired — run `gmcli login` again");
         }
         Ok(resp)
     }
@@ -134,7 +134,7 @@ impl RegistryClient {
         let url = format!("{}{path}", self.api_url());
         let token = self
             .access_token()
-            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gm-miner login` first"))?
+            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gmcli login` first"))?
             .to_owned();
 
         let resp = self
@@ -147,7 +147,7 @@ impl RegistryClient {
             .with_context(|| format!("POST {url}"))?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
-            bail!("authentication expired — run `gm-miner login` again");
+            bail!("authentication expired — run `gmcli login` again");
         }
         Ok(resp)
     }
@@ -161,7 +161,7 @@ impl RegistryClient {
         let url = format!("{}{path}", self.api_url());
         let token = self
             .access_token()
-            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gm-miner login` first"))?
+            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gmcli login` first"))?
             .to_owned();
 
         let resp = self
@@ -173,12 +173,12 @@ impl RegistryClient {
             .with_context(|| format!("DELETE {url}"))?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
-            bail!("authentication expired — run `gm-miner login` again");
+            bail!("authentication expired — run `gmcli login` again");
         }
         Ok(resp)
     }
 
-    /// Cheap authenticated probe used by `gm-miner deploy` before any
+    /// Cheap authenticated probe used by `gmcli deploy` before any
     /// expensive CVM work. A missing access token surfaces as "not logged
     /// in" and a 401 response surfaces as "authentication expired" — both
     /// from `get` itself. Any non-auth error (e.g. registry 404 because
@@ -206,7 +206,7 @@ impl RegistryClient {
         {
             bail!(
                 "authentication token has expired (or expires within \
-                 {}s) — run `gm-miner login` again before deploying",
+                 {}s) — run `gmcli login` again before deploying",
                 crate::config::TOKEN_EXPIRY_MARGIN_SECS
             );
         }

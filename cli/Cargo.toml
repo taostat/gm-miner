@@ -37,7 +37,7 @@ too_many_arguments = "allow"
 dist = true
 
 [[bin]]
-name = "gm-miner"
+name = "gmcli"
 path = "src/main.rs"
 
 [lib]

@@ -1,7 +1,7 @@
 //! Reusable external-tool preflight: detect a required CLI on PATH and, when
 //! it is missing, offer to install it.
 //!
-//! `gm-miner` bridges to external tools rather than reimplementing them —
+//! `gmcli` bridges to external tools rather than reimplementing them —
 //! `phala` for deploy, `btcli` for assisted hotkey registration. Both need the
 //! same primitive: is the tool present, and if not, can we install it for the
 //! operator? [`ensure_dependency`] is that primitive, parameterised by a
@@ -12,7 +12,7 @@ use std::io::{IsTerminal as _, Write as _};
 
 use anyhow::{bail, Context, Result};
 
-/// An external CLI `gm-miner` shells out to.
+/// An external CLI `gmcli` shells out to.
 ///
 /// `name` is the executable as invoked on PATH. `purpose` is the one-line
 /// "what it's for" shown before offering to install. `installer` is the
@@ -45,11 +45,11 @@ pub struct Prerequisite {
 }
 
 /// `btcli` (bittensor-cli) — owns the wallet and signs the on-chain
-/// registration extrinsic. `gm-miner` never touches wallet keys.
+/// registration extrinsic. `gmcli` never touches wallet keys.
 pub const BTCLI: Dependency = Dependency {
     name: "btcli",
     purpose: "btcli (bittensor-cli) signs the on-chain hotkey registration — \
-              it owns your wallet keys; gm-miner never sees them",
+              it owns your wallet keys; gmcli never sees them",
     installer: InstallCommand {
         program: "pipx",
         args: &["install", "bittensor-cli"],
@@ -63,7 +63,7 @@ pub const BTCLI: Dependency = Dependency {
 };
 
 /// Whether `tool` resolves to a runnable executable on PATH. Probed by
-/// `tool --version`, the convention every CLI gm-miner bridges to supports.
+/// `tool --version`, the convention every CLI gmcli bridges to supports.
 #[must_use]
 pub fn on_path(tool: &str) -> bool {
     std::process::Command::new(tool)

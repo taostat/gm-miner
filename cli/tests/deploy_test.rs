@@ -1,4 +1,4 @@
-//! Integration tests for the `gm-miner deploy` hash-verification flow.
+//! Integration tests for the `gmcli deploy` hash-verification flow.
 //!
 //! Uses wiremock to mock the registry `/image-versions` endpoint and a
 //! stub `PhalaClient` to simulate the Phala Cloud deploy step, so no real
@@ -314,7 +314,7 @@ fn deploy_errors_when_no_provider_keys_set() {
         .filter(|k| k.any_set())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no provider keys; run `gm-miner set-api-keys \
+                "no provider keys; run `gmcli set-api-keys \
                  --anthropic <key>` (and/or --openai / --google) first"
             )
         });
@@ -342,7 +342,7 @@ fn deploy_errors_when_provider_keys_all_none() {
         .filter(|k| k.any_set())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no provider keys; run `gm-miner set-api-keys \
+                "no provider keys; run `gmcli set-api-keys \
                  --anthropic <key>` (and/or --openai / --google) first"
             )
         });

@@ -1,6 +1,6 @@
 //! Bridge to `btcli` (bittensor-cli) for on-chain hotkey work.
 //!
-//! `gm-miner` never handles wallet private keys — `btcli` owns the wallet and
+//! `gmcli` never handles wallet private keys — `btcli` owns the wallet and
 //! signs the registration extrinsic. This module shells out to `btcli` and
 //! parses its `--json-output`, keeping every parse isolated behind the
 //! [`BtcliBridge`] trait so tests inject canned output instead of running a
@@ -103,7 +103,7 @@ pub trait BtcliBridge {
 }
 
 /// One neuron row from `btcli subnet metagraph --json-output --no-prompt`.
-/// Only the fields gm-miner reads are modelled; btcli emits many more.
+/// Only the fields gmcli reads are modelled; btcli emits many more.
 /// Verified against bittensor-cli 9.20.x, which keys the row's address `hotkey`,
 /// its per-tempo emission `emissions` (plural), and `stake` in alpha.
 #[derive(Debug, Deserialize)]
@@ -292,7 +292,7 @@ impl BtcliBridge for RealBtcli {
             args.push("--no-prompt");
         }
         // Inherit stdio: btcli prompts for the wallet password and shows the
-        // burn-cost confirmation itself — gm-miner must not capture that.
+        // burn-cost confirmation itself — gmcli must not capture that.
         let status = std::process::Command::new("btcli")
             .args(&args)
             .status()

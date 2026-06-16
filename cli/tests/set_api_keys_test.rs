@@ -1,4 +1,4 @@
-//! Integration tests for `gm-miner set-api-keys`.
+//! Integration tests for `gmcli set-api-keys`.
 //!
 //! Verifies:
 //!   - Config file is created with mode 0600.
@@ -40,7 +40,7 @@ fn apply_set_api_keys(
 /// Saved config must be mode 0600 (owner read/write only).
 ///
 /// This exercises `config::save` directly with a known path rather than
-/// relying on the global `GM_MINER_CONFIG_DIR` env var (which is not
+/// relying on the global `GMCLI_CONFIG_DIR` env var (which is not
 /// thread-safe across parallel test threads).
 #[cfg(unix)]
 #[test]

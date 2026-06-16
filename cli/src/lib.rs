@@ -1,4 +1,4 @@
-//! gm-miner CLI library — shared types and logic for the CLI binary and tests.
+//! gmcli CLI library — shared types and logic for the CLI binary and tests.
 
 pub mod auth;
 pub mod btcli;

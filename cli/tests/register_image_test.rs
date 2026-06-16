@@ -1,9 +1,9 @@
-//! Tests for `gm-miner register-image` auto-discovery of the deployed
+//! Tests for `gmcli register-image` auto-discovery of the deployed
 //! miner's image hashes and endpoint.
 //!
 //! `register-image` reads the live hashes from `phala cvms get <app-id>
 //! --json` via `parse_phala_cvm_detail`, and the miner's public endpoint
-//! via `parse_phala_cvm_endpoint` — the same CVM-detail parsers `gm-miner
+//! via `parse_phala_cvm_endpoint` — the same CVM-detail parsers `gmcli
 //! deploy` uses. These tests exercise those pure parsers directly (exit
 //! status + raw stdout in, parsed value out), so no real `phala` CLI is
 //! needed.
@@ -151,7 +151,7 @@ fn not_deployed_error_is_actionable() {
         "no measured hashes for CVM '{app_id}' \
          (compose_hash/os_image_hash not present in \
          `phala cvms get {app_id} --json`); \
-         deploy first with `gm-miner deploy`"
+         deploy first with `gmcli deploy`"
     );
     let msg = err.to_string();
     assert!(
@@ -159,7 +159,7 @@ fn not_deployed_error_is_actionable() {
         "error must name the app id; got: {msg}"
     );
     assert!(
-        msg.contains("gm-miner deploy"),
-        "error must point the operator at `gm-miner deploy`; got: {msg}"
+        msg.contains("gmcli deploy"),
+        "error must point the operator at `gmcli deploy`; got: {msg}"
     );
 }
