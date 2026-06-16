@@ -47,8 +47,7 @@ pub enum Registration {
 pub struct NeuronStats {
     /// The neuron's uid on the subnet.
     pub uid: u64,
-    /// Per-block emission to this neuron, in alpha (the metagraph reports
-    /// emission per block, not per tempo).
+    /// Per-tempo emission to this neuron, in alpha.
     pub emission_alpha: f64,
     /// Total stake on this neuron, in alpha.
     pub stake_alpha: f64,
@@ -56,6 +55,9 @@ pub struct NeuronStats {
     pub incentive: f64,
     /// Normalised dividend share `[0, 1]` — the validating component.
     pub dividends: f64,
+    /// Blocks per tempo, used to turn per-tempo emission into a per-day
+    /// estimate. `None` when the metagraph omits it.
+    pub tempo_blocks: Option<u64>,
 }
 
 /// The on-chain primitives `register-hotkey` needs. Real impl shells out to
@@ -103,7 +105,7 @@ pub trait BtcliBridge {
 /// One neuron row from `btcli subnet metagraph --json-output --no-prompt`.
 /// Only the fields gm-miner reads are modelled; btcli emits many more.
 /// Verified against bittensor-cli 9.20.x, which keys the row's address `hotkey`,
-/// its per-block emission `emissions` (plural), and `stake` in alpha.
+/// its per-tempo emission `emissions` (plural), and `stake` in alpha.
 #[derive(Debug, Deserialize)]
 struct MetagraphNeuron {
     #[serde(alias = "hotkey_ss58")]
@@ -119,12 +121,22 @@ struct MetagraphNeuron {
     dividends: f64,
 }
 
+/// The subnet `tempo` block from `btcli subnet metagraph --json-output`:
+/// bittensor-cli 9.20.x nests `tempo` (blocks per epoch) under a `tempo` object.
+#[derive(Debug, Deserialize)]
+struct MetagraphTempo {
+    tempo: u64,
+}
+
 /// The slice of `btcli subnet metagraph --json-output --no-prompt` we parse:
-/// the neuron rows, under the `uids` key in bittensor-cli 9.20.x.
+/// the neuron rows (under the `uids` key in bittensor-cli 9.20.x) plus the
+/// subnet `tempo`, used to turn per-tempo emission into a per-day estimate.
 #[derive(Debug, Deserialize)]
 struct MetagraphOutput {
     #[serde(alias = "neurons", default)]
     uids: Vec<MetagraphNeuron>,
+    #[serde(default)]
+    tempo: Option<MetagraphTempo>,
 }
 
 /// Find a hotkey's uid in `btcli subnet metagraph --json-output --no-prompt`.
@@ -142,11 +154,12 @@ fn parse_registration(json: &[u8], ss58: &str) -> Result<Registration> {
 }
 
 /// Read a hotkey's [`NeuronStats`] from `btcli subnet metagraph --json-output
-/// --no-prompt`, or `None` when the row is absent. Same `uids` shape as
+/// --no-prompt`, or `None` when the row is absent. Same `uids`/`tempo` shape as
 /// [`parse_registration`]; isolated here so the JSON contract lives in one place.
 fn parse_neuron_stats(json: &[u8], ss58: &str) -> Result<Option<NeuronStats>> {
     let parsed: MetagraphOutput = serde_json::from_slice(json)
         .context("parse `btcli subnet metagraph --json-output --no-prompt`")?;
+    let tempo_blocks = parsed.tempo.map(|t| t.tempo);
     Ok(parsed
         .uids
         .into_iter()
@@ -157,6 +170,7 @@ fn parse_neuron_stats(json: &[u8], ss58: &str) -> Result<Option<NeuronStats>> {
             stake_alpha: n.stake,
             incentive: n.incentive,
             dividends: n.dividends,
+            tempo_blocks,
         }))
 }
 
@@ -319,8 +333,7 @@ mod tests {
     // Trimmed real output of `btcli subnet metagraph --netuid 482 --network
     // test --json-output --no-prompt` (bittensor-cli 9.20.x): neuron rows under
     // `uids`, each keyed `uid`/`hotkey`/`emissions`/`stake`/`incentive`/
-    // `dividends`. (The real output carries more keys, e.g. a `tempo` object,
-    // which gm-miner ignores.)
+    // `dividends`, plus the nested `tempo` object.
     const METAGRAPH_JSON: &[u8] = br#"{"netuid":482,"registration_cost":0.0005,
         "tempo":{"block_since_last_step":50,"tempo":360},
         "uids":[
@@ -364,6 +377,7 @@ mod tests {
         assert!((stats.stake_alpha - 56788.59).abs() < 1e-9);
         assert!((stats.incentive - 1.0).abs() < 1e-9);
         assert!((stats.dividends - 0.0).abs() < 1e-9);
+        assert_eq!(stats.tempo_blocks, Some(360));
     }
 
     #[test]
@@ -373,14 +387,15 @@ mod tests {
     }
 
     #[test]
-    fn neuron_stats_default_missing_numeric_fields() {
-        // A sparse row (only uid/hotkey/emissions) still parses; absent numeric
-        // fields default to zero rather than failing.
+    fn neuron_stats_tolerate_missing_tempo() {
+        // A metagraph without the tempo object still parses; the per-day
+        // estimate is simply unavailable.
         let json = br#"{"netuid":482,"uids":[{"uid":3,"hotkey":"5CCC","emissions":1.0}]}"#;
         let stats = parse_neuron_stats(json, "5CCC")
             .expect("parse stats")
             .expect("hotkey present");
         assert_eq!(stats.uid, 3);
+        assert_eq!(stats.tempo_blocks, None);
         assert!((stats.stake_alpha - 0.0).abs() < 1e-9);
     }
 
