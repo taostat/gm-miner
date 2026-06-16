@@ -173,6 +173,24 @@ fn phala_cli_logged_in() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// A short label for whichever credential source a deploy would use, or `None`
+/// when none is configured. The same precedence deploy follows: an env key,
+/// then the stored config key, then an existing `phala` CLI login session.
+///
+/// `stored_key` is the value of `Config::phala_api_key` (network-independent).
+/// `gmcli doctor` calls this so its Phala check accepts exactly the sources
+/// deploy accepts — otherwise it would report a usable deploy as not ready.
+#[must_use]
+pub fn credential_source(stored_key: Option<&str>) -> Option<&'static str> {
+    if key_from_env().is_some() {
+        return Some("PHALA_API_KEY / PHALA_CLOUD_API_KEY env var");
+    }
+    if non_empty(stored_key).is_some() {
+        return Some("saved gmcli config key");
+    }
+    phala_cli_logged_in().then_some("`phala` CLI login session")
+}
+
 /// The non-interactive key sources, in priority order: flag, env, stored
 /// config. `None` means "fall through to the interactive prompt". Gathers the
 /// env and stored values, then delegates the precedence to [`pick_key_source`].

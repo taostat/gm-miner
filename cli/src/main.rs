@@ -2600,18 +2600,19 @@ async fn wizard_login(
     )
 }
 
-/// Wizard step 3: deploy worker #1. A miner with a tracked worker is offered
-/// the skip (a re-deploy is fine but rarely what onboarding wants).
+/// Wizard step 4: deploy worker #1. This step is worker #1 onboarding only —
+/// `gmcli deploy` registers `WorkerRegistration::First`. A miner who already
+/// has a registered worker has finished onboarding, so the step is skipped
+/// with a pointer to `gmcli worker add` (the correct command for more
+/// capacity); the wizard never re-runs `deploy` over a registered worker #1,
+/// which would replace its registry endpoint.
 async fn wizard_deploy(cfg: Config) -> Result<WizardFlow> {
     let title = "Step 4/5 · deploy worker";
-    if has_deployed_worker(&cfg)
-        && !gm_miner_cli::dependency::confirm(
-            "A worker is already deployed. Deploy another?",
-            false,
-            false,
-        )?
-    {
-        gm_miner_cli::wizard::already_done(title, "a worker is already deployed");
+    if has_deployed_worker(&cfg) {
+        gm_miner_cli::wizard::already_done(
+            title,
+            "worker #1 is already deployed (add more with `gmcli worker add`)",
+        );
         return Ok(WizardFlow::Continue);
     }
     let args = deploy_args_from_flags(default_deploy_flags());
@@ -2736,7 +2737,7 @@ async fn cmd_doctor(cfg: Config) -> Result<()> {
         login_check(&cfg),
         provider_keys_check(&cfg),
         phala_cli_check(),
-        phala_api_key_check(),
+        phala_api_key_check(&cfg),
     ];
     checks.push(hotkey_check(cfg).await);
 
@@ -2824,26 +2825,17 @@ fn phala_cli_check() -> Check {
     }
 }
 
-fn phala_api_key_check() -> Check {
-    if std::env::var("PHALA_CLOUD_API_KEY").is_ok_and(|v| !v.trim().is_empty()) {
-        return Check::pass("Phala Cloud API key (PHALA_CLOUD_API_KEY)", String::new());
-    }
-    // No env var — fall back to whether `phala` already holds a stored auth.
-    // `phala whoami` exits non-zero when not authenticated (unlike `status`,
-    // which reports state but still exits 0).
-    let phala_logged_in = std::process::Command::new("phala")
-        .arg("whoami")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if phala_logged_in {
-        Check::pass("Phala Cloud auth (via `phala` CLI)", String::new())
-    } else {
-        Check::fail(
+fn phala_api_key_check(cfg: &Config) -> Check {
+    // Accept exactly the sources `deploy` resolves a Phala credential from
+    // (env var, saved gmcli config key, or an existing `phala` CLI session),
+    // so doctor never reports a deploy that can authenticate as not ready.
+    match gm_miner_cli::phala::credential_source(cfg.phala_api_key.as_deref()) {
+        Some(source) => Check::pass(format!("Phala Cloud credential ({source})"), String::new()),
+        None => Check::fail(
             "Phala Cloud API key",
-            "set PHALA_CLOUD_API_KEY or run `phala auth login` (or `phala login`)",
-        )
+            "no Phala credential — set PHALA_API_KEY, run `phala auth login`, \
+             or paste a key when `gmcli deploy` prompts (it is then saved)",
+        ),
     }
 }
 
