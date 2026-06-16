@@ -16,15 +16,28 @@ conventions) live in the gm repo's `docs/contracts/`.
 
 ## Install
 
-The `gm-miner` CLI runs operator-side from a laptop. Prebuilt binaries
-for macOS (Apple Silicon + Intel) and Linux (x86-64) are published on
-the [GitHub Releases page](https://github.com/taostat/gm-miner/releases).
+The `gmcli` CLI runs operator-side from a laptop. Prebuilt binaries for
+macOS (Apple Silicon + Intel), Linux (x86-64 + aarch64), and Windows
+(x86-64) are published on the
+[GitHub Releases page](https://github.com/taostat/gm-miner/releases).
 
-Install the latest release with the one-line installer:
+Install the latest release with the one-line installer (macOS / Linux):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/taostat/gm-miner/releases/latest/download/gm-miner-cli-installer.sh | sh
+  https://github.com/taostat/gm-miner/releases/latest/download/gmcli-installer.sh | sh
+```
+
+On Windows, use the PowerShell installer:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/taostat/gm-miner/releases/latest/download/gmcli-installer.ps1 | iex"
+```
+
+On macOS / Linux with Homebrew:
+
+```sh
+brew install taostat/gmcli/gmcli
 ```
 
 The installer downloads the binary for your platform, places it in
@@ -35,7 +48,7 @@ The installer downloads the binary for your platform, places it in
 Verify the install:
 
 ```sh
-gm-miner --version
+gmcli --version
 ```
 
 Releases (workflow + installer) are produced by `dist`. To cut a

@@ -1880,7 +1880,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gm-miner-cli"
+name = "gmcli"
 version = "0.1.0"
 dependencies = [
  "anyhow",

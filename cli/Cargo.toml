@@ -1,11 +1,17 @@
 [package]
-name = "gm-miner-cli"
+# The package is named after the binary it ships (`gmcli`) so that
+# cargo-dist names every artifact, installer, and Homebrew formula
+# `gmcli-*` rather than after the crate. The library target keeps its
+# own `gm_miner_cli` name (see [lib] below) and the OAuth client_id
+# remains `gm-miner-cli`, so neither imports nor auth are affected.
+name = "gmcli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+homepage = "https://github.com/taostat/gm-miner"
 description = "gm miner CLI — login, deploy, doctor, declare-product(s), status, worker management."
 
 [lints.clippy]
