@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
-description = "gm miner CLI — login, register-image, list-products, declare-product, update-prices, status."
+description = "gm miner CLI — login, deploy, doctor, declare-product(s), status, worker management."
 
 [lints.clippy]
 # Inherit all workspace lints, then relax the ones that don't apply to a CLI.
