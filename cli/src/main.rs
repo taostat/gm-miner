@@ -377,7 +377,7 @@ async fn main() -> Result<()> {
             anthropic,
             openai,
             google,
-        } => cmd_set_api_keys(anthropic, openai, google),
+        } => cmd_set_api_keys(explicit_network, anthropic, openai, google),
         Command::Gm => {
             cmd_gm();
             Ok(())
@@ -573,6 +573,42 @@ async fn ensure_fresh_token(mut cfg: Config) -> Result<Config> {
     cfg.active_entry_mut().tokens = Some(token.to_entry_keeping(previous_refresh));
     config::save(&cfg).context("save refreshed token")?;
     Ok(cfg)
+}
+
+/// Non-interactively refresh the active token if it is expired and a
+/// `refresh_token` is stored. Never opens a browser or runs the device-code
+/// flow — a diagnostic like `doctor` must report state, not mutate auth by
+/// launching an interactive login.
+///
+/// Returns the (possibly refreshed) config. Any failure — no refresh token,
+/// a rejected refresh, an unreachable auth-gateway — leaves the config
+/// untouched and returns it as-is, so the caller's checks report the real
+/// logged-out/expired state.
+async fn try_refresh_token(mut cfg: Config) -> Config {
+    let needs_refresh = cfg
+        .active_tokens()
+        .is_some_and(config::TokenEntry::is_expired_or_near);
+    if !needs_refresh {
+        return cfg;
+    }
+    let Some(refresh) = cfg.active_tokens().and_then(|t| t.refresh_token.clone()) else {
+        return cfg;
+    };
+
+    let api_url = cfg.api_url();
+    let Ok(auth_cfg) = get_auth_config(&api_url).await else {
+        return cfg;
+    };
+    let Ok(auth::RefreshOutcome::Refreshed(token)) =
+        auth::refresh_token(&auth_cfg.token_url, &auth_cfg.client_id, &refresh).await
+    else {
+        return cfg;
+    };
+
+    let previous_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
+    cfg.active_entry_mut().tokens = Some(token.to_entry_keeping(previous_refresh));
+    let _ = config::save(&cfg);
+    cfg
 }
 
 /// Obtain a fresh access token: try the stored `refresh_token` first, fall
@@ -987,6 +1023,7 @@ fn validate_key(name: &str, value: &str) -> Result<()> {
 }
 
 fn cmd_set_api_keys(
+    explicit_network: Option<Network>,
     anthropic: Option<String>,
     openai: Option<String>,
     google: Option<String>,
@@ -1004,6 +1041,13 @@ fn cmd_set_api_keys(
 
     let mut cfg = config::load()
         .context("load gm-miner config (delete ~/.gm-miner/config.json if corrupted)")?;
+
+    // Provider keys are network-independent, but an explicit --network here
+    // is still the user's sticky selection — persist it so the promise holds
+    // even when set-api-keys is the command that carries the flag.
+    if let Some(network) = explicit_network {
+        cfg.set_network(network);
+    }
 
     {
         let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
@@ -2010,13 +2054,13 @@ async fn cmd_doctor(cfg: Config) -> Result<()> {
         network.netuid()
     );
 
-    // Refresh an expired-but-refreshable token up front so the checklist
-    // reflects what a real deploy would see — `ensure_fresh_token` is what the
-    // deploy/status paths run before touching the registry. A refresh failure
-    // is not fatal here: keep the pre-refresh config so `login_check` /
-    // `hotkey_check` report the true state with the fix.
-    let fallback = cfg.clone();
-    let cfg = ensure_fresh_token(cfg).await.unwrap_or(fallback);
+    // Non-interactively refresh an expired-but-refreshable token up front so
+    // the checklist reflects what a real deploy would see. Unlike the deploy
+    // path's `ensure_fresh_token`, this never falls back to an interactive
+    // device-code login — a preflight diagnostic must not open a browser or
+    // block on auth. A refresh that can't happen leaves the config as-is and
+    // `login_check`/`hotkey_check` report the true state.
+    let cfg = try_refresh_token(cfg).await;
 
     let mut checks = vec![
         network_check(network, &cfg),
