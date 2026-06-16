@@ -488,14 +488,14 @@ async fn deploy_defaults_to_supported_image_ref() {
         "the supported image_ref must survive the fetch"
     );
 
-    // No flags → the supported ref is the default source (no build), marked
-    // gm_published so the deploy pulls it anonymously (no GHCR creds).
+    // No flags → the supported ref is the default source (no build). Whether
+    // it needs pull credentials is decided later by an anonymous registry
+    // probe, not from any flag here.
     let source = resolve_image_source(None, None, approved.image_ref.as_deref()).unwrap();
     assert_eq!(
         source,
         ImageSource::Prebuilt {
             image_ref: "ghcr.io/taostat/gm-miner@sha256:supported".to_owned(),
-            gm_published: true,
         }
     );
 }
