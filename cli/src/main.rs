@@ -290,20 +290,15 @@ enum Command {
     ///
     /// Reads your hotkey's neuron row straight from the subnet metagraph (via
     /// btcli) and reports uid, stake, and per-tempo emission in the subnet's
-    /// alpha token. Reports on the hotkey recorded by `register-hotkey`; pass
-    /// `--hotkey-ss58 <addr>` to report on a different one.
+    /// alpha token. Reports on your own hotkey — taken from your login token,
+    /// or the one recorded by `register-hotkey` — so there's nothing to pass.
     ///
     /// This is the on-chain emission view (v1). Your gm USD-spread earnings are
     /// a future (v2) view.
     #[command(after_help = "Examples:\n  \
         gm-miner earnings\n  \
-        gm-miner --network testnet earnings\n  \
-        gm-miner earnings --hotkey-ss58 5GrwvaEF...")]
+        gm-miner --network testnet earnings")]
     Earnings {
-        /// Report on this ss58 address instead of the recorded hotkey.
-        #[arg(long = "hotkey-ss58", value_name = "SS58")]
-        hotkey_ss58: Option<String>,
-
         /// Skip the btcli install prompt for non-interactive use.
         #[arg(long)]
         yes: bool,
@@ -513,9 +508,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let mut client = RegistryClient::new(cfg);
             cmd_status(&mut client).await
         }
-        Command::Earnings { hotkey_ss58, yes } => {
+        Command::Earnings { yes } => {
             let cfg = load_config(explicit_network, api_url)?;
-            cmd_earnings(&cfg, hotkey_ss58.as_deref(), yes)
+            cmd_earnings(&cfg, yes)
         }
         Command::DeclareProduct {
             provider,
@@ -2296,9 +2291,9 @@ fn confirm_spend(network: Network, wallet: &str, hotkey: &str, assume_yes: bool)
 /// command is the only place that pays the install cost. The summary is rendered
 /// by [`render_earnings`]; a hotkey absent from the metagraph yields actionable
 /// guidance, not a raw dump.
-fn cmd_earnings(cfg: &Config, override_ss58: Option<&str>, yes: bool) -> Result<()> {
+fn cmd_earnings(cfg: &Config, yes: bool) -> Result<()> {
     let network = cfg.resolved_network();
-    let hotkey = resolve_hotkey(cfg, network, override_ss58)?;
+    let hotkey = resolve_hotkey(cfg, network)?;
 
     ensure_dependency(&BTCLI, yes)?;
     let stats = RealBtcli.neuron_stats(network, &hotkey.ss58)?;
@@ -3478,37 +3473,32 @@ mod tests {
     }
 
     #[test]
-    fn clap_parses_earnings_with_and_without_override() {
+    fn clap_parses_earnings_and_rejects_a_hotkey_arg() {
         use super::Network;
 
         let bare = <Cli as clap::Parser>::try_parse_from(["gm-miner", "earnings"])
             .unwrap()
             .command;
-        assert!(matches!(
-            bare,
-            Command::Earnings {
-                hotkey_ss58: None,
-                yes: false,
-            }
-        ));
+        assert!(matches!(bare, Command::Earnings { yes: false }));
 
         let cli = <Cli as clap::Parser>::try_parse_from([
             "gm-miner",
             "--network",
             "testnet",
             "earnings",
-            "--hotkey-ss58",
-            "5Grw",
             "--yes",
         ])
         .unwrap();
         assert_eq!(cli.explicit_network(), Some(Network::Testnet));
-        assert!(matches!(
-            cli.command,
-            Command::Earnings {
-                hotkey_ss58: Some(s),
-                yes: true,
-            } if s == "5Grw"
-        ));
+        assert!(matches!(cli.command, Command::Earnings { yes: true }));
+
+        // The hotkey is derived (login token / register-hotkey), never passed.
+        assert!(<Cli as clap::Parser>::try_parse_from([
+            "gm-miner",
+            "earnings",
+            "--hotkey-ss58",
+            "5Grw"
+        ])
+        .is_err());
     }
 }

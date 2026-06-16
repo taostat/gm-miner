@@ -39,33 +39,27 @@ impl ResolvedHotkey {
     }
 }
 
-/// Choose the hotkey to report on: an explicit `--hotkey-ss58` override wins,
-/// else the network's recorded hotkey, else an error pointing at
-/// `register-hotkey`.
+/// The hotkey to report on — the operator's own, derived rather than asked for:
+/// the login token's `sub` claim, else the recorded `register-hotkey` identity.
 ///
-/// The override is reported with no local name (it was typed in, not recorded).
+/// A single-hotkey operator never needs to type their ss58: logging in (or
+/// registering) already tells gm-miner who they are.
 ///
 /// # Errors
-/// Returns an error when neither an override nor a recorded hotkey is available,
-/// naming `register-hotkey` (and the network, in case the operator is simply on
-/// the wrong one) so the next step is obvious.
-pub fn resolve_hotkey(
-    cfg: &Config,
-    network: Network,
-    override_ss58: Option<&str>,
-) -> Result<ResolvedHotkey> {
-    if let Some(ss58) = override_ss58 {
-        return Ok(ResolvedHotkey {
-            ss58: ss58.trim().to_owned(),
-            name: None,
-        });
+/// Returns an error when neither a login token nor a recorded hotkey is
+/// available, naming `login`/`register-hotkey` (and the network, in case the
+/// operator is simply on the wrong one) so the next step is obvious.
+pub fn resolve_hotkey(cfg: &Config, network: Network) -> Result<ResolvedHotkey> {
+    if let Some(ss58) = cfg.token_hotkey() {
+        return Ok(ResolvedHotkey { ss58, name: None });
     }
     if let Some(record) = cfg.registered_hotkey() {
         return Ok(ResolvedHotkey::from_record(record));
     }
     bail!(
         "no hotkey to report on for {network} (netuid {}).\n  \
-         record one first: `gm-miner register-hotkey` (or pass `--hotkey-ss58 <addr>`).\n  \
+         set up your miner first: `gm-miner register-hotkey`, then `gm-miner login`\n  \
+         (already registered on the subnet? just `gm-miner login`).\n  \
          on the wrong network? pass `--network mainnet`/`--network testnet`.",
         network.netuid()
     )
@@ -146,11 +140,12 @@ pub fn render_earnings(
 mod tests {
     use super::{render_earnings, resolve_hotkey, ResolvedHotkey};
     use crate::btcli::NeuronStats;
-    use crate::config::{Config, HotkeyRecord};
+    use crate::config::{Config, HotkeyRecord, TokenEntry};
     use crate::network::Network;
+    use base64::Engine as _;
 
     const SS58: &str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-    const OVERRIDE: &str = "5FFCSZsDr38iPJtZED3ze4EjVsQNsufauYHpqpcKtfYt8ikz";
+    const TOKEN_SS58: &str = "5FFCSZsDr38iPJtZED3ze4EjVsQNsufauYHpqpcKtfYt8ikz";
 
     fn cfg_with_hotkey(network: Network, record: Option<HotkeyRecord>) -> Config {
         let mut cfg = Config::default();
@@ -158,6 +153,24 @@ mod tests {
         if let Some(record) = record {
             cfg.active_entry_mut().set_registered_hotkey(record);
         }
+        cfg
+    }
+
+    /// A JWT whose `sub` claim is `ss58` (unsigned — only the payload matters).
+    fn jwt_with_sub(ss58: &str) -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"sub":"{ss58}"}}"#));
+        format!("h.{payload}.s")
+    }
+
+    fn cfg_with_token(network: Network, sub: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.set_network(network);
+        cfg.active_entry_mut().tokens = Some(TokenEntry {
+            access_token: Some(jwt_with_sub(sub)),
+            token_expires_at: None,
+            refresh_token: None,
+        });
         cfg
     }
 
@@ -173,24 +186,30 @@ mod tests {
     }
 
     #[test]
-    fn override_flag_wins_over_registered_hotkey() {
-        let cfg = cfg_with_hotkey(
-            Network::Testnet,
-            Some(HotkeyRecord {
-                ss58: SS58.to_owned(),
-                name: Some("miner".to_owned()),
-                verified: true,
-            }),
-        );
-        let resolved =
-            resolve_hotkey(&cfg, Network::Testnet, Some(OVERRIDE)).expect("override resolves");
+    fn token_sub_is_the_default_hotkey() {
+        let cfg = cfg_with_token(Network::Testnet, TOKEN_SS58);
+        let resolved = resolve_hotkey(&cfg, Network::Testnet).expect("token resolves");
         assert_eq!(
             resolved,
             ResolvedHotkey {
-                ss58: OVERRIDE.to_owned(),
+                ss58: TOKEN_SS58.to_owned(),
                 name: None,
             }
         );
+    }
+
+    #[test]
+    fn token_hotkey_wins_over_registered() {
+        // Both present: the login token is authoritative (it's who the registry
+        // says you are), so it wins over the locally recorded register-hotkey.
+        let mut cfg = cfg_with_token(Network::Testnet, TOKEN_SS58);
+        cfg.active_entry_mut().set_registered_hotkey(HotkeyRecord {
+            ss58: SS58.to_owned(),
+            name: Some("miner".to_owned()),
+            verified: true,
+        });
+        let resolved = resolve_hotkey(&cfg, Network::Testnet).expect("token resolves");
+        assert_eq!(resolved.ss58, TOKEN_SS58);
     }
 
     #[test]
@@ -203,7 +222,7 @@ mod tests {
                 verified: true,
             }),
         );
-        let resolved = resolve_hotkey(&cfg, Network::Testnet, None).expect("registered resolves");
+        let resolved = resolve_hotkey(&cfg, Network::Testnet).expect("registered resolves");
         assert_eq!(resolved.ss58, SS58);
         assert_eq!(resolved.name.as_deref(), Some("miner"));
     }
@@ -211,7 +230,7 @@ mod tests {
     #[test]
     fn no_hotkey_errors_with_register_hint() {
         let cfg = cfg_with_hotkey(Network::Mainnet, None);
-        let err = resolve_hotkey(&cfg, Network::Mainnet, None).expect_err("must fail");
+        let err = resolve_hotkey(&cfg, Network::Mainnet).expect_err("must fail");
         let msg = format!("{err}");
         assert!(msg.contains("register-hotkey"), "got: {msg}");
         assert!(msg.contains("mainnet"), "got: {msg}");
@@ -229,15 +248,7 @@ mod tests {
             }),
         );
         cfg.set_network(Network::Mainnet);
-        assert!(resolve_hotkey(&cfg, Network::Mainnet, None).is_err());
-    }
-
-    #[test]
-    fn override_is_trimmed() {
-        let cfg = cfg_with_hotkey(Network::Testnet, None);
-        let resolved =
-            resolve_hotkey(&cfg, Network::Testnet, Some("  5ABC  ")).expect("override resolves");
-        assert_eq!(resolved.ss58, "5ABC");
+        assert!(resolve_hotkey(&cfg, Network::Mainnet).is_err());
     }
 
     #[test]
