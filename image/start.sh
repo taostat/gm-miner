@@ -57,9 +57,13 @@ if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "GOOGLE_API_KEY set"
 fi
+if [[ -n "${CHUTES_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "CHUTES_API_KEY set"
+fi
 
 if [[ "${HAS_KEY}" -eq 0 ]]; then
-  log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY must be set"
+  log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY must be set"
   exit 1
 fi
 

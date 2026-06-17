@@ -360,6 +360,31 @@ static_resources:
                                 value: "Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
 
+                        ## ── Chutes ──────────────────────────────────────────
+                        ##  Enabled only when CHUTES_API_KEY is set.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "chutes"
+                          route:
+                            cluster: chutes
+                            host_rewrite_literal: llm.chutes.ai
+                            timeout: 120s
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                          request_headers_to_add:
+                            - header:
+                                key: authorization
+                                value: "Bearer %ENVIRONMENT(CHUTES_API_KEY)%"
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+
                         ## ── Gemini ──────────────────────────────────────────
                         ##  Enabled only when GOOGLE_API_KEY is set.
                         - match:
@@ -733,6 +758,39 @@ static_resources:
                 - san_type: DNS
                   matcher:
                     exact: api.openai.com
+
+    ## ── Chutes ────────────────────────────────────────────────────────
+    - name: chutes
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: chutes
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: llm.chutes.ai
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: llm.chutes.ai
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: llm.chutes.ai
 
     ## ── Gemini ────────────────────────────────────────────────────────
     - name: gemini

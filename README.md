@@ -6,13 +6,13 @@ identical behavior; miners supply upstream API capacity and earn the spread. The
 inside an Intel TDX TEE so neither operators nor host machines see buyer content or miners'
 upstream keys.
 
-You bring your own provider API keys (Anthropic, OpenAI, Google) and your own funded
+You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes) and your own funded
 [Phala Cloud](https://cloud.phala.network) account. The `gmcli` tool handles the full operator
 lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Envoy-only miner image with three provider routes (Anthropic / OpenAI / Gemini) and an optional `benchmark` route to a synthetic upstream. Pinned to digest. The runtime is `envoy` plus its native `/stats/prometheus` exposure — no sidecar service. |
+| `image/` | Envoy-only miner image with four provider routes (Anthropic / OpenAI / Gemini / Chutes) and an optional `benchmark` route to a synthetic upstream. Pinned to digest. The runtime is `envoy` plus its native `/stats/prometheus` exposure — no sidecar service. |
 | `cli/` | `gmcli` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. Runs operator-side from a laptop, not inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -92,13 +92,14 @@ Credentials are stored in `~/.gmcli/config.json`.
 
 ### 3. Set your provider API keys
 
-Your provider API keys (Anthropic, OpenAI, Google) are baked into the miner container at deploy
-time and stay inside the TEE — gm never sees them. Set the keys for whichever providers you
+Your provider API keys (Anthropic, OpenAI, Google, Chutes) are baked into the miner container at
+deploy time and stay inside the TEE — gm never sees them. Set the keys for whichever providers you
 intend to serve:
 
 ```sh
 gmcli set-api-keys --anthropic sk-ant-...
 gmcli set-api-keys --openai sk-... --google AIza...
+gmcli set-api-keys --chutes cpk-...
 ```
 
 Each flag replaces the stored value; omitted flags leave existing values intact.
@@ -209,7 +210,7 @@ gmcli worker remove <worker_id>
 | `gmcli login` | Device-code OAuth login; stores credentials in `~/.gmcli/config.json` |
 | `gmcli register-hotkey` | Record the serving hotkey (`--hotkey-ss58` or assisted via btcli) |
 | `gmcli deploy` | Full deploy: fetch approved image, launch Phala CVM, verify hashes, register worker |
-| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google) |
+| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes) |
 | `gmcli declare-product` | Declare a single model offer with a discount |
 | `gmcli declare-products` | Fan one discount across the catalog or one provider's slice |
 | `gmcli status` | Registration state + per-product eligibility and rates |

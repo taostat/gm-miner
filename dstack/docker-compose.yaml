@@ -14,8 +14,8 @@
 ## the compose_hash — which the registry's attestation enforcement
 ## rejects.
 ##
-## Provider keys (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY)
-## are NOT rendered into this file — `phala deploy` encrypts them client-
+## Provider keys (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY /
+## CHUTES_API_KEY) are NOT rendered into this file — `phala deploy` encrypts them client-
 ## side to the CVM key from the .env file written by `gmcli deploy`.
 ## Set only the keys you have; an unset key makes the upstream return 401,
 ## which the registry surfaces as a "key not configured" capability failure.
@@ -74,6 +74,7 @@ services:
       - ANTHROPIC_API_KEY
       - OPENAI_API_KEY
       - GOOGLE_API_KEY
+      - CHUTES_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
       ## Active network — `testnet` or `mainnet`. Rendered as a literal

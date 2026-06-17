@@ -1068,6 +1068,11 @@ pub fn render_env_file(
         lines.push_str(k);
         lines.push('\n');
     }
+    if let Some(k) = &env_vars.chutes {
+        lines.push_str("CHUTES_API_KEY=");
+        lines.push_str(k);
+        lines.push('\n');
+    }
     // The node secret envoy enforces as the x-gm-node-key header. Always
     // written: `cmd_deploy` resolves it before this call.
     lines.push_str("GM_NODE_SECRET=");
@@ -1968,9 +1973,11 @@ mod tests {
             anthropic: Some("sk-ant".to_owned()),
             openai: None,
             google: None,
+            chutes: Some("cpk-chutes".to_owned()),
         };
         let body = render_env_file(&keys, "node-secret-xyz", None);
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
+        assert!(body.contains("CHUTES_API_KEY=cpk-chutes\n"));
         assert!(body.contains("GM_NODE_SECRET=node-secret-xyz\n"));
         assert!(
             !body.contains("DSTACK_DOCKER_"),

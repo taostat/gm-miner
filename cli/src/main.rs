@@ -117,7 +117,8 @@ enum Command {
     /// leave existing values intact.  Key values are never echoed back.
     #[command(after_help = "Examples:\n  \
         gmcli set-api-keys --anthropic sk-ant-...\n  \
-        gmcli set-api-keys --openai sk-... --google AIza...")]
+        gmcli set-api-keys --openai sk-... --google AIza...\n  \
+        gmcli set-api-keys --chutes cpk-...")]
     SetApiKeys {
         /// Anthropic API key (sk-ant-...).
         #[arg(long)]
@@ -130,6 +131,10 @@ enum Command {
         /// Google API key.
         #[arg(long)]
         google: Option<String>,
+
+        /// Chutes API key (cpk_...).
+        #[arg(long)]
+        chutes: Option<String>,
     },
 
     /// Deploy the miner to Phala Cloud with trust-correct hash verification.
@@ -530,7 +535,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             anthropic,
             openai,
             google,
-        } => cmd_set_api_keys(explicit_network, anthropic, openai, google),
+            chutes,
+        } => cmd_set_api_keys(explicit_network, anthropic, openai, google, chutes),
         Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
         Command::Gm => {
             cmd_gm();
@@ -1332,6 +1338,7 @@ fn cmd_set_api_keys(
     anthropic: Option<String>,
     openai: Option<String>,
     google: Option<String>,
+    chutes: Option<String>,
 ) -> Result<()> {
     // Reject empty values up front so they don't pass the deploy preflight.
     if let Some(ref k) = anthropic {
@@ -1343,11 +1350,14 @@ fn cmd_set_api_keys(
     if let Some(ref k) = google {
         validate_key("google", k)?;
     }
+    if let Some(ref k) = chutes {
+        validate_key("chutes", k)?;
+    }
 
     // Load → mutate → save under the lock so a concurrent `deploy` save can't
     // be clobbered, and re-read fresh inside the lock so we merge onto the
     // latest on-disk state rather than a snapshot taken before the lock.
-    let (has_anthropic, has_openai, has_google) = config::with_config_lock(|| {
+    let (has_anthropic, has_openai, has_google, has_chutes) = config::with_config_lock(|| {
         let mut cfg = config::load()
             .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
 
@@ -1368,10 +1378,14 @@ fn cmd_set_api_keys(
         if let Some(k) = google {
             keys.google = Some(k);
         }
+        if let Some(k) = chutes {
+            keys.chutes = Some(k);
+        }
         let snapshot = (
             keys.anthropic.is_some(),
             keys.openai.is_some(),
             keys.google.is_some(),
+            keys.chutes.is_some(),
         );
 
         config::save(&cfg).context("save config")?;
@@ -1388,10 +1402,13 @@ fn cmd_set_api_keys(
     if has_google {
         set_names.push("google");
     }
+    if has_chutes {
+        set_names.push("chutes");
+    }
 
     // Report which providers are now configured — never print the values.
     if set_names.is_empty() {
-        println!("No keys stored (pass --anthropic, --openai, or --google to set one).");
+        println!("No keys stored (pass --anthropic, --openai, --google, or --chutes to set one).");
     } else {
         println!("Provider keys updated.");
         for name in &set_names {
@@ -1516,7 +1533,7 @@ async fn cmd_deploy(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no provider keys; run `gmcli set-api-keys \
-                 --anthropic <key>` (and/or --openai / --google) first"
+                 --anthropic <key>` (and/or --openai / --google / --chutes) first"
             )
         })?;
 
@@ -1807,7 +1824,9 @@ async fn cmd_login(
 
     println!("Login successful ({} network).", cfg.resolved_network());
     println!("Credentials saved to {}", config::config_path().display());
-    println!("\nNext: gmcli set-api-keys --anthropic <key>  (and/or --openai / --google)");
+    println!(
+        "\nNext: gmcli set-api-keys --anthropic <key>  (and/or --openai / --google / --chutes)"
+    );
     Ok(())
 }
 
@@ -2991,46 +3010,55 @@ fn wizard_provider_keys(
         gm_miner_cli::wizard::already_done(title, "provider keys already set");
         return Ok(WizardFlow::Continue);
     }
-    let (anthropic, openai, google) = prompt_provider_keys(assume_yes)?;
-    if anthropic.is_none() && openai.is_none() && google.is_none() {
+    let keys = prompt_provider_keys(assume_yes)?;
+    if keys.anthropic.is_none()
+        && keys.openai.is_none()
+        && keys.google.is_none()
+        && keys.chutes.is_none()
+    {
         println!("  No keys entered — skipping. Set them later with `gmcli set-api-keys`.");
         return Ok(WizardFlow::Continue);
     }
-    let command = describe_keys_command(anthropic.as_deref(), openai.as_deref(), google.as_deref());
+    let command = describe_keys_command(&keys);
     run_wizard_step!(
         title,
         &command,
         assume_yes,
-        cmd_set_api_keys(explicit_network, anthropic, openai, google)
+        cmd_set_api_keys(
+            explicit_network,
+            keys.anthropic,
+            keys.openai,
+            keys.google,
+            keys.chutes,
+        )
     )
 }
 
 /// Prompt for each provider key in turn (blank to skip a provider).
-fn prompt_provider_keys(
-    assume_yes: bool,
-) -> Result<(Option<String>, Option<String>, Option<String>)> {
-    let anthropic = prompt_line("Anthropic API key (blank to skip):", assume_yes)?;
-    let openai = prompt_line("OpenAI API key (blank to skip):", assume_yes)?;
-    let google = prompt_line("Google API key (blank to skip):", assume_yes)?;
-    Ok((anthropic, openai, google))
+fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
+    Ok(ProviderKeys {
+        anthropic: prompt_line("Anthropic API key (blank to skip):", assume_yes)?,
+        openai: prompt_line("OpenAI API key (blank to skip):", assume_yes)?,
+        google: prompt_line("Google API key (blank to skip):", assume_yes)?,
+        chutes: prompt_line("Chutes API key (blank to skip):", assume_yes)?,
+    })
 }
 
 /// Render the `set-api-keys` command for display, naming only the providers
 /// the miner supplied (never echoing the secret values).
-fn describe_keys_command(
-    anthropic: Option<&str>,
-    openai: Option<&str>,
-    google: Option<&str>,
-) -> String {
+fn describe_keys_command(keys: &ProviderKeys) -> String {
     let mut cmd = String::from("gmcli set-api-keys");
-    if anthropic.is_some() {
+    if keys.anthropic.is_some() {
         cmd.push_str(" --anthropic <key>");
     }
-    if openai.is_some() {
+    if keys.openai.is_some() {
         cmd.push_str(" --openai <key>");
     }
-    if google.is_some() {
+    if keys.google.is_some() {
         cmd.push_str(" --google <key>");
+    }
+    if keys.chutes.is_some() {
+        cmd.push_str(" --chutes <key>");
     }
     cmd
 }
@@ -3158,12 +3186,15 @@ fn provider_keys_check(cfg: &Config) -> Check {
         if k.google.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             names.push("google");
         }
+        if k.chutes.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            names.push("chutes");
+        }
         names
     });
     if set.is_empty() {
         Check::fail(
             "Provider keys set",
-            "no provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google)",
+            "no provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google / --chutes)",
         )
     } else {
         Check::pass(
@@ -4417,6 +4448,7 @@ mod tests {
                     anthropic: Some(value.to_owned()),
                     openai: None,
                     google: None,
+                    chutes: None,
                 }),
                 ..Default::default()
             }

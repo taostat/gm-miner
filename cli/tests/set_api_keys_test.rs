@@ -21,6 +21,7 @@ fn apply_set_api_keys(
     anthropic: Option<&str>,
     openai: Option<&str>,
     google: Option<&str>,
+    chutes: Option<&str>,
 ) -> Config {
     let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
     if let Some(k) = anthropic {
@@ -31,6 +32,9 @@ fn apply_set_api_keys(
     }
     if let Some(k) = google {
         keys.google = Some(k.to_owned());
+    }
+    if let Some(k) = chutes {
+        keys.chutes = Some(k.to_owned());
     }
     cfg
 }
@@ -50,7 +54,7 @@ fn config_file_is_mode_0600_after_save() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.json");
 
-    let cfg = apply_set_api_keys(Config::default(), Some("sk-ant-test"), None, None);
+    let cfg = apply_set_api_keys(Config::default(), Some("sk-ant-test"), None, None, None);
 
     // Serialise directly to the temp path.
     let bytes = serde_json::to_vec_pretty(&cfg).unwrap();
@@ -69,10 +73,10 @@ fn config_file_is_mode_0600_after_save() {
 #[test]
 fn missing_flags_preserve_existing_keys() {
     // First call: set anthropic only.
-    let cfg1 = apply_set_api_keys(Config::default(), Some("sk-ant-1"), None, None);
+    let cfg1 = apply_set_api_keys(Config::default(), Some("sk-ant-1"), None, None, None);
 
     // Second call: set openai only — anthropic must survive.
-    let cfg2 = apply_set_api_keys(cfg1, None, Some("sk-openai-1"), None);
+    let cfg2 = apply_set_api_keys(cfg1, None, Some("sk-openai-1"), None, None);
 
     let keys = cfg2.provider_keys.unwrap();
     assert_eq!(keys.anthropic.as_deref(), Some("sk-ant-1"));
@@ -82,33 +86,41 @@ fn missing_flags_preserve_existing_keys() {
 
 #[test]
 fn new_value_replaces_existing_key() {
-    let cfg1 = apply_set_api_keys(Config::default(), Some("old-key"), None, None);
-    let cfg2 = apply_set_api_keys(cfg1, Some("new-key"), None, None);
+    let cfg1 = apply_set_api_keys(Config::default(), Some("old-key"), None, None, None);
+    let cfg2 = apply_set_api_keys(cfg1, Some("new-key"), None, None, None);
     let keys = cfg2.provider_keys.unwrap();
     assert_eq!(keys.anthropic.as_deref(), Some("new-key"));
 }
 
 #[test]
 fn no_flags_leaves_config_unchanged() {
-    let cfg1 = apply_set_api_keys(Config::default(), Some("sk-ant-x"), Some("sk-oai-x"), None);
-    let cfg2 = apply_set_api_keys(cfg1, None, None, None);
+    let cfg1 = apply_set_api_keys(
+        Config::default(),
+        Some("sk-ant-x"),
+        Some("sk-oai-x"),
+        None,
+        None,
+    );
+    let cfg2 = apply_set_api_keys(cfg1, None, None, None, None);
     let keys = cfg2.provider_keys.unwrap();
     assert_eq!(keys.anthropic.as_deref(), Some("sk-ant-x"));
     assert_eq!(keys.openai.as_deref(), Some("sk-oai-x"));
 }
 
 #[test]
-fn all_three_providers_can_be_set() {
+fn all_providers_can_be_set() {
     let cfg = apply_set_api_keys(
         Config::default(),
         Some("ant-key"),
         Some("oai-key"),
         Some("ggl-key"),
+        Some("cpk-key"),
     );
     let keys = cfg.provider_keys.unwrap();
     assert_eq!(keys.anthropic.as_deref(), Some("ant-key"));
     assert_eq!(keys.openai.as_deref(), Some("oai-key"));
     assert_eq!(keys.google.as_deref(), Some("ggl-key"));
+    assert_eq!(keys.chutes.as_deref(), Some("cpk-key"));
 }
 
 // ── Key values not echoed ─────────────────────────────────────────────────────
@@ -125,7 +137,7 @@ fn all_three_providers_can_be_set() {
 #[test]
 fn key_value_stored_but_not_displayable() {
     let secret = "super-secret-key-xyz-9999";
-    let cfg = apply_set_api_keys(Config::default(), Some(secret), None, None);
+    let cfg = apply_set_api_keys(Config::default(), Some(secret), None, None, None);
     let keys = cfg.provider_keys.unwrap();
     // Value is stored correctly.
     assert_eq!(keys.anthropic.as_deref(), Some(secret));
@@ -147,6 +159,7 @@ fn any_set_true_when_anthropic_set() {
         anthropic: Some("k".to_owned()),
         openai: None,
         google: None,
+        chutes: None,
     };
     assert!(keys.any_set());
 }
@@ -157,6 +170,7 @@ fn any_set_true_when_openai_set() {
         anthropic: None,
         openai: Some("k".to_owned()),
         google: None,
+        chutes: None,
     };
     assert!(keys.any_set());
 }
@@ -167,6 +181,7 @@ fn any_set_true_when_google_set() {
         anthropic: None,
         openai: None,
         google: Some("k".to_owned()),
+        chutes: None,
     };
     assert!(keys.any_set());
 }
@@ -180,6 +195,7 @@ fn any_set_false_for_empty_string() {
         anthropic: Some(String::new()),
         openai: None,
         google: None,
+        chutes: None,
     };
     assert!(!keys.any_set(), "Some(\"\") must not count as set");
 }
@@ -191,8 +207,20 @@ fn any_set_false_for_whitespace_only() {
         anthropic: None,
         openai: Some("  ".to_owned()),
         google: None,
+        chutes: None,
     };
     assert!(!keys.any_set());
+}
+
+#[test]
+fn any_set_true_when_chutes_set() {
+    let keys = ProviderKeys {
+        anthropic: None,
+        openai: None,
+        google: None,
+        chutes: Some("k".to_owned()),
+    };
+    assert!(keys.any_set());
 }
 
 // ── Empty-key rejection in set-api-keys ──────────────────────────────────────

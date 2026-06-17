@@ -315,6 +315,8 @@ pub struct ProviderKeys {
     pub openai: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub google: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chutes: Option<String>,
 }
 
 impl ProviderKeys {
@@ -326,7 +328,10 @@ impl ProviderKeys {
     #[must_use]
     pub fn any_set(&self) -> bool {
         let non_empty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
-        non_empty(&self.anthropic) || non_empty(&self.openai) || non_empty(&self.google)
+        non_empty(&self.anthropic)
+            || non_empty(&self.openai)
+            || non_empty(&self.google)
+            || non_empty(&self.chutes)
     }
 }
 

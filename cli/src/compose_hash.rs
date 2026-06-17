@@ -60,13 +60,15 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// every supported provider key name plus the node secret, regardless of
 /// which keys an individual miner has configured. Hash covers names only,
 /// not values, so every miner produces the same `compose_hash`. The order
-/// matches `render_env_file`: Anthropic, `OpenAI`, Google, node secret.
-/// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
-/// gm image is public and those vars do not appear in `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 4] = [
+/// matches `render_env_file`: Anthropic, `OpenAI`, Google, Chutes, node
+/// secret. Private-registry pull credentials (`DSTACK_DOCKER_*`) are
+/// excluded: the gm image is public and those vars do not appear in
+/// `allowed_envs`.
+const CANONICAL_ALLOWED_ENVS: [&str; 5] = [
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
+    "CHUTES_API_KEY",
     "GM_NODE_SECRET",
 ];
 
@@ -194,22 +196,22 @@ mod tests {
         "ghcr.io/taostat/gm-miner@sha256:ac9292e9bfa21100885768db4a84ab191e8ba4ac48859a9905c5867a1c59dc53";
 
     /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
-    /// this image ref + `CANONICAL_ALLOWED_ENVS` (all four provider key names).
+    /// this image ref + `CANONICAL_ALLOWED_ENVS` (all five provider key names,
+    /// including `CHUTES_API_KEY`).
     ///
-    /// This supersedes the pre-canonicalization hash
-    /// `e47562cd6e1f663817371745399eb92b234f6adb0049df21248f9392249f8fbc`,
-    /// which was computed with only the three-name set
-    /// `["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GM_NODE_SECRET"]` and
-    /// therefore varied by which keys a miner had configured. The old hash is
-    /// retired: the registry row it anchors must be replaced with the new
-    /// canonical row before existing miners redeploy.
+    /// This supersedes the four-name hash
+    /// `9a0f459450e3ada3fee959392aef16adb0c66467a50458db587fcabbe48acc42`,
+    /// which was computed before the Chutes upstream added `CHUTES_API_KEY` to
+    /// `allowed_envs` and the dstack compose. The old hash is retired: the
+    /// registry row it anchors must be replaced with the new canonical row
+    /// before existing miners redeploy.
     ///
     /// Rollout: publish a new `ImageVersion` with this hash to the testnet
     /// registry (`gmcli publish-image-version`), redeploy the live testnet
     /// miners so their measured hash becomes this value, confirm attestation
-    /// matches, then retire the old `e47562cd` row.
+    /// matches, then retire the old `9a0f4594` row.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "9a0f459450e3ada3fee959392aef16adb0c66467a50458db587fcabbe48acc42";
+        "89cdc0e68863e2291bfaf6299199dc0e4f4bd0d7839cd975bba2eb7bc5b29d0c";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
@@ -268,8 +270,8 @@ mod tests {
                 .get("allowed_envs")
                 .and_then(|v| v.as_array())
                 .map(Vec::len),
-            Some(4),
-            "allowed_envs must be the canonical 4-name set"
+            Some(5),
+            "allowed_envs must be the canonical 5-name set"
         );
     }
 

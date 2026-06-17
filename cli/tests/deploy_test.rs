@@ -257,6 +257,7 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
         anthropic: Some("key".to_owned()),
         openai: None,
         google: None,
+        chutes: None,
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
@@ -292,6 +293,7 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
         anthropic: Some("key".to_owned()),
         openai: None,
         google: None,
+        chutes: None,
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
@@ -342,6 +344,7 @@ fn deploy_errors_when_provider_keys_all_none() {
             anthropic: None,
             openai: None,
             google: None,
+            chutes: None,
         }),
         phala_api_key: None,
         api_url_override: None,
@@ -397,6 +400,7 @@ fn phala_failure_surfaces_as_error() {
         anthropic: Some("key".to_owned()),
         openai: None,
         google: None,
+        chutes: None,
     };
     let err = FailingPhala
         .deploy("compose-content", &keys, "test-node-secret-1234", None, 300)
@@ -414,6 +418,7 @@ fn timeout_error_is_actionable() {
         anthropic: Some("key".to_owned()),
         openai: None,
         google: None,
+        chutes: None,
     };
     let err = TimedOutPhala
         .deploy("compose", &keys, "test-node-secret-1234", None, 0)
@@ -688,6 +693,7 @@ fn any_set_false_for_empty_string() {
         anthropic: Some(String::new()),
         openai: None,
         google: None,
+        chutes: None,
     };
     assert!(
         !keys.any_set(),
@@ -702,6 +708,7 @@ fn any_set_false_for_whitespace_only() {
         anthropic: None,
         openai: Some("   ".to_owned()),
         google: None,
+        chutes: None,
     };
     assert!(!keys.any_set());
 }
@@ -713,6 +720,7 @@ fn any_set_true_for_non_empty_key() {
         anthropic: None,
         openai: None,
         google: Some("real-key".to_owned()),
+        chutes: None,
     };
     assert!(keys.any_set());
 }
