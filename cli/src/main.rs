@@ -2426,13 +2426,9 @@ async fn post_declare_product(
         .context("POST /miners/products")?;
 
     let status = resp.status();
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("parse declare-product response")?;
-
     if !status.is_success() {
-        bail!("registry returned {status}: {}", error_detail(&json));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error("declare-product", status, &body));
     }
     Ok(())
 }
