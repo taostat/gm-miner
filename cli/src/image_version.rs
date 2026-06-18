@@ -214,7 +214,7 @@ mod tests {
         );
         assert_eq!(
             registry_url_for(Network::Mainnet, None),
-            "https://gm-registry.taostats.io"
+            "https://registry.saygm.com"
         );
     }
 
