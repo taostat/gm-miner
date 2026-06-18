@@ -54,7 +54,7 @@ impl Network {
     pub fn default_registry_url(self) -> &'static str {
         match self {
             Self::Testnet => "https://test-registry.saygm.com",
-            Self::Mainnet => "https://gm-registry.taostats.io",
+            Self::Mainnet => "https://registry.saygm.com",
         }
     }
 
@@ -121,7 +121,7 @@ mod tests {
         );
         assert_eq!(
             Network::Mainnet.default_registry_url(),
-            "https://gm-registry.taostats.io"
+            "https://registry.saygm.com"
         );
     }
 

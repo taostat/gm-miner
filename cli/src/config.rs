@@ -924,7 +924,7 @@ mod tests {
         // Default (no active_network) is mainnet.
         let cfg = Config::default();
         assert_eq!(cfg.resolved_network(), Network::Mainnet);
-        assert_eq!(cfg.api_url(), "https://gm-registry.taostats.io");
+        assert_eq!(cfg.api_url(), "https://registry.saygm.com");
     }
 
     #[test]
