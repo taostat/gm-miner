@@ -67,7 +67,7 @@ fn absent_override_keeps_stored_value() {
 fn absent_override_and_no_stored_value_uses_mainnet_default() {
     let cfg = config_for(Network::Mainnet);
     let resolved = resolve_api_url(&cfg, None);
-    assert_eq!(resolved, "https://gm-registry.taostats.io");
+    assert_eq!(resolved, "https://registry.saygm.com");
 }
 
 #[test]
