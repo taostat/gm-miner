@@ -2,11 +2,11 @@
 //! it is missing, offer to install it.
 //!
 //! `gmcli` bridges to external tools rather than reimplementing them —
-//! `phala` for deploy, `btcli` for assisted hotkey registration. Both need the
-//! same primitive: is the tool present, and if not, can we install it for the
-//! operator? [`ensure_dependency`] is that primitive, parameterised by a
-//! [`Dependency`] descriptor so a new tool slots in by value, not by a new
-//! copy of the detection-and-install dance.
+//! `phala` for deploy, `btcli` for read-only wallet/metagraph checks during
+//! hotkey setup. Both need the same primitive: is the tool present, and if not,
+//! can we install it for the operator? [`ensure_dependency`] is that primitive,
+//! parameterised by a [`Dependency`] descriptor so a new tool slots in by value,
+//! not by a new copy of the detection-and-install dance.
 
 use std::io::{IsTerminal as _, Write as _};
 
@@ -44,12 +44,12 @@ pub struct Prerequisite {
     pub hint: &'static str,
 }
 
-/// `btcli` (bittensor-cli) — owns the wallet and signs the on-chain
-/// registration extrinsic. `gmcli` never touches wallet keys.
+/// `btcli` (bittensor-cli) — reads the local wallet list and subnet metagraph.
+/// The operator runs wallet-signing commands themselves.
 pub const BTCLI: Dependency = Dependency {
     name: "btcli",
-    purpose: "btcli (bittensor-cli) signs the on-chain hotkey registration — \
-              it owns your wallet keys; gmcli never sees them",
+    purpose: "btcli (bittensor-cli) reads your local wallet list and subnet \
+              metagraph; run any wallet-signing command yourself",
     installer: InstallCommand {
         program: "pipx",
         args: &["install", "bittensor-cli"],

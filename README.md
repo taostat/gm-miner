@@ -68,15 +68,17 @@ gmcli register-hotkey --hotkey-ss58 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGK
 ```
 
 **Assisted flow (requires btcli):** if you have not registered yet, omit `--hotkey-ss58` and
-pass the btcli wallet and hotkey name. gmcli offers to register a fresh hotkey through btcli
-(btcli holds your wallet keys — gmcli never sees them):
+pass the btcli wallet and hotkey name. gmcli resolves the hotkey's ss58 from your local btcli
+wallet, checks the subnet metagraph, and — when the hotkey isn't registered yet — prints the
+exact `btcli subnet register` command for you to run. gmcli never signs an on-chain extrinsic
+or touches your wallet keys; you run any wallet-signing command yourself:
 
 ```sh
 gmcli register-hotkey --wallet miner --hotkey default
 ```
 
-btcli is only needed for the assisted registration flow. The bring-your-own path (`--hotkey-ss58`)
-has no btcli dependency.
+btcli is only needed for these read-only wallet/metagraph lookups in the assisted flow. The
+bring-your-own path (`--hotkey-ss58`) has no btcli dependency.
 
 ### 2. Log in
 

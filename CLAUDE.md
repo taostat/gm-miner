@@ -15,7 +15,7 @@ declaration, and price management.
 - `cli/src/client.rs` — `RegistryClient`: typed HTTP wrappers for registry endpoints
 - `cli/src/config.rs` — `Config` loaded from `~/.gmcli/config.json` (mode 0600); supports `mainnet`/`testnet` networks
 - `cli/src/network.rs` — `Network` enum (testnet/mainnet) carrying `netuid`, chain websocket, and default registry URL; the seam later work (register-hotkey, earnings) reads coordinates from
-- `cli/src/btcli.rs` — `BtcliBridge` trait + `RealBtcli`: bridge to `btcli` (bittensor-cli) for hotkey registration/metagraph queries; `gmcli` never touches wallet keys. `btcli_network()` maps `Network`→`test`/`finney`
+- `cli/src/btcli.rs` — `BtcliBridge` trait + `RealBtcli`: bridge to `btcli` (bittensor-cli) for read-only wallet-list and metagraph queries; `gmcli` never signs an extrinsic or touches wallet keys — the operator runs any wallet-signing command themselves. `btcli_network()` maps `Network`→`test`/`finney`
 - `cli/src/dependency.rs` — `ensure_dependency(&Dependency, assume_yes)`: reusable PATH-detect-and-offer-to-install primitive (e.g. `BTCLI`); `register-hotkey`'s assisted flow uses it, `deploy`/future init-wizard can adopt it
 - `cli/src/register_hotkey.rs` — pure decision logic for `register-hotkey` (ss58 validation, bring-your-own vs assisted), testable against a stubbed `BtcliBridge`
 - `cli/src/deploy.rs` — `PhalaClient` trait + `RealPhalaClient`; deploy orchestration: compose rendering, `phala deploy`, `phala cvms get` hash polling, hash verification
@@ -51,7 +51,7 @@ cargo test -p gm-miner-cli
 | `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google) to `~/.gmcli/config.json` |
 | `deploy` | Full trust-correct deploy: build/push image + Phala Cloud deploy + hash verification + image registration |
 | `login` | Device-code OAuth flow; stores access token in config |
-| `register-hotkey` | Record the serving hotkey: `--hotkey-ss58` records one registered elsewhere; otherwise registers a fresh hotkey via the `btcli` bridge (`--wallet`/`--hotkey`) |
+| `register-hotkey` | Record the serving hotkey: `--hotkey-ss58` records one registered elsewhere; otherwise (`--wallet`/`--hotkey`) resolves the local btcli hotkey, checks the metagraph, and prints the `btcli subnet register` command for the operator to run — gmcli never signs |
 | `doctor` | Preflight checklist (network, login, provider keys, `phala` CLI + API key, hotkey registration) with actionable fixes |
 | `register-image` | Re-register an already-deployed image (debugging / registry resync; hidden from default help) |
 | `declare-product` | Register a single miner-product offer with a pct discount |

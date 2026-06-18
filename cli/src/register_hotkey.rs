@@ -1,5 +1,4 @@
-//! `gmcli register-hotkey` — record (and optionally register) the hotkey
-//! the miner serves under.
+//! `gmcli register-hotkey` — record the hotkey the miner serves under.
 //!
 //! Two flows, dispatched on whether the operator passed `--hotkey-ss58`:
 //!
@@ -9,8 +8,9 @@
 //!   confirm the hotkey is on the subnet and capture its uid; if not, we
 //!   accept the address and defer verification to the first deploy/login,
 //!   which the registry/gateway probe anyway.
-//! - **Assisted** (no `--hotkey-ss58`): gmcli offers to register a fresh
-//!   hotkey through `btcli`. This is the only flow that requires `btcli`.
+//! - **Assisted** (no `--hotkey-ss58`): gmcli resolves the local btcli hotkey,
+//!   prints the `btcli subnet register` command for the operator when needed,
+//!   and verifies via the metagraph. gmcli never registers or signs.
 //!
 //! The pure decision logic lives here behind the [`BtcliBridge`] trait so it
 //! is unit-testable with canned btcli output; main.rs owns the clap wiring,
@@ -122,53 +122,13 @@ pub fn record_byo(
     }
 }
 
-/// The record to persist after a successful `btcli subnet register`, plus
-/// whether the metagraph already shows the new uid.
-#[derive(Debug, PartialEq, Eq)]
-pub struct PostRegister {
-    pub record: HotkeyRecord,
-    /// `Some(uid)` once the hotkey appears on the metagraph; `None` while
-    /// registration is still settling (it can take a block).
-    pub uid: Option<u64>,
-}
-
-/// Build the record to persist after `btcli subnet register` returns, re-reading
-/// the metagraph for the new uid.
-///
-/// btcli has already reported success, so the hotkey *is* registered — we always
-/// persist its known `ss58`. The metagraph can lag a block, so a uid that hasn't
-/// appeared yet leaves the record `verified: false` with `uid: None` rather than
-/// discarding a successful registration. The caller reports the settling state.
-///
-/// # Errors
-/// Returns an error only if the metagraph query itself fails (btcli unreachable).
-pub fn confirm_registered(
-    bridge: &dyn BtcliBridge,
-    network: Network,
-    ss58: &str,
-    hotkey_name: &str,
-) -> Result<PostRegister> {
-    let uid = match bridge.registration_of(network, ss58)? {
-        Registration::Registered { uid } => Some(uid),
-        Registration::Absent => None,
-    };
-    Ok(PostRegister {
-        record: HotkeyRecord {
-            ss58: ss58.to_owned(),
-            name: Some(hotkey_name.to_owned()),
-            verified: uid.is_some(),
-        },
-        uid,
-    })
-}
-
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{confirm_registered, record_byo, validate_ss58};
+    use super::{record_byo, validate_ss58};
     use crate::btcli::{BtcliBridge, Registration};
     use crate::config::HotkeyRecord;
     use crate::network::Network;
@@ -183,15 +143,6 @@ mod tests {
     impl BtcliBridge for StubBridge {
         fn registration_of(&self, _network: Network, _ss58: &str) -> Result<Registration> {
             Ok(self.result.clone())
-        }
-        fn register(
-            &self,
-            _network: Network,
-            _wallet: &str,
-            _hotkey: &str,
-            _assume_yes: bool,
-        ) -> Result<()> {
-            Ok(())
         }
         fn hotkey_ss58(&self, _wallet: &str, _hotkey: &str) -> Result<Option<String>> {
             Ok(None)
@@ -261,37 +212,5 @@ mod tests {
         let err =
             record_byo(Some(&bridge), Network::Testnet, "not-an-address").expect_err("must fail");
         assert!(format!("{err}").contains("invalid --hotkey-ss58"));
-    }
-
-    #[test]
-    fn confirm_registered_captures_uid_and_verifies() {
-        let bridge = StubBridge {
-            result: Registration::Registered { uid: 9 },
-        };
-        let out =
-            confirm_registered(&bridge, Network::Testnet, VALID_SS58, "default").expect("confirm");
-        assert_eq!(out.uid, Some(9));
-        assert_eq!(
-            out.record,
-            HotkeyRecord {
-                ss58: VALID_SS58.to_owned(),
-                name: Some("default".to_owned()),
-                verified: true,
-            }
-        );
-    }
-
-    #[test]
-    fn confirm_registered_still_records_ss58_while_settling() {
-        // btcli succeeded but the metagraph hasn't caught up: the ss58 is still
-        // recorded (the registration happened), just unverified with no uid.
-        let bridge = StubBridge {
-            result: Registration::Absent,
-        };
-        let out =
-            confirm_registered(&bridge, Network::Mainnet, VALID_SS58, "default").expect("confirm");
-        assert_eq!(out.uid, None);
-        assert_eq!(out.record.ss58, VALID_SS58);
-        assert!(!out.record.verified);
     }
 }

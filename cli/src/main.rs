@@ -7,7 +7,7 @@
 //!   login            — Taostats device-code OAuth flow
 //!   doctor           — preflight checklist (network, login, keys, phala, hotkey)
 //!   register-hotkey  — record the serving hotkey (bring-your-own ss58, or
-//!                      register a fresh one via the btcli bridge)
+//!                      print the btcli register command to run yourself)
 //!   register-image   — re-register the deployed miner's image hashes (hidden)
 //!   declare-product  — declare a single offer (--provider X --model Y --discount-pct N)
 //!   declare-products — fan out one discount over the whole catalog, or one provider
@@ -52,7 +52,7 @@ use gm_miner_cli::{
     earnings::{render_earnings, resolve_hotkey},
     network::Network,
     node_secret,
-    register_hotkey::{confirm_registered, record_byo},
+    register_hotkey::record_byo,
     terms,
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider,
@@ -221,13 +221,13 @@ enum Command {
         gmcli --network testnet doctor")]
     Doctor,
 
-    /// Record (and optionally register) the hotkey your miner serves under.
+    /// Record the hotkey your miner serves under.
     ///
     /// Two flows. If you already registered a hotkey elsewhere (a browser
     /// wallet, another machine), pass `--hotkey-ss58 <addr>` and gmcli just
     /// records it — no btcli needed. If you have not, omit `--hotkey-ss58` and
-    /// pass `--wallet`/`--hotkey`: gmcli offers to register a fresh hotkey
-    /// through btcli (which owns your wallet keys — gmcli never sees them).
+    /// pass `--wallet`/`--hotkey`: gmcli prints the btcli register command for
+    /// you to run yourself, then verifies the result via read-only chain state.
     #[command(after_help = "Examples:\n  \
         gmcli register-hotkey --hotkey-ss58 5GrwvaEF...     # already registered elsewhere\n  \
         gmcli --network testnet register-hotkey --wallet miner --hotkey default\n  \
@@ -235,8 +235,8 @@ enum Command {
     RegisterHotkey {
         /// The ss58 address of a hotkey you already registered elsewhere.
         /// When set, gmcli records it (verifying via btcli if present) and
-        /// never registers anything. When omitted, gmcli offers to register
-        /// a fresh hotkey via btcli using `--wallet`/`--hotkey`.
+        /// never registers anything. When omitted, gmcli resolves the local
+        /// btcli hotkey and prints the register command for you to run.
         #[arg(long = "hotkey-ss58", value_name = "SS58")]
         hotkey_ss58: Option<String>,
 
@@ -248,8 +248,7 @@ enum Command {
         #[arg(long)]
         hotkey: Option<String>,
 
-        /// Skip confirmation prompts (install offers, the spend gate) for
-        /// non-interactive use.
+        /// Skip prompts (install offers, ss58 paste prompt) for non-interactive use.
         #[arg(long)]
         yes: bool,
     },
@@ -2537,7 +2536,8 @@ impl Check {
 ///
 /// Dispatches on `--hotkey-ss58`: present means bring-your-own (just record,
 /// verify via btcli only if it happens to be installed); absent means the
-/// assisted btcli flow (offer to install btcli, then register a fresh hotkey).
+/// assisted btcli flow (offer to install btcli, resolve the local hotkey, and
+/// print the register command for the operator when needed).
 /// Either way the resulting [`HotkeyRecord`] is persisted to the active
 /// network's config so login/deploy/doctor/earnings can reference it.
 fn cmd_register_hotkey(
@@ -2571,8 +2571,8 @@ fn register_hotkey_byo(network: Network, ss58: &str) -> Result<()> {
     Ok(())
 }
 
-/// Assisted: register a fresh hotkey through btcli. The only flow that needs
-/// btcli — so it (and only it) runs [`ensure_dependency`] for it.
+/// Assisted: resolve a local btcli hotkey and verify it. The only flow that
+/// needs btcli up front — so it (and only it) runs [`ensure_dependency`] for it.
 fn register_hotkey_assisted(
     network: Network,
     wallet: Option<String>,
@@ -2584,21 +2584,18 @@ fn register_hotkey_assisted(
     let btcli = RealBtcli;
 
     // Resolve the ss58 up front — it is both proof the local wallet/hotkey
-    // exists and the address we record afterwards. When the hotkey is absent
-    // from the local wallet store (not yet created, or a typoed name), we
-    // print the exact btcli commands for the operator to run and ask them to
-    // paste the resulting ss58 back. We never shell out to key-generation or
-    // signing commands — those stay with the operator.
+    // exists and the address we verify. If the hotkey is not local, or is local
+    // but not registered on the subnet, we hand the btcli register command to
+    // the operator. gmcli never shells out to key-generation or signing
+    // commands — those stay with the operator.
     let Some(ss58) = btcli.hotkey_ss58(&wallet, &hotkey)? else {
-        let netuid = network.netuid();
-        let chain = gm_miner_cli::btcli::btcli_network(network);
+        let register_command = btcli_register_command(network, &wallet, &hotkey);
         println!(
             "Hotkey `{hotkey}` not found under wallet `{wallet}`.\n\
              Run these commands in your terminal, then paste the ss58 below:\n\
              \n\
                btcli wallet new-hotkey --wallet.name {wallet} --wallet.hotkey {hotkey}\n\
-               btcli subnet register --wallet.name {wallet} --wallet.hotkey {hotkey} \
-             --netuid {netuid} --network {chain}\n"
+               {register_command}\n"
         );
         let Some(ss58) = gm_miner_cli::wizard::prompt_line(
             "Hotkey ss58 address (from `btcli wallet list` after the above):",
@@ -2618,9 +2615,27 @@ fn register_hotkey_assisted(
         return persist_already_registered(network, &wallet, &hotkey, &ss58, uid);
     }
 
-    confirm_spend(network, &wallet, &hotkey, yes)?;
-    btcli.register(network, &wallet, &hotkey, yes)?;
-    finish_assisted(network, &btcli, &wallet, &hotkey, &ss58)
+    let register_command = btcli_register_command(network, &wallet, &hotkey);
+    println!(
+        "{wallet}/{hotkey} ({ss58}) is not registered on {network} (netuid {}).\n\
+         Run this command in your terminal:\n\
+         \n\
+           {register_command}\n\
+         \n\
+         Then re-run `gmcli register-hotkey --wallet {wallet} --hotkey {hotkey}` to verify \
+         and record it.",
+        network.netuid()
+    );
+    Ok(())
+}
+
+fn btcli_register_command(network: Network, wallet: &str, hotkey: &str) -> String {
+    let netuid = network.netuid();
+    let chain = gm_miner_cli::btcli::btcli_network(network);
+    format!(
+        "btcli subnet register --wallet.name {wallet} --wallet.hotkey {hotkey} \
+         --netuid {netuid} --network {chain}"
+    )
 }
 
 /// Both `--wallet` and `--hotkey` are required for the assisted flow; a missing
@@ -2659,51 +2674,6 @@ fn persist_already_registered(
          Nothing to do."
     );
     Ok(())
-}
-
-/// After a successful `btcli subnet register`, confirm the new uid and persist.
-/// `ss58` is the address resolved (and validated to exist) before registering.
-fn finish_assisted(
-    network: Network,
-    btcli: &RealBtcli,
-    wallet: &str,
-    hotkey: &str,
-    ss58: &str,
-) -> Result<()> {
-    let outcome = confirm_registered(btcli, network, ss58, hotkey)?;
-    persist_registered_hotkey(network.as_str(), outcome.record)
-        .context("persist registered hotkey")?;
-    match outcome.uid {
-        Some(uid) => {
-            println!("Registered {wallet}/{hotkey} ({ss58}) on {network} — uid {uid}.");
-            println!("Next: `gmcli deploy` to launch a worker under this hotkey.");
-        }
-        None => {
-            // btcli succeeded but the metagraph hasn't caught up — the hotkey
-            // is recorded; the uid lands within a block.
-            println!(
-                "Registered {wallet}/{hotkey} ({ss58}) on {network}. The metagraph is still \
-                 catching up — run `gmcli status` shortly to see the uid."
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Show the spend and gate on the operator's confirmation. `assume_yes` and a
-/// non-TTY both skip the prompt. btcli prints the exact burn cost and prompts
-/// again itself, so this is the gm-level "are you sure" before handing off.
-fn confirm_spend(network: Network, wallet: &str, hotkey: &str, assume_yes: bool) -> Result<()> {
-    println!("About to register a hotkey on-chain — this burns TAO:");
-    println!("  network : {network} (netuid {})", network.netuid());
-    println!("  wallet  : {wallet}");
-    println!("  hotkey  : {hotkey}");
-    println!("btcli will show the exact burn cost and ask for your wallet password.");
-    if gm_miner_cli::dependency::confirm("Proceed?", false, assume_yes)? {
-        Ok(())
-    } else {
-        bail!("aborted — no hotkey was registered.");
-    }
 }
 
 // ── earnings ─────────────────────────────────────────────────────────────────

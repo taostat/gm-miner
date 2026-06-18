@@ -1,10 +1,10 @@
-//! Bridge to `btcli` (bittensor-cli) for on-chain hotkey work.
+//! Bridge to `btcli` (bittensor-cli) for read-only hotkey lookups.
 //!
-//! `gmcli` never handles wallet private keys — `btcli` owns the wallet and
-//! signs the registration extrinsic. This module shells out to `btcli` and
-//! parses its `--json-output`, keeping every parse isolated behind the
-//! [`BtcliBridge`] trait so tests inject canned output instead of running a
-//! real chain query.
+//! `gmcli` never handles wallet private keys. It shells out to `btcli` only
+//! for read-only metagraph and wallet-list queries; the operator runs any
+//! wallet-signing command themselves. This module parses `--json-output`,
+//! keeping every parse isolated behind the [`BtcliBridge`] trait so tests
+//! inject canned output instead of running a real chain query.
 //!
 //! Network mapping is fixed: the gm [`Network`](crate::network::Network)
 //! resolves to btcli's `--network` value (`test` for testnet / netuid 482,
@@ -60,8 +60,8 @@ pub struct NeuronStats {
     pub tempo_blocks: Option<u64>,
 }
 
-/// The on-chain primitives `register-hotkey` needs. Real impl shells out to
-/// `btcli`; tests inject a stub returning canned values.
+/// The read-only chain and local-wallet queries `register-hotkey` needs. Real
+/// impl shells out to `btcli`; tests inject a stub returning canned values.
 pub trait BtcliBridge {
     /// The hotkey's registration on `network`'s subnet, by ss58 address.
     ///
@@ -78,24 +78,10 @@ pub trait BtcliBridge {
     /// Returns an error if btcli can't be run or its output can't be parsed.
     fn neuron_stats(&self, network: Network, ss58: &str) -> Result<Option<NeuronStats>>;
 
-    /// Register `wallet`/`hotkey` on `network`'s subnet, streaming btcli's
-    /// output (including its own cost confirmation) through. `assume_yes`
-    /// passes btcli's non-interactive `--no-prompt`.
-    ///
-    /// # Errors
-    /// Returns an error if btcli exits non-zero.
-    fn register(
-        &self,
-        network: Network,
-        wallet: &str,
-        hotkey: &str,
-        assume_yes: bool,
-    ) -> Result<()>;
-
     /// Resolve a `wallet`/`hotkey` name to its ss58 address via the local
     /// wallet store. Returns `None` when the pair isn't in the store (a typoed
-    /// name) or the output can't be parsed, so callers can refuse to spend
-    /// rather than register blind.
+    /// name) or the output can't be parsed, so callers can avoid recording or
+    /// instructing the operator to register the wrong hotkey.
     ///
     /// # Errors
     /// Returns an error only when btcli itself can't be run.
@@ -245,17 +231,29 @@ impl RealBtcli {
     fn metagraph_json(network: Network) -> Result<Vec<u8>> {
         let netuid = network.netuid().to_string();
         let chain = btcli_network(network);
-        Self::run(&[
-            "subnet",
-            "metagraph",
-            "--netuid",
-            &netuid,
-            "--network",
-            chain,
-            "--json-output",
-            "--no-prompt",
-        ])
+        let args = metagraph_args(&netuid, chain);
+        Self::run(&args)
     }
+}
+
+/// The `btcli subnet metagraph` args for a subnet. Built here so the read-only
+/// arg set is one place the no-sign invariant can be asserted in tests.
+fn metagraph_args<'a>(netuid: &'a str, chain: &'a str) -> [&'a str; 8] {
+    [
+        "subnet",
+        "metagraph",
+        "--netuid",
+        netuid,
+        "--network",
+        chain,
+        "--json-output",
+        "--no-prompt",
+    ]
+}
+
+/// The `btcli wallet list` args. Read-only — lists the local wallet store.
+fn wallet_list_args() -> [&'static str; 3] {
+    ["wallet", "list", "--json-output"]
 }
 
 impl BtcliBridge for RealBtcli {
@@ -267,48 +265,8 @@ impl BtcliBridge for RealBtcli {
         parse_neuron_stats(&Self::metagraph_json(network)?, ss58)
     }
 
-    fn register(
-        &self,
-        network: Network,
-        wallet: &str,
-        hotkey: &str,
-        assume_yes: bool,
-    ) -> Result<()> {
-        let netuid = network.netuid().to_string();
-        let chain = btcli_network(network);
-        let mut args = vec![
-            "subnet",
-            "register",
-            "--netuid",
-            &netuid,
-            "--network",
-            chain,
-            "--wallet.name",
-            wallet,
-            "--wallet.hotkey",
-            hotkey,
-        ];
-        if assume_yes {
-            args.push("--no-prompt");
-        }
-        // Inherit stdio: btcli prompts for the wallet password and shows the
-        // burn-cost confirmation itself — gmcli must not capture that.
-        let status = std::process::Command::new("btcli")
-            .args(&args)
-            .status()
-            .context("run `btcli subnet register`")?;
-        if !status.success() {
-            bail!(
-                "btcli registration failed. Wrong network, insufficient balance, \
-                 or a missing/locked wallet are the usual causes — check the btcli \
-                 output above."
-            );
-        }
-        Ok(())
-    }
-
     fn hotkey_ss58(&self, wallet: &str, hotkey: &str) -> Result<Option<String>> {
-        let stdout = Self::run(&["wallet", "list", "--json-output"])?;
+        let stdout = Self::run(&wallet_list_args())?;
         Ok(parse_hotkey_ss58(&stdout, wallet, hotkey))
     }
 }
@@ -320,9 +278,45 @@ impl BtcliBridge for RealBtcli {
 )]
 mod tests {
     use super::{
-        btcli_network, parse_hotkey_ss58, parse_neuron_stats, parse_registration, Registration,
+        btcli_network, metagraph_args, parse_hotkey_ss58, parse_neuron_stats, parse_registration,
+        wallet_list_args, Registration,
     };
     use crate::network::Network;
+
+    /// btcli subcommands that change chain or wallet state. Every arg list gmcli
+    /// hands to `btcli` must avoid all of these — gmcli only ever reads.
+    const SIGNING_SUBCOMMANDS: &[&str] = &[
+        "register",
+        "new-hotkey",
+        "new-coldkey",
+        "create",
+        "regen-hotkey",
+        "regen-coldkey",
+        "stake",
+        "unstake",
+        "transfer",
+        "send",
+        "set-weights",
+        "sign",
+    ];
+
+    fn assert_read_only(args: &[&str]) {
+        for arg in args {
+            assert!(
+                !SIGNING_SUBCOMMANDS.contains(arg),
+                "btcli args {args:?} include signing subcommand {arg:?} — gmcli must never sign"
+            );
+        }
+    }
+
+    #[test]
+    fn btcli_arg_sets_are_read_only() {
+        // Every command gmcli runs against btcli is a read-only query; gmcli
+        // never invokes a wallet-signing subcommand.
+        assert_read_only(&metagraph_args("482", "test"));
+        assert_read_only(&metagraph_args("28", "finney"));
+        assert_read_only(&wallet_list_args());
+    }
 
     #[test]
     fn network_maps_to_btcli_chain() {
@@ -431,7 +425,7 @@ mod tests {
     #[test]
     fn unresolvable_hotkey_ss58_is_none_not_error() {
         // Empty wallet list, unknown wallet, and unparseable output all return
-        // None so the caller refuses to spend rather than panicking.
+        // None so the caller refuses to act on a bad local-wallet match.
         let json = wallet_list_json();
         assert_eq!(
             parse_hotkey_ss58(br#"{"wallets":[]}"#, "miner", "default"),
