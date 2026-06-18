@@ -121,6 +121,23 @@ pub struct DstackAttestationProvider {
     dstack_socket: Option<String>,
 }
 
+// The dstack guest agent can hang; bound quote requests in-process instead of relying on a proxy timeout.
+const QUOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Await `fut` under `timeout`, flattening both the timeout and the inner
+/// error into a single message string. A fired timeout reports the bound so
+/// the operator sees the request was cut off in-process, not by the agent.
+async fn with_quote_timeout<T, E: std::fmt::Display>(
+    timeout: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_elapsed) => Err(format!("get_quote timed out after {}s", timeout.as_secs())),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StaticAttestationFields {
     app_id: String,
@@ -178,10 +195,9 @@ impl AttestationProvider for DstackAttestationProvider {
         let pubkey_bytes = self.keypair.public_bytes();
         let report_data = compute_report_data(&pubkey_bytes, nonce);
         let client = DstackClient::new(self.dstack_socket.as_deref());
-        let quote = client
-            .get_quote(report_data.to_vec())
+        let quote = with_quote_timeout(QUOTE_TIMEOUT, client.get_quote(report_data.to_vec()))
             .await
-            .map_err(|e| AttestationError::DstackQuote(e.to_string()))?;
+            .map_err(AttestationError::DstackQuote)?;
         let quote_bytes = quote
             .decode_quote()
             .map_err(|e| AttestationError::DstackQuote(format!("decode hex quote: {e}")))?;
@@ -305,6 +321,40 @@ mod tests {
         let expected = compute_report_data(&pubkey, nonce);
         let got = BASE64_STANDARD.decode(&info.report_data).unwrap();
         assert_eq!(got.as_slice(), &expected);
+    }
+
+    #[tokio::test]
+    async fn quote_timeout_fires_on_hang() {
+        // A short real timeout keeps the test fast without needing the
+        // tokio test-util paused clock.
+        let timeout = std::time::Duration::from_millis(20);
+        let hang = std::future::pending::<Result<(), String>>();
+        let result = with_quote_timeout(timeout, hang).await;
+        let err = result.expect_err("a hanging quote future must time out");
+        assert!(
+            err.starts_with("get_quote timed out"),
+            "the timeout branch must report a timeout, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_timeout_passes_through_success() {
+        let timeout = std::time::Duration::from_secs(10);
+        let ready = std::future::ready(Ok::<_, String>(42));
+        let value = with_quote_timeout(timeout, ready)
+            .await
+            .expect("a ready future must not time out");
+        assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn quote_timeout_propagates_inner_error() {
+        let timeout = std::time::Duration::from_secs(10);
+        let failed = std::future::ready(Err::<(), _>("dstack agent refused"));
+        let err = with_quote_timeout(timeout, failed)
+            .await
+            .expect_err("an inner error must propagate");
+        assert_eq!(err, "dstack agent refused");
     }
 
     #[tokio::test]

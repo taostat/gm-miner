@@ -141,6 +141,14 @@ pub async fn device_login(
     .await
 }
 
+/// Whether a failed token poll is worth retrying within the device-code
+/// deadline. Connect and timeout failures are transient network blips; a
+/// builder error (e.g. a malformed `token_url` from `/auth/config`) can never
+/// recover, so it must abort immediately rather than wait out the deadline.
+fn is_transient(err: &reqwest::Error) -> bool {
+    !err.is_builder() && (err.is_connect() || err.is_timeout() || err.is_request())
+}
+
 async fn poll_for_token(
     token_url: &str,
     client_id: &str,
@@ -167,7 +175,7 @@ async fn poll_for_token(
         let client = no_pool_client()?;
 
         // OAuth token endpoints are form-encoded per RFC 8628 §3.4.
-        let resp = client
+        let send = client
             .post(token_url)
             .form(&[
                 ("client_id", client_id),
@@ -175,8 +183,22 @@ async fn poll_for_token(
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])
             .send()
-            .await
-            .with_context(|| format!("POST {token_url}"))?;
+            .await;
+        let resp = match send {
+            Ok(resp) => resp,
+            // A transient transport failure must not abort the flow: the
+            // device code is still valid, so keep polling until the deadline
+            // above stops the loop. A non-transient error (bad URL, request
+            // build) would never recover, so surface it immediately.
+            Err(e) if is_transient(&e) => {
+                eprint!(".");
+                continue;
+            }
+            Err(e) => {
+                eprintln!();
+                return Err(e).with_context(|| format!("POST {token_url}"));
+            }
+        };
 
         let status = resp.status();
 
@@ -320,5 +342,51 @@ impl TokenResponse {
             entry.refresh_token = previous_refresh;
         }
         entry
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "tests intentionally panic on unexpected values"
+)]
+mod tests {
+    use super::poll_for_token;
+
+    /// A transient transport failure (here: connection refused) must not abort
+    /// the device-login poll. The loop swallows the send error, keeps polling,
+    /// and only stops when the device code's `expires_in` deadline passes —
+    /// surfacing the timeout message, never the raw transport error.
+    #[tokio::test]
+    async fn poll_tolerates_transient_send_errors() {
+        // Port 1 is unbound, so every poll's `send()` fails with connection
+        // refused. `initial_interval = 1`, `expires_in = 2` lets exactly one
+        // poll fail before the deadline, proving the failure is tolerated.
+        let result =
+            poll_for_token("http://127.0.0.1:1/token", "client-id", "device-code", 1, 2).await;
+        let err = result.expect_err("an unreachable token endpoint must not succeed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("login timed out"),
+            "a transient send error must let polling continue to the deadline, \
+             not abort with a transport error: {msg}"
+        );
+    }
+
+    /// A non-transient error — a malformed `token_url` that reqwest rejects at
+    /// build time — must abort immediately with the actionable POST error,
+    /// not silently retry until the deadline and report a misleading timeout.
+    #[tokio::test]
+    async fn poll_aborts_immediately_on_non_transient_error() {
+        // `expires_in` is large so a deadline-driven exit would take far too
+        // long; a fast return proves the abort path fired.
+        let result = poll_for_token("http://[::1", "client-id", "device-code", 0, 3600).await;
+        let err = result.expect_err("a malformed token_url must not succeed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("POST http://[::1"),
+            "a non-transient error must surface the actionable POST error, \
+             not a deadline timeout: {msg}"
+        );
     }
 }

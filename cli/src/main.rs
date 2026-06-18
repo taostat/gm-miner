@@ -1051,6 +1051,12 @@ fn error_detail(json: &serde_json::Value) -> String {
         .map_or_else(|| json.to_string(), str::to_owned)
 }
 
+fn status_error(op: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .map_or_else(|_| body.to_owned(), |json| error_detail(&json));
+    anyhow::anyhow!("{op} failed ({status}): {detail}")
+}
+
 /// Turn a failed `GET /miners/me` into an actionable error instead of dumping
 /// the raw response body.
 ///
@@ -2090,11 +2096,12 @@ async fn post_register_image(
         .context("POST /miners/register")?;
 
     let status = resp.status();
-    let json: serde_json::Value = resp.json().await.context("parse register response")?;
-
     if !status.is_success() {
-        bail!("register failed ({status}): {}", error_detail(&json));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error("register", status, &body));
     }
+
+    let json: serde_json::Value = resp.json().await.context("parse register response")?;
 
     let worker_id = json
         .get("worker_id")
@@ -2138,11 +2145,12 @@ async fn post_add_worker(
         .with_context(|| format!("POST {path}"))?;
 
     let status = resp.status();
-    let json: serde_json::Value = resp.json().await.context("parse worker-add response")?;
-
     if !status.is_success() {
-        bail!("worker add failed ({status}): {}", error_detail(&json));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error("worker add", status, &body));
     }
+
+    let json: serde_json::Value = resp.json().await.context("parse worker-add response")?;
 
     let created: WorkerCreateResponse =
         serde_json::from_value(json).context("parse worker-add response shape")?;
@@ -2418,13 +2426,9 @@ async fn post_declare_product(
         .context("POST /miners/products")?;
 
     let status = resp.status();
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("parse declare-product response")?;
-
     if !status.is_success() {
-        bail!("registry returned {status}: {}", error_detail(&json));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error("declare-product", status, &body));
     }
     Ok(())
 }
@@ -3430,10 +3434,48 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
 mod tests {
     use super::{
         effective_per_mtok_ndollars, effective_rate_summary, filter_catalog, format_discount_pct,
-        format_per_mtok_usd, parse_discount_pct, Cli, Command, Product, Provider, WorkerCommand,
-        MAX_DISCOUNT_BP,
+        format_per_mtok_usd, parse_discount_pct, status_error, Cli, Command, Product, Provider,
+        WorkerCommand, MAX_DISCOUNT_BP,
     };
     use gm_miner_cli::types::{RetailDimensions, RetailPrice};
+
+    #[test]
+    fn status_error_surfaces_non_json_5xx_body() {
+        // An intermediary returns a 502 with an HTML body — not JSON. The
+        // error must name the status and carry the raw body verbatim so the
+        // operator sees the real failure, not a generic JSON-parse error.
+        let err = status_error(
+            "register",
+            reqwest::StatusCode::BAD_GATEWAY,
+            "<html><body>502 Bad Gateway</body></html>",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("register failed"),
+            "names the operation: {msg}"
+        );
+        assert!(msg.contains("502"), "names the status: {msg}");
+        assert!(
+            msg.contains("502 Bad Gateway"),
+            "carries the raw body: {msg}"
+        );
+    }
+
+    #[test]
+    fn status_error_extracts_json_detail() {
+        let err = status_error(
+            "worker add",
+            reqwest::StatusCode::CONFLICT,
+            r#"{"detail":"hotkey already has a worker"}"#,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("worker add failed (409"), "{msg}");
+        assert!(msg.contains("hotkey already has a worker"), "{msg}");
+        assert!(
+            !msg.contains("detail"),
+            "the JSON envelope must be unwrapped, not dumped: {msg}"
+        );
+    }
 
     fn p(provider: Provider, model: &str, status: &str) -> Product {
         Product {
