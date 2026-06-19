@@ -21,7 +21,7 @@ compose-hash at boot and binds it to the attestation quote.
 |---|---|---|
 | Envoy base image | Yes | Pinned by `@sha256:…` digest |
 | Rust builder base | Yes | Pinned by `@sha256:…` digest |
-| Rust binary: `gmcli` (CLI) | Yes, given same toolchain | `RUSTFLAGS="-C codegen-units=1 -C debuginfo=0"`, `CARGO_INCREMENTAL=0`, `SOURCE_DATE_EPOCH` set |
+| Rust binaries: `gmcli`, `gm-miner-attestd`, `gm-miner-ratls` | Yes, given same toolchain | `RUSTFLAGS="-C codegen-units=1 -C debuginfo=0"`, `CARGO_INCREMENTAL=0`, `SOURCE_DATE_EPOCH` set |
 | `envoy.yaml` | Yes | Static config, version-controlled |
 | `start.sh` | Yes | Static script, version-controlled |
 
@@ -40,11 +40,11 @@ When updating the Envoy or Rust builder base:
 
 ```bash
 # Get the current digest for the envoy image:
-docker manifest inspect envoyproxy/envoy:v1.32-latest \
+docker manifest inspect envoyproxy/envoy:v1.38-latest \
   | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest'
 
 # Get the current digest for the Rust builder:
-docker manifest inspect rust:1.83-slim-bookworm \
+docker manifest inspect rust:1.96-slim-bookworm \
   | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest'
 ```
 

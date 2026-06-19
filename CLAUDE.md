@@ -22,7 +22,7 @@ declaration, and price management.
 - `cli/src/image.rs` — miner image build/push: `docker buildx --push` to a public registry, digest resolution
 - `cli/src/node_secret.rs` — per-worker node secret: a fresh secret per worker (CVM), reused across re-deploys of the same `--app-name`, persisted in the worker's config record, embedded in compose env so envoy enforces it
 - discount/price conversion lives in `cli/src/main.rs` (`parse_discount_pct`, `format_per_mtok_usd`) — decimal-string → nano-dollars (u64), integer-only, no floats
-- `cli/src/types.rs` — shared types: `MinerPriceBlock`, `MinerStatus`, `Product`, `Provider`
+- `cli/src/types.rs` — shared types: `Provider`, `Product`, `MinerStatus`, and the worker request/response shapes (`WorkerCreateRequest`, `WorkerEntry`, `WorkerListResponse`)
 - `image/` — the miner container image (Dockerfile, envoy config)
 - `dstack/` — the compose template `gmcli deploy` renders and submits to Phala Cloud
 
@@ -48,7 +48,8 @@ cargo test -p gm-miner-cli
 
 | Command | Purpose |
 |---|---|
-| `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google) to `~/.gmcli/config.json` |
+| `init` | Guided onboarding wizard: register hotkey → login → set keys → deploy → declare products, skipping steps already done |
+| `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes) to `~/.gmcli/config.json` |
 | `deploy` | Full trust-correct deploy: build/push image + Phala Cloud deploy + hash verification + image registration |
 | `login` | Device-code OAuth flow; stores access token in config |
 | `register-hotkey` | Record the serving hotkey: `--hotkey-ss58` records one registered elsewhere; otherwise (`--wallet`/`--hotkey`) resolves the local btcli hotkey, checks the metagraph, and prints the `btcli subnet register` command for the operator to run — gmcli never signs |
@@ -57,7 +58,9 @@ cargo test -p gm-miner-cli
 | `declare-product` | Register a single miner-product offer with a pct discount |
 | `declare-products` | Fan one discount across the catalog (or one provider) |
 | `status` | Show current registration state, per-product eligibility, and the per-Mtok rate received (`list-products` is a hidden alias) |
+| `earnings` | Read the hotkey's neuron row from the subnet metagraph (via btcli) and report UID, stake, and per-tempo emission |
 | `worker add/list/remove` | Manage the data-plane workers (Phala CVMs) attached to the hotkey |
+| `publish-image-version` | Compute the release image's `compose_hash`/`os_image_hash` offline and upsert the approved `ImageVersion` to the registry (release pipeline; needs the registry admin key) |
 
 Network selection is a sticky `--network testnet|mainnet` (mainnet by default);
 `--testnet` is the shorthand. The `Network` profile (`cli/src/network.rs`)

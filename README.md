@@ -12,7 +12,7 @@ lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Envoy-only miner image with four provider routes (Anthropic / OpenAI / Gemini / Chutes) and an optional `benchmark` route to a synthetic upstream. Pinned to digest. The runtime is `envoy` plus its native `/stats/prometheus` exposure — no sidecar service. |
+| `image/` | Miner container image with four provider routes (Anthropic / OpenAI / Gemini / Chutes) and an optional `benchmark` route to a synthetic upstream. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs two co-located processes: the attestation server (serves `GET /attestation/info` with a fresh TDX quote) and the envoy data plane (proxies provider traffic and exposes `/stats/prometheus`). |
 | `cli/` | `gmcli` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. Runs operator-side from a laptop, not inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -39,8 +39,8 @@ Three steps to a running miner.
    ```
 
    The installer places the binary in `~/.cargo/bin` (or `CARGO_HOME`) and ensures that
-   directory is on your `PATH`. To install a specific version, replace `latest` with a tag, e.g.
-   `download/v0.1.0/`.
+   directory is on your `PATH`. To install a specific version, replace `latest/download` with
+   `download/<tag>`, e.g. `https://github.com/taostat/gm-miner/releases/download/v0.1.0/gmcli-installer.sh`.
 
 3. **Run the guided onboarding:**
 
@@ -49,8 +49,8 @@ Three steps to a running miner.
    gmcli init                     # mainnet (netuid 28, default)
    ```
 
-   `gmcli init` walks you through hotkey → login → deploy → provider keys, detecting and
-   skipping anything already done. That's it.
+   `gmcli init` walks you through hotkey → login → provider keys → deploy → declare products,
+   detecting and skipping anything already done. That's it.
 
 ## Manual setup (advanced)
 
@@ -208,7 +208,7 @@ gmcli worker remove <worker_id>
 
 | Command | Description |
 |---|---|
-| `gmcli init` | Guided onboarding wizard: register hotkey → login → deploy → set keys → declare products |
+| `gmcli init` | Guided onboarding wizard: register hotkey → login → set keys → deploy → declare products |
 | `gmcli login` | Device-code OAuth login; stores credentials in `~/.gmcli/config.json` |
 | `gmcli register-hotkey` | Record the serving hotkey (`--hotkey-ss58` or assisted via btcli) |
 | `gmcli deploy` | Full deploy: fetch approved image, launch Phala CVM, verify hashes, register worker |
