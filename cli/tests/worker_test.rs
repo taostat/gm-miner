@@ -56,6 +56,39 @@ fn worker_create_request_serialises_to_registry_shape() {
 }
 
 #[test]
+fn worker_create_request_omits_absent_node_secret() {
+    // `node_secret: None` must drop the key entirely, not emit
+    // `"node_secret": null`. The registry leaves a stored secret untouched
+    // only when the field is absent; a `null` would be a distinct (and wrong)
+    // instruction. This is the `register-image`-resync path where the CLI does
+    // not track the worker's secret locally.
+    let body = serde_json::to_value(WorkerCreateRequest {
+        endpoint: "https://app_y-8080s.dstack-prod5.phala.network",
+        attestation_endpoint: "https://app_y-8080s.dstack-prod5.phala.network",
+        compose_hash: "c".repeat(64).as_str(),
+        os_image_hash: "d".repeat(64).as_str(),
+        node_secret: None,
+    })
+    .unwrap();
+
+    let obj = body.as_object().expect("body serialises to a JSON object");
+    assert!(
+        !obj.contains_key("node_secret"),
+        "an absent node_secret must be omitted, not serialised as null: {body}"
+    );
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "endpoint": "https://app_y-8080s.dstack-prod5.phala.network",
+            "attestation_endpoint": "https://app_y-8080s.dstack-prod5.phala.network",
+            "compose_hash": "c".repeat(64),
+            "os_image_hash": "d".repeat(64),
+        }),
+        "worker-add body with no secret must carry exactly the four required fields"
+    );
+}
+
+#[test]
 fn worker_list_response_deserialises() {
     let json = serde_json::json!({
         "workers": [

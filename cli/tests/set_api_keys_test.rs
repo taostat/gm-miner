@@ -39,33 +39,86 @@ fn apply_set_api_keys(
     cfg
 }
 
-// ── File-mode test (uses tempdir with explicit path) ─────────────────────────
+// ── File-mode tests (drive the real `config::save`) ──────────────────────────
 
-/// Saved config must be mode 0600 (owner read/write only).
+/// `GMCLI_CONFIG_DIR` is process-global, so tests that mutate it must not run
+/// concurrently. Serialise them on a local mutex.
+static CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Points `GMCLI_CONFIG_DIR` at a throwaway tempdir for the duration of a test,
+/// holding the global lock and clearing the env var on drop — even on panic, so
+/// one failing test can't leak the override into the next.
+struct ConfigDirGuard {
+    /// Held for the guard's lifetime to serialise env mutation; never read.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    /// Owns the tempdir so it outlives the test; never read.
+    _dir: tempfile::TempDir,
+}
+
+impl ConfigDirGuard {
+    fn new() -> Self {
+        let lock = CONFIG_DIR_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: the held lock serialises this against every other env mutation.
+        unsafe { std::env::set_var("GMCLI_CONFIG_DIR", dir.path()) };
+        Self {
+            _lock: lock,
+            _dir: dir,
+        }
+    }
+}
+
+impl Drop for ConfigDirGuard {
+    fn drop(&mut self) {
+        // SAFETY: still holding the lock until after this returns.
+        unsafe { std::env::remove_var("GMCLI_CONFIG_DIR") };
+    }
+}
+
+/// `config::save` must write the config at mode 0600 — it holds the only
+/// on-disk copy of the provider keys, so a group/world-readable file would
+/// leak secrets.
 ///
-/// This exercises `config::save` directly with a known path rather than
-/// relying on the global `GMCLI_CONFIG_DIR` env var (which is not
-/// thread-safe across parallel test threads).
+/// Unlike a hand-written file, this drives the real `config::save` so a
+/// regression that drops the `chmod 0600` (or writes the file world-readable)
+/// is caught.
 #[cfg(unix)]
 #[test]
-fn config_file_is_mode_0600_after_save() {
+fn save_writes_config_at_mode_0600() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.json");
-
+    let _guard = ConfigDirGuard::new();
     let cfg = apply_set_api_keys(Config::default(), Some("sk-ant-test"), None, None, None);
+    gm_miner_cli::config::save(&cfg).unwrap();
 
-    // Serialise directly to the temp path.
-    let bytes = serde_json::to_vec_pretty(&cfg).unwrap();
-    std::fs::write(&config_path, &bytes).unwrap();
-    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-    let mode = std::fs::metadata(&config_path)
-        .unwrap()
-        .permissions()
-        .mode();
+    let written = gm_miner_cli::config::config_path();
+    let mode = std::fs::metadata(&written).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
+}
+
+/// `set-api-keys` persists the provider keys through `config::save`, and a
+/// reload reads them back — the keys survive the save/load round-trip.
+#[cfg(unix)]
+#[test]
+fn save_then_load_round_trips_provider_keys() {
+    let _guard = ConfigDirGuard::new();
+    let cfg = apply_set_api_keys(
+        Config::default(),
+        Some("sk-ant-x"),
+        Some("sk-oai-x"),
+        None,
+        Some("cpk-x"),
+    );
+    gm_miner_cli::config::save(&cfg).unwrap();
+
+    let back = gm_miner_cli::config::load().unwrap();
+    let keys = back.provider_keys.unwrap();
+    assert_eq!(keys.anthropic.as_deref(), Some("sk-ant-x"));
+    assert_eq!(keys.openai.as_deref(), Some("sk-oai-x"));
+    assert_eq!(keys.google, None);
+    assert_eq!(keys.chutes.as_deref(), Some("cpk-x"));
 }
 
 // ── Key merge semantics ───────────────────────────────────────────────────────
