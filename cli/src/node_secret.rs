@@ -159,6 +159,35 @@ mod tests {
     }
 
     #[test]
+    fn for_worker_re_keys_a_whitespace_only_stored_secret() {
+        // A WorkerRecord whose stored secret is whitespace-only is treated as
+        // absent: `for_worker` mints a fresh secret and reports it as freshly
+        // generated. The caller persists the new value, so the re-key is what
+        // re-establishes a usable credential — a blank stored secret cannot be
+        // what envoy enforces.
+        let entry = entry_with(vec![worker("gm-miner-1", "   \t \n ")]);
+        let (secret, fresh) = for_worker(Some(&entry), "gm-miner-1", false)
+            .expect("re-key a whitespace-only stored secret");
+        assert!(
+            fresh,
+            "a whitespace-only stored secret must be replaced with a fresh one"
+        );
+        assert_eq!(secret.len(), SECRET_BYTES * 2);
+        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn for_worker_re_keys_an_empty_stored_secret() {
+        // An empty (rather than whitespace) stored secret is the same case:
+        // there is nothing to reuse, so a fresh secret is minted.
+        let entry = entry_with(vec![worker("gm-miner-1", "")]);
+        let (secret, fresh) =
+            for_worker(Some(&entry), "gm-miner-1", false).expect("re-key an empty stored secret");
+        assert!(fresh, "an empty stored secret must be replaced");
+        assert_eq!(secret.len(), SECRET_BYTES * 2);
+    }
+
+    #[test]
     fn for_worker_generates_a_fresh_secret_for_a_new_worker() {
         let entry = entry_with(vec![worker("gm-miner-1", "secret-1")]);
         let (secret, fresh) =

@@ -502,7 +502,12 @@ async fn probe_with_bearer(
 /// Returns `Ok(None)` when the token endpoint itself denies the anonymous
 /// request (`401`/`403`) — the image is private. Other non-success statuses
 /// are surfaced as errors.
-async fn fetch_anonymous_token(
+///
+/// # Errors
+/// Returns an error if the token request cannot be sent, the endpoint returns
+/// a non-`401`/`403` failure status, or the token response body cannot be
+/// parsed.
+pub async fn fetch_anonymous_token(
     client: &reqwest::Client,
     challenge: &BearerChallenge,
 ) -> Result<Option<String>> {
