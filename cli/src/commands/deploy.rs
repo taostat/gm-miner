@@ -115,7 +115,7 @@ pub(crate) fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
 
 /// Build and run the deploy subcommand from parsed CLI arguments.
 ///
-/// Separated from `main` to keep the dispatch match arm small.
+/// Separated from `dispatch` to keep the match arm small.
 pub(crate) async fn cmd_deploy_subcommand(
     cfg: Config,
     args: DeployArgs,

@@ -12,7 +12,7 @@
 //! registry's approved `ImageVersion` list — there is no client-side KMS
 //! trust-pinning to do.
 //!
-//! Steps (orchestrated from `main::cmd_deploy`):
+//! Steps (orchestrated from `commands::deploy::cmd_deploy`):
 //!   1. Read provider API keys from config; error early if none set.
 //!   2. Auth preflight (`GET /miners/me`) — fail fast if the operator
 //!      forgot `gmcli login` or has a stale token, before any CVM work.
