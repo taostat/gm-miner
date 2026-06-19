@@ -9,7 +9,8 @@ declaration, and price management.
 
 ## Layout
 
-- `cli/src/main.rs` — all CLI subcommand dispatch; pure coordination, no logic
+- `cli/src/main.rs` — clap surface plus the `dispatch` / `dispatch_worker` routers; pure coordination, no logic
+- `cli/src/commands/` — one module per subcommand handler (`deploy`, `products`, `hotkey`, `doctor`, `wizard`, `keys`, `earnings`, `fun`) plus `persist` (config/token persistence) and the shared `status_error`/`me_error` helpers in `commands/mod.rs`
 - `cli/src/lib.rs` — module declarations; re-exports for binary and tests
 - `cli/src/auth.rs` — Taostats device-code OAuth2 flow
 - `cli/src/client.rs` — `RegistryClient`: typed HTTP wrappers for registry endpoints
@@ -18,10 +19,10 @@ declaration, and price management.
 - `cli/src/btcli.rs` — `BtcliBridge` trait + `RealBtcli`: bridge to `btcli` (bittensor-cli) for read-only wallet-list and metagraph queries; `gmcli` never signs an extrinsic or touches wallet keys — the operator runs any wallet-signing command themselves. `btcli_network()` maps `Network`→`test`/`finney`
 - `cli/src/dependency.rs` — `ensure_dependency(&Dependency, assume_yes)`: reusable PATH-detect-and-offer-to-install primitive (e.g. `BTCLI`); `register-hotkey`'s assisted flow uses it, `deploy`/future init-wizard can adopt it
 - `cli/src/register_hotkey.rs` — pure decision logic for `register-hotkey` (ss58 validation, bring-your-own vs assisted), testable against a stubbed `BtcliBridge`
-- `cli/src/deploy.rs` — `PhalaClient` trait + `RealPhalaClient`; deploy orchestration: compose rendering, `phala deploy`, `phala cvms get` hash polling, hash verification
+- `cli/src/deploy/` — deploy orchestration split by responsibility: `mod.rs` (`prepare_deploy_target`, `ImageProvisioner`), `cvm.rs` (`PhalaClient` trait + `RealPhalaClient`, `phala deploy` / `phala cvms get`), `registry_auth.rs` (private-registry pull-credential probing), `compose.rs` (env/compose rendering), `version.rs` (image-version fetch/select), `hashes.rs` (hash normalize/verify)
 - `cli/src/image.rs` — miner image build/push: `docker buildx --push` to a public registry, digest resolution
 - `cli/src/node_secret.rs` — per-worker node secret: a fresh secret per worker (CVM), reused across re-deploys of the same `--app-name`, persisted in the worker's config record, embedded in compose env so envoy enforces it
-- discount/price conversion lives in `cli/src/main.rs` (`parse_discount_pct`, `format_per_mtok_usd`) — decimal-string → nano-dollars (u64), integer-only, no floats
+- `cli/src/pricing.rs` — discount/price conversion (`parse_discount_pct`, `format_per_mtok_usd`, `effective_per_mtok_ndollars`) — decimal-string → nano-dollars (u64), integer-only, no floats
 - `cli/src/types.rs` — shared types: `Provider`, `Product`, `MinerStatus`, and the worker request/response shapes (`WorkerCreateRequest`, `WorkerEntry`, `WorkerListResponse`)
 - `image/` — the miner container image (Dockerfile, envoy config)
 - `dstack/` — the compose template `gmcli deploy` renders and submits to Phala Cloud
