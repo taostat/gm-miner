@@ -15,7 +15,7 @@ liable for any action a provider takes against your account.
 
 ## 2. What "supplying capacity" means
 
-As a gm miner you resell inference capacity from upstream model providers
+As a gm miner you supply inference capacity from upstream model providers
 (such as Anthropic, OpenAI, or Google) by running a gm miner image in a
 confidential VM. Your provider API keys are encrypted to your TEE and are never
 seen by gm operators, validators, or the gateway. You — not gm — hold the
@@ -23,10 +23,9 @@ commercial relationship with each provider.
 
 ## 3. Acceptable use
 
-- Supply only capacity you are authorised to resell under your own provider
+- Supply only capacity you are authorised to supply under your own provider
   agreements.
-- Do not present capacity you do not control, or keys that belong to another
-  party, as your own.
+- Do not present capacity you do not control as your own.
 - Keep your provider accounts in good standing for as long as you offer their
   models through gm.
 
