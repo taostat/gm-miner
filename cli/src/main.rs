@@ -24,10 +24,7 @@
 //! Pricing follows the registry's pct-discount model: a miner declares
 //! a single `discount_bp` in `[0, 9990]` per (provider, model) offer, and
 //! the gateway derives the miner payout as
-//! `retail × (10_000 − discount_bp) / 10_000` at settlement. See
-//! `docs/plans/miner-pct-discount-pricing.md` in the gm repo.
-//!
-//! Contract: workstreams.md §W4
+//! `retail × (10_000 − discount_bp) / 10_000` at settlement.
 //!
 //! `main.rs` is pure coordination — the clap surface plus the [`dispatch`] /
 //! [`dispatch_worker`] routers. Every command handler lives in a focused
@@ -346,9 +343,9 @@ enum Command {
     /// Guided onboarding: walk a new miner through the whole setup in order.
     ///
     /// Runs the lifecycle one step at a time — register your hotkey, log in,
-    /// deploy a worker, set provider keys, declare products — showing the
+    /// set provider keys, deploy a worker, declare products — showing the
     /// exact command for each and asking before it runs. Steps already done
-    /// (a recorded hotkey, a valid login, a deployed worker, set keys) are
+    /// (a recorded hotkey, a valid login, set keys, a deployed worker) are
     /// detected and skipped, so a returning miner breezes through.
     #[command(after_help = "Examples:\n  \
         gmcli init\n  \
@@ -422,7 +419,7 @@ pub(crate) struct DeployFlags {
     pub(crate) image_repo: Option<String>,
 
     /// Image tag applied to the build before digest resolution.
-    #[arg(long, env = "IMAGE_TAG", default_value = "v0.1.0")]
+    #[arg(long, env = "IMAGE_TAG", default_value = "v0.1.4")]
     pub(crate) image_tag: String,
 
     /// Phala Cloud instance type for the CVM.

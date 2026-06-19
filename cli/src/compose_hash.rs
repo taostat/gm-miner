@@ -189,29 +189,24 @@ mod tests {
     use super::*;
 
     /// The testnet image ref whose `app_compose` hashes to the registry's
-    /// approved baseline below — the gm-published public miner image at the
-    /// `fix/deploy-public-image` release (read from the registry's
-    /// `image_ref` field for `REGISTRY_TESTNET_COMPOSE_HASH`).
+    /// approved baseline below — the gm-published public miner image for the
+    /// current supported release (v0.1.4). Must track the newest supported
+    /// image version: when a new `ImageVersion` is published, bump both this
+    /// ref and `REGISTRY_TESTNET_COMPOSE_HASH` to the live registry row.
     const TESTNET_IMAGE_REF: &str =
-        "ghcr.io/taostat/gm-miner@sha256:ac9292e9bfa21100885768db4a84ab191e8ba4ac48859a9905c5867a1c59dc53";
+        "ghcr.io/taostat/gm-miner@sha256:bcb3d8ca557d380319481234c3455602c69891f928ebefd4ec53def67999de80";
 
     /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
-    /// this image ref + `CANONICAL_ALLOWED_ENVS` (all five provider key names,
-    /// including `CHUTES_API_KEY`).
+    /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (all five provider key
+    /// names, including `CHUTES_API_KEY`).
     ///
-    /// This supersedes the four-name hash
-    /// `9a0f459450e3ada3fee959392aef16adb0c66467a50458db587fcabbe48acc42`,
-    /// which was computed before the Chutes upstream added `CHUTES_API_KEY` to
-    /// `allowed_envs` and the dstack compose. The old hash is retired: the
-    /// registry row it anchors must be replaced with the new canonical row
-    /// before existing miners redeploy.
-    ///
-    /// Rollout: publish a new `ImageVersion` with this hash to the testnet
-    /// registry (`gmcli publish-image-version`), redeploy the live testnet
-    /// miners so their measured hash becomes this value, confirm attestation
-    /// matches, then retire the old `9a0f4594` row.
+    /// This is the live registry-approved hash for v0.1.4, attested by the
+    /// testnet miners (read from `attested_compose_hashes` on the registry
+    /// routing-table). The anchor must track the newest supported image
+    /// version: bump it in lockstep with `TESTNET_IMAGE_REF` whenever a new
+    /// `ImageVersion` is published, then confirm live miners attest to it.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "89cdc0e68863e2291bfaf6299199dc0e4f4bd0d7839cd975bba2eb7bc5b29d0c";
+        "cc1e164effb1e846cec6b3ef68388bcc2c0bdfaaf4fdb7519f1dabe1999eea01";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
@@ -219,9 +214,11 @@ mod tests {
             .expect("offline compose hash must compute");
         assert_eq!(
             computed, REGISTRY_TESTNET_COMPOSE_HASH,
-            "offline compose_hash must reproduce the canonical testnet hash byte-for-byte; \
-             if this fails after a compose/env change, update REGISTRY_TESTNET_COMPOSE_HASH \
-             and publish a new ImageVersion to the registry"
+            "offline compose_hash must reproduce the live registry-approved testnet hash \
+             byte-for-byte; the anchor must track the newest supported image version. If this \
+             fails after a compose/env/image change, bump TESTNET_IMAGE_REF and \
+             REGISTRY_TESTNET_COMPOSE_HASH to the live registry routing-table row and publish \
+             a new ImageVersion to the registry"
         );
     }
 

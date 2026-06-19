@@ -9,5 +9,8 @@ __pycache__/
 .ruff_cache/
 .ty_cache/
 
+# operator deploy artifacts (contain a real provider-key .env)
+/dist/
+
 # local scratch artifacts
 /test_b64

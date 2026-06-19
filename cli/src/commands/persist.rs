@@ -230,7 +230,9 @@ pub(crate) async fn try_refresh_token(mut cfg: Config) -> Config {
     let override_active = cfg.api_url_override.is_some();
     cfg.active_entry_mut().tokens = Some(entry.clone());
     // try_refresh_token only ever reaches here via a successful refresh grant.
-    let _ = persist_refreshed_tokens(network, entry, override_active, true);
+    if let Err(e) = persist_refreshed_tokens(network, entry, override_active, true) {
+        tracing::warn!("failed to persist refreshed tokens: {e}");
+    }
     cfg
 }
 

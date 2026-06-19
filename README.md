@@ -261,13 +261,13 @@ A release is triggered by pushing a **version tag** matching `v<major>.<minor>.<
 the workflow cross-builds `gmcli` for all configured targets, generates the shell installer, and
 publishes a GitHub Release with the artifacts and checksums.
 
-To cut `v0.1.0`:
+To cut a release (the current version is `0.1.4`):
 
 ```sh
-# 1. Ensure Cargo.toml `version` is 0.1.0 and main is green.
+# 1. Ensure Cargo.toml `version` matches the tag (e.g. 0.1.4) and main is green.
 # 2. Tag and push.
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 The `release` workflow also runs in dry-run mode on pull requests, so changes to the pipeline
