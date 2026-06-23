@@ -370,6 +370,10 @@ fn resolve_and_render_target(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "deploy orchestration is kept flat so the ordered operational steps stay visible"
+)]
 pub(crate) async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
@@ -399,7 +403,8 @@ pub(crate) async fn cmd_deploy(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no provider keys; run `gmcli set-api-keys \
-                 --anthropic <key>` (and/or --openai / --google / --chutes) first"
+                 --anthropic <key>` (and/or --openai / --google / --chutes, \
+                 or configure --anthropic-upstream bedrock / --openai-upstream azure) first"
             )
         })?;
 

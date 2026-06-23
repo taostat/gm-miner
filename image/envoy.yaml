@@ -316,7 +316,14 @@ static_resources:
                                   exact: "anthropic"
                           route:
                             cluster: anthropic
-                            host_rewrite_literal: api.anthropic.com
+                            host_rewrite_literal: __GM_ANTHROPIC_HOST__
+                            ## gm:anthropic-path-rewrite-begin
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/messages$"
+                              substitution: "/anthropic/v1/messages"
+                            ## gm:anthropic-path-rewrite-end
                             timeout: 120s
                           request_headers_to_remove:
                             - authorization
@@ -327,13 +334,13 @@ static_resources:
                             - x-gm-provider
                           request_headers_to_add:
                             - header:
-                                key: x-api-key
-                                value: "%ENVIRONMENT(ANTHROPIC_API_KEY)%"
+                                key: __GM_ANTHROPIC_AUTH_HEADER__
+                                value: "__GM_ANTHROPIC_AUTH_VALUE__"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
                             - header:
                                 key: anthropic-version
                                 value: "2023-06-01"
-                              append_action: ADD_IF_ABSENT
+                              append_action: __GM_ANTHROPIC_VERSION_APPEND_ACTION__
 
                         ## ── OpenAI ──────────────────────────────────────────
                         ##  Enabled only when OPENAI_API_KEY is set.
@@ -345,7 +352,14 @@ static_resources:
                                   exact: "openai"
                           route:
                             cluster: openai
-                            host_rewrite_literal: api.openai.com
+                            host_rewrite_literal: __GM_OPENAI_HOST__
+                            ## gm:openai-path-rewrite-begin
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/chat/completions$"
+                              substitution: "/openai/v1/chat/completions"
+                            ## gm:openai-path-rewrite-end
                             timeout: 120s
                           request_headers_to_remove:
                             - authorization
@@ -356,8 +370,8 @@ static_resources:
                             - x-gm-provider
                           request_headers_to_add:
                             - header:
-                                key: authorization
-                                value: "Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
+                                key: __GM_OPENAI_AUTH_HEADER__
+                                value: "__GM_OPENAI_AUTH_VALUE__"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
 
                         ## ── Chutes ──────────────────────────────────────────
@@ -472,7 +486,198 @@ static_resources:
                       default_source_code:
                         inline_string: |
                           local expected = "__GM_NODE_SECRET__"
+                          ## gm:bedrock-model-rewrite-begin
+                          local bedrock_model_map = {
+                          __GM_BEDROCK_MODEL_MAP_LUA__
+                          }
+
+                          local function json_error(handle, detail)
+                            handle:respond(
+                              {[":status"] = "400",
+                               ["content-type"] = "application/json"},
+                              "{\"error\":\"invalid Bedrock model rewrite request: " .. detail .. "\"}")
+                            return true
+                          end
+
+                          local function skip_ws(text, pos)
+                            local len = #text
+                            while pos <= len do
+                              local c = text:sub(pos, pos)
+                              if c ~= " " and c ~= "\n" and c ~= "\r" and c ~= "\t" then
+                                break
+                              end
+                              pos = pos + 1
+                            end
+                            return pos
+                          end
+
+                          local function parse_json_string(text, pos)
+                            if text:sub(pos, pos) ~= "\"" then
+                              return nil, nil, nil, nil
+                            end
+                            local value = {}
+                            local i = pos + 1
+                            while i <= #text do
+                              local c = text:sub(i, i)
+                              if c == "\"" then
+                                return table.concat(value), pos + 1, i - 1, i + 1
+                              end
+                              if c == "\\" then
+                                local e = text:sub(i + 1, i + 1)
+                                if e == "\"" or e == "\\" or e == "/" then
+                                  value[#value + 1] = e
+                                  i = i + 2
+                                elseif e == "b" then
+                                  value[#value + 1] = "\b"
+                                  i = i + 2
+                                elseif e == "f" then
+                                  value[#value + 1] = "\f"
+                                  i = i + 2
+                                elseif e == "n" then
+                                  value[#value + 1] = "\n"
+                                  i = i + 2
+                                elseif e == "r" then
+                                  value[#value + 1] = "\r"
+                                  i = i + 2
+                                elseif e == "t" then
+                                  value[#value + 1] = "\t"
+                                  i = i + 2
+                                else
+                                  return nil, nil, nil, nil
+                                end
+                              else
+                                value[#value + 1] = c
+                                i = i + 1
+                              end
+                            end
+                            return nil, nil, nil, nil
+                          end
+
+                          local function skip_json_value(text, pos)
+                            local depth = 0
+                            local in_string = false
+                            local escaped = false
+                            local i = pos
+                            while i <= #text do
+                              local c = text:sub(i, i)
+                              if in_string then
+                                if escaped then
+                                  escaped = false
+                                elseif c == "\\" then
+                                  escaped = true
+                                elseif c == "\"" then
+                                  in_string = false
+                                end
+                              else
+                                if c == "\"" then
+                                  in_string = true
+                                elseif c == "{" or c == "[" then
+                                  depth = depth + 1
+                                elseif c == "}" or c == "]" then
+                                  if depth == 0 then
+                                    return i
+                                  end
+                                  depth = depth - 1
+                                elseif c == "," and depth == 0 then
+                                  return i
+                                end
+                              end
+                              i = i + 1
+                            end
+                            return i
+                          end
+
+                          local function find_top_level_model(text)
+                            local pos = skip_ws(text, 1)
+                            if text:sub(pos, pos) ~= "{" then
+                              return nil, nil, nil, "body is not a JSON object"
+                            end
+                            pos = pos + 1
+                            while true do
+                              pos = skip_ws(text, pos)
+                              local c = text:sub(pos, pos)
+                              if c == "}" then
+                                return nil, nil, nil, nil
+                              end
+                              local key, _, _, next_pos = parse_json_string(text, pos)
+                              if key == nil then
+                                return nil, nil, nil, "object key is not a JSON string"
+                              end
+                              pos = skip_ws(text, next_pos)
+                              if text:sub(pos, pos) ~= ":" then
+                                return nil, nil, nil, "object key is missing ':'"
+                              end
+                              pos = skip_ws(text, pos + 1)
+                              if key == "model" then
+                                local model, value_start, value_end = parse_json_string(text, pos)
+                                if model == nil then
+                                  return nil, nil, nil, "model is not a JSON string"
+                                end
+                                return model, value_start, value_end, nil
+                              end
+                              pos = skip_json_value(text, pos)
+                              pos = skip_ws(text, pos)
+                              c = text:sub(pos, pos)
+                              if c == "," then
+                                pos = pos + 1
+                              elseif c == "}" then
+                                return nil, nil, nil, nil
+                              else
+                                return nil, nil, nil, "object member is missing ',' or '}'"
+                              end
+                            end
+                          end
+
+                          local function json_escape(value)
+                            value = value:gsub("\\", "\\\\")
+                            value = value:gsub("\"", "\\\"")
+                            value = value:gsub("\n", "\\n")
+                            value = value:gsub("\r", "\\r")
+                            value = value:gsub("\t", "\\t")
+                            return value
+                          end
+
+                          local function maybe_rewrite_bedrock_model(handle)
+                            if handle:headers():get("x-gm-provider") ~= "anthropic" then
+                              return false
+                            end
+                            if expected ~= "" and handle:headers():get("x-gm-node-key") ~= expected then
+                              return false
+                            end
+                            local body = handle:body()
+                            if body == nil or body:length() == 0 then
+                              return false
+                            end
+                            local text = body:getBytes(0, body:length())
+                            local model, value_start, value_end, err = find_top_level_model(text)
+                            if err ~= nil then
+                              return json_error(handle, err)
+                            end
+                            if model == nil then
+                              return false
+                            end
+                            local replacement = bedrock_model_map[model]
+                            if replacement == nil then
+                              return json_error(handle, "no Bedrock mapping for model")
+                            end
+                            local rewritten = text:sub(1, value_start - 1)
+                              .. json_escape(replacement)
+                              .. text:sub(value_end + 1)
+                            body:setBytes(rewritten)
+                            handle:headers():remove("content-length")
+                            handle:headers():add("content-length", tostring(#rewritten))
+                            return false
+                          end
+                          ## gm:bedrock-model-rewrite-end
                           function envoy_on_request(handle)
+                            ## gm:bedrock-model-rewrite-begin
+                            if expected == "" then
+                              if maybe_rewrite_bedrock_model(handle) then
+                                return
+                              end
+                              return
+                            end
+                            ## gm:bedrock-model-rewrite-end
                             if expected == "" then
                               return
                             end
@@ -497,6 +702,11 @@ static_resources:
                                  ["content-type"] = "application/json"},
                                 "{\"error\":\"missing or invalid x-gm-node-key\"}")
                             end
+                            ## gm:bedrock-model-rewrite-begin
+                            if maybe_rewrite_bedrock_model(handle) then
+                              return
+                            end
+                            ## gm:bedrock-model-rewrite-end
                           end
                   ## ── Graceful load shedding ──────────────────────────
                   ##  The miner's saturation signal. Without it a miner
@@ -710,13 +920,13 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: api.anthropic.com
-                      port_value: 443
+                      address: __GM_ANTHROPIC_HOST__
+                      port_value: __GM_ANTHROPIC_PORT__
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          sni: api.anthropic.com
+          sni: __GM_ANTHROPIC_HOST__
           common_tls_context:
             validation_context:
               trusted_ca:
@@ -724,7 +934,7 @@ static_resources:
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
-                    exact: api.anthropic.com
+                    exact: __GM_ANTHROPIC_HOST__
 
     ## ── OpenAI ────────────────────────────────────────────────────────
     - name: openai
@@ -743,13 +953,13 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: api.openai.com
-                      port_value: 443
+                      address: __GM_OPENAI_HOST__
+                      port_value: __GM_OPENAI_PORT__
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          sni: api.openai.com
+          sni: __GM_OPENAI_HOST__
           common_tls_context:
             validation_context:
               trusted_ca:
@@ -757,7 +967,7 @@ static_resources:
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
-                    exact: api.openai.com
+                    exact: __GM_OPENAI_HOST__
 
     ## ── Chutes ────────────────────────────────────────────────────────
     - name: chutes

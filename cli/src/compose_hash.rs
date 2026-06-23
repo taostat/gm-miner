@@ -60,13 +60,21 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// every supported provider key name plus the node secret, regardless of
 /// which keys an individual miner has configured. Hash covers names only,
 /// not values, so every miner produces the same `compose_hash`. The order
-/// matches `render_env_file`: Anthropic, `OpenAI`, Google, Chutes, node
-/// secret. Private-registry pull credentials (`DSTACK_DOCKER_*`) are
+/// matches `render_env_file`: Anthropic direct/Bedrock, `OpenAI` direct/Azure,
+/// Google, Chutes, node secret. Private-registry pull credentials
+/// (`DSTACK_DOCKER_*`) are
 /// excluded: the gm image is public and those vars do not appear in
 /// `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 5] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 12] = [
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_UPSTREAM",
+    "BEDROCK_REGION",
+    "BEDROCK_API_KEY",
+    "BEDROCK_MODEL_MAP",
     "OPENAI_API_KEY",
+    "OPENAI_UPSTREAM",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_KEY",
     "GOOGLE_API_KEY",
     "CHUTES_API_KEY",
     "GM_NODE_SECRET",
@@ -197,8 +205,8 @@ mod tests {
         "ghcr.io/taostat/gm-miner@sha256:bcb3d8ca557d380319481234c3455602c69891f928ebefd4ec53def67999de80";
 
     /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
-    /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (all five provider key
-    /// names, including `CHUTES_API_KEY`).
+    /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
+    /// keys, cloud upstream settings, and node secret).
     ///
     /// This is the live registry-approved hash for v0.1.4, attested by the
     /// testnet miners (read from `attested_compose_hashes` on the registry
@@ -206,7 +214,7 @@ mod tests {
     /// version: bump it in lockstep with `TESTNET_IMAGE_REF` whenever a new
     /// `ImageVersion` is published, then confirm live miners attest to it.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "cc1e164effb1e846cec6b3ef68388bcc2c0bdfaaf4fdb7519f1dabe1999eea01";
+        "21e050d0c7f781b3379d5c88221c921e5483b72a4bf8635e6eeb93aa53f16389";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
@@ -267,8 +275,8 @@ mod tests {
                 .get("allowed_envs")
                 .and_then(|v| v.as_array())
                 .map(Vec::len),
-            Some(5),
-            "allowed_envs must be the canonical 5-name set"
+            Some(CANONICAL_ALLOWED_ENVS.len()),
+            "allowed_envs must be the canonical env-name set"
         );
     }
 

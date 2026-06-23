@@ -258,6 +258,7 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
@@ -294,6 +295,7 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
@@ -345,6 +347,7 @@ fn deploy_errors_when_provider_keys_all_none() {
             openai: None,
             google: None,
             chutes: None,
+            ..ProviderKeys::default()
         }),
         phala_api_key: None,
         api_url_override: None,
@@ -401,6 +404,7 @@ fn phala_failure_surfaces_as_error() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     let err = FailingPhala
         .deploy("compose-content", &keys, "test-node-secret-1234", None, 300)
@@ -419,6 +423,7 @@ fn timeout_error_is_actionable() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     let err = TimedOutPhala
         .deploy("compose", &keys, "test-node-secret-1234", None, 0)
@@ -694,6 +699,7 @@ fn any_set_false_for_empty_string() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(
         !keys.any_set(),
@@ -709,6 +715,7 @@ fn any_set_false_for_whitespace_only() {
         openai: Some("   ".to_owned()),
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(!keys.any_set());
 }
@@ -721,6 +728,7 @@ fn any_set_true_for_non_empty_key() {
         openai: None,
         google: Some("real-key".to_owned()),
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
 }

@@ -321,7 +321,14 @@ fn wizard_provider_keys(
         cmd_set_api_keys(
             explicit_network,
             keys.anthropic,
+            keys.anthropic_upstream,
+            keys.bedrock_region,
+            keys.bedrock_api_key,
+            keys.bedrock_model_map,
             keys.openai,
+            keys.openai_upstream,
+            keys.azure_openai_endpoint,
+            keys.azure_openai_api_key,
             keys.google,
             keys.chutes,
         )
@@ -332,7 +339,14 @@ fn wizard_provider_keys(
 fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
     Ok(ProviderKeys {
         anthropic: prompt_line("Anthropic API key (blank to skip):", assume_yes)?,
+        anthropic_upstream: None,
+        bedrock_region: None,
+        bedrock_api_key: None,
+        bedrock_model_map: None,
         openai: prompt_line("OpenAI API key (blank to skip):", assume_yes)?,
+        openai_upstream: None,
+        azure_openai_endpoint: None,
+        azure_openai_api_key: None,
         google: prompt_line("Google API key (blank to skip):", assume_yes)?,
         chutes: prompt_line("Chutes API key (blank to skip):", assume_yes)?,
     })
@@ -345,8 +359,22 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     if keys.anthropic.is_some() {
         cmd.push_str(" --anthropic <key>");
     }
+    if keys.anthropic_upstream.as_deref() == Some("bedrock") {
+        cmd.push_str(" --anthropic-upstream bedrock");
+    }
+    if keys.bedrock_api_key.is_some() {
+        cmd.push_str(
+            " --bedrock-region <region> --bedrock-api-key <key> --bedrock-model-map <json>",
+        );
+    }
     if keys.openai.is_some() {
         cmd.push_str(" --openai <key>");
+    }
+    if keys.openai_upstream.as_deref() == Some("azure") {
+        cmd.push_str(" --openai-upstream azure");
+    }
+    if keys.azure_openai_api_key.is_some() {
+        cmd.push_str(" --azure-openai-endpoint <url> --azure-openai-api-key <key>");
     }
     if keys.google.is_some() {
         cmd.push_str(" --google <key>");

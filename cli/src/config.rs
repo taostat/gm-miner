@@ -312,7 +312,21 @@ pub struct ProviderKeys {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic_upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bedrock_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bedrock_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bedrock_model_map: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_openai_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure_openai_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub google: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,8 +342,12 @@ impl ProviderKeys {
     #[must_use]
     pub fn any_set(&self) -> bool {
         let non_empty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
-        non_empty(&self.anthropic)
-            || non_empty(&self.openai)
+        let anthropic_upstream = self.anthropic_upstream.as_deref().unwrap_or("direct");
+        let openai_upstream = self.openai_upstream.as_deref().unwrap_or("direct");
+        ((anthropic_upstream == "direct" && non_empty(&self.anthropic))
+            || (anthropic_upstream == "bedrock" && non_empty(&self.bedrock_api_key)))
+            || ((openai_upstream == "direct" && non_empty(&self.openai))
+                || (openai_upstream == "azure" && non_empty(&self.azure_openai_api_key)))
             || non_empty(&self.google)
             || non_empty(&self.chutes)
     }

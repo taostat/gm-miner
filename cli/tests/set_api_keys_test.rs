@@ -213,6 +213,7 @@ fn any_set_true_when_anthropic_set() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
 }
@@ -224,6 +225,7 @@ fn any_set_true_when_openai_set() {
         openai: Some("k".to_owned()),
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
 }
@@ -235,6 +237,7 @@ fn any_set_true_when_google_set() {
         openai: None,
         google: Some("k".to_owned()),
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
 }
@@ -249,6 +252,7 @@ fn any_set_false_for_empty_string() {
         openai: None,
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(!keys.any_set(), "Some(\"\") must not count as set");
 }
@@ -261,6 +265,7 @@ fn any_set_false_for_whitespace_only() {
         openai: Some("  ".to_owned()),
         google: None,
         chutes: None,
+        ..ProviderKeys::default()
     };
     assert!(!keys.any_set());
 }
@@ -272,8 +277,39 @@ fn any_set_true_when_chutes_set() {
         openai: None,
         google: None,
         chutes: Some("k".to_owned()),
+        ..ProviderKeys::default()
     };
     assert!(keys.any_set());
+}
+
+#[test]
+fn any_set_true_when_bedrock_selected_and_key_set() {
+    let keys = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        bedrock_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(keys.any_set());
+}
+
+#[test]
+fn any_set_true_when_azure_selected_and_key_set() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(keys.any_set());
+}
+
+#[test]
+fn cloud_key_without_selector_does_not_pass_preflight() {
+    let keys = ProviderKeys {
+        bedrock_api_key: Some("k".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(!keys.any_set());
 }
 
 // ── Empty-key rejection in set-api-keys ──────────────────────────────────────

@@ -43,15 +43,244 @@ set -euo pipefail
 
 log() { printf '[start] %s\n' "$*" >&2; }
 
+lowercase() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+ANTHROPIC_UPSTREAM="${ANTHROPIC_UPSTREAM:-direct}"
+OPENAI_UPSTREAM="${OPENAI_UPSTREAM:-direct}"
+
+validate_hostname() {
+  local name="$1"
+  local host="$2"
+  if [[ -z "${host}" || "${host}" == *[!A-Za-z0-9.-]* || "${host}" == .* || "${host}" == *. || "${host}" == *..* ]]; then
+    log "error: ${name} must be a DNS host (got '${host}')"
+    exit 1
+  fi
+}
+
+require_host_suffix() {
+  local name="$1"
+  local host="$2"
+  shift 2
+  local suffix
+  for suffix in "$@"; do
+    if [[ "${host}" == *".${suffix}" ]]; then
+      return
+    fi
+  done
+  log "error: ${name} host '${host}' is not in the allowed suffix set: $*"
+  exit 1
+}
+
+parse_azure_host() {
+  local endpoint="$1"
+  local rest="${endpoint}"
+  case "${endpoint}" in
+    https://*) rest="${endpoint#https://}" ;;
+    http://*)
+      log "error: AZURE_OPENAI_ENDPOINT must use https when a scheme is provided"
+      exit 1
+      ;;
+    *://*)
+      log "error: AZURE_OPENAI_ENDPOINT has unsupported URL scheme"
+      exit 1
+      ;;
+  esac
+  rest="${rest%%/*}"
+  rest="${rest%%\?*}"
+  rest="${rest%%#*}"
+  if [[ "${rest}" == *"@"* ]]; then
+    log "error: AZURE_OPENAI_ENDPOINT must not contain userinfo"
+    exit 1
+  fi
+  if [[ "${rest}" == *:* ]]; then
+    rest="${rest%%:*}"
+  fi
+  lowercase "${rest}"
+}
+
+lua_table_from_bedrock_model_map() {
+  local map="$1"
+  BEDROCK_MODEL_MAP_JSON="${map}" awk '
+    function fail(message) {
+      print "[start] error: BEDROCK_MODEL_MAP " message > "/dev/stderr"
+      exit 1
+    }
+    function skip_ws() {
+      while (pos <= len && substr(json, pos, 1) ~ /[[:space:]]/) {
+        pos++
+      }
+    }
+    function parse_model_id_string(    ch, value) {
+      if (substr(json, pos, 1) != "\"") {
+        fail("must be a JSON object with string keys and string values")
+      }
+      pos++
+      value = ""
+      while (pos <= len) {
+        ch = substr(json, pos, 1)
+        if (ch == "\"") {
+          pos++
+          if (value !~ /^[A-Za-z0-9._:\/-]+$/) {
+            fail("contains an unsupported model id character")
+          }
+          return value
+        }
+        if (ch == "\\") {
+          fail("must use unescaped model id strings")
+        }
+        value = value ch
+        pos++
+      }
+      fail("contains an unterminated string")
+    }
+    BEGIN {
+      json = ENVIRON["BEDROCK_MODEL_MAP_JSON"]
+      len = length(json)
+      pos = 1
+      skip_ws()
+      if (substr(json, pos, 1) != "{") {
+        fail("must be a JSON object")
+      }
+      pos++
+      skip_ws()
+      if (substr(json, pos, 1) == "}") {
+        fail("must contain at least one model mapping")
+      }
+      while (1) {
+        key = parse_model_id_string()
+        skip_ws()
+        if (substr(json, pos, 1) != ":") {
+          fail("is missing ':' after a model id")
+        }
+        pos++
+        skip_ws()
+        value = parse_model_id_string()
+        printf "                            [\"%s\"] = \"%s\",\n", key, value
+        count++
+        skip_ws()
+        ch = substr(json, pos, 1)
+        if (ch == ",") {
+          pos++
+          skip_ws()
+          continue
+        }
+        if (ch == "}") {
+          pos++
+          skip_ws()
+          if (pos <= len) {
+            fail("has trailing content after the object")
+          }
+          exit 0
+        }
+        fail("is missing comma or closing brace after a mapping")
+      }
+    }
+  '
+}
+
+# ── Resolve provider upstream selectors ───────────────────────────────
+ANTHROPIC_HOST=api.anthropic.com
+ANTHROPIC_PORT=443
+ANTHROPIC_PATH_REWRITE=0
+ANTHROPIC_AUTH_HEADER=x-api-key
+ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(ANTHROPIC_API_KEY)%"
+ANTHROPIC_VERSION_APPEND_ACTION=ADD_IF_ABSENT
+BEDROCK_MODEL_REWRITE=0
+BEDROCK_MODEL_MAP_LUA=
+
+case "${ANTHROPIC_UPSTREAM}" in
+  direct) ;;
+  bedrock)
+    if [[ -z "${BEDROCK_REGION:-}" ]]; then
+      log "error: BEDROCK_REGION must be set when ANTHROPIC_UPSTREAM=bedrock"
+      exit 1
+    fi
+    if [[ -z "${BEDROCK_API_KEY:-}" ]]; then
+      log "error: BEDROCK_API_KEY must be set when ANTHROPIC_UPSTREAM=bedrock"
+      exit 1
+    fi
+    if [[ -z "${BEDROCK_MODEL_MAP:-}" ]]; then
+      log "error: BEDROCK_MODEL_MAP must be set when ANTHROPIC_UPSTREAM=bedrock"
+      exit 1
+    fi
+    if [[ ! "${BEDROCK_REGION}" =~ ^[A-Za-z0-9-]+$ ]]; then
+      log "error: BEDROCK_REGION must contain only letters, numbers, and hyphens"
+      exit 1
+    fi
+    ANTHROPIC_HOST="bedrock-mantle.$(lowercase "${BEDROCK_REGION}").api.aws"
+    validate_hostname "Bedrock" "${ANTHROPIC_HOST}"
+    case "${ANTHROPIC_HOST}" in
+      bedrock-mantle.*.api.aws) ;;
+      *)
+        log "error: Bedrock host '${ANTHROPIC_HOST}' is not allowed"
+        exit 1
+        ;;
+    esac
+    ANTHROPIC_PATH_REWRITE=1
+    ANTHROPIC_AUTH_HEADER=x-api-key
+    ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(BEDROCK_API_KEY)%"
+    ANTHROPIC_VERSION_APPEND_ACTION=OVERWRITE_IF_EXISTS_OR_ADD
+    BEDROCK_MODEL_REWRITE=1
+    BEDROCK_MODEL_MAP_LUA="$(lua_table_from_bedrock_model_map "${BEDROCK_MODEL_MAP}")"
+    ;;
+  *)
+    log "error: ANTHROPIC_UPSTREAM must be 'direct' or 'bedrock' (got '${ANTHROPIC_UPSTREAM}')"
+    exit 1
+    ;;
+esac
+
+OPENAI_HOST=api.openai.com
+OPENAI_PORT=443
+OPENAI_PATH_REWRITE=0
+OPENAI_AUTH_HEADER=authorization
+OPENAI_AUTH_VALUE="Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
+
+case "${OPENAI_UPSTREAM}" in
+  direct) ;;
+  azure)
+    if [[ -z "${AZURE_OPENAI_ENDPOINT:-}" ]]; then
+      log "error: AZURE_OPENAI_ENDPOINT must be set when OPENAI_UPSTREAM=azure"
+      exit 1
+    fi
+    if [[ -z "${AZURE_OPENAI_API_KEY:-}" ]]; then
+      log "error: AZURE_OPENAI_API_KEY must be set when OPENAI_UPSTREAM=azure"
+      exit 1
+    fi
+    OPENAI_HOST="$(parse_azure_host "${AZURE_OPENAI_ENDPOINT}")"
+    validate_hostname "Azure OpenAI" "${OPENAI_HOST}"
+    require_host_suffix "Azure OpenAI" "${OPENAI_HOST}" \
+      openai.azure.com \
+      services.ai.azure.com \
+      cognitiveservices.azure.com
+    OPENAI_PATH_REWRITE=1
+    OPENAI_AUTH_HEADER=api-key
+    OPENAI_AUTH_VALUE="%ENVIRONMENT(AZURE_OPENAI_API_KEY)%"
+    ;;
+  *)
+    log "error: OPENAI_UPSTREAM must be 'direct' or 'azure' (got '${OPENAI_UPSTREAM}')"
+    exit 1
+    ;;
+esac
+
 # ── Require at least one provider key ─────────────────────────────────
 HAS_KEY=0
-if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "ANTHROPIC_API_KEY set"
 fi
-if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" && -n "${BEDROCK_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "BEDROCK_API_KEY set"
+fi
+if [[ "${OPENAI_UPSTREAM}" == "direct" && -n "${OPENAI_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "OPENAI_API_KEY set"
+fi
+if [[ "${OPENAI_UPSTREAM}" == "azure" && -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "AZURE_OPENAI_API_KEY set"
 fi
 if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
   HAS_KEY=1
@@ -63,7 +292,11 @@ if [[ -n "${CHUTES_API_KEY:-}" ]]; then
 fi
 
 if [[ "${HAS_KEY}" -eq 0 ]]; then
-  log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY must be set"
+  if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && "${OPENAI_UPSTREAM}" == "direct" ]]; then
+    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY must be set"
+  else
+    log "error: at least one usable provider key must be set"
+  fi
   exit 1
 fi
 
@@ -136,11 +369,24 @@ fi
 #      `## gm:benchmark-tls-begin` / `-end` whole-line sentinels. Kept
 #      when the URL is https; dropped (the cluster stays plain HTTP/1.1)
 #      when it is http.
-RENDERED_CONFIG=/tmp/envoy.rendered.yaml
+RENDERED_CONFIG="${GM_RENDERED_CONFIG:-/tmp/envoy.rendered.yaml}"
 GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_BENCHMARK_HOST="${BENCHMARK_HOST}" \
   GM_BENCHMARK_PORT="${BENCHMARK_PORT}" \
   GM_BENCHMARK_TLS="${BENCHMARK_TLS}" \
+  GM_ANTHROPIC_HOST="${ANTHROPIC_HOST}" \
+  GM_ANTHROPIC_PORT="${ANTHROPIC_PORT}" \
+  GM_ANTHROPIC_PATH_REWRITE="${ANTHROPIC_PATH_REWRITE}" \
+  GM_ANTHROPIC_AUTH_HEADER="${ANTHROPIC_AUTH_HEADER}" \
+  GM_ANTHROPIC_AUTH_VALUE="${ANTHROPIC_AUTH_VALUE}" \
+  GM_ANTHROPIC_VERSION_APPEND_ACTION="${ANTHROPIC_VERSION_APPEND_ACTION}" \
+  GM_OPENAI_HOST="${OPENAI_HOST}" \
+  GM_OPENAI_PORT="${OPENAI_PORT}" \
+  GM_OPENAI_PATH_REWRITE="${OPENAI_PATH_REWRITE}" \
+  GM_OPENAI_AUTH_HEADER="${OPENAI_AUTH_HEADER}" \
+  GM_OPENAI_AUTH_VALUE="${OPENAI_AUTH_VALUE}" \
+  GM_BEDROCK_MODEL_REWRITE="${BEDROCK_MODEL_REWRITE}" \
+  GM_BEDROCK_MODEL_MAP_LUA="${BEDROCK_MODEL_MAP_LUA}" \
   awk '
   function subst(line, token, value,    out, rest, pos) {
     out = ""
@@ -156,17 +402,49 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     bench_host = ENVIRON["GM_BENCHMARK_HOST"]
     bench_port = ENVIRON["GM_BENCHMARK_PORT"]
     bench_tls = (ENVIRON["GM_BENCHMARK_TLS"] == "1")
+    anthropic_host = ENVIRON["GM_ANTHROPIC_HOST"]
+    anthropic_port = ENVIRON["GM_ANTHROPIC_PORT"]
+    anthropic_path_rewrite = (ENVIRON["GM_ANTHROPIC_PATH_REWRITE"] == "1")
+    anthropic_auth_header = ENVIRON["GM_ANTHROPIC_AUTH_HEADER"]
+    anthropic_auth_value = ENVIRON["GM_ANTHROPIC_AUTH_VALUE"]
+    anthropic_version_append_action = ENVIRON["GM_ANTHROPIC_VERSION_APPEND_ACTION"]
+    openai_host = ENVIRON["GM_OPENAI_HOST"]
+    openai_port = ENVIRON["GM_OPENAI_PORT"]
+    openai_path_rewrite = (ENVIRON["GM_OPENAI_PATH_REWRITE"] == "1")
+    openai_auth_header = ENVIRON["GM_OPENAI_AUTH_HEADER"]
+    openai_auth_value = ENVIRON["GM_OPENAI_AUTH_VALUE"]
+    bedrock_model_rewrite = (ENVIRON["GM_BEDROCK_MODEL_REWRITE"] == "1")
+    bedrock_model_map_lua = ENVIRON["GM_BEDROCK_MODEL_MAP_LUA"]
   }
   /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
   /^[[:space:]]*## gm:benchmark-tls-end[[:space:]]*$/   { in_tls = 0; next }
   in_tls && !bench_tls { next }
+  /^[[:space:]]*## gm:anthropic-path-rewrite-begin[[:space:]]*$/ { in_anthropic_path_rewrite = 1; next }
+  /^[[:space:]]*## gm:anthropic-path-rewrite-end[[:space:]]*$/   { in_anthropic_path_rewrite = 0; next }
+  in_anthropic_path_rewrite && !anthropic_path_rewrite { next }
+  /^[[:space:]]*## gm:openai-path-rewrite-begin[[:space:]]*$/ { in_openai_path_rewrite = 1; next }
+  /^[[:space:]]*## gm:openai-path-rewrite-end[[:space:]]*$/   { in_openai_path_rewrite = 0; next }
+  in_openai_path_rewrite && !openai_path_rewrite { next }
+  /^[[:space:]]*## gm:bedrock-model-rewrite-begin[[:space:]]*$/ { in_bedrock_model_rewrite = 1; next }
+  /^[[:space:]]*## gm:bedrock-model-rewrite-end[[:space:]]*$/   { in_bedrock_model_rewrite = 0; next }
+  in_bedrock_model_rewrite && !bedrock_model_rewrite { next }
   {
     line = subst($0, "__GM_NODE_SECRET__", secret)
     line = subst(line, "__GM_BENCHMARK_HOST__", bench_host)
     line = subst(line, "__GM_BENCHMARK_PORT__", bench_port)
+    line = subst(line, "__GM_ANTHROPIC_HOST__", anthropic_host)
+    line = subst(line, "__GM_ANTHROPIC_PORT__", anthropic_port)
+    line = subst(line, "__GM_ANTHROPIC_AUTH_HEADER__", anthropic_auth_header)
+    line = subst(line, "__GM_ANTHROPIC_AUTH_VALUE__", anthropic_auth_value)
+    line = subst(line, "__GM_ANTHROPIC_VERSION_APPEND_ACTION__", anthropic_version_append_action)
+    line = subst(line, "__GM_OPENAI_HOST__", openai_host)
+    line = subst(line, "__GM_OPENAI_PORT__", openai_port)
+    line = subst(line, "__GM_OPENAI_AUTH_HEADER__", openai_auth_header)
+    line = subst(line, "__GM_OPENAI_AUTH_VALUE__", openai_auth_value)
+    line = subst(line, "__GM_BEDROCK_MODEL_MAP_LUA__", bedrock_model_map_lua)
     print line
   }
-' /etc/envoy/envoy.yaml >"${RENDERED_CONFIG}"
+' "${GM_ENVOY_TEMPLATE_PATH:-/etc/envoy/envoy.yaml}" >"${RENDERED_CONFIG}"
 
 if [[ -n "${GM_NODE_SECRET:-}" ]]; then
   log "GM_NODE_SECRET set — envoy enforces x-gm-node-key on inbound requests"
@@ -180,8 +458,20 @@ else
   log "benchmark route proxies to http://${BENCHMARK_HOST}:${BENCHMARK_PORT} (GM_NETWORK=${GM_NETWORK})"
 fi
 
+if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" ]]; then
+  log "anthropic route proxies to AWS Bedrock at https://${ANTHROPIC_HOST}:${ANTHROPIC_PORT}"
+fi
+if [[ "${OPENAI_UPSTREAM}" == "azure" ]]; then
+  log "openai route proxies to Azure OpenAI at https://${OPENAI_HOST}:${OPENAI_PORT}"
+fi
+
 GM_IMAGE_VERSION="${GM_IMAGE_VERSION:-unknown}"
 log "image version: ${GM_IMAGE_VERSION}"
+
+if [[ "${GM_START_RENDER_ONLY:-}" == "1" ]]; then
+  log "render-only mode complete: ${RENDERED_CONFIG}"
+  exit 0
+fi
 
 # ── Provision the data-plane RA-TLS certificate ───────────────────────
 # Mechanism 2 of attestation-and-identity.md. gm-miner-ratls calls the

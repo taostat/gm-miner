@@ -49,7 +49,20 @@ pub fn render_env_file(
     let mut lines = String::new();
     for (name, value) in [
         ("ANTHROPIC_API_KEY", env_vars.anthropic.as_deref()),
+        ("ANTHROPIC_UPSTREAM", env_vars.anthropic_upstream.as_deref()),
+        ("BEDROCK_REGION", env_vars.bedrock_region.as_deref()),
+        ("BEDROCK_API_KEY", env_vars.bedrock_api_key.as_deref()),
+        ("BEDROCK_MODEL_MAP", env_vars.bedrock_model_map.as_deref()),
         ("OPENAI_API_KEY", env_vars.openai.as_deref()),
+        ("OPENAI_UPSTREAM", env_vars.openai_upstream.as_deref()),
+        (
+            "AZURE_OPENAI_ENDPOINT",
+            env_vars.azure_openai_endpoint.as_deref(),
+        ),
+        (
+            "AZURE_OPENAI_API_KEY",
+            env_vars.azure_openai_api_key.as_deref(),
+        ),
         ("GOOGLE_API_KEY", env_vars.google.as_deref()),
         ("CHUTES_API_KEY", env_vars.chutes.as_deref()),
     ] {
@@ -274,6 +287,7 @@ mod tests {
             openai: None,
             google: None,
             chutes: Some("cpk-chutes".to_owned()),
+            ..ProviderKeys::default()
         };
         let body = render_env_file(&keys, "node-secret-xyz", None);
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
@@ -305,6 +319,7 @@ mod tests {
             openai: None,
             google: None,
             chutes: Some("cpk-only".to_owned()),
+            ..ProviderKeys::default()
         };
         let body = render_env_file(&keys, "node-secret", None);
         let names: Vec<&str> = body
@@ -316,7 +331,14 @@ mod tests {
             names,
             vec![
                 "ANTHROPIC_API_KEY",
+                "ANTHROPIC_UPSTREAM",
+                "BEDROCK_REGION",
+                "BEDROCK_API_KEY",
+                "BEDROCK_MODEL_MAP",
                 "OPENAI_API_KEY",
+                "OPENAI_UPSTREAM",
+                "AZURE_OPENAI_ENDPOINT",
+                "AZURE_OPENAI_API_KEY",
                 "GOOGLE_API_KEY",
                 "CHUTES_API_KEY",
                 "GM_NODE_SECRET",

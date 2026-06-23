@@ -16,10 +16,32 @@ fn validate_key(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_selector(name: &str, value: &str, allowed: &[&str]) -> Result<()> {
+    validate_key(name, value)?;
+    if !allowed.contains(&value) {
+        bail!(
+            "invalid value for --{name}: {value}; expected one of {}",
+            allowed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "single CLI command handler validates, persists, and reports all provider settings"
+)]
 pub(crate) fn cmd_set_api_keys(
     explicit_network: Option<Network>,
     anthropic: Option<String>,
+    anthropic_upstream: Option<String>,
+    bedrock_region: Option<String>,
+    bedrock_api_key: Option<String>,
+    bedrock_model_map: Option<String>,
     openai: Option<String>,
+    openai_upstream: Option<String>,
+    azure_openai_endpoint: Option<String>,
+    azure_openai_api_key: Option<String>,
     google: Option<String>,
     chutes: Option<String>,
 ) -> Result<()> {
@@ -27,8 +49,29 @@ pub(crate) fn cmd_set_api_keys(
     if let Some(ref k) = anthropic {
         validate_key("anthropic", k)?;
     }
+    if let Some(ref v) = anthropic_upstream {
+        validate_selector("anthropic-upstream", v, &["direct", "bedrock"])?;
+    }
+    if let Some(ref v) = bedrock_region {
+        validate_key("bedrock-region", v)?;
+    }
+    if let Some(ref k) = bedrock_api_key {
+        validate_key("bedrock-api-key", k)?;
+    }
+    if let Some(ref v) = bedrock_model_map {
+        validate_key("bedrock-model-map", v)?;
+    }
     if let Some(ref k) = openai {
         validate_key("openai", k)?;
+    }
+    if let Some(ref v) = openai_upstream {
+        validate_selector("openai-upstream", v, &["direct", "azure"])?;
+    }
+    if let Some(ref v) = azure_openai_endpoint {
+        validate_key("azure-openai-endpoint", v)?;
+    }
+    if let Some(ref k) = azure_openai_api_key {
+        validate_key("azure-openai-api-key", k)?;
     }
     if let Some(ref k) = google {
         validate_key("google", k)?;
@@ -40,47 +83,77 @@ pub(crate) fn cmd_set_api_keys(
     // Load → mutate → save under the lock so a concurrent `deploy` save can't
     // be clobbered, and re-read fresh inside the lock so we merge onto the
     // latest on-disk state rather than a snapshot taken before the lock.
-    let (has_anthropic, has_openai, has_google, has_chutes) = config::with_config_lock(|| {
-        let mut cfg = config::load()
-            .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
+    let (has_anthropic, has_bedrock, has_openai, has_azure, has_google, has_chutes) =
+        config::with_config_lock(|| {
+            let mut cfg = config::load()
+                .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
 
-        // Provider keys are network-independent, but an explicit --network here
-        // is still the user's sticky selection — persist it so the promise holds
-        // even when set-api-keys is the command that carries the flag.
-        if let Some(network) = explicit_network {
-            cfg.set_network(network);
-        }
+            // Provider keys are network-independent, but an explicit --network here
+            // is still the user's sticky selection — persist it so the promise holds
+            // even when set-api-keys is the command that carries the flag.
+            if let Some(network) = explicit_network {
+                cfg.set_network(network);
+            }
 
-        let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
-        if let Some(k) = anthropic {
-            keys.anthropic = Some(k);
-        }
-        if let Some(k) = openai {
-            keys.openai = Some(k);
-        }
-        if let Some(k) = google {
-            keys.google = Some(k);
-        }
-        if let Some(k) = chutes {
-            keys.chutes = Some(k);
-        }
-        let snapshot = (
-            keys.anthropic.is_some(),
-            keys.openai.is_some(),
-            keys.google.is_some(),
-            keys.chutes.is_some(),
-        );
+            let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
+            if let Some(k) = anthropic {
+                keys.anthropic = Some(k);
+            }
+            if let Some(v) = anthropic_upstream {
+                keys.anthropic_upstream = Some(v);
+            }
+            if let Some(v) = bedrock_region {
+                keys.bedrock_region = Some(v);
+            }
+            if let Some(k) = bedrock_api_key {
+                keys.bedrock_api_key = Some(k);
+            }
+            if let Some(v) = bedrock_model_map {
+                keys.bedrock_model_map = Some(v);
+            }
+            if let Some(k) = openai {
+                keys.openai = Some(k);
+            }
+            if let Some(v) = openai_upstream {
+                keys.openai_upstream = Some(v);
+            }
+            if let Some(v) = azure_openai_endpoint {
+                keys.azure_openai_endpoint = Some(v);
+            }
+            if let Some(k) = azure_openai_api_key {
+                keys.azure_openai_api_key = Some(k);
+            }
+            if let Some(k) = google {
+                keys.google = Some(k);
+            }
+            if let Some(k) = chutes {
+                keys.chutes = Some(k);
+            }
+            let snapshot = (
+                keys.anthropic.is_some(),
+                keys.bedrock_api_key.is_some(),
+                keys.openai.is_some(),
+                keys.azure_openai_api_key.is_some(),
+                keys.google.is_some(),
+                keys.chutes.is_some(),
+            );
 
-        config::save(&cfg).context("save config")?;
-        Ok(snapshot)
-    })?;
+            config::save(&cfg).context("save config")?;
+            Ok(snapshot)
+        })?;
 
     let mut set_names: Vec<&str> = Vec::new();
     if has_anthropic {
         set_names.push("anthropic");
     }
+    if has_bedrock {
+        set_names.push("bedrock");
+    }
     if has_openai {
         set_names.push("openai");
+    }
+    if has_azure {
+        set_names.push("azure-openai");
     }
     if has_google {
         set_names.push("google");
@@ -91,7 +164,10 @@ pub(crate) fn cmd_set_api_keys(
 
     // Report which providers are now configured — never print the values.
     if set_names.is_empty() {
-        println!("No keys stored (pass --anthropic, --openai, --google, or --chutes to set one).");
+        println!(
+            "No keys stored (pass --anthropic, --openai, --google, --chutes, \
+             --bedrock-api-key, or --azure-openai-api-key to set one)."
+        );
     } else {
         println!("Provider keys updated.");
         for name in &set_names {

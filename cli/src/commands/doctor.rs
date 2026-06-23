@@ -145,8 +145,20 @@ fn provider_keys_check(cfg: &Config) -> Check {
         if k.anthropic.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             names.push("anthropic");
         }
+        if k.bedrock_api_key
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            names.push("bedrock");
+        }
         if k.openai.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             names.push("openai");
+        }
+        if k.azure_openai_api_key
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            names.push("azure-openai");
         }
         if k.google.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             names.push("google");
@@ -159,7 +171,7 @@ fn provider_keys_check(cfg: &Config) -> Check {
     if set.is_empty() {
         Check::fail(
             "Provider keys set",
-            "no provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google / --chutes)",
+            "no provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google / --chutes, or configure Bedrock/Azure upstreams)",
         )
     } else {
         Check::pass(

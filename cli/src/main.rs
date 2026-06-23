@@ -131,15 +131,47 @@ enum Command {
     #[command(after_help = "Examples:\n  \
         gmcli set-api-keys --anthropic sk-ant-...\n  \
         gmcli set-api-keys --openai sk-... --google AIza...\n  \
-        gmcli set-api-keys --chutes cpk-...")]
+        gmcli set-api-keys --chutes cpk-...\n  \
+        gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
+          --bedrock-api-key brk-... --bedrock-model-map '{\"claude-sonnet-4-6\":\"us.anthropic.claude-sonnet-4-6-v1\"}'\n  \
+        gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
+          --azure-openai-api-key ...")]
     SetApiKeys {
         /// Anthropic API key (sk-ant-...).
         #[arg(long)]
         anthropic: Option<String>,
 
+        /// Anthropic upstream selector: direct or bedrock.
+        #[arg(long)]
+        anthropic_upstream: Option<String>,
+
+        /// AWS Bedrock region for `ANTHROPIC_UPSTREAM=bedrock`.
+        #[arg(long)]
+        bedrock_region: Option<String>,
+
+        /// AWS Bedrock API key for `ANTHROPIC_UPSTREAM=bedrock`.
+        #[arg(long)]
+        bedrock_api_key: Option<String>,
+
+        /// JSON map from gm Claude model id to Bedrock model id.
+        #[arg(long)]
+        bedrock_model_map: Option<String>,
+
         /// `OpenAI` API key (sk-...).
         #[arg(long)]
         openai: Option<String>,
+
+        /// `OpenAI` upstream selector: direct or azure.
+        #[arg(long)]
+        openai_upstream: Option<String>,
+
+        /// Azure `OpenAI` endpoint URL or host for `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_openai_endpoint: Option<String>,
+
+        /// Azure `OpenAI` API key for `OPENAI_UPSTREAM=azure`.
+        #[arg(long)]
+        azure_openai_api_key: Option<String>,
 
         /// Google API key.
         #[arg(long)]
@@ -538,6 +570,10 @@ async fn main() -> Result<()> {
 /// Resolve the global flags and run the selected subcommand. Split from
 /// [`main`] so the startup banner/tracing setup stays separate from the
 /// per-command routing.
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level CLI dispatch is intentionally a flat subcommand match"
+)]
 async fn dispatch(cli: Cli) -> Result<()> {
     let explicit_network = cli.explicit_network();
     let api_url = cli.api_url.clone();
@@ -545,10 +581,30 @@ async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::SetApiKeys {
             anthropic,
+            anthropic_upstream,
+            bedrock_region,
+            bedrock_api_key,
+            bedrock_model_map,
             openai,
+            openai_upstream,
+            azure_openai_endpoint,
+            azure_openai_api_key,
             google,
             chutes,
-        } => cmd_set_api_keys(explicit_network, anthropic, openai, google, chutes),
+        } => cmd_set_api_keys(
+            explicit_network,
+            anthropic,
+            anthropic_upstream,
+            bedrock_region,
+            bedrock_api_key,
+            bedrock_model_map,
+            openai,
+            openai_upstream,
+            azure_openai_endpoint,
+            azure_openai_api_key,
+            google,
+            chutes,
+        ),
         Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
         Command::Gm => {
             cmd_gm();
@@ -1634,6 +1690,7 @@ mod tests {
                     openai: None,
                     google: None,
                     chutes: None,
+                    ..ProviderKeys::default()
                 }),
                 ..Default::default()
             }

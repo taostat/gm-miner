@@ -6,13 +6,13 @@ identical behavior; miners supply upstream API capacity and earn the spread. The
 inside an Intel TDX TEE so neither operators nor host machines see buyer content or miners'
 upstream keys.
 
-You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes) and your own funded
-[Phala Cloud](https://cloud.phala.network) account. The `gmcli` tool handles the full operator
-lifecycle from your laptop.
+You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, or Bedrock/Azure behind
+the existing Anthropic/OpenAI routes) and your own funded [Phala Cloud](https://cloud.phala.network)
+account. The `gmcli` tool handles the full operator lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Miner container image with four provider routes (Anthropic / OpenAI / Gemini / Chutes) and an optional `benchmark` route to a synthetic upstream. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs two co-located processes: the attestation server (serves `GET /attestation/info` with a fresh TDX quote) and the envoy data plane (proxies provider traffic and exposes `/stats/prometheus`). |
+| `image/` | Miner container image with four provider routes (Anthropic / OpenAI / Gemini / Chutes) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic or AWS Bedrock; OpenAI can target direct OpenAI or Azure OpenAI. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs two co-located processes: the attestation server (serves `GET /attestation/info` with a fresh TDX quote) and the envoy data plane (proxies provider traffic and exposes `/stats/prometheus`). |
 | `cli/` | `gmcli` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. Runs operator-side from a laptop, not inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -105,6 +105,31 @@ gmcli set-api-keys --chutes cpk-...
 ```
 
 Each flag replaces the stored value; omitted flags leave existing values intact.
+
+To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
+API, select Bedrock and provide the Bedrock region, API key, and model-id map:
+
+```sh
+gmcli set-api-keys \
+  --anthropic-upstream bedrock \
+  --bedrock-region us-west-2 \
+  --bedrock-api-key <bedrock-api-key> \
+  --bedrock-model-map '{"claude-sonnet-4-6":"us.anthropic.claude-sonnet-4-6-v1"}'
+```
+
+To serve the existing `openai` route through Azure OpenAI instead of the direct OpenAI API, select
+Azure and provide the resource endpoint and API key:
+
+```sh
+gmcli set-api-keys \
+  --openai-upstream azure \
+  --azure-openai-endpoint https://<resource>.openai.azure.com \
+  --azure-openai-api-key <azure-api-key>
+```
+
+Azure OpenAI must have deployments named exactly like the gm model id, for example `gpt-4o`;
+the miner does not rewrite Azure model ids. Bedrock requires its own model ids, so the miner
+rewrites the top-level Anthropic request `model` field using `BEDROCK_MODEL_MAP`.
 
 ### 4. Deploy your miner
 

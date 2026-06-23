@@ -46,8 +46,11 @@ non-blank regardless of the value. `gmcli deploy` therefore writes every
 provider key name on its own line unconditionally — a configured key as
 `NAME=<value>`, an unset key as a bare `NAME=` — so the measured `allowed_envs`
 is the same fixed set for every miner no matter which providers they
-configured. That set is `compose_hash::CANONICAL_ALLOWED_ENVS`: the four
-provider keys plus the node secret (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+configured. That set is `compose_hash::CANONICAL_ALLOWED_ENVS`: the direct
+provider keys, the Anthropic/OpenAI cloud upstream selectors and cloud
+settings, plus the node secret (`ANTHROPIC_API_KEY`, `ANTHROPIC_UPSTREAM`,
+`BEDROCK_REGION`, `BEDROCK_API_KEY`, `BEDROCK_MODEL_MAP`, `OPENAI_API_KEY`,
+`OPENAI_UPSTREAM`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
 `GOOGLE_API_KEY`, `CHUTES_API_KEY`, `GM_NODE_SECRET`), with no private-registry
 pull credentials. The registry's approved baseline is keyed on it.
 
