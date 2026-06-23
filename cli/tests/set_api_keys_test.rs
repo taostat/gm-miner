@@ -312,6 +312,45 @@ fn cloud_key_without_selector_does_not_pass_preflight() {
     assert!(!keys.any_set());
 }
 
+#[test]
+fn validate_upstreams_rejects_incomplete_bedrock() {
+    let keys = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        bedrock_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(err.contains("--bedrock-region"), "{err}");
+    assert!(err.contains("--bedrock-model-map"), "{err}");
+}
+
+#[test]
+fn validate_upstreams_rejects_incomplete_azure() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(err.contains("--azure-openai-endpoint"), "{err}");
+}
+
+#[test]
+fn validate_upstreams_accepts_complete_cloud_and_direct() {
+    let complete = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        bedrock_region: Some("us-west-2".to_owned()),
+        bedrock_api_key: Some("k".to_owned()),
+        bedrock_model_map: Some("{\"a\":\"b\"}".to_owned()),
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_endpoint: Some("https://r.openai.azure.com".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(complete.validate_upstreams().is_ok());
+    assert!(ProviderKeys::default().validate_upstreams().is_ok());
+}
+
 // ── Empty-key rejection in set-api-keys ──────────────────────────────────────
 
 /// Passing `--openai ""` must be rejected with a clear error before the

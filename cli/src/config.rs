@@ -351,6 +351,66 @@ impl ProviderKeys {
             || non_empty(&self.google)
             || non_empty(&self.chutes)
     }
+
+    /// Reject a selected cloud upstream that is missing fields `start.sh`
+    /// requires at boot. Without this, `gmcli deploy` would launch a CVM that
+    /// crash-loops because `start.sh` exits — fail fast at deploy instead.
+    ///
+    /// # Errors
+    /// Returns an error when `anthropic_upstream`/`openai_upstream` is an
+    /// unknown value, or when a selected `bedrock`/`azure` upstream is missing
+    /// a required field.
+    pub fn validate_upstreams(&self) -> Result<()> {
+        let non_empty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+        match self.anthropic_upstream.as_deref().unwrap_or("direct") {
+            "direct" => {}
+            "bedrock" => {
+                let missing: Vec<&str> = [
+                    ("--bedrock-region", non_empty(&self.bedrock_region)),
+                    ("--bedrock-api-key", non_empty(&self.bedrock_api_key)),
+                    ("--bedrock-model-map", non_empty(&self.bedrock_model_map)),
+                ]
+                .into_iter()
+                .filter_map(|(flag, set)| (!set).then_some(flag))
+                .collect();
+                if !missing.is_empty() {
+                    anyhow::bail!(
+                        "anthropic-upstream=bedrock requires {} — set via `gmcli set-api-keys`",
+                        missing.join(", ")
+                    );
+                }
+            }
+            other => {
+                anyhow::bail!("anthropic-upstream must be 'direct' or 'bedrock' (got '{other}')")
+            }
+        }
+        match self.openai_upstream.as_deref().unwrap_or("direct") {
+            "direct" => {}
+            "azure" => {
+                let missing: Vec<&str> = [
+                    (
+                        "--azure-openai-endpoint",
+                        non_empty(&self.azure_openai_endpoint),
+                    ),
+                    (
+                        "--azure-openai-api-key",
+                        non_empty(&self.azure_openai_api_key),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(flag, set)| (!set).then_some(flag))
+                .collect();
+                if !missing.is_empty() {
+                    anyhow::bail!(
+                        "openai-upstream=azure requires {} — set via `gmcli set-api-keys`",
+                        missing.join(", ")
+                    );
+                }
+            }
+            other => anyhow::bail!("openai-upstream must be 'direct' or 'azure' (got '{other}')"),
+        }
+        Ok(())
+    }
 }
 
 /// Record of the operator's one-time acceptance of the gm miner terms.

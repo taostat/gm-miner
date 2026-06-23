@@ -407,6 +407,7 @@ pub(crate) async fn cmd_deploy(
                  or configure --anthropic-upstream bedrock / --openai-upstream azure) first"
             )
         })?;
+    keys.validate_upstreams()?;
 
     // Step 1b: resolve the per-worker node secret. Each worker (CVM)
     // carries its own `x-gm-node-key` secret, never shared with a sibling
