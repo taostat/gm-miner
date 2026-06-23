@@ -10,7 +10,7 @@ use clap::Parser as _;
 
 use gm_miner_cli::{
     client::RegistryClient,
-    config::{self, Config, ProviderKeys, WorkerRecord},
+    config::{self, Config, WorkerRecord},
     dependency::{ensure_dependency, PHALA},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
@@ -640,10 +640,6 @@ async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
 /// public endpoint via `phala cvms get <app-id> --json`, re-registers
 /// worker #1 (`POST /miners/register`), then refreshes the worker record
 /// with the returned `worker_id`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "register-image recovery flow is kept flat so each resync step stays visible"
-)]
 pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> {
     // register-image re-registers worker #1 via `POST /miners/register`
     // (which refreshes the miner's oldest worker). The CLI's first worker
@@ -693,10 +689,6 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
         (node_secret, tracked.map(|w| w.app_name.clone()))
     };
     let network = cfg.active_network().to_owned();
-    let backend = cfg
-        .provider_keys
-        .as_ref()
-        .and_then(ProviderKeys::worker_backend);
     // Scope the same Phala key deploy would use (env or saved config key) onto
     // register-image's `phala cvms get`, so a recovery run works off the key
     // the deploy prompt persisted — not only a separate CLI login / env var.
@@ -763,7 +755,10 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
             os_image_hash: &os_image_hash,
             endpoint: &endpoint,
             node_secret: node_secret.as_deref(),
-            backend,
+            // register-image re-registers an already-existing worker. Omitting
+            // backend preserves the registry's stored provenance instead of
+            // relabeling this worker from the operator's current global config.
+            backend: None,
             // A register-image resync re-asserts the image, not the terms; the
             // registry keeps whatever acceptance the first deploy recorded.
             accepted_terms_version: None,

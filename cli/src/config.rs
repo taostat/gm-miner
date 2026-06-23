@@ -354,6 +354,77 @@ fn require_present(label: &str, fields: &[(&str, Option<&str>)]) -> Result<()> {
     Ok(())
 }
 
+const AZURE_OPENAI_ALLOWED_SUFFIXES: [&str; 3] = [
+    "openai.azure.com",
+    "services.ai.azure.com",
+    "cognitiveservices.azure.com",
+];
+
+fn validate_bedrock_region(region: &str) -> Result<()> {
+    if region
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("--bedrock-region must contain only letters, numbers, and hyphens")
+    }
+}
+
+fn validate_dns_host(label: &str, host: &str) -> Result<()> {
+    let valid = !host.is_empty()
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..")
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!("{label} must be a DNS host (got '{host}')")
+    }
+}
+
+fn host_allowed_by_suffix(host: &str, suffix: &str) -> bool {
+    host.len() > suffix.len()
+        && host.ends_with(suffix)
+        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+}
+
+fn validate_azure_openai_endpoint(endpoint: &str) -> Result<()> {
+    let mut rest = endpoint;
+    if let Some(stripped) = endpoint.strip_prefix("https://") {
+        rest = stripped;
+    } else if endpoint.starts_with("http://") {
+        anyhow::bail!("--azure-openai-endpoint must use https when a scheme is provided");
+    } else if endpoint.contains("://") {
+        anyhow::bail!("--azure-openai-endpoint has unsupported URL scheme");
+    }
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        anyhow::bail!("--azure-openai-endpoint must not contain userinfo");
+    }
+    let host = authority
+        .split_once(':')
+        .map_or(authority, |(host, _)| host)
+        .to_ascii_lowercase();
+    validate_dns_host("--azure-openai-endpoint host", &host)?;
+
+    if AZURE_OPENAI_ALLOWED_SUFFIXES
+        .iter()
+        .any(|suffix| host_allowed_by_suffix(&host, suffix))
+    {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "--azure-openai-endpoint host '{host}' is not in the allowed suffix set: {}",
+            AZURE_OPENAI_ALLOWED_SUFFIXES.join(", ")
+        )
+    }
+}
+
 impl ProviderKeys {
     /// Returns true if at least one key is set to a non-empty, non-whitespace value.
     #[must_use]
@@ -379,32 +450,40 @@ impl ProviderKeys {
     pub fn validate_upstreams(&self) -> Result<()> {
         match self.anthropic_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
-            "bedrock" => require_present(
-                "anthropic-upstream=bedrock",
-                &[
-                    ("--bedrock-region", self.bedrock_region.as_deref()),
-                    ("--bedrock-api-key", self.bedrock_api_key.as_deref()),
-                ],
-            )?,
+            "bedrock" => {
+                require_present(
+                    "anthropic-upstream=bedrock",
+                    &[
+                        ("--bedrock-region", self.bedrock_region.as_deref()),
+                        ("--bedrock-api-key", self.bedrock_api_key.as_deref()),
+                    ],
+                )?;
+                validate_bedrock_region(self.bedrock_region.as_deref().unwrap_or_default())?;
+            }
             other => {
                 anyhow::bail!("anthropic-upstream must be 'direct' or 'bedrock' (got '{other}')")
             }
         }
         match self.openai_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
-            "azure" => require_present(
-                "openai-upstream=azure",
-                &[
-                    (
-                        "--azure-openai-endpoint",
-                        self.azure_openai_endpoint.as_deref(),
-                    ),
-                    (
-                        "--azure-openai-api-key",
-                        self.azure_openai_api_key.as_deref(),
-                    ),
-                ],
-            )?,
+            "azure" => {
+                require_present(
+                    "openai-upstream=azure",
+                    &[
+                        (
+                            "--azure-openai-endpoint",
+                            self.azure_openai_endpoint.as_deref(),
+                        ),
+                        (
+                            "--azure-openai-api-key",
+                            self.azure_openai_api_key.as_deref(),
+                        ),
+                    ],
+                )?;
+                validate_azure_openai_endpoint(
+                    self.azure_openai_endpoint.as_deref().unwrap_or_default(),
+                )?;
+            }
             other => anyhow::bail!("openai-upstream must be 'direct' or 'azure' (got '{other}')"),
         }
         Ok(())

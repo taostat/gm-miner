@@ -738,7 +738,7 @@ static_resources:
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
-                    exact: __GM_ANTHROPIC_HOST__
+                    __GM_ANTHROPIC_SAN_MATCH__: __GM_ANTHROPIC_SAN_VALUE__
 
     ## ── OpenAI ────────────────────────────────────────────────────────
     - name: openai
@@ -771,7 +771,7 @@ static_resources:
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:
-                    exact: __GM_OPENAI_HOST__
+                    __GM_OPENAI_SAN_MATCH__: __GM_OPENAI_SAN_VALUE__
 
     ## ── Chutes ────────────────────────────────────────────────────────
     - name: chutes

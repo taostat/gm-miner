@@ -324,6 +324,21 @@ fn validate_upstreams_rejects_incomplete_bedrock() {
 }
 
 #[test]
+fn validate_upstreams_rejects_malformed_bedrock_region() {
+    let keys = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        bedrock_region: Some("us-west-2.evil.example".to_owned()),
+        bedrock_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(
+        err.contains("--bedrock-region must contain only letters, numbers, and hyphens"),
+        "{err}"
+    );
+}
+
+#[test]
 fn validate_upstreams_rejects_incomplete_azure() {
     let keys = ProviderKeys {
         openai_upstream: Some("azure".to_owned()),
@@ -332,6 +347,36 @@ fn validate_upstreams_rejects_incomplete_azure() {
     };
     let err = keys.validate_upstreams().unwrap_err().to_string();
     assert!(err.contains("--azure-openai-endpoint"), "{err}");
+}
+
+#[test]
+fn validate_upstreams_rejects_non_https_azure_endpoint() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_endpoint: Some("http://r.openai.azure.com".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(
+        err.contains("--azure-openai-endpoint must use https"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_upstreams_rejects_non_allowed_azure_endpoint() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        azure_openai_endpoint: Some("https://api.evil.example".to_owned()),
+        azure_openai_api_key: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let err = keys.validate_upstreams().unwrap_err().to_string();
+    assert!(
+        err.contains("host 'api.evil.example' is not in the allowed suffix set"),
+        "{err}"
+    );
 }
 
 #[test]

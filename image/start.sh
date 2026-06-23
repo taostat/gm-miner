@@ -73,6 +73,19 @@ require_host_suffix() {
   exit 1
 }
 
+matched_host_suffix() {
+  local host="$1"
+  shift
+  local suffix
+  for suffix in "$@"; do
+    if [[ "${host}" == *".${suffix}" ]]; then
+      printf '%s' "${suffix}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 parse_azure_host() {
   local endpoint="$1"
   local rest="${endpoint}"
@@ -107,6 +120,8 @@ ANTHROPIC_PATH_REWRITE=0
 ANTHROPIC_AUTH_HEADER=x-api-key
 ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(ANTHROPIC_API_KEY)%"
 ANTHROPIC_VERSION_APPEND_ACTION=ADD_IF_ABSENT
+ANTHROPIC_SAN_MATCH=exact
+ANTHROPIC_SAN_VALUE="${ANTHROPIC_HOST}"
 
 case "${ANTHROPIC_UPSTREAM}" in
   direct) ;;
@@ -136,6 +151,8 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_AUTH_HEADER=x-api-key
     ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(BEDROCK_API_KEY)%"
     ANTHROPIC_VERSION_APPEND_ACTION=OVERWRITE_IF_EXISTS_OR_ADD
+    ANTHROPIC_SAN_MATCH=suffix
+    ANTHROPIC_SAN_VALUE=.api.aws
     ;;
   *)
     log "error: ANTHROPIC_UPSTREAM must be 'direct' or 'bedrock' (got '${ANTHROPIC_UPSTREAM}')"
@@ -148,6 +165,8 @@ OPENAI_PORT=443
 OPENAI_PATH_REWRITE=0
 OPENAI_AUTH_HEADER=authorization
 OPENAI_AUTH_VALUE="Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
+OPENAI_SAN_MATCH=exact
+OPENAI_SAN_VALUE="${OPENAI_HOST}"
 
 case "${OPENAI_UPSTREAM}" in
   direct) ;;
@@ -166,6 +185,13 @@ case "${OPENAI_UPSTREAM}" in
       openai.azure.com \
       services.ai.azure.com \
       cognitiveservices.azure.com
+    OPENAI_SAN_MATCH=suffix
+    OPENAI_SAN_VALUE=".$(
+      matched_host_suffix "${OPENAI_HOST}" \
+        openai.azure.com \
+        services.ai.azure.com \
+        cognitiveservices.azure.com
+    )"
     OPENAI_PATH_REWRITE=1
     OPENAI_AUTH_HEADER=api-key
     OPENAI_AUTH_VALUE="%ENVIRONMENT(AZURE_OPENAI_API_KEY)%"
@@ -292,11 +318,15 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_ANTHROPIC_AUTH_HEADER="${ANTHROPIC_AUTH_HEADER}" \
   GM_ANTHROPIC_AUTH_VALUE="${ANTHROPIC_AUTH_VALUE}" \
   GM_ANTHROPIC_VERSION_APPEND_ACTION="${ANTHROPIC_VERSION_APPEND_ACTION}" \
+  GM_ANTHROPIC_SAN_MATCH="${ANTHROPIC_SAN_MATCH}" \
+  GM_ANTHROPIC_SAN_VALUE="${ANTHROPIC_SAN_VALUE}" \
   GM_OPENAI_HOST="${OPENAI_HOST}" \
   GM_OPENAI_PORT="${OPENAI_PORT}" \
   GM_OPENAI_PATH_REWRITE="${OPENAI_PATH_REWRITE}" \
   GM_OPENAI_AUTH_HEADER="${OPENAI_AUTH_HEADER}" \
   GM_OPENAI_AUTH_VALUE="${OPENAI_AUTH_VALUE}" \
+  GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
+  GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
   awk '
   function subst(line, token, value,    out, rest, pos) {
     out = ""
@@ -318,11 +348,15 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     anthropic_auth_header = ENVIRON["GM_ANTHROPIC_AUTH_HEADER"]
     anthropic_auth_value = ENVIRON["GM_ANTHROPIC_AUTH_VALUE"]
     anthropic_version_append_action = ENVIRON["GM_ANTHROPIC_VERSION_APPEND_ACTION"]
+    anthropic_san_match = ENVIRON["GM_ANTHROPIC_SAN_MATCH"]
+    anthropic_san_value = ENVIRON["GM_ANTHROPIC_SAN_VALUE"]
     openai_host = ENVIRON["GM_OPENAI_HOST"]
     openai_port = ENVIRON["GM_OPENAI_PORT"]
     openai_path_rewrite = (ENVIRON["GM_OPENAI_PATH_REWRITE"] == "1")
     openai_auth_header = ENVIRON["GM_OPENAI_AUTH_HEADER"]
     openai_auth_value = ENVIRON["GM_OPENAI_AUTH_VALUE"]
+    openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
+    openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
   }
   /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
   /^[[:space:]]*## gm:benchmark-tls-end[[:space:]]*$/   { in_tls = 0; next }
@@ -342,10 +376,14 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_ANTHROPIC_AUTH_HEADER__", anthropic_auth_header)
     line = subst(line, "__GM_ANTHROPIC_AUTH_VALUE__", anthropic_auth_value)
     line = subst(line, "__GM_ANTHROPIC_VERSION_APPEND_ACTION__", anthropic_version_append_action)
+    line = subst(line, "__GM_ANTHROPIC_SAN_MATCH__", anthropic_san_match)
+    line = subst(line, "__GM_ANTHROPIC_SAN_VALUE__", anthropic_san_value)
     line = subst(line, "__GM_OPENAI_HOST__", openai_host)
     line = subst(line, "__GM_OPENAI_PORT__", openai_port)
     line = subst(line, "__GM_OPENAI_AUTH_HEADER__", openai_auth_header)
     line = subst(line, "__GM_OPENAI_AUTH_VALUE__", openai_auth_value)
+    line = subst(line, "__GM_OPENAI_SAN_MATCH__", openai_san_match)
+    line = subst(line, "__GM_OPENAI_SAN_VALUE__", openai_san_value)
     print line
   }
 ' "${GM_ENVOY_TEMPLATE_PATH:-/etc/envoy/envoy.yaml}" >"${RENDERED_CONFIG}"

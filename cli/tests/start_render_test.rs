@@ -56,6 +56,8 @@ fn direct_unset_render_matches_pre_cloud_output_byte_for_byte() {
     assert!(status.success(), "render failed: {stderr}");
     let actual = hex::encode(Sha256::digest(rendered.as_bytes()));
     assert_eq!(actual, DIRECT_TESTNET_SHA256);
+    assert!(rendered.contains("exact: api.anthropic.com"));
+    assert!(rendered.contains("exact: api.openai.com"));
 }
 
 #[test]
@@ -68,6 +70,8 @@ fn explicit_direct_render_matches_pre_cloud_output_byte_for_byte() {
     assert!(status.success(), "render failed: {stderr}");
     let actual = hex::encode(Sha256::digest(rendered.as_bytes()));
     assert_eq!(actual, DIRECT_TESTNET_SHA256);
+    assert!(rendered.contains("exact: api.anthropic.com"));
+    assert!(rendered.contains("exact: api.openai.com"));
 }
 
 #[test]
@@ -88,6 +92,8 @@ fn bedrock_and_azure_render_cloud_upstreams() {
     assert!(rendered.contains("host_rewrite_literal: bedrock-mantle.us-west-2.api.aws"));
     assert!(rendered.contains("address: bedrock-mantle.us-west-2.api.aws"));
     assert!(rendered.contains("sni: bedrock-mantle.us-west-2.api.aws"));
+    assert!(rendered.contains("suffix: .api.aws"));
+    assert!(!rendered.contains("exact: bedrock-mantle.us-west-2.api.aws"));
     assert!(rendered.contains("substitution: \"/anthropic/v1/messages\""));
     assert!(rendered.contains("value: \"%ENVIRONMENT(BEDROCK_API_KEY)%\""));
     assert!(rendered.contains("append_action: OVERWRITE_IF_EXISTS_OR_ADD"));
@@ -95,6 +101,8 @@ fn bedrock_and_azure_render_cloud_upstreams() {
 
     assert!(rendered.contains("host_rewrite_literal: gm-resource.openai.azure.com"));
     assert!(rendered.contains("address: gm-resource.openai.azure.com"));
+    assert!(rendered.contains("suffix: .openai.azure.com"));
+    assert!(!rendered.contains("exact: gm-resource.openai.azure.com"));
     assert!(rendered.contains("substitution: \"/openai/v1/chat/completions\""));
     assert!(rendered.contains("key: api-key"));
     assert!(rendered.contains("value: \"%ENVIRONMENT(AZURE_OPENAI_API_KEY)%\""));
