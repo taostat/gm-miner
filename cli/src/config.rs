@@ -409,6 +409,21 @@ impl ProviderKeys {
         }
         Ok(())
     }
+
+    /// Registry worker provenance is a single optional backend marker. If both
+    /// cloud upstreams are configured, Bedrock takes precedence; the registry
+    /// only needs "cloud-backed, use the inference probe" here, while each
+    /// offer's `upstream_model` carries the per-model translation detail.
+    #[must_use]
+    pub fn worker_backend(&self) -> Option<&'static str> {
+        if self.anthropic_upstream.as_deref() == Some("bedrock") {
+            Some("bedrock")
+        } else if self.openai_upstream.as_deref() == Some("azure") {
+            Some("azure")
+        } else {
+            None
+        }
+    }
 }
 
 /// Record of the operator's one-time acceptance of the gm miner terms.

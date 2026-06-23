@@ -28,6 +28,7 @@ pub(crate) async fn cmd_declare_product(
     provider: &Provider,
     model: &str,
     discount_bp: u32,
+    upstream_model: Option<&str>,
 ) -> Result<()> {
     let catalog = fetch_catalog(client).await?;
     let product = catalog
@@ -36,7 +37,7 @@ pub(crate) async fn cmd_declare_product(
         .find(|p| &p.provider == provider && p.model == model)
         .ok_or_else(|| anyhow::anyhow!("{provider}/{model} is not in the registry catalog"))?;
 
-    post_declare_product(client, provider, model, discount_bp).await?;
+    post_declare_product(client, provider, model, discount_bp, upstream_model).await?;
 
     let dims = &product.retail_price.dimensions;
     let retail_in = format_per_mtok_usd(dims.input_per_mtok_ndollars);
@@ -100,7 +101,9 @@ pub(crate) async fn cmd_declare_products(
     let mut err_count = 0_usize;
     for product in &targets {
         let rate = effective_rate_summary(&product.retail_price.dimensions, discount_bp);
-        match post_declare_product(client, &product.provider, &product.model, discount_bp).await {
+        match post_declare_product(client, &product.provider, &product.model, discount_bp, None)
+            .await
+        {
             Ok(()) => {
                 println!(
                     "  {}/{}: {discount_pct}% off → {rate} → ok",
@@ -134,11 +137,13 @@ async fn post_declare_product(
     provider: &Provider,
     model: &str,
     discount_bp: u32,
+    upstream_model: Option<&str>,
 ) -> Result<()> {
     let body = serde_json::to_value(ProductDeclarationRequest {
         provider: provider.as_str(),
         model,
         discount_bp,
+        upstream_model,
     })
     .context("serialize declare-product body")?;
 

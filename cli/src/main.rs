@@ -128,6 +128,7 @@ enum Command {
     ///
     /// Each flag, if provided, replaces the stored value.  Omitted flags
     /// leave existing values intact.  Key values are never echoed back.
+    /// Worker backend provenance is derived from the upstream selectors at deploy time.
     #[command(after_help = "Examples:\n  \
         gmcli set-api-keys --anthropic sk-ant-...\n  \
         gmcli set-api-keys --openai sk-... --google AIza...\n  \
@@ -300,6 +301,7 @@ enum Command {
     /// whole catalog (or one provider's slice), use `declare-products`.
     #[command(after_help = "Examples:\n  \
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
+        gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 --upstream-model us.anthropic.claude-sonnet-4-6-v1\n  \
         gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5")]
     DeclareProduct {
         /// Provider: anthropic, openai, gemini, or chutes.
@@ -309,6 +311,11 @@ enum Command {
         /// Model identifier, e.g. `claude-sonnet-4-6`.
         #[arg(long)]
         model: String,
+
+        /// Upstream model id for cloud-backed offers, e.g. a Bedrock model id.
+        /// Azure deployments named exactly like the gm model id do not need this.
+        #[arg(long = "upstream-model", value_name = "ID")]
+        upstream_model: Option<String>,
 
         /// Percent off retail; range [0, 99.90]. You will receive
         /// (100 - PCT)% of retail per token (e.g. `--discount-pct 10.5`
@@ -657,12 +664,20 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::DeclareProduct {
             provider,
             model,
+            upstream_model,
             discount_bp,
         } => {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_declare_product(&mut client, &provider, &model, discount_bp).await
+            cmd_declare_product(
+                &mut client,
+                &provider,
+                &model,
+                discount_bp,
+                upstream_model.as_deref(),
+            )
+            .await
         }
         Command::DeclareProducts {
             provider,
@@ -1306,6 +1321,31 @@ mod tests {
                 discount_bp: 1055,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn clap_accepts_upstream_model_for_single_declare() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "declare-product",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-6",
+            "--discount-pct",
+            "5",
+            "--upstream-model",
+            "us.anthropic.claude-sonnet-4-6-v1",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::DeclareProduct {
+                upstream_model: Some(ref upstream_model),
+                ..
+            } if upstream_model == "us.anthropic.claude-sonnet-4-6-v1"
         ));
     }
 

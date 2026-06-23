@@ -4,8 +4,8 @@
 //!
 //! Covers:
 //!   * `ProductDeclarationRequest` serialises to the exact
-//!     `{provider, model, discount_bp}` body the registry's pct-discount API
-//!     expects (no `miner_price`, no extra fields).
+//!     `{provider, model, discount_bp, upstream_model?}` body the registry's
+//!     pct-discount API expects (no `miner_price`, no extra fields).
 //!   * `ProductCatalogResponse` deserialises the new wrapper shape returned
 //!     by `GET /products` (`{products: [...], generated_at: ...}`).
 //!   * `Provider::Benchmark` round-trips through serde so a benchmark
@@ -40,6 +40,7 @@ fn declaration_request_serialises_to_pct_discount_shape() {
         provider: Provider::Anthropic.as_str(),
         model: "claude-sonnet-4-6",
         discount_bp: 500,
+        upstream_model: None,
     })
     .unwrap();
 
@@ -55,6 +56,28 @@ fn declaration_request_serialises_to_pct_discount_shape() {
 }
 
 #[test]
+fn declaration_request_includes_upstream_model_when_set() {
+    let body = serde_json::to_value(ProductDeclarationRequest {
+        provider: Provider::Anthropic.as_str(),
+        model: "claude-sonnet-4-6",
+        discount_bp: 500,
+        upstream_model: Some("us.anthropic.claude-sonnet-4-6-v1"),
+    })
+    .unwrap();
+
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "discount_bp": 500,
+            "upstream_model": "us.anthropic.claude-sonnet-4-6-v1",
+        }),
+        "Bedrock offers can carry the upstream model id as metadata"
+    );
+}
+
+#[test]
 fn declaration_request_zero_discount_is_quote_at_retail() {
     // discount_bp=0 means "quote at retail" — the lower bound of the
     // registry's [0, 9990] range. Must serialise as the integer 0, not
@@ -63,6 +86,7 @@ fn declaration_request_zero_discount_is_quote_at_retail() {
         provider: "openai",
         model: "gpt-5.5",
         discount_bp: 0,
+        upstream_model: None,
     })
     .unwrap();
 
@@ -79,6 +103,7 @@ fn declaration_request_max_discount_at_cap() {
         provider: "gemini",
         model: "gemini-2.5-pro",
         discount_bp: 9990,
+        upstream_model: None,
     })
     .unwrap();
     assert_eq!(body["discount_bp"], serde_json::json!(9990));
@@ -203,6 +228,7 @@ async fn post_miners_products_puts_exact_pct_discount_body_on_the_wire() {
         provider: "anthropic",
         model: "claude-sonnet-4-6",
         discount_bp: 500,
+        upstream_model: None,
     })
     .unwrap();
 
@@ -235,6 +261,7 @@ async fn post_miners_products_propagates_registry_error_body() {
         provider: "openai",
         model: "gpt-does-not-exist",
         discount_bp: 100,
+        upstream_model: None,
     })
     .unwrap();
 

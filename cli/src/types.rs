@@ -148,6 +148,8 @@ pub struct ProductDeclarationRequest<'a> {
     pub provider: &'a str,
     pub model: &'a str,
     pub discount_bp: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<&'a str>,
 }
 
 /// Body of `POST /miners/{hotkey}/workers` (`WorkerCreateRequest`).
@@ -165,6 +167,8 @@ pub struct WorkerCreateRequest<'a> {
     /// `worker add` always carries the freshly-generated per-worker secret.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_secret: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<&'a str>,
 }
 
 /// Response from `POST /miners/{hotkey}/workers` (`WorkerCreateResponse`).

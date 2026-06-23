@@ -10,7 +10,7 @@ use clap::Parser as _;
 
 use gm_miner_cli::{
     client::RegistryClient,
-    config::{self, Config, WorkerRecord},
+    config::{self, Config, ProviderKeys, WorkerRecord},
     dependency::{ensure_dependency, PHALA},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
@@ -546,6 +546,7 @@ pub(crate) async fn cmd_deploy(
             os_image_hash: &verified.os_image_hash,
             endpoint: &actual.endpoint,
             node_secret: Some(&node_secret),
+            backend: keys.worker_backend(),
             accepted_terms_version: Some(terms::CURRENT_TERMS_VERSION),
         },
     )
@@ -639,6 +640,10 @@ async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
 /// public endpoint via `phala cvms get <app-id> --json`, re-registers
 /// worker #1 (`POST /miners/register`), then refreshes the worker record
 /// with the returned `worker_id`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "register-image recovery flow is kept flat so each resync step stays visible"
+)]
 pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> {
     // register-image re-registers worker #1 via `POST /miners/register`
     // (which refreshes the miner's oldest worker). The CLI's first worker
@@ -688,6 +693,10 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
         (node_secret, tracked.map(|w| w.app_name.clone()))
     };
     let network = cfg.active_network().to_owned();
+    let backend = cfg
+        .provider_keys
+        .as_ref()
+        .and_then(ProviderKeys::worker_backend);
     // Scope the same Phala key deploy would use (env or saved config key) onto
     // register-image's `phala cvms get`, so a recovery run works off the key
     // the deploy prompt persisted — not only a separate CLI login / env var.
@@ -754,6 +763,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
             os_image_hash: &os_image_hash,
             endpoint: &endpoint,
             node_secret: node_secret.as_deref(),
+            backend,
             // A register-image resync re-asserts the image, not the terms; the
             // registry keeps whatever acceptance the first deploy recorded.
             accepted_terms_version: None,
@@ -852,6 +862,8 @@ struct WorkerImageArgs<'a> {
     /// registry leaves any stored value untouched (a `register-image` for
     /// a worker whose secret the CLI does not track locally).
     node_secret: Option<&'a str>,
+    /// Worker provenance derived from configured upstream selectors.
+    backend: Option<&'a str>,
     /// The gm-miner-terms version the operator accepted, sent on the
     /// first-worker registration so the registry records it on the miner row.
     /// `None` omits the field — the registry leaves any stored value untouched
@@ -869,18 +881,17 @@ async fn post_register_image(
     // non-empty strings. `attestation_endpoint` is reserved for future
     // attested-channel work and not yet consumed by the registry, so the
     // envoy endpoint is sent as a placeholder for both.
-    let mut body = serde_json::json!({
-        "compose_hash": args.compose_hash,
-        "os_image_hash": args.os_image_hash,
-        "endpoint": args.endpoint,
-        "attestation_endpoint": args.endpoint,
-    });
-    // A present secret is stored and served to the gateway (Mechanism 1 of
-    // attestation-and-identity.md). `None` omits the field so the registry
-    // leaves any stored value untouched.
-    if let Some(secret) = args.node_secret {
-        body["node_secret"] = serde_json::Value::String(secret.to_owned());
-    }
+    let mut body = serde_json::to_value(WorkerCreateRequest {
+        endpoint: args.endpoint,
+        // `attestation_endpoint` is reserved for future attested-channel
+        // work; send the envoy endpoint as a placeholder, matching worker add.
+        attestation_endpoint: args.endpoint,
+        compose_hash: args.compose_hash,
+        os_image_hash: args.os_image_hash,
+        node_secret: args.node_secret,
+        backend: args.backend,
+    })
+    .context("serialize register body")?;
     // The accepted terms version, recorded on the miner row keyed to hotkey —
     // the tamper-resistant copy of the local config acceptance. `None` (a
     // register-image resync) leaves any stored value untouched.
@@ -933,6 +944,7 @@ async fn post_add_worker(
         compose_hash: args.compose_hash,
         os_image_hash: args.os_image_hash,
         node_secret: args.node_secret,
+        backend: args.backend,
     })
     .context("serialize worker-add body")?;
 

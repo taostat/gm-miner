@@ -128,7 +128,9 @@ gmcli set-api-keys \
 
 Azure OpenAI must have deployments named exactly like the gm model id, for example `gpt-4o`;
 the miner does not rewrite Azure model ids. Bedrock model-id translation is handled by the
-gateway before requests reach the miner.
+gateway before requests reach the miner. Worker backend provenance is auto-derived from these
+selectors when you deploy: `anthropic-upstream=bedrock` registers `bedrock`, otherwise
+`openai-upstream=azure` registers `azure`, and direct workers omit the backend field.
 
 ### 4. Deploy your miner
 
@@ -182,10 +184,14 @@ Or declare a single offer:
 
 ```sh
 gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5
+gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 \
+  --upstream-model us.anthropic.claude-sonnet-4-6-v1
 ```
 
 `--discount-pct` accepts a value in `[0, 99.90]` with up to two decimal places (e.g. `10.5`).
 `0` means at retail; `99.90` is the cap (keeps per-request revenue strictly positive).
+Use `--upstream-model` only when the upstream expects a different id, typically Bedrock. Azure
+deployments named exactly like the gm model id do not need it.
 
 ### 6. Check your status
 

@@ -4,7 +4,7 @@
 //! Covers:
 //!   * `WorkerCreateRequest` serialises to the exact
 //!     `{endpoint, attestation_endpoint, compose_hash, os_image_hash,
-//!     node_secret}` body `POST /miners/{hotkey}/workers` expects.
+//!     node_secret, backend?}` body `POST /miners/{hotkey}/workers` expects.
 //!   * A wiremock-backed round-trip proves the body actually put on the
 //!     wire for `worker add` matches that shape and carries the per-worker
 //!     node secret.
@@ -21,7 +21,7 @@
 
 use gm_miner_cli::{
     client::RegistryClient,
-    config::{Config, NetworkEntry, TokenEntry},
+    config::{Config, NetworkEntry, ProviderKeys, TokenEntry},
     types::{WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse},
 };
 use wiremock::{
@@ -39,6 +39,7 @@ fn worker_create_request_serialises_to_registry_shape() {
         compose_hash: "a".repeat(64).as_str(),
         os_image_hash: "b".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
+        backend: None,
     })
     .unwrap();
 
@@ -68,6 +69,7 @@ fn worker_create_request_omits_absent_node_secret() {
         compose_hash: "c".repeat(64).as_str(),
         os_image_hash: "d".repeat(64).as_str(),
         node_secret: None,
+        backend: None,
     })
     .unwrap();
 
@@ -85,6 +87,69 @@ fn worker_create_request_omits_absent_node_secret() {
             "os_image_hash": "d".repeat(64),
         }),
         "worker-add body with no secret must carry exactly the four required fields"
+    );
+}
+
+#[test]
+fn worker_create_request_carries_bedrock_backend_from_config() {
+    let keys = ProviderKeys {
+        anthropic_upstream: Some("bedrock".to_owned()),
+        openai_upstream: Some("azure".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let body = serde_json::to_value(WorkerCreateRequest {
+        endpoint: "https://app_bedrock-8080s.dstack-prod5.phala.network",
+        attestation_endpoint: "https://app_bedrock-8080s.dstack-prod5.phala.network",
+        compose_hash: "e".repeat(64).as_str(),
+        os_image_hash: "f".repeat(64).as_str(),
+        node_secret: Some("deadbeef"),
+        backend: keys.worker_backend(),
+    })
+    .unwrap();
+
+    assert_eq!(body["backend"], serde_json::json!("bedrock"));
+}
+
+#[test]
+fn worker_create_request_carries_azure_backend_from_config() {
+    let keys = ProviderKeys {
+        openai_upstream: Some("azure".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let body = serde_json::to_value(WorkerCreateRequest {
+        endpoint: "https://app_azure-8080s.dstack-prod5.phala.network",
+        attestation_endpoint: "https://app_azure-8080s.dstack-prod5.phala.network",
+        compose_hash: "1".repeat(64).as_str(),
+        os_image_hash: "2".repeat(64).as_str(),
+        node_secret: Some("deadbeef"),
+        backend: keys.worker_backend(),
+    })
+    .unwrap();
+
+    assert_eq!(body["backend"], serde_json::json!("azure"));
+}
+
+#[test]
+fn worker_create_request_omits_direct_backend_from_config() {
+    let keys = ProviderKeys {
+        anthropic_upstream: Some("direct".to_owned()),
+        openai_upstream: Some("direct".to_owned()),
+        ..ProviderKeys::default()
+    };
+    let body = serde_json::to_value(WorkerCreateRequest {
+        endpoint: "https://app_direct-8080s.dstack-prod5.phala.network",
+        attestation_endpoint: "https://app_direct-8080s.dstack-prod5.phala.network",
+        compose_hash: "3".repeat(64).as_str(),
+        os_image_hash: "4".repeat(64).as_str(),
+        node_secret: Some("deadbeef"),
+        backend: keys.worker_backend(),
+    })
+    .unwrap();
+
+    let obj = body.as_object().expect("body serialises to a JSON object");
+    assert!(
+        !obj.contains_key("backend"),
+        "direct workers omit backend instead of serialising null: {body}"
     );
 }
 
@@ -195,6 +260,7 @@ async fn worker_add_puts_exact_body_with_per_worker_secret_on_the_wire() {
         compose_hash: "a".repeat(64).as_str(),
         os_image_hash: "b".repeat(64).as_str(),
         node_secret: Some("per-worker-secret"),
+        backend: None,
     })
     .unwrap();
 
