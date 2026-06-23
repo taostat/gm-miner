@@ -100,86 +100,6 @@ parse_azure_host() {
   lowercase "${rest}"
 }
 
-lua_table_from_bedrock_model_map() {
-  local map="$1"
-  BEDROCK_MODEL_MAP_JSON="${map}" awk '
-    function fail(message) {
-      print "[start] error: BEDROCK_MODEL_MAP " message > "/dev/stderr"
-      exit 1
-    }
-    function skip_ws() {
-      while (pos <= len && substr(json, pos, 1) ~ /[[:space:]]/) {
-        pos++
-      }
-    }
-    function parse_model_id_string(    ch, value) {
-      if (substr(json, pos, 1) != "\"") {
-        fail("must be a JSON object with string keys and string values")
-      }
-      pos++
-      value = ""
-      while (pos <= len) {
-        ch = substr(json, pos, 1)
-        if (ch == "\"") {
-          pos++
-          if (value !~ /^[A-Za-z0-9._:\/-]+$/) {
-            fail("contains an unsupported model id character")
-          }
-          return value
-        }
-        if (ch == "\\") {
-          fail("must use unescaped model id strings")
-        }
-        value = value ch
-        pos++
-      }
-      fail("contains an unterminated string")
-    }
-    BEGIN {
-      json = ENVIRON["BEDROCK_MODEL_MAP_JSON"]
-      len = length(json)
-      pos = 1
-      skip_ws()
-      if (substr(json, pos, 1) != "{") {
-        fail("must be a JSON object")
-      }
-      pos++
-      skip_ws()
-      if (substr(json, pos, 1) == "}") {
-        fail("must contain at least one model mapping")
-      }
-      while (1) {
-        key = parse_model_id_string()
-        skip_ws()
-        if (substr(json, pos, 1) != ":") {
-          fail("is missing ':' after a model id")
-        }
-        pos++
-        skip_ws()
-        value = parse_model_id_string()
-        printf "                            [\"%s\"] = \"%s\",\n", key, value
-        count++
-        skip_ws()
-        ch = substr(json, pos, 1)
-        if (ch == ",") {
-          pos++
-          skip_ws()
-          continue
-        }
-        if (ch == "}") {
-          pos++
-          skip_ws()
-          if (pos <= len) {
-            fail("has trailing content after the object")
-          }
-          exit 0
-        }
-        fail("is missing comma or closing brace after a mapping")
-      }
-    }
-  '
-}
-
 # ── Resolve provider upstream selectors ───────────────────────────────
 ANTHROPIC_HOST=api.anthropic.com
 ANTHROPIC_PORT=443
@@ -187,8 +107,6 @@ ANTHROPIC_PATH_REWRITE=0
 ANTHROPIC_AUTH_HEADER=x-api-key
 ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(ANTHROPIC_API_KEY)%"
 ANTHROPIC_VERSION_APPEND_ACTION=ADD_IF_ABSENT
-BEDROCK_MODEL_REWRITE=0
-BEDROCK_MODEL_MAP_LUA=
 
 case "${ANTHROPIC_UPSTREAM}" in
   direct) ;;
@@ -199,10 +117,6 @@ case "${ANTHROPIC_UPSTREAM}" in
     fi
     if [[ -z "${BEDROCK_API_KEY:-}" ]]; then
       log "error: BEDROCK_API_KEY must be set when ANTHROPIC_UPSTREAM=bedrock"
-      exit 1
-    fi
-    if [[ -z "${BEDROCK_MODEL_MAP:-}" ]]; then
-      log "error: BEDROCK_MODEL_MAP must be set when ANTHROPIC_UPSTREAM=bedrock"
       exit 1
     fi
     if [[ ! "${BEDROCK_REGION}" =~ ^[A-Za-z0-9-]+$ ]]; then
@@ -222,8 +136,6 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_AUTH_HEADER=x-api-key
     ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(BEDROCK_API_KEY)%"
     ANTHROPIC_VERSION_APPEND_ACTION=OVERWRITE_IF_EXISTS_OR_ADD
-    BEDROCK_MODEL_REWRITE=1
-    BEDROCK_MODEL_MAP_LUA="$(lua_table_from_bedrock_model_map "${BEDROCK_MODEL_MAP}")"
     ;;
   *)
     log "error: ANTHROPIC_UPSTREAM must be 'direct' or 'bedrock' (got '${ANTHROPIC_UPSTREAM}')"
@@ -385,8 +297,6 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_OPENAI_PATH_REWRITE="${OPENAI_PATH_REWRITE}" \
   GM_OPENAI_AUTH_HEADER="${OPENAI_AUTH_HEADER}" \
   GM_OPENAI_AUTH_VALUE="${OPENAI_AUTH_VALUE}" \
-  GM_BEDROCK_MODEL_REWRITE="${BEDROCK_MODEL_REWRITE}" \
-  GM_BEDROCK_MODEL_MAP_LUA="${BEDROCK_MODEL_MAP_LUA}" \
   awk '
   function subst(line, token, value,    out, rest, pos) {
     out = ""
@@ -413,8 +323,6 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     openai_path_rewrite = (ENVIRON["GM_OPENAI_PATH_REWRITE"] == "1")
     openai_auth_header = ENVIRON["GM_OPENAI_AUTH_HEADER"]
     openai_auth_value = ENVIRON["GM_OPENAI_AUTH_VALUE"]
-    bedrock_model_rewrite = (ENVIRON["GM_BEDROCK_MODEL_REWRITE"] == "1")
-    bedrock_model_map_lua = ENVIRON["GM_BEDROCK_MODEL_MAP_LUA"]
   }
   /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
   /^[[:space:]]*## gm:benchmark-tls-end[[:space:]]*$/   { in_tls = 0; next }
@@ -425,9 +333,6 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   /^[[:space:]]*## gm:openai-path-rewrite-begin[[:space:]]*$/ { in_openai_path_rewrite = 1; next }
   /^[[:space:]]*## gm:openai-path-rewrite-end[[:space:]]*$/   { in_openai_path_rewrite = 0; next }
   in_openai_path_rewrite && !openai_path_rewrite { next }
-  /^[[:space:]]*## gm:bedrock-model-rewrite-begin[[:space:]]*$/ { in_bedrock_model_rewrite = 1; next }
-  /^[[:space:]]*## gm:bedrock-model-rewrite-end[[:space:]]*$/   { in_bedrock_model_rewrite = 0; next }
-  in_bedrock_model_rewrite && !bedrock_model_rewrite { next }
   {
     line = subst($0, "__GM_NODE_SECRET__", secret)
     line = subst(line, "__GM_BENCHMARK_HOST__", bench_host)
@@ -441,7 +346,6 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_OPENAI_PORT__", openai_port)
     line = subst(line, "__GM_OPENAI_AUTH_HEADER__", openai_auth_header)
     line = subst(line, "__GM_OPENAI_AUTH_VALUE__", openai_auth_value)
-    line = subst(line, "__GM_BEDROCK_MODEL_MAP_LUA__", bedrock_model_map_lua)
     print line
   }
 ' "${GM_ENVOY_TEMPLATE_PATH:-/etc/envoy/envoy.yaml}" >"${RENDERED_CONFIG}"

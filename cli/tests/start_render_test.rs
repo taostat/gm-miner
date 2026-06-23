@@ -76,10 +76,6 @@ fn bedrock_and_azure_render_cloud_upstreams() {
         ("ANTHROPIC_UPSTREAM", "bedrock"),
         ("BEDROCK_REGION", "us-west-2"),
         ("BEDROCK_API_KEY", "bedrock-key"),
-        (
-            "BEDROCK_MODEL_MAP",
-            "{\"claude-sonnet-4-6\":\"us.anthropic.claude-sonnet-4-6-v1\"}",
-        ),
         ("OPENAI_UPSTREAM", "azure"),
         (
             "AZURE_OPENAI_ENDPOINT",
@@ -95,8 +91,7 @@ fn bedrock_and_azure_render_cloud_upstreams() {
     assert!(rendered.contains("substitution: \"/anthropic/v1/messages\""));
     assert!(rendered.contains("value: \"%ENVIRONMENT(BEDROCK_API_KEY)%\""));
     assert!(rendered.contains("append_action: OVERWRITE_IF_EXISTS_OR_ADD"));
-    assert!(rendered.contains("[\"claude-sonnet-4-6\"] = \"us.anthropic.claude-sonnet-4-6-v1\","));
-    assert!(rendered.contains("local function maybe_rewrite_bedrock_model(handle)"));
+    assert!(!rendered.contains("local function json_error"));
 
     assert!(rendered.contains("host_rewrite_literal: gm-resource.openai.azure.com"));
     assert!(rendered.contains("address: gm-resource.openai.azure.com"));
@@ -125,10 +120,6 @@ fn bedrock_region_validation_rejects_bad_host_input() {
         ("ANTHROPIC_UPSTREAM", "bedrock"),
         ("BEDROCK_REGION", "us-west-2.evil.example"),
         ("BEDROCK_API_KEY", "bedrock-key"),
-        (
-            "BEDROCK_MODEL_MAP",
-            "{\"claude-sonnet-4-6\":\"us.anthropic.claude-sonnet-4-6-v1\"}",
-        ),
     ]);
     assert!(!status.success(), "bad Bedrock region should fail");
     assert!(

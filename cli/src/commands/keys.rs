@@ -37,7 +37,6 @@ pub(crate) fn cmd_set_api_keys(
     anthropic_upstream: Option<String>,
     bedrock_region: Option<String>,
     bedrock_api_key: Option<String>,
-    bedrock_model_map: Option<String>,
     openai: Option<String>,
     openai_upstream: Option<String>,
     azure_openai_endpoint: Option<String>,
@@ -57,9 +56,6 @@ pub(crate) fn cmd_set_api_keys(
     }
     if let Some(ref k) = bedrock_api_key {
         validate_key("bedrock-api-key", k)?;
-    }
-    if let Some(ref v) = bedrock_model_map {
-        validate_key("bedrock-model-map", v)?;
     }
     if let Some(ref k) = openai {
         validate_key("openai", k)?;
@@ -107,9 +103,6 @@ pub(crate) fn cmd_set_api_keys(
             }
             if let Some(k) = bedrock_api_key {
                 keys.bedrock_api_key = Some(k);
-            }
-            if let Some(v) = bedrock_model_map {
-                keys.bedrock_model_map = Some(v);
             }
             if let Some(k) = openai {
                 keys.openai = Some(k);

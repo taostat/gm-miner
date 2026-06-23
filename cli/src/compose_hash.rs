@@ -65,12 +65,11 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// (`DSTACK_DOCKER_*`) are
 /// excluded: the gm image is public and those vars do not appear in
 /// `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 12] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 11] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
     "BEDROCK_API_KEY",
-    "BEDROCK_MODEL_MAP",
     "OPENAI_API_KEY",
     "OPENAI_UPSTREAM",
     "AZURE_OPENAI_ENDPOINT",
@@ -214,7 +213,7 @@ mod tests {
     /// version: bump it in lockstep with `TESTNET_IMAGE_REF` whenever a new
     /// `ImageVersion` is published, then confirm live miners attest to it.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "21e050d0c7f781b3379d5c88221c921e5483b72a4bf8635e6eeb93aa53f16389";
+        "c910e6335acd8d7db18da18c7f6978f0e47db1093b589bceb356330a592f0b8d";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {

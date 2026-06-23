@@ -107,14 +107,13 @@ gmcli set-api-keys --chutes cpk-...
 Each flag replaces the stored value; omitted flags leave existing values intact.
 
 To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
-API, select Bedrock and provide the Bedrock region, API key, and model-id map:
+API, select Bedrock and provide the Bedrock region and API key:
 
 ```sh
 gmcli set-api-keys \
   --anthropic-upstream bedrock \
   --bedrock-region us-west-2 \
-  --bedrock-api-key <bedrock-api-key> \
-  --bedrock-model-map '{"claude-sonnet-4-6":"us.anthropic.claude-sonnet-4-6-v1"}'
+  --bedrock-api-key <bedrock-api-key>
 ```
 
 To serve the existing `openai` route through Azure OpenAI instead of the direct OpenAI API, select
@@ -128,8 +127,8 @@ gmcli set-api-keys \
 ```
 
 Azure OpenAI must have deployments named exactly like the gm model id, for example `gpt-4o`;
-the miner does not rewrite Azure model ids. Bedrock requires its own model ids, so the miner
-rewrites the top-level Anthropic request `model` field using `BEDROCK_MODEL_MAP`.
+the miner does not rewrite Azure model ids. Bedrock model-id translation is handled by the
+gateway before requests reach the miner.
 
 ### 4. Deploy your miner
 

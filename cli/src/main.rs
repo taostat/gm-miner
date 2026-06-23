@@ -133,7 +133,7 @@ enum Command {
         gmcli set-api-keys --openai sk-... --google AIza...\n  \
         gmcli set-api-keys --chutes cpk-...\n  \
         gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
-          --bedrock-api-key brk-... --bedrock-model-map '{\"claude-sonnet-4-6\":\"us.anthropic.claude-sonnet-4-6-v1\"}'\n  \
+          --bedrock-api-key brk-...\n  \
         gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
           --azure-openai-api-key ...")]
     SetApiKeys {
@@ -152,10 +152,6 @@ enum Command {
         /// AWS Bedrock API key for `ANTHROPIC_UPSTREAM=bedrock`.
         #[arg(long)]
         bedrock_api_key: Option<String>,
-
-        /// JSON map from gm Claude model id to Bedrock model id.
-        #[arg(long)]
-        bedrock_model_map: Option<String>,
 
         /// `OpenAI` API key (sk-...).
         #[arg(long)]
@@ -584,7 +580,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
             anthropic_upstream,
             bedrock_region,
             bedrock_api_key,
-            bedrock_model_map,
             openai,
             openai_upstream,
             azure_openai_endpoint,
@@ -597,7 +592,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
             anthropic_upstream,
             bedrock_region,
             bedrock_api_key,
-            bedrock_model_map,
             openai,
             openai_upstream,
             azure_openai_endpoint,

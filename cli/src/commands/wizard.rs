@@ -324,7 +324,6 @@ fn wizard_provider_keys(
             keys.anthropic_upstream,
             keys.bedrock_region,
             keys.bedrock_api_key,
-            keys.bedrock_model_map,
             keys.openai,
             keys.openai_upstream,
             keys.azure_openai_endpoint,
@@ -342,7 +341,6 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         anthropic_upstream: None,
         bedrock_region: None,
         bedrock_api_key: None,
-        bedrock_model_map: None,
         openai: prompt_line("OpenAI API key (blank to skip):", assume_yes)?,
         openai_upstream: None,
         azure_openai_endpoint: None,
@@ -363,9 +361,7 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
         cmd.push_str(" --anthropic-upstream bedrock");
     }
     if keys.bedrock_api_key.is_some() {
-        cmd.push_str(
-            " --bedrock-region <region> --bedrock-api-key <key> --bedrock-model-map <json>",
-        );
+        cmd.push_str(" --bedrock-region <region> --bedrock-api-key <key>");
     }
     if keys.openai.is_some() {
         cmd.push_str(" --openai <key>");

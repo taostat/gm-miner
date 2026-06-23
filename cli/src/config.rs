@@ -318,8 +318,6 @@ pub struct ProviderKeys {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bedrock_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bedrock_model_map: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_upstream: Option<String>,
@@ -386,7 +384,6 @@ impl ProviderKeys {
                 &[
                     ("--bedrock-region", self.bedrock_region.as_deref()),
                     ("--bedrock-api-key", self.bedrock_api_key.as_deref()),
-                    ("--bedrock-model-map", self.bedrock_model_map.as_deref()),
                 ],
             )?,
             other => {

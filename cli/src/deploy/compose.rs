@@ -52,7 +52,6 @@ pub fn render_env_file(
         ("ANTHROPIC_UPSTREAM", env_vars.anthropic_upstream.as_deref()),
         ("BEDROCK_REGION", env_vars.bedrock_region.as_deref()),
         ("BEDROCK_API_KEY", env_vars.bedrock_api_key.as_deref()),
-        ("BEDROCK_MODEL_MAP", env_vars.bedrock_model_map.as_deref()),
         ("OPENAI_API_KEY", env_vars.openai.as_deref()),
         ("OPENAI_UPSTREAM", env_vars.openai_upstream.as_deref()),
         (
@@ -334,7 +333,6 @@ mod tests {
                 "ANTHROPIC_UPSTREAM",
                 "BEDROCK_REGION",
                 "BEDROCK_API_KEY",
-                "BEDROCK_MODEL_MAP",
                 "OPENAI_API_KEY",
                 "OPENAI_UPSTREAM",
                 "AZURE_OPENAI_ENDPOINT",

@@ -321,7 +321,6 @@ fn validate_upstreams_rejects_incomplete_bedrock() {
     };
     let err = keys.validate_upstreams().unwrap_err().to_string();
     assert!(err.contains("--bedrock-region"), "{err}");
-    assert!(err.contains("--bedrock-model-map"), "{err}");
 }
 
 #[test]
@@ -341,7 +340,6 @@ fn validate_upstreams_accepts_complete_cloud_and_direct() {
         anthropic_upstream: Some("bedrock".to_owned()),
         bedrock_region: Some("us-west-2".to_owned()),
         bedrock_api_key: Some("k".to_owned()),
-        bedrock_model_map: Some("{\"a\":\"b\"}".to_owned()),
         openai_upstream: Some("azure".to_owned()),
         azure_openai_endpoint: Some("https://r.openai.azure.com".to_owned()),
         azure_openai_api_key: Some("k".to_owned()),
