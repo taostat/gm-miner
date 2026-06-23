@@ -933,6 +933,7 @@ mod tests {
                         app_name: "gm-miner-2".to_owned(),
                         node_secret: "provisional".to_owned(),
                         provisional_secondary: true,
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -1282,6 +1283,7 @@ mod tests {
                         app_name: "gm-miner-2".to_owned(),
                         node_secret: "provisional".to_owned(),
                         provisional_secondary: true,
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()

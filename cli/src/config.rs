@@ -127,6 +127,12 @@ pub struct WorkerRecord {
     /// The worker's `x-gm-node-key` pre-shared credential (Mechanism 1 of
     /// `docs/plans/attestation-and-identity.md`).
     pub node_secret: String,
+    /// Registry worker provenance derived from the provider upstream selectors
+    /// active when this worker was deployed. Stored per worker so
+    /// `register-image` recovery preserves the deployed backend instead of
+    /// relabeling from whatever global config is current later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     /// Set on a *provisional* record (empty `worker_id`) that a `worker add`
     /// wrote before its registry POST — i.e. an in-flight or failed secondary
     /// worker. It keeps that stub off the worker-#1 registration paths
@@ -811,6 +817,24 @@ mod tests {
     }
 
     #[test]
+    fn worker_backend_defaults_and_omits_when_absent() {
+        let json = r#"{"worker_id":"01J0A","app_id":"app_01J0A","app_name":"gm-miner-1","node_secret":"secret"}"#;
+        let worker: WorkerRecord = serde_json::from_str(json).expect("parse legacy worker record");
+        assert_eq!(worker.backend, None);
+
+        let resaved = serde_json::to_string(&worker).expect("serialize worker record");
+        assert!(
+            !resaved.contains("backend"),
+            "absent worker backend must stay omitted: {resaved}"
+        );
+
+        let mut cloud = worker;
+        cloud.backend = Some("bedrock".to_owned());
+        let cloud_json = serde_json::to_value(&cloud).expect("serialize cloud worker");
+        assert_eq!(cloud_json["backend"], "bedrock");
+    }
+
+    #[test]
     fn empty_workers_vec_is_omitted_from_json() {
         // A network that never deployed must not bloat config.json with an
         // empty `workers` array, matching the skip-if-empty contract.
@@ -914,6 +938,7 @@ mod tests {
                     app_name: "gm-miner-3".to_owned(),
                     node_secret: "s".to_owned(),
                     provisional_secondary: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()

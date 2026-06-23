@@ -140,45 +140,22 @@ fn login_check(cfg: &Config) -> Check {
 }
 
 fn provider_keys_check(cfg: &Config) -> Check {
-    let set: Vec<&str> = cfg.provider_keys.as_ref().map_or_else(Vec::new, |k| {
-        let mut names = Vec::new();
-        if k.anthropic.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-            names.push("anthropic");
-        }
-        if k.bedrock_api_key
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            names.push("bedrock");
-        }
-        if k.openai.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-            names.push("openai");
-        }
-        if k.azure_openai_api_key
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            names.push("azure-openai");
-        }
-        if k.google.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-            names.push("google");
-        }
-        if k.chutes.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-            names.push("chutes");
-        }
-        names
-    });
-    if set.is_empty() {
-        Check::fail(
-            "Provider keys set",
-            "no provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google / --chutes, or configure Bedrock/Azure upstreams)",
-        )
-    } else {
-        Check::pass(
-            format!("Provider keys set ({})", set.join(", ")),
-            String::new(),
-        )
+    let Some(keys) = cfg.provider_keys.as_ref() else {
+        return Check::fail(
+            "Provider keys usable",
+            "no usable provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google / --chutes, or configure Bedrock/Azure upstreams)",
+        );
+    };
+    if !keys.any_set() {
+        return Check::fail(
+            "Provider keys usable",
+            "no usable provider keys — selected cloud upstreams need their selector and required key, or configure a direct provider key",
+        );
     }
+    if let Err(err) = keys.validate_upstreams() {
+        return Check::fail("Provider upstream config", err.to_string());
+    }
+    Check::pass("Provider keys usable", "upstream config valid")
 }
 
 fn phala_cli_check() -> Check {
@@ -280,4 +257,76 @@ async fn hotkey_check(cfg: Config) -> Check {
         );
     }
     Check::fail(label, format!("registry returned {status}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{provider_keys_check, Status};
+    use gm_miner_cli::config::{Config, ProviderKeys};
+
+    fn cfg(keys: ProviderKeys) -> Config {
+        Config {
+            provider_keys: Some(keys),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cloud_key_without_selector_is_not_usable() {
+        let check = provider_keys_check(&cfg(ProviderKeys {
+            bedrock_api_key: Some("bedrock-key".to_owned()),
+            ..ProviderKeys::default()
+        }));
+
+        assert!(check.status == Status::Fail);
+        assert!(check.label.contains("Provider keys usable"));
+        assert!(
+            check.note.contains("no usable provider keys"),
+            "got: {}",
+            check.note
+        );
+    }
+
+    #[test]
+    fn selected_bedrock_without_region_fails_upstream_validation() {
+        let check = provider_keys_check(&cfg(ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_api_key: Some("bedrock-key".to_owned()),
+            ..ProviderKeys::default()
+        }));
+
+        assert!(check.status == Status::Fail);
+        assert!(check.label.contains("Provider upstream config"));
+        assert!(
+            check.note.contains("--bedrock-region"),
+            "got: {}",
+            check.note
+        );
+    }
+
+    #[test]
+    fn complete_bedrock_config_passes() {
+        let check = provider_keys_check(&cfg(ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_region: Some("us-east-1".to_owned()),
+            bedrock_api_key: Some("bedrock-key".to_owned()),
+            ..ProviderKeys::default()
+        }));
+
+        assert!(check.status == Status::Pass);
+        assert!(check.note.contains("upstream config valid"));
+    }
+
+    #[test]
+    fn complete_azure_config_passes() {
+        let check = provider_keys_check(&cfg(ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            azure_openai_endpoint: Some("https://acct.openai.azure.com".to_owned()),
+            azure_openai_api_key: Some("azure-key".to_owned()),
+            ..ProviderKeys::default()
+        }));
+
+        assert!(check.status == Status::Pass);
+        assert!(check.note.contains("upstream config valid"));
+    }
 }
