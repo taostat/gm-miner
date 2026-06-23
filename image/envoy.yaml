@@ -670,15 +670,10 @@ static_resources:
                           end
                           ## gm:bedrock-model-rewrite-end
                           function envoy_on_request(handle)
-                            ## gm:bedrock-model-rewrite-begin
                             if expected == "" then
-                              if maybe_rewrite_bedrock_model(handle) then
-                                return
-                              end
-                              return
-                            end
-                            ## gm:bedrock-model-rewrite-end
-                            if expected == "" then
+                              ## gm:bedrock-model-rewrite-begin
+                              maybe_rewrite_bedrock_model(handle)
+                              ## gm:bedrock-model-rewrite-end
                               return
                             end
                             -- The attestation surface is public by

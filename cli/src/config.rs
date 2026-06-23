@@ -333,23 +333,41 @@ pub struct ProviderKeys {
     pub chutes: Option<String>,
 }
 
+/// True when `v` holds a non-empty, non-whitespace value. `Some("")` and
+/// `Some("  ")` count as unset so an accidental empty-string assignment (e.g.
+/// from an unset shell variable) doesn't silently pass the deploy preflight.
+fn non_empty(v: Option<&str>) -> bool {
+    v.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Bail naming every flag in `fields` whose value is unset, for a selected
+/// cloud upstream that `start.sh` would otherwise reject at boot.
+fn require_present(label: &str, fields: &[(&str, Option<&str>)]) -> Result<()> {
+    let missing: Vec<&str> = fields
+        .iter()
+        .filter_map(|(flag, v)| (!non_empty(*v)).then_some(*flag))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "{label} requires {} — set via `gmcli set-api-keys`",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 impl ProviderKeys {
     /// Returns true if at least one key is set to a non-empty, non-whitespace value.
-    ///
-    /// `Some("")` and `Some("  ")` are treated as not set so that accidental
-    /// empty-string assignments (e.g. from an unset shell variable) don't
-    /// silently pass the deploy preflight check.
     #[must_use]
     pub fn any_set(&self) -> bool {
-        let non_empty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
         let anthropic_upstream = self.anthropic_upstream.as_deref().unwrap_or("direct");
         let openai_upstream = self.openai_upstream.as_deref().unwrap_or("direct");
-        ((anthropic_upstream == "direct" && non_empty(&self.anthropic))
-            || (anthropic_upstream == "bedrock" && non_empty(&self.bedrock_api_key)))
-            || ((openai_upstream == "direct" && non_empty(&self.openai))
-                || (openai_upstream == "azure" && non_empty(&self.azure_openai_api_key)))
-            || non_empty(&self.google)
-            || non_empty(&self.chutes)
+        ((anthropic_upstream == "direct" && non_empty(self.anthropic.as_deref()))
+            || (anthropic_upstream == "bedrock" && non_empty(self.bedrock_api_key.as_deref())))
+            || ((openai_upstream == "direct" && non_empty(self.openai.as_deref()))
+                || (openai_upstream == "azure" && non_empty(self.azure_openai_api_key.as_deref())))
+            || non_empty(self.google.as_deref())
+            || non_empty(self.chutes.as_deref())
     }
 
     /// Reject a selected cloud upstream that is missing fields `start.sh`
@@ -361,52 +379,35 @@ impl ProviderKeys {
     /// unknown value, or when a selected `bedrock`/`azure` upstream is missing
     /// a required field.
     pub fn validate_upstreams(&self) -> Result<()> {
-        let non_empty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
         match self.anthropic_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
-            "bedrock" => {
-                let missing: Vec<&str> = [
-                    ("--bedrock-region", non_empty(&self.bedrock_region)),
-                    ("--bedrock-api-key", non_empty(&self.bedrock_api_key)),
-                    ("--bedrock-model-map", non_empty(&self.bedrock_model_map)),
-                ]
-                .into_iter()
-                .filter_map(|(flag, set)| (!set).then_some(flag))
-                .collect();
-                if !missing.is_empty() {
-                    anyhow::bail!(
-                        "anthropic-upstream=bedrock requires {} — set via `gmcli set-api-keys`",
-                        missing.join(", ")
-                    );
-                }
-            }
+            "bedrock" => require_present(
+                "anthropic-upstream=bedrock",
+                &[
+                    ("--bedrock-region", self.bedrock_region.as_deref()),
+                    ("--bedrock-api-key", self.bedrock_api_key.as_deref()),
+                    ("--bedrock-model-map", self.bedrock_model_map.as_deref()),
+                ],
+            )?,
             other => {
                 anyhow::bail!("anthropic-upstream must be 'direct' or 'bedrock' (got '{other}')")
             }
         }
         match self.openai_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
-            "azure" => {
-                let missing: Vec<&str> = [
+            "azure" => require_present(
+                "openai-upstream=azure",
+                &[
                     (
                         "--azure-openai-endpoint",
-                        non_empty(&self.azure_openai_endpoint),
+                        self.azure_openai_endpoint.as_deref(),
                     ),
                     (
                         "--azure-openai-api-key",
-                        non_empty(&self.azure_openai_api_key),
+                        self.azure_openai_api_key.as_deref(),
                     ),
-                ]
-                .into_iter()
-                .filter_map(|(flag, set)| (!set).then_some(flag))
-                .collect();
-                if !missing.is_empty() {
-                    anyhow::bail!(
-                        "openai-upstream=azure requires {} — set via `gmcli set-api-keys`",
-                        missing.join(", ")
-                    );
-                }
-            }
+                ],
+            )?,
             other => anyhow::bail!("openai-upstream must be 'direct' or 'azure' (got '{other}')"),
         }
         Ok(())
