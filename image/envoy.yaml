@@ -329,7 +329,7 @@ static_resources:
                             ##  gpt-5.5 at high reasoning effort, which returns the whole
                             ##  completion in one burst — is not cut off mid-generation.
                             ##  Applied uniformly across the provider routes below.
-                            timeout: 200s
+                            timeout: 620s
                           request_headers_to_remove:
                             - authorization
                             - x-gm-request-id
@@ -365,7 +365,7 @@ static_resources:
                                 regex: "^/v1/chat/completions$"
                               substitution: "/openai/v1/chat/completions"
                             ## gm:openai-path-rewrite-end
-                            timeout: 200s
+                            timeout: 620s
                           request_headers_to_remove:
                             - authorization
                             - x-gm-request-id
@@ -390,7 +390,7 @@ static_resources:
                           route:
                             cluster: chutes
                             host_rewrite_literal: llm.chutes.ai
-                            timeout: 200s
+                            timeout: 620s
                           request_headers_to_remove:
                             - authorization
                             - x-gm-request-id
@@ -415,7 +415,7 @@ static_resources:
                           route:
                             cluster: gemini
                             host_rewrite_literal: generativelanguage.googleapis.com
-                            timeout: 200s
+                            timeout: 620s
                           request_headers_to_remove:
                             - authorization
                             - x-gm-request-id
@@ -444,7 +444,7 @@ static_resources:
                           route:
                             cluster: benchmark
                             host_rewrite_literal: __GM_BENCHMARK_HOST__
-                            timeout: 200s
+                            timeout: 620s
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
