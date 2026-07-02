@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use gm_miner_cli::{
-    client::{build_http_client, RegistryClient},
+    client::{build_http_client, RegistryClient, ME_PATH},
     config::{Config, ProviderKeys, WorkerRecord},
-    types::{ProductCatalogResponse, Provider, WorkerListResponse},
+    types::{MinerStatus, ProductCatalogResponse, Provider, WorkerListResponse},
 };
 use reqwest::Url;
 use serde_json::Value;
@@ -43,9 +43,32 @@ struct StreamingTarget {
 
 struct ProviderProbe {
     provider: Provider,
+    /// Canonical gm model id, shown in output. The request body carries the
+    /// upstream deployment id when the offer declared one (see [`ProbeModel`]).
     model: String,
     path: &'static str,
     body: Value,
+}
+
+/// The two model ids a probe needs: the canonical gm id for display and the
+/// upstream deployment/model id to actually send.
+///
+/// Azure/Bedrock offers map a canonical model to a distinct upstream
+/// deployment name; the gateway rewrites the request `model` to that upstream
+/// id before forwarding to the miner CVM. This self-test bypasses the gateway,
+/// so it performs the same rewrite — otherwise the probe 404s on exactly the
+/// cloud setups the streaming check exists to warn about.
+struct ProbeModel {
+    canonical: String,
+    upstream: Option<String>,
+}
+
+impl ProbeModel {
+    /// The id to place in the request body: the declared upstream deployment
+    /// when present, else the canonical gm model id.
+    fn wire_model(&self) -> &str {
+        self.upstream.as_deref().unwrap_or(&self.canonical)
+    }
 }
 
 struct ProbeTiming {
@@ -96,7 +119,7 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
     let model_catalog = fetch_probe_models(cfg, &providers).await;
     for provider in providers {
         let model = model_catalog.model_for(&provider);
-        let probe = build_probe(provider, model);
+        let probe = build_probe(provider, &model);
         let result = run_provider_probe(target, &probe).await;
         print_probe_result(&probe, result);
     }
@@ -195,35 +218,73 @@ fn non_empty(value: Option<&str>) -> bool {
 }
 
 struct ProbeModels {
-    models: std::collections::HashMap<Provider, String>,
+    models: std::collections::HashMap<Provider, ProbeModel>,
 }
 
 impl ProbeModels {
-    fn model_for(&self, provider: &Provider) -> String {
-        self.models
-            .get(provider)
-            .cloned()
-            .unwrap_or_else(|| fallback_model(provider).to_owned())
+    fn model_for(&self, provider: &Provider) -> ProbeModel {
+        match self.models.get(provider) {
+            Some(model) => ProbeModel {
+                canonical: model.canonical.clone(),
+                upstream: model.upstream.clone(),
+            },
+            None => ProbeModel {
+                canonical: fallback_model(provider).to_owned(),
+                upstream: None,
+            },
+        }
     }
 }
 
+/// Resolve the probe model per provider: a canonical gm model id from the
+/// public catalog, joined with the miner's own declared `upstream_model` (from
+/// `/miners/me`) so cloud-backed offers probe their real upstream deployment.
+///
+/// Both lookups are best-effort — a failed catalog or offer fetch degrades to
+/// the canonical [`fallback_model`], and a missing upstream mapping simply
+/// sends the canonical id. The check must never fail the deploy it advises on.
 async fn fetch_probe_models(cfg: &Config, providers: &[Provider]) -> ProbeModels {
+    let canonical = fetch_canonical_models(cfg, providers).await;
+    let upstream = fetch_declared_upstreams(cfg).await;
+
+    let mut models = std::collections::HashMap::new();
+    for provider in providers {
+        let Some(canonical) = canonical.get(provider).cloned() else {
+            continue;
+        };
+        let upstream = upstream
+            .get(&(provider.clone(), canonical.clone()))
+            .cloned()
+            .flatten();
+        models.insert(
+            provider.clone(),
+            ProbeModel {
+                canonical,
+                upstream,
+            },
+        );
+    }
+    ProbeModels { models }
+}
+
+/// Public `GET /products` → the active canonical model per provider.
+async fn fetch_canonical_models(
+    cfg: &Config,
+    providers: &[Provider],
+) -> std::collections::HashMap<Provider, String> {
     let url = format!("{}/products", cfg.api_url());
-    let products = match build_http_client() {
-        Ok(client) => {
-            let response = client.get(&url).send().await;
-            match response {
-                Ok(resp) if resp.status().is_success() => {
-                    resp.json::<ProductCatalogResponse>().await.ok()
-                }
-                _ => None,
+    let catalog = match build_http_client() {
+        Ok(client) => match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                resp.json::<ProductCatalogResponse>().await.ok()
             }
-        }
+            _ => None,
+        },
         Err(_) => None,
     };
 
     let mut models = std::collections::HashMap::new();
-    if let Some(catalog) = products {
+    if let Some(catalog) = catalog {
         for provider in providers {
             if let Some(product) = catalog
                 .products
@@ -234,7 +295,31 @@ async fn fetch_probe_models(cfg: &Config, providers: &[Provider]) -> ProbeModels
             }
         }
     }
-    ProbeModels { models }
+    models
+}
+
+/// Authenticated `GET /miners/me` → the miner's own declared upstream mapping,
+/// keyed by `(provider, canonical model)`. Empty when the miner is not logged
+/// in or the registry omits the field.
+async fn fetch_declared_upstreams(
+    cfg: &Config,
+) -> std::collections::HashMap<(Provider, String), Option<String>> {
+    let mut client = RegistryClient::new(cfg.clone());
+    let status = match client.get(ME_PATH).await {
+        Ok(resp) if resp.status().is_success() => resp.json::<MinerStatus>().await.ok(),
+        _ => None,
+    };
+
+    let mut upstreams = std::collections::HashMap::new();
+    if let Some(status) = status {
+        for offer in status.products {
+            let Ok(provider) = offer.provider.parse::<Provider>() else {
+                continue;
+            };
+            upstreams.insert((provider, offer.model), offer.upstream_model);
+        }
+    }
+    upstreams
 }
 
 fn fallback_model(provider: &Provider) -> &'static str {
@@ -247,14 +332,14 @@ fn fallback_model(provider: &Provider) -> &'static str {
     }
 }
 
-fn build_probe(provider: Provider, model: String) -> ProviderProbe {
+fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
     match provider {
         Provider::Anthropic => ProviderProbe {
             provider,
-            model: model.clone(),
+            model: model.canonical.clone(),
             path: "/v1/messages",
             body: serde_json::json!({
-                "model": model,
+                "model": model.wire_model(),
                 "max_tokens": MAX_TOKENS,
                 "stream": true,
                 "messages": [{"role": "user", "content": probe_prompt()}],
@@ -270,14 +355,17 @@ fn build_probe(provider: Provider, model: String) -> ProviderProbe {
     }
 }
 
-fn openai_compatible_probe(provider: Provider, model: String, path: &'static str) -> ProviderProbe {
-    let body_model = model.clone();
+fn openai_compatible_probe(
+    provider: Provider,
+    model: &ProbeModel,
+    path: &'static str,
+) -> ProviderProbe {
     ProviderProbe {
         provider,
-        model,
+        model: model.canonical.clone(),
         path,
         body: serde_json::json!({
-            "model": body_model,
+            "model": model.wire_model(),
             "max_tokens": MAX_TOKENS,
             "stream": true,
             "messages": [{"role": "user", "content": probe_prompt()}],
@@ -563,6 +651,31 @@ mod tests {
     fn classify_clearly_streaming_timing_as_streaming() {
         let offsets = [ms(250), ms(620), ms(980), ms(1_360), ms(1_720)];
         assert_eq!(classify_streaming(&offsets), StreamingVerdict::Streaming);
+    }
+
+    #[test]
+    fn probe_sends_declared_upstream_model_when_present() {
+        let model = ProbeModel {
+            canonical: "claude-sonnet-4-6".to_owned(),
+            upstream: Some("us.anthropic.claude-sonnet-4-6-v1".to_owned()),
+        };
+        let probe = build_probe(Provider::Anthropic, &model);
+        assert_eq!(
+            probe.body["model"],
+            Value::String("us.anthropic.claude-sonnet-4-6-v1".to_owned())
+        );
+        assert_eq!(probe.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn probe_sends_canonical_model_without_upstream_mapping() {
+        let model = ProbeModel {
+            canonical: "gpt-5.5".to_owned(),
+            upstream: None,
+        };
+        let probe = build_probe(Provider::OpenAI, &model);
+        assert_eq!(probe.body["model"], Value::String("gpt-5.5".to_owned()));
+        assert_eq!(probe.model, "gpt-5.5");
     }
 
     #[test]
