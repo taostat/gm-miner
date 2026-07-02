@@ -28,3 +28,13 @@ rules:
   unpinned-images:
     ignore:
       - release.yml
+
+  # dtolnay/rust-toolchain force-pushes its `stable`/`nightly` tags, so the
+  # SHA we pin is not reachable from the current tag ref and zizmor flags it
+  # as an impostor commit. Verified benign: 29eef336 is a genuine dtolnay
+  # commit ("toolchain: stable", 2026-03-27). Same root cause as the
+  # ref-version-mismatch suppression above.
+  impostor-commit:
+    ignore:
+      - ci.yml
+      - publish-image-version.yml
