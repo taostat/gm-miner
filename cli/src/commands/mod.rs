@@ -12,6 +12,7 @@ pub mod hotkey;
 pub mod keys;
 pub mod persist;
 pub mod products;
+pub mod streaming_check;
 pub mod wizard;
 
 use gm_miner_cli::network::Network;

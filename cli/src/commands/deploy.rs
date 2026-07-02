@@ -27,6 +27,7 @@ use crate::commands::persist::{
     persist_accepted_terms, persist_worker_record, remove_provisional_worker,
 };
 use crate::commands::status_error;
+use crate::commands::streaming_check::deploy_streaming_advisory;
 use crate::{DeployFlags, PublishImageVersionFlags};
 
 /// Parsed `gmcli deploy` arguments, grouped so the dispatch match arm
@@ -568,7 +569,7 @@ pub(crate) async fn cmd_deploy(
             worker_id: worker_id.clone(),
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
-            node_secret,
+            node_secret: node_secret.clone(),
             backend: worker_backend,
             // Registered: role is read from position, never this flag.
             provisional_secondary: false,
@@ -576,6 +577,7 @@ pub(crate) async fn cmd_deploy(
     )?;
 
     print_deploy_summary(&worker_id, &actual.app_id, registration);
+    deploy_streaming_advisory(cfg, &actual.endpoint, &node_secret).await;
     Ok(())
 }
 
@@ -620,7 +622,7 @@ async fn register_worker(
 }
 
 /// Fetch the calling miner's hotkey from `GET /miners/me`.
-async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
+pub(crate) async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> {
     let resp = client
         .get(gm_miner_cli::client::ME_PATH)
         .await

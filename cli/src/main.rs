@@ -58,6 +58,7 @@ use crate::commands::hotkey::cmd_register_hotkey;
 use crate::commands::keys::cmd_set_api_keys;
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::products::{cmd_declare_product, cmd_declare_products, cmd_status};
+use crate::commands::streaming_check::cmd_check_streaming;
 use crate::commands::wizard::cmd_init;
 
 // Re-exports so the in-file `mod tests` block can keep reaching items it moved
@@ -262,6 +263,17 @@ enum Command {
         gmcli doctor\n  \
         gmcli --network testnet doctor")]
     Doctor,
+
+    /// Check whether the deployed miner streams tokens or buffers upstream output.
+    ///
+    /// Sends one tiny streaming inference request per configured provider
+    /// through the miner's own data plane using the stored worker node secret.
+    /// Buffered output usually means Azure `OpenAI`'s synchronous content filter
+    /// is delaying token delivery.
+    #[command(after_help = "Examples:\n  \
+        gmcli check-streaming\n  \
+        gmcli --network testnet check-streaming")]
+    CheckStreaming,
 
     /// Record the hotkey your miner serves under.
     ///
@@ -630,6 +642,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Doctor => {
             let cfg = load_config(explicit_network, api_url)?;
             cmd_doctor(cfg).await
+        }
+        Command::CheckStreaming => {
+            let cfg = load_config(explicit_network, api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            cmd_check_streaming(cfg).await
         }
         Command::RegisterHotkey {
             hotkey_ss58,
