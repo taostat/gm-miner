@@ -22,12 +22,18 @@ const BUFFERED_FIRST_WAIT: Duration = Duration::from_secs(1);
 const BUFFERED_RATIO: f64 = 0.20;
 const MAX_TOKENS: u32 = 32;
 
-const AZURE_GUIDANCE: &str = "Your {provider} upstream returned a buffered response \
-(likely Azure's synchronous content filter). Buyers see slow first-token and you're \
-less likely to be routed to. To stream token-by-token: Azure AI Foundry -> Content \
-filters -> create a configuration with 'Asynchronous Filter' enabled in the \
-Streaming section, and apply it to your gpt deployments (requires API version \
-2024-02-01+). Trade-off: content moderation is delayed.";
+const BUFFERED_GUIDANCE: &str = "Your {provider} upstream returned a buffered response: \
+the whole completion arrived in one burst instead of token-by-token. Buyers see slow \
+first-token and this worker is less likely to be routed to. Check the upstream account \
+and any proxy in front of it for response buffering.";
+
+// Azure-only addendum: Azure OpenAI's default content filter buffers streamed
+// completions; the fix is its opt-in Asynchronous Filter (delayed moderation).
+const AZURE_GUIDANCE: &str = "If this deployment runs on Azure OpenAI, the usual cause \
+is the default synchronous content filter. Fix: enable the 'Asynchronous Filter' \
+streaming option in a content-filter (guardrails) configuration in the Azure portal \
+and apply it to your deployments (requires API version 2024-02-01 or later). \
+Trade-off: content moderation runs after tokens are streamed, so it is delayed.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamingVerdict {
@@ -593,7 +599,13 @@ fn print_probe_result(probe: &ProviderProbe, result: Result<Vec<Duration>>) {
                     probe.model,
                     timing_summary(&offsets)
                 );
-                println!("       {}", AZURE_GUIDANCE.replace("{provider}", provider));
+                println!(
+                    "       {}",
+                    BUFFERED_GUIDANCE.replace("{provider}", provider)
+                );
+                if probe.provider == Provider::OpenAI {
+                    println!("       {AZURE_GUIDANCE}");
+                }
             }
             StreamingVerdict::Inconclusive => {
                 println!(
