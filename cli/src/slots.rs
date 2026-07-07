@@ -172,9 +172,19 @@ pub fn validate_cloud_backend_single_keys(keys: &ProviderKeys) -> Result<()> {
 /// Returns an error naming the offending env var when any configured
 /// direct-provider key holds multiple segments.
 pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
+    // Keys sidelined by a cloud upstream selector are never read by the
+    // image, so a stale semicolon value there must not block the deploy.
+    let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
+    let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
     let direct = [
-        ("ANTHROPIC_API_KEY", keys.anthropic.as_deref()),
-        ("OPENAI_API_KEY", keys.openai.as_deref()),
+        (
+            "ANTHROPIC_API_KEY",
+            keys.anthropic.as_deref().filter(|_| anthropic_direct),
+        ),
+        (
+            "OPENAI_API_KEY",
+            keys.openai.as_deref().filter(|_| openai_direct),
+        ),
         ("GOOGLE_API_KEY", keys.google.as_deref()),
         ("CHUTES_API_KEY", keys.chutes.as_deref()),
     ];
@@ -257,6 +267,12 @@ mod tests {
         );
         keys.anthropic = Some("sk-single".to_owned());
         reject_multikey_for_legacy_image(&keys).expect("single key is legacy-safe");
+        // A semicolon value sidelined by a cloud selector is inert: the
+        // image reads BEDROCK_API_KEY instead, so the deploy proceeds.
+        keys.anthropic = Some("sk-a;sk-b".to_owned());
+        keys.anthropic_upstream = Some("bedrock".to_owned());
+        reject_multikey_for_legacy_image(&keys)
+            .expect("bedrock sidelines the direct anthropic key");
     }
 
     #[test]

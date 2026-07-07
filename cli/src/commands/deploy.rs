@@ -344,14 +344,27 @@ async fn phala_preflight(args: &DeployArgs) -> Result<Option<String>> {
 
 /// Whether the deploy target is a slot-capable image.
 ///
-/// Capability comes from the SELECTED APPROVED ROW's publish-time feature
-/// stamp. A custom `--image-ref`/`--image-repo` image is opaque to that
-/// row, so it is treated as legacy: slots are never advertised for an
-/// entrypoint the registry cannot vouch for (registration would reject
-/// the claim anyway; deciding here keeps a multi-key env from ever
-/// reaching a CVM that cannot parse it).
-fn image_is_slot_capable(args: &DeployArgs, approved: &ImageVersion) -> bool {
-    args.image_ref.is_none() && args.image_repo.is_none() && approved.slot_capable()
+/// Capability comes from the registry rows' publish-time feature stamps:
+/// the selected approved row on the default path, or — when the operator
+/// passes an explicit `--image-ref` — whichever approved row published
+/// that exact digest. An image the registry cannot vouch for (an unknown
+/// ref, or any `--image-repo` build) is treated as legacy: slots are
+/// never advertised for an entrypoint without a stamped row, which also
+/// keeps a multi-key env from ever reaching a CVM that cannot parse it.
+fn image_is_slot_capable(
+    args: &DeployArgs,
+    approved: &ImageVersion,
+    versions: &[ImageVersion],
+) -> bool {
+    if args.image_repo.is_some() {
+        return false;
+    }
+    match args.image_ref.as_deref() {
+        None => approved.slot_capable(),
+        Some(explicit) => versions
+            .iter()
+            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.slot_capable()),
+    }
 }
 
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
@@ -470,7 +483,7 @@ pub(crate) async fn cmd_deploy(
     let existing_worker_id = existing_worker_id_for(cfg, &args.app_name);
     let (node_secret, freshly_generated) =
         node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
-    let provider_slots = if image_is_slot_capable(args, approved) {
+    let provider_slots = if image_is_slot_capable(args, approved, &versions) {
         slots::provider_slots_for_keys(keys, &node_secret)?
     } else {
         // The target image's entrypoint predates slots: it cannot fan out
