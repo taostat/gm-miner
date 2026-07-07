@@ -23,5 +23,11 @@ while preserving the first occurrence order.
 Cloud backends are single-slot in this release: do not use semicolons in
 `BEDROCK_API_KEY` or `AZURE_OPENAI_API_KEY`.
 
+Upgrade order: the registry must support slot metadata before this CLI
+version registers workers — a pre-slot registry rejects the registration
+with a 422 (`provider_slots` is an unknown field there). Old miners keep
+working against a slot-aware gateway as single-slot workers; nothing is
+required of operators who stay on one key per provider.
+
 Protocol authority lives in the gm repo:
 <https://github.com/taostat/gm/blob/main/docs/contracts/upstream-key-slots.md>.
