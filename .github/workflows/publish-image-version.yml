@@ -38,6 +38,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Resolve target networks
+    runs-on: ubuntu-24.04
+    outputs:
+      networks: ${{ steps.networks.outputs.networks }}
+    steps:
+      # A `-dev` prerelease tag (e.g. v0.3.0-dev) publishes to testnet only,
+      # mirroring the gm repo's `-dev`-is-testnet convention. This lets a
+      # feature roll out to the testnet registry ahead of mainnet, whose
+      # registry may not yet accept a newer ImageVersion payload. A plain
+      # tag (v0.3.0) publishes to both networks.
+      - name: Resolve networks from tag
+        id: networks
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${REF_NAME}" == *-dev ]]; then
+            echo 'networks=["testnet"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'networks=["testnet","mainnet"]' >> "$GITHUB_OUTPUT"
+          fi
+
   build-image:
     name: Build and push miner image
     runs-on: ubuntu-24.04
@@ -86,14 +109,14 @@ jobs:
 
   publish:
     name: Publish ${{ matrix.network }} ImageVersion
-    needs: build-image
+    needs: [plan, build-image]
     runs-on: ubuntu-24.04
     strategy:
       # Never cancel a network mid-publish, and let one network's failure
       # surface without masking the other's result.
       fail-fast: false
       matrix:
-        network: [testnet, mainnet]
+        network: ${{ fromJson(needs.plan.outputs.networks) }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
