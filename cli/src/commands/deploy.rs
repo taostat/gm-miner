@@ -356,15 +356,19 @@ fn image_is_slot_capable(
     approved: &ImageVersion,
     versions: &[ImageVersion],
 ) -> bool {
+    // Mirrors `resolve_image_source` precedence exactly: an explicit
+    // --image-ref wins over --image-repo, which wins over the approved
+    // row's default ref. The capability verdict must describe the image
+    // that actually deploys.
+    if let Some(explicit) = args.image_ref.as_deref() {
+        return versions
+            .iter()
+            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.slot_capable());
+    }
     if args.image_repo.is_some() {
         return false;
     }
-    match args.image_ref.as_deref() {
-        None => approved.slot_capable(),
-        Some(explicit) => versions
-            .iter()
-            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.slot_capable()),
-    }
+    approved.slot_capable()
 }
 
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
