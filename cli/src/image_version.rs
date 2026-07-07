@@ -57,6 +57,12 @@ pub const REGISTRY_ADMIN_KEY_HEADER: &str = "X-API-Key";
 pub struct AdminImageVersionRequest {
     pub compose_hash: String,
     pub os_image_hash: String,
+    /// Capabilities of the image being published, stamped as a
+    /// compile-time constant of THIS release: a build without slot
+    /// support cannot claim it. The registry keys worker slot-capability
+    /// off this whitelist row (docs/contracts/upstream-key-slots.md in
+    /// the gm repo, "Slot capability" section).
+    pub features: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,6 +74,10 @@ pub struct AdminImageVersionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
 }
+
+/// Features this release's image supports. Stamped verbatim onto every
+/// published whitelist row.
+pub const IMAGE_FEATURES: [&str; 1] = ["upstream-key-slots"];
 
 /// The git provenance stamped onto a published version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -97,6 +107,7 @@ pub fn build_admin_request(
     AdminImageVersionRequest {
         compose_hash: normalize_hash(compose_hash),
         os_image_hash: normalize_hash(os_image_hash),
+        features: IMAGE_FEATURES.iter().map(ToString::to_string).collect(),
         notes: Some(release_notes(network, provenance)),
         git_repo: provenance.repo.clone(),
         git_commit: provenance.commit.clone(),
@@ -284,6 +295,8 @@ mod tests {
         assert!(obj.contains_key("os_image_hash"));
         assert!(obj.contains_key("notes"));
         assert!(obj.contains_key("image_ref"));
+        // Every published row carries this release's capability stamp.
+        assert_eq!(json["features"], serde_json::json!(["upstream-key-slots"]),);
     }
 
     #[test]
