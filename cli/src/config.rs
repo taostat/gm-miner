@@ -454,6 +454,7 @@ impl ProviderKeys {
     /// unknown value, or when a selected `bedrock`/`azure` upstream is missing
     /// a required field.
     pub fn validate_upstreams(&self) -> Result<()> {
+        crate::slots::validate_cloud_backend_single_keys(self)?;
         match self.anthropic_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
             "bedrock" => {

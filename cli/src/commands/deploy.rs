@@ -19,7 +19,7 @@ use gm_miner_cli::{
         to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, PhalaClient,
         PHALA_ENDPOINT_FIELD,
     },
-    node_secret, terms,
+    node_secret, slots, terms,
     types::{MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse},
 };
 
@@ -434,6 +434,7 @@ pub(crate) async fn cmd_deploy(
     let existing_worker_id = existing_worker_id_for(cfg, &args.app_name);
     let (node_secret, freshly_generated) =
         node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
+    let provider_slots = slots::provider_slots_for_keys(keys, &node_secret)?;
     if freshly_generated {
         println!(
             "Generated a fresh node secret for worker '{}'.",
@@ -553,6 +554,7 @@ pub(crate) async fn cmd_deploy(
             endpoint: &actual.endpoint,
             node_secret: Some(&node_secret),
             backend: worker_backend.as_deref(),
+            provider_slots: (!provider_slots.is_empty()).then_some(&provider_slots),
             accepted_terms_version: Some(terms::CURRENT_TERMS_VERSION),
         },
     )
@@ -665,6 +667,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
         node_secret,
         existing_app_name,
         backend: register_backend,
+        provider_slots,
     } = register_image_context(&cfg, app_id)?;
     let network = cfg.active_network().to_owned();
     // Scope the same Phala key deploy would use (env or saved config key) onto
@@ -739,6 +742,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
             // whatever global config is current later. If no local record
             // exists, current config is only a best-effort fallback.
             backend: register_backend.as_deref(),
+            provider_slots: provider_slots.as_ref(),
             // A register-image resync re-asserts the image, not the terms; the
             // registry keeps whatever acceptance the first deploy recorded.
             accepted_terms_version: None,
@@ -788,6 +792,7 @@ struct RegisterImageContext {
     node_secret: Option<String>,
     existing_app_name: Option<String>,
     backend: Option<String>,
+    provider_slots: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 fn register_image_context(cfg: &Config, app_id: &str) -> Result<RegisterImageContext> {
@@ -823,10 +828,18 @@ fn register_image_context(cfg: &Config, app_id: &str) -> Result<RegisterImageCon
             .and_then(config::NetworkEntry::legacy_node_secret)
             .map(str::to_owned)
     });
+    let provider_slots = cfg
+        .provider_keys
+        .as_ref()
+        .zip(node_secret.as_deref())
+        .map(|(keys, secret)| slots::provider_slots_for_keys(keys, secret))
+        .transpose()?
+        .filter(|slots| !slots.is_empty());
     Ok(RegisterImageContext {
         node_secret,
         existing_app_name: tracked.map(|w| w.app_name.clone()),
         backend: register_image_backend(tracked, cfg),
+        provider_slots,
     })
 }
 
@@ -896,6 +909,8 @@ struct WorkerImageArgs<'a> {
     node_secret: Option<&'a str>,
     /// Worker provenance derived from configured upstream selectors.
     backend: Option<&'a str>,
+    /// Direct-upstream provider slot ids advertised to the registry.
+    provider_slots: Option<&'a std::collections::BTreeMap<String, Vec<String>>>,
     /// The gm-miner-terms version the operator accepted, sent on the
     /// first-worker registration so the registry records it on the miner row.
     /// `None` omits the field — the registry leaves any stored value untouched
@@ -922,6 +937,7 @@ async fn post_register_image(
         os_image_hash: args.os_image_hash,
         node_secret: args.node_secret,
         backend: args.backend,
+        provider_slots: args.provider_slots,
     })
     .context("serialize register body")?;
     // The accepted terms version, recorded on the miner row keyed to hotkey —
@@ -977,6 +993,7 @@ async fn post_add_worker(
         os_image_hash: args.os_image_hash,
         node_secret: args.node_secret,
         backend: args.backend,
+        provider_slots: args.provider_slots,
     })
     .context("serialize worker-add body")?;
 
@@ -1149,6 +1166,7 @@ mod tests {
             os_image_hash: "b".repeat(64).as_str(),
             node_secret: Some("secret"),
             backend: backend.as_deref(),
+            provider_slots: None,
         })
         .expect("serialize register-image request");
         assert_eq!(body["backend"], "bedrock");

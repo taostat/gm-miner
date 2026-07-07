@@ -67,6 +67,8 @@ dirs         = "6"
 open         = "5"
 base64       = "0.22"
 fd-lock      = "4"
+data-encoding = "=2.11.0"
+hmac         = "=0.13.0"
 
 [dev-dependencies]
 wiremock     = "0.6"

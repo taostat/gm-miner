@@ -306,6 +306,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_env_file_preserves_semicolon_multikey_values() {
+        let keys = ProviderKeys {
+            anthropic: Some("sk-ant-a; sk-ant-b ".to_owned()),
+            openai: Some("sk-a;sk-b".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let body = render_env_file(&keys, "node-secret", None);
+        assert!(body.contains("ANTHROPIC_API_KEY=sk-ant-a; sk-ant-b \n"));
+        assert!(body.contains("OPENAI_API_KEY=sk-a;sk-b\n"));
+        assert!(!body.contains("GM_ANTHROPIC_KEY_SLOT_"));
+    }
+
     /// Every canonical provider key NAME is present on its own line — in the
     /// `CANONICAL_ALLOWED_ENVS` order — even when the miner configured only
     /// one provider. This is the env-file half of the static-`allowed_envs`

@@ -246,6 +246,18 @@ enum Command {
         flags: Box<PublishImageVersionFlags>,
     },
 
+    /// Render upstream key slot exports for the container entrypoint.
+    #[command(hide = true)]
+    SlotEnv {
+        /// Provider id: anthropic, openai, gemini, or chutes.
+        #[arg(long)]
+        provider: Provider,
+
+        /// Name of the environment variable holding the semicolon-separated keys.
+        #[arg(long = "env-var")]
+        env_var: String,
+    },
+
     /// Alias for `status` — the product table is folded into `status`.
     ///
     /// Kept so existing muscle memory and scripts keep working; it runs the
@@ -668,6 +680,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = load_config(explicit_network, api_url)?;
             cmd_publish_image_version(&cfg, *flags).await
         }
+        Command::SlotEnv { provider, env_var } => cmd_slot_env(&provider, &env_var),
         Command::ListProducts | Command::Status => {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
@@ -706,6 +719,27 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cmd_declare_products(&mut client, provider.as_ref(), discount_bp).await
         }
     }
+}
+
+fn cmd_slot_env(provider: &Provider, env_var: &str) -> Result<()> {
+    if matches!(provider, Provider::Benchmark) {
+        anyhow::bail!("benchmark does not use upstream key slots");
+    }
+    let node_secret = std::env::var("GM_NODE_SECRET")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("GM_NODE_SECRET must be set to derive upstream key slots")
+        })?;
+    let raw = std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{env_var} must be set to derive upstream key slots"))?;
+    print!(
+        "{}",
+        gm_miner_cli::slots::render_slot_env_exports(provider.as_str(), &raw, &node_secret)?
+    );
+    Ok(())
 }
 
 /// Route the `worker` subcommands. Each loads config, refreshes the token,

@@ -47,6 +47,69 @@ lowercase() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+lua_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+lua_bool() {
+  if [[ "$1" == "1" ]]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+lua_slot_map() {
+  local ids="$1"
+  local prefix="$2"
+  if [[ -z "${ids}" ]]; then
+    printf '{}'
+    return
+  fi
+
+  local -a slot_ids
+  local IFS=';'
+  read -r -a slot_ids <<<"${ids}"
+
+  local out="{"
+  local idx=1
+  local slot_id
+  for slot_id in "${slot_ids[@]}"; do
+    if [[ "${idx}" -gt 1 ]]; then
+      out+=", "
+    fi
+    out+="[$(lua_string "${slot_id}")]=$(lua_string "${prefix}_KEY_SLOT_${idx}")"
+    idx=$((idx + 1))
+  done
+  out+="}"
+  printf '%s' "${out}"
+}
+
+lua_default_slot_env() {
+  local ids="$1"
+  local prefix="$2"
+  if [[ -z "${ids}" ]]; then
+    printf 'nil'
+  else
+    lua_string "${prefix}_KEY_SLOT_1"
+  fi
+}
+
+fan_out_slots() {
+  local provider="$1"
+  local env_var="$2"
+  local exports
+  if ! exports="$("${GMCLI_BIN:-gmcli}" slot-env --provider "${provider}" --env-var "${env_var}")"; then
+    log "error: failed to derive upstream key slots for ${env_var}"
+    exit 1
+  fi
+  # shellcheck disable=SC2090 # gmcli emits shell-quoted export lines only.
+  eval "${exports}"
+}
+
 ANTHROPIC_UPSTREAM="${ANTHROPIC_UPSTREAM:-direct}"
 OPENAI_UPSTREAM="${OPENAI_UPSTREAM:-direct}"
 
@@ -122,6 +185,8 @@ ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(ANTHROPIC_API_KEY)%"
 ANTHROPIC_VERSION_APPEND_ACTION=ADD_IF_ABSENT
 ANTHROPIC_SAN_MATCH=exact
 ANTHROPIC_SAN_VALUE="${ANTHROPIC_HOST}"
+ANTHROPIC_STATIC_AUTH=0
+ANTHROPIC_CLOUD=0
 
 case "${ANTHROPIC_UPSTREAM}" in
   direct) ;;
@@ -132,6 +197,10 @@ case "${ANTHROPIC_UPSTREAM}" in
     fi
     if [[ -z "${BEDROCK_API_KEY:-}" ]]; then
       log "error: BEDROCK_API_KEY must be set when ANTHROPIC_UPSTREAM=bedrock"
+      exit 1
+    fi
+    if [[ "${BEDROCK_API_KEY}" == *";"* ]]; then
+      log "error: BEDROCK_API_KEY cannot contain ';' when ANTHROPIC_UPSTREAM=bedrock; cloud backends are single-slot in this release"
       exit 1
     fi
     if [[ ! "${BEDROCK_REGION}" =~ ^[A-Za-z0-9-]+$ ]]; then
@@ -153,6 +222,8 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_VERSION_APPEND_ACTION=OVERWRITE_IF_EXISTS_OR_ADD
     ANTHROPIC_SAN_MATCH=suffix
     ANTHROPIC_SAN_VALUE=.api.aws
+    ANTHROPIC_STATIC_AUTH=1
+    ANTHROPIC_CLOUD=1
     ;;
   *)
     log "error: ANTHROPIC_UPSTREAM must be 'direct' or 'bedrock' (got '${ANTHROPIC_UPSTREAM}')"
@@ -167,6 +238,8 @@ OPENAI_AUTH_HEADER=authorization
 OPENAI_AUTH_VALUE="Bearer %ENVIRONMENT(OPENAI_API_KEY)%"
 OPENAI_SAN_MATCH=exact
 OPENAI_SAN_VALUE="${OPENAI_HOST}"
+OPENAI_STATIC_AUTH=0
+OPENAI_CLOUD=0
 
 case "${OPENAI_UPSTREAM}" in
   direct) ;;
@@ -177,6 +250,10 @@ case "${OPENAI_UPSTREAM}" in
     fi
     if [[ -z "${AZURE_OPENAI_API_KEY:-}" ]]; then
       log "error: AZURE_OPENAI_API_KEY must be set when OPENAI_UPSTREAM=azure"
+      exit 1
+    fi
+    if [[ "${AZURE_OPENAI_API_KEY}" == *";"* ]]; then
+      log "error: AZURE_OPENAI_API_KEY cannot contain ';' when OPENAI_UPSTREAM=azure; cloud backends are single-slot in this release"
       exit 1
     fi
     OPENAI_HOST="$(parse_azure_host "${AZURE_OPENAI_ENDPOINT}")"
@@ -195,6 +272,8 @@ case "${OPENAI_UPSTREAM}" in
     OPENAI_PATH_REWRITE=1
     OPENAI_AUTH_HEADER=api-key
     OPENAI_AUTH_VALUE="%ENVIRONMENT(AZURE_OPENAI_API_KEY)%"
+    OPENAI_STATIC_AUTH=1
+    OPENAI_CLOUD=1
     ;;
   *)
     log "error: OPENAI_UPSTREAM must be 'direct' or 'azure' (got '${OPENAI_UPSTREAM}')"
@@ -237,6 +316,29 @@ if [[ "${HAS_KEY}" -eq 0 ]]; then
   fi
   exit 1
 fi
+
+# ── Fan direct provider keys out into per-slot process env ────────────
+if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  fan_out_slots anthropic ANTHROPIC_API_KEY
+fi
+if [[ "${OPENAI_UPSTREAM}" == "direct" && -n "${OPENAI_API_KEY:-}" ]]; then
+  fan_out_slots openai OPENAI_API_KEY
+fi
+if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+  fan_out_slots gemini GOOGLE_API_KEY
+fi
+if [[ -n "${CHUTES_API_KEY:-}" ]]; then
+  fan_out_slots chutes CHUTES_API_KEY
+fi
+
+GM_ANTHROPIC_SLOT_MAP="$(lua_slot_map "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
+GM_ANTHROPIC_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
+GM_OPENAI_SLOT_MAP="$(lua_slot_map "${GM_OPENAI_SLOT_IDS:-}" "GM_OPENAI")"
+GM_OPENAI_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_OPENAI_SLOT_IDS:-}" "GM_OPENAI")"
+GM_GEMINI_SLOT_MAP="$(lua_slot_map "${GM_GEMINI_SLOT_IDS:-}" "GM_GEMINI")"
+GM_GEMINI_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_GEMINI_SLOT_IDS:-}" "GM_GEMINI")"
+GM_CHUTES_SLOT_MAP="$(lua_slot_map "${GM_CHUTES_SLOT_IDS:-}" "GM_CHUTES")"
+GM_CHUTES_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_CHUTES_SLOT_IDS:-}" "GM_CHUTES")"
 
 # ── Resolve the benchmark upstream ────────────────────────────────────
 # The benchmark URL is hardcoded per network in this script, NOT taken
@@ -296,11 +398,9 @@ fi
 # /etc/envoy/envoy.yaml stays untouched.
 #
 #   1. The node secret. Envoy's inbound Lua filter enforces x-gm-node-key
-#      against a config literal — Envoy's Lua sandbox does not document
-#      os.getenv support, so the secret is substituted in rather than
-#      read at Lua runtime. An unset GM_NODE_SECRET renders an empty
-#      literal, which the filter treats as "skip the check" (a miner
-#      predating node-secret auth).
+#      against a config literal. Provider slot maps render as slot ids and
+#      per-slot env var names only; key values stay in the Envoy process
+#      environment and Lua reads them with os.getenv at request time.
 #   2. The benchmark cluster's host and port — resolved above from the
 #      hardcoded per-network URL.
 #   3. The benchmark cluster's upstream TLS block, delimited by
@@ -318,6 +418,10 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_ANTHROPIC_AUTH_HEADER="${ANTHROPIC_AUTH_HEADER}" \
   GM_ANTHROPIC_AUTH_VALUE="${ANTHROPIC_AUTH_VALUE}" \
   GM_ANTHROPIC_VERSION_APPEND_ACTION="${ANTHROPIC_VERSION_APPEND_ACTION}" \
+  GM_ANTHROPIC_STATIC_AUTH="${ANTHROPIC_STATIC_AUTH}" \
+  GM_ANTHROPIC_CLOUD="$(lua_bool "${ANTHROPIC_CLOUD}")" \
+  GM_ANTHROPIC_SLOT_MAP="${GM_ANTHROPIC_SLOT_MAP}" \
+  GM_ANTHROPIC_DEFAULT_SLOT_ENV="${GM_ANTHROPIC_DEFAULT_SLOT_ENV}" \
   GM_ANTHROPIC_SAN_MATCH="${ANTHROPIC_SAN_MATCH}" \
   GM_ANTHROPIC_SAN_VALUE="${ANTHROPIC_SAN_VALUE}" \
   GM_OPENAI_HOST="${OPENAI_HOST}" \
@@ -325,6 +429,14 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_OPENAI_PATH_REWRITE="${OPENAI_PATH_REWRITE}" \
   GM_OPENAI_AUTH_HEADER="${OPENAI_AUTH_HEADER}" \
   GM_OPENAI_AUTH_VALUE="${OPENAI_AUTH_VALUE}" \
+  GM_OPENAI_STATIC_AUTH="${OPENAI_STATIC_AUTH}" \
+  GM_OPENAI_CLOUD="$(lua_bool "${OPENAI_CLOUD}")" \
+  GM_OPENAI_SLOT_MAP="${GM_OPENAI_SLOT_MAP}" \
+  GM_OPENAI_DEFAULT_SLOT_ENV="${GM_OPENAI_DEFAULT_SLOT_ENV}" \
+  GM_GEMINI_SLOT_MAP="${GM_GEMINI_SLOT_MAP}" \
+  GM_GEMINI_DEFAULT_SLOT_ENV="${GM_GEMINI_DEFAULT_SLOT_ENV}" \
+  GM_CHUTES_SLOT_MAP="${GM_CHUTES_SLOT_MAP}" \
+  GM_CHUTES_DEFAULT_SLOT_ENV="${GM_CHUTES_DEFAULT_SLOT_ENV}" \
   GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
   GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
   awk '
@@ -348,6 +460,10 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     anthropic_auth_header = ENVIRON["GM_ANTHROPIC_AUTH_HEADER"]
     anthropic_auth_value = ENVIRON["GM_ANTHROPIC_AUTH_VALUE"]
     anthropic_version_append_action = ENVIRON["GM_ANTHROPIC_VERSION_APPEND_ACTION"]
+    anthropic_static_auth = (ENVIRON["GM_ANTHROPIC_STATIC_AUTH"] == "1")
+    anthropic_cloud = ENVIRON["GM_ANTHROPIC_CLOUD"]
+    anthropic_slot_map = ENVIRON["GM_ANTHROPIC_SLOT_MAP"]
+    anthropic_default_slot_env = ENVIRON["GM_ANTHROPIC_DEFAULT_SLOT_ENV"]
     anthropic_san_match = ENVIRON["GM_ANTHROPIC_SAN_MATCH"]
     anthropic_san_value = ENVIRON["GM_ANTHROPIC_SAN_VALUE"]
     openai_host = ENVIRON["GM_OPENAI_HOST"]
@@ -355,6 +471,14 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     openai_path_rewrite = (ENVIRON["GM_OPENAI_PATH_REWRITE"] == "1")
     openai_auth_header = ENVIRON["GM_OPENAI_AUTH_HEADER"]
     openai_auth_value = ENVIRON["GM_OPENAI_AUTH_VALUE"]
+    openai_static_auth = (ENVIRON["GM_OPENAI_STATIC_AUTH"] == "1")
+    openai_cloud = ENVIRON["GM_OPENAI_CLOUD"]
+    openai_slot_map = ENVIRON["GM_OPENAI_SLOT_MAP"]
+    openai_default_slot_env = ENVIRON["GM_OPENAI_DEFAULT_SLOT_ENV"]
+    gemini_slot_map = ENVIRON["GM_GEMINI_SLOT_MAP"]
+    gemini_default_slot_env = ENVIRON["GM_GEMINI_DEFAULT_SLOT_ENV"]
+    chutes_slot_map = ENVIRON["GM_CHUTES_SLOT_MAP"]
+    chutes_default_slot_env = ENVIRON["GM_CHUTES_DEFAULT_SLOT_ENV"]
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
   }
@@ -364,9 +488,15 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   /^[[:space:]]*## gm:anthropic-path-rewrite-begin[[:space:]]*$/ { in_anthropic_path_rewrite = 1; next }
   /^[[:space:]]*## gm:anthropic-path-rewrite-end[[:space:]]*$/   { in_anthropic_path_rewrite = 0; next }
   in_anthropic_path_rewrite && !anthropic_path_rewrite { next }
+  /^[[:space:]]*## gm:anthropic-static-auth-begin[[:space:]]*$/ { in_anthropic_static_auth = 1; next }
+  /^[[:space:]]*## gm:anthropic-static-auth-end[[:space:]]*$/   { in_anthropic_static_auth = 0; next }
+  in_anthropic_static_auth && !anthropic_static_auth { next }
   /^[[:space:]]*## gm:openai-path-rewrite-begin[[:space:]]*$/ { in_openai_path_rewrite = 1; next }
   /^[[:space:]]*## gm:openai-path-rewrite-end[[:space:]]*$/   { in_openai_path_rewrite = 0; next }
   in_openai_path_rewrite && !openai_path_rewrite { next }
+  /^[[:space:]]*## gm:openai-static-auth-begin[[:space:]]*$/ { in_openai_static_auth = 1; next }
+  /^[[:space:]]*## gm:openai-static-auth-end[[:space:]]*$/   { in_openai_static_auth = 0; next }
+  in_openai_static_auth && !openai_static_auth { next }
   {
     line = subst($0, "__GM_NODE_SECRET__", secret)
     line = subst(line, "__GM_BENCHMARK_HOST__", bench_host)
@@ -376,12 +506,22 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_ANTHROPIC_AUTH_HEADER__", anthropic_auth_header)
     line = subst(line, "__GM_ANTHROPIC_AUTH_VALUE__", anthropic_auth_value)
     line = subst(line, "__GM_ANTHROPIC_VERSION_APPEND_ACTION__", anthropic_version_append_action)
+    line = subst(line, "__GM_ANTHROPIC_CLOUD__", anthropic_cloud)
+    line = subst(line, "__GM_ANTHROPIC_SLOT_MAP__", anthropic_slot_map)
+    line = subst(line, "__GM_ANTHROPIC_DEFAULT_SLOT_ENV__", anthropic_default_slot_env)
     line = subst(line, "__GM_ANTHROPIC_SAN_MATCH__", anthropic_san_match)
     line = subst(line, "__GM_ANTHROPIC_SAN_VALUE__", anthropic_san_value)
     line = subst(line, "__GM_OPENAI_HOST__", openai_host)
     line = subst(line, "__GM_OPENAI_PORT__", openai_port)
     line = subst(line, "__GM_OPENAI_AUTH_HEADER__", openai_auth_header)
     line = subst(line, "__GM_OPENAI_AUTH_VALUE__", openai_auth_value)
+    line = subst(line, "__GM_OPENAI_CLOUD__", openai_cloud)
+    line = subst(line, "__GM_OPENAI_SLOT_MAP__", openai_slot_map)
+    line = subst(line, "__GM_OPENAI_DEFAULT_SLOT_ENV__", openai_default_slot_env)
+    line = subst(line, "__GM_GEMINI_SLOT_MAP__", gemini_slot_map)
+    line = subst(line, "__GM_GEMINI_DEFAULT_SLOT_ENV__", gemini_default_slot_env)
+    line = subst(line, "__GM_CHUTES_SLOT_MAP__", chutes_slot_map)
+    line = subst(line, "__GM_CHUTES_DEFAULT_SLOT_ENV__", chutes_default_slot_env)
     line = subst(line, "__GM_OPENAI_SAN_MATCH__", openai_san_match)
     line = subst(line, "__GM_OPENAI_SAN_VALUE__", openai_san_value)
     print line

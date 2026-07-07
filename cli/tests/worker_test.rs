@@ -40,6 +40,7 @@ fn worker_create_request_serialises_to_registry_shape() {
         os_image_hash: "b".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
         backend: None,
+        provider_slots: None,
     })
     .unwrap();
 
@@ -70,6 +71,7 @@ fn worker_create_request_omits_absent_node_secret() {
         os_image_hash: "d".repeat(64).as_str(),
         node_secret: None,
         backend: None,
+        provider_slots: None,
     })
     .unwrap();
 
@@ -104,6 +106,7 @@ fn worker_create_request_carries_bedrock_backend_from_config() {
         os_image_hash: "f".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
         backend: keys.worker_backend(),
+        provider_slots: None,
     })
     .unwrap();
 
@@ -123,6 +126,7 @@ fn worker_create_request_carries_azure_backend_from_config() {
         os_image_hash: "2".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
         backend: keys.worker_backend(),
+        provider_slots: None,
     })
     .unwrap();
 
@@ -143,6 +147,7 @@ fn worker_create_request_omits_direct_backend_from_config() {
         os_image_hash: "4".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
         backend: keys.worker_backend(),
+        provider_slots: None,
     })
     .unwrap();
 
@@ -150,6 +155,35 @@ fn worker_create_request_omits_direct_backend_from_config() {
     assert!(
         !obj.contains_key("backend"),
         "direct workers omit backend instead of serialising null: {body}"
+    );
+}
+
+#[test]
+fn worker_create_request_serialises_provider_slots_when_present() {
+    let provider_slots = std::collections::BTreeMap::from([
+        (
+            "anthropic".to_owned(),
+            vec!["ZITBCTOEBDW4".to_owned(), "UPJNFA27FVZP".to_owned()],
+        ),
+        ("gemini".to_owned(), vec!["AAAAAAAAAAAA".to_owned()]),
+    ]);
+    let body = serde_json::to_value(WorkerCreateRequest {
+        endpoint: "https://app_slots-8080s.dstack-prod5.phala.network",
+        attestation_endpoint: "https://app_slots-8080s.dstack-prod5.phala.network",
+        compose_hash: "5".repeat(64).as_str(),
+        os_image_hash: "6".repeat(64).as_str(),
+        node_secret: Some("deadbeef"),
+        backend: None,
+        provider_slots: Some(&provider_slots),
+    })
+    .unwrap();
+
+    assert_eq!(
+        body["provider_slots"],
+        serde_json::json!({
+            "anthropic": ["ZITBCTOEBDW4", "UPJNFA27FVZP"],
+            "gemini": ["AAAAAAAAAAAA"],
+        })
     );
 }
 
@@ -261,6 +295,7 @@ async fn worker_add_puts_exact_body_with_per_worker_secret_on_the_wire() {
         os_image_hash: "b".repeat(64).as_str(),
         node_secret: Some("per-worker-secret"),
         backend: None,
+        provider_slots: None,
     })
     .unwrap();
 

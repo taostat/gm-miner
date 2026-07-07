@@ -105,6 +105,14 @@ gmcli set-api-keys --chutes cpk-...
 ```
 
 Each flag replaces the stored value; omitted flags leave existing values intact.
+For direct upstreams, each existing key flag also accepts up to 8 semicolon-separated keys. The
+miner advertises opaque slot ids for those keys so the gateway can pick one per request:
+
+```sh
+gmcli set-api-keys --anthropic "sk-ant-a;sk-ant-b;sk-ant-c"
+```
+
+See [multi-key slots](docs/multi-key-slots.md) for the slot behavior and limits.
 
 To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
 API, select Bedrock and provide the Bedrock region and API key:
@@ -130,7 +138,9 @@ Azure OpenAI must have deployments named exactly like the gm model id, for examp
 the miner does not rewrite Azure model ids. Bedrock model-id translation is handled by the
 gateway before requests reach the miner. Worker backend provenance is auto-derived from these
 selectors when you deploy: `anthropic-upstream=bedrock` registers `bedrock`, otherwise
-`openai-upstream=azure` registers `azure`, and direct workers omit the backend field.
+`openai-upstream=azure` registers `azure`, and direct workers omit the backend field. Bedrock and
+Azure keys are single-slot in this release; semicolons in `BEDROCK_API_KEY` or
+`AZURE_OPENAI_API_KEY` are rejected.
 
 ### 4. Deploy your miner
 

@@ -273,6 +273,8 @@ static_resources:
                           route:
                             cluster: attestd
                             timeout: 10s
+                          request_headers_to_remove:
+                            - x-gm-upstream-slot
                           ## Exempt the attestation surface from the
                           ##  inbound rate limit. The registry's control
                           ##  loop probes this path every cycle and
@@ -331,17 +333,19 @@ static_resources:
                             ##  Applied uniformly across the provider routes below.
                             timeout: 620s
                           request_headers_to_remove:
-                            - authorization
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
                             - x-gm-node-key
                             - x-gm-provider
+                            - x-gm-upstream-slot
                           request_headers_to_add:
+                            ## gm:anthropic-static-auth-begin
                             - header:
                                 key: __GM_ANTHROPIC_AUTH_HEADER__
                                 value: "__GM_ANTHROPIC_AUTH_VALUE__"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                            ## gm:anthropic-static-auth-end
                             - header:
                                 key: anthropic-version
                                 value: "2023-06-01"
@@ -367,17 +371,19 @@ static_resources:
                             ## gm:openai-path-rewrite-end
                             timeout: 620s
                           request_headers_to_remove:
-                            - authorization
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
                             - x-gm-node-key
                             - x-gm-provider
+                            - x-gm-upstream-slot
+                          ## gm:openai-static-auth-begin
                           request_headers_to_add:
                             - header:
                                 key: __GM_OPENAI_AUTH_HEADER__
                                 value: "__GM_OPENAI_AUTH_VALUE__"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                          ## gm:openai-static-auth-end
 
                         ## ── Chutes ──────────────────────────────────────────
                         ##  Enabled only when CHUTES_API_KEY is set.
@@ -392,17 +398,12 @@ static_resources:
                             host_rewrite_literal: llm.chutes.ai
                             timeout: 620s
                           request_headers_to_remove:
-                            - authorization
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
                             - x-gm-node-key
                             - x-gm-provider
-                          request_headers_to_add:
-                            - header:
-                                key: authorization
-                                value: "Bearer %ENVIRONMENT(CHUTES_API_KEY)%"
-                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                            - x-gm-upstream-slot
 
                         ## ── Gemini ──────────────────────────────────────────
                         ##  Enabled only when GOOGLE_API_KEY is set.
@@ -417,17 +418,12 @@ static_resources:
                             host_rewrite_literal: generativelanguage.googleapis.com
                             timeout: 620s
                           request_headers_to_remove:
-                            - authorization
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
                             - x-gm-node-key
                             - x-gm-provider
-                          request_headers_to_add:
-                            - header:
-                                key: x-goog-api-key
-                                value: "%ENVIRONMENT(GOOGLE_API_KEY)%"
-                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                            - x-gm-upstream-slot
 
                         ## ── Benchmark ───────────────────────────────────────
                         ##  A plain proxy to the synthetic benchmark upstream —
@@ -446,11 +442,13 @@ static_resources:
                             host_rewrite_literal: __GM_BENCHMARK_HOST__
                             timeout: 620s
                           request_headers_to_remove:
+                            - authorization
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
                             - x-gm-node-key
                             - x-gm-provider
+                            - x-gm-upstream-slot
 
                         ## ── Fallback: no provider matched ─────────────────────
                         ##  Catch-all for requests whose `x-gm-provider` header
@@ -467,9 +465,12 @@ static_resources:
                             body:
                               inline_string: |
                                 {"error":"provider not configured on this miner"}
+                          request_headers_to_remove:
+                            - authorization
+                            - x-gm-upstream-slot
 
                 http_filters:
-                  ## ── Inbound node-secret auth ────────────────────────
+                  ## ── Inbound node-secret auth + slot selection ────────
                   ##  Mechanism 1 of attestation-and-identity.md. The Lua
                   ##  filter compares the `x-gm-node-key` request header
                   ##  against the expected secret and rejects a mismatch
@@ -479,22 +480,136 @@ static_resources:
                   ##  placeholder below with the value of the
                   ##  `GM_NODE_SECRET` env var at container start, then
                   ##  execs envoy against the rendered config. The secret
-                  ##  is a config literal at runtime — the filter does not
-                  ##  depend on Lua reading the process environment, which
-                  ##  Envoy's Lua sandbox does not document as supported.
-                  ##  When `GM_NODE_SECRET` is unset `start.sh` substitutes
-                  ##  an empty string and the filter skips the check, so a
-                  ##  miner predating node-secret auth still serves.
+                  ##  is a config literal at runtime. Provider keys are
+                  ##  different: start.sh fans them out into per-slot
+                  ##  process env vars and renders only slot ids + env var
+                  ##  names below. Lua reads those env vars at request time
+                  ##  with os.getenv, sets the provider auth header for
+                  ##  direct upstreams, and returns 421 for an unavailable
+                  ##  slot before the router can forward upstream.
                   - name: envoy.filters.http.lua
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
                       default_source_code:
                         inline_string: |
                           local expected = "__GM_NODE_SECRET__"
-                          function envoy_on_request(handle)
-                            if expected == "" then
-                              return
+                          local slot_config = {
+                            anthropic = {
+                              cloud = __GM_ANTHROPIC_CLOUD__,
+                              direct_env = "ANTHROPIC_API_KEY",
+                              default_env = __GM_ANTHROPIC_DEFAULT_SLOT_ENV__,
+                              slots = __GM_ANTHROPIC_SLOT_MAP__,
+                            },
+                            openai = {
+                              cloud = __GM_OPENAI_CLOUD__,
+                              direct_env = "OPENAI_API_KEY",
+                              default_env = __GM_OPENAI_DEFAULT_SLOT_ENV__,
+                              slots = __GM_OPENAI_SLOT_MAP__,
+                            },
+                            gemini = {
+                              cloud = false,
+                              direct_env = "GOOGLE_API_KEY",
+                              default_env = __GM_GEMINI_DEFAULT_SLOT_ENV__,
+                              slots = __GM_GEMINI_SLOT_MAP__,
+                            },
+                            chutes = {
+                              cloud = false,
+                              direct_env = "CHUTES_API_KEY",
+                              default_env = __GM_CHUTES_DEFAULT_SLOT_ENV__,
+                              slots = __GM_CHUTES_SLOT_MAP__,
+                            },
+                          }
+
+                          local function json_escape(value)
+                            value = tostring(value or "")
+                            value = value:gsub("\\", "\\\\")
+                            value = value:gsub("\"", "\\\"")
+                            value = value:gsub("[%z\1-\31]", function(ch)
+                              return string.format("\\u%04x", string.byte(ch))
+                            end)
+                            return value
+                          end
+
+                          local function slot_unavailable(handle, slot_id)
+                            handle:respond(
+                              {[":status"] = "421",
+                               ["content-type"] = "application/json"},
+                              "{\"error\":{\"type\":\"gm_slot_unavailable\",\"slot_id\":\"" ..
+                                json_escape(slot_id) .. "\"}}")
+                          end
+
+                          local function strip_inbound_auth(headers)
+                            headers:remove("authorization")
+                            headers:remove("x-api-key")
+                            headers:remove("x-goog-api-key")
+                            headers:remove("api-key")
+                          end
+
+                          local function getenv(name)
+                            if os == nil or os.getenv == nil then
+                              return nil
                             end
+                            return os.getenv(name)
+                          end
+
+                          local function set_direct_auth(headers, provider, key)
+                            if provider == "anthropic" then
+                              headers:remove("x-api-key")
+                              headers:add("x-api-key", key)
+                            elseif provider == "openai" then
+                              headers:remove("authorization")
+                              headers:add("authorization", "Bearer " .. key)
+                            elseif provider == "gemini" then
+                              headers:remove("x-goog-api-key")
+                              headers:add("x-goog-api-key", key)
+                            elseif provider == "chutes" then
+                              headers:remove("authorization")
+                              headers:add("authorization", "Bearer " .. key)
+                            end
+                          end
+
+                          local function select_upstream_slot(handle, provider)
+                            local cfg = slot_config[provider]
+                            if cfg == nil then
+                              return true
+                            end
+
+                            local headers = handle:headers()
+                            local requested = headers:get("x-gm-upstream-slot")
+                            if cfg.cloud then
+                              if requested ~= nil then
+                                slot_unavailable(handle, requested)
+                                return false
+                              end
+                              return true
+                            end
+
+                            local env_name = nil
+                            if requested ~= nil then
+                              env_name = cfg.slots[requested]
+                              if env_name == nil then
+                                slot_unavailable(handle, requested)
+                                return false
+                              end
+                            else
+                              env_name = cfg.default_env or cfg.direct_env
+                            end
+
+                            local key = getenv(env_name)
+                            if key == nil then
+                              if env_name == cfg.direct_env then
+                                key = ""
+                              else
+                                slot_unavailable(handle, requested or "")
+                                return false
+                              end
+                            end
+
+                            set_direct_auth(headers, provider, key)
+                            return true
+                          end
+
+                          function envoy_on_request(handle)
                             -- The attestation surface is public by
                             -- contract: the registry's control loop
                             -- probes GET /attestation/info WITHOUT the
@@ -509,12 +624,21 @@ static_resources:
                             if bare == "/attestation/info" then
                               return
                             end
-                            local presented = handle:headers():get("x-gm-node-key")
-                            if presented ~= expected then
-                              handle:respond(
-                                {[":status"] = "401",
-                                 ["content-type"] = "application/json"},
-                                "{\"error\":\"missing or invalid x-gm-node-key\"}")
+                            local headers = handle:headers()
+                            if expected ~= "" then
+                              local presented = headers:get("x-gm-node-key")
+                              if presented ~= expected then
+                                handle:respond(
+                                  {[":status"] = "401",
+                                   ["content-type"] = "application/json"},
+                                  "{\"error\":\"missing or invalid x-gm-node-key\"}")
+                                return
+                              end
+                            end
+                            strip_inbound_auth(headers)
+                            local provider = headers:get("x-gm-provider")
+                            if not select_upstream_slot(handle, provider) then
+                              return
                             end
                           end
                   ## ── Graceful load shedding ──────────────────────────
@@ -633,6 +757,7 @@ static_resources:
                             timeout: 10s
                           request_headers_to_remove:
                             - x-gm-node-key
+                            - x-gm-upstream-slot
                         ## Every other path — including the rest of the
                         ## admin surface — returns 404 and never reaches
                         ## the admin port.
@@ -643,6 +768,8 @@ static_resources:
                             body:
                               inline_string: |
                                 {"error":"not found; only /stats/prometheus is exposed"}
+                          request_headers_to_remove:
+                            - x-gm-upstream-slot
                 http_filters:
                   ## Same node-secret gate as the data plane, without
                   ## the /attestation/info exemption — every path here
