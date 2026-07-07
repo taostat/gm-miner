@@ -530,6 +530,11 @@ static_resources:
                             return value
                           end
 
+                          -- 421 is reserved for slot mismatch by the
+                          -- upstream-key-slots protocol contract
+                          -- (gm repo, docs/contracts/upstream-key-slots.md):
+                          -- no provider returns it through these routes,
+                          -- so the gateway classifies it pre-stream.
                           local function slot_unavailable(handle, slot_id)
                             handle:respond(
                               {[":status"] = "421",
@@ -552,29 +557,27 @@ static_resources:
                             return os.getenv(name)
                           end
 
+                          -- Callers must strip_inbound_auth(headers)
+                          -- first; these adds rely on the auth headers
+                          -- already being gone.
                           local function set_direct_auth(headers, provider, key)
                             if provider == "anthropic" then
-                              headers:remove("x-api-key")
                               headers:add("x-api-key", key)
                             elseif provider == "openai" then
-                              headers:remove("authorization")
                               headers:add("authorization", "Bearer " .. key)
                             elseif provider == "gemini" then
-                              headers:remove("x-goog-api-key")
                               headers:add("x-goog-api-key", key)
                             elseif provider == "chutes" then
-                              headers:remove("authorization")
                               headers:add("authorization", "Bearer " .. key)
                             end
                           end
 
-                          local function select_upstream_slot(handle, provider)
+                          local function select_upstream_slot(handle, headers, provider)
                             local cfg = slot_config[provider]
                             if cfg == nil then
                               return true
                             end
 
-                            local headers = handle:headers()
                             local requested = headers:get("x-gm-upstream-slot")
                             if cfg.cloud then
                               if requested ~= nil then
@@ -619,12 +622,12 @@ static_resources:
                             -- still requires x-gm-node-key. The :path
                             -- pseudo-header carries the query string
                             -- (?nonce=...), so strip it before matching.
-                            local path = handle:headers():get(":path") or ""
+                            local headers = handle:headers()
+                            local path = headers:get(":path") or ""
                             local bare = path:match("^[^?]*")
                             if bare == "/attestation/info" then
                               return
                             end
-                            local headers = handle:headers()
                             if expected ~= "" then
                               local presented = headers:get("x-gm-node-key")
                               if presented ~= expected then
@@ -637,7 +640,7 @@ static_resources:
                             end
                             strip_inbound_auth(headers)
                             local provider = headers:get("x-gm-provider")
-                            if not select_upstream_slot(handle, provider) then
+                            if not select_upstream_slot(handle, headers, provider) then
                               return
                             end
                           end

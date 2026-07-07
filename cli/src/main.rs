@@ -725,15 +725,10 @@ fn cmd_slot_env(provider: &Provider, env_var: &str) -> Result<()> {
     if matches!(provider, Provider::Benchmark) {
         anyhow::bail!("benchmark does not use upstream key slots");
     }
-    let node_secret = std::env::var("GM_NODE_SECRET")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("GM_NODE_SECRET must be set to derive upstream key slots")
-        })?;
-    let raw = std::env::var(env_var)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
+    let node_secret = gm_miner_cli::deploy::non_empty_env("GM_NODE_SECRET").ok_or_else(|| {
+        anyhow::anyhow!("GM_NODE_SECRET must be set to derive upstream key slots")
+    })?;
+    let raw = gm_miner_cli::deploy::non_empty_env(env_var)
         .ok_or_else(|| anyhow::anyhow!("{env_var} must be set to derive upstream key slots"))?;
     print!(
         "{}",
