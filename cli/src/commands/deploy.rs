@@ -454,6 +454,7 @@ pub(crate) async fn cmd_deploy(
                 app_name: args.app_name.clone(),
                 node_secret: node_secret.clone(),
                 backend: worker_backend.clone(),
+                provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
                 provisional_secondary,
             },
         )?;
@@ -528,6 +529,7 @@ pub(crate) async fn cmd_deploy(
             app_name: args.app_name.clone(),
             node_secret: node_secret.clone(),
             backend: worker_backend.clone(),
+            provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
             provisional_secondary,
         },
     )?;
@@ -573,6 +575,7 @@ pub(crate) async fn cmd_deploy(
             app_name: args.app_name.clone(),
             node_secret: node_secret.clone(),
             backend: worker_backend,
+            provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
             // Registered: role is read from position, never this flag.
             provisional_secondary: false,
         },
@@ -769,6 +772,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
                 app_name,
                 node_secret: secret,
                 backend: register_backend,
+                provider_slots: provider_slots.clone(),
                 provisional_secondary: false,
             },
         )?;
@@ -828,13 +832,12 @@ fn register_image_context(cfg: &Config, app_id: &str) -> Result<RegisterImageCon
             .and_then(config::NetworkEntry::legacy_node_secret)
             .map(str::to_owned)
     });
-    let provider_slots = cfg
-        .provider_keys
-        .as_ref()
-        .zip(node_secret.as_deref())
-        .map(|(keys, secret)| slots::provider_slots_for_keys(keys, secret))
-        .transpose()?
-        .filter(|slots| !slots.is_empty());
+    // Re-send the slot ids recorded at deploy time, never a re-derivation
+    // from current config: local keys may have changed since this CVM was
+    // deployed, and advertising slots the worker does not hold turns every
+    // slot-routed request into a 421. An untracked CVM has no record, so it
+    // re-registers unslotted until a proper deploy.
+    let provider_slots = tracked.and_then(|w| w.provider_slots.clone());
     Ok(RegisterImageContext {
         node_secret,
         existing_app_name: tracked.map(|w| w.app_name.clone()),

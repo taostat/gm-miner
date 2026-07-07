@@ -93,6 +93,37 @@ fn direct_multikey_render_contains_slot_ids_not_key_values() {
 }
 
 #[test]
+fn no_node_secret_single_key_falls_back_to_direct_env() {
+    // Legacy/no-node-secret deployments cannot derive slot ids; a single
+    // direct key must keep rendering via the pre-slot direct env fallback.
+    let (status, _, stderr, rendered) = render_envoy([
+        ("GM_NODE_SECRET", ""),
+        ("ANTHROPIC_API_KEY", "sk-ant-legacy"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert!(!rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
+    assert!(rendered.contains("exact: api.anthropic.com"));
+    assert!(!rendered.contains("sk-ant-legacy"));
+}
+
+#[test]
+fn no_node_secret_multikey_fails_fast() {
+    let (status, _, stderr, _) = render_envoy([
+        ("GM_NODE_SECRET", ""),
+        ("ANTHROPIC_API_KEY", "sk-ant-a;sk-ant-b"),
+    ]);
+    assert!(
+        !status.success(),
+        "multi-key without a node secret must fail"
+    );
+    assert!(
+        stderr.contains("GM_NODE_SECRET is unset"),
+        "actionable error expected, got: {stderr}"
+    );
+    assert!(!stderr.contains("sk-ant-a"), "no key material in errors");
+}
+
+#[test]
 fn bedrock_and_azure_render_cloud_upstreams() {
     let (status, _, stderr, rendered) = render_envoy([
         ("ANTHROPIC_UPSTREAM", "bedrock"),

@@ -101,6 +101,17 @@ lua_default_slot_env() {
 fan_out_slots() {
   local provider="$1"
   local env_var="$2"
+  # Legacy/no-node-secret deployments cannot derive slot ids (the HMAC key
+  # is the node secret). A single key keeps working through the direct env
+  # fallback in the Lua filter; multiple keys have nothing to select them
+  # by, so that combination is a configuration error.
+  if [[ -z "${GM_NODE_SECRET:-}" ]]; then
+    if [[ "${!env_var:-}" == *";"* ]]; then
+      log "error: ${env_var} holds multiple keys but GM_NODE_SECRET is unset; upstream key slots require a node secret"
+      exit 1
+    fi
+    return 0
+  fi
   local exports
   if ! exports="$("${GMCLI_BIN:-gmcli}" slot-env --provider "${provider}" --env-var "${env_var}")"; then
     log "error: failed to derive upstream key slots for ${env_var}"
