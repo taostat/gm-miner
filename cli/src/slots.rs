@@ -162,6 +162,32 @@ pub fn validate_cloud_backend_single_keys(keys: &ProviderKeys) -> Result<()> {
     Ok(())
 }
 
+/// Reject semicolon-separated direct keys when the deploy target image
+/// cannot fan them out.
+///
+/// A legacy image's entrypoint passes the raw value as ONE credential —
+/// every provider request would fail against a key like `sk-a;sk-b`.
+///
+/// # Errors
+/// Returns an error naming the offending env var when any configured
+/// direct-provider key holds multiple segments.
+pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
+    let direct = [
+        ("ANTHROPIC_API_KEY", keys.anthropic.as_deref()),
+        ("OPENAI_API_KEY", keys.openai.as_deref()),
+        ("GOOGLE_API_KEY", keys.google.as_deref()),
+        ("CHUTES_API_KEY", keys.chutes.as_deref()),
+    ];
+    for (var, value) in direct {
+        if has_semicolon(value) {
+            bail!(
+                "{var} holds multiple keys but the selected image predates upstream                  key slots; deploy a slot-capable version (newer --version) or drop                  the extra keys"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[must_use]
 pub fn shell_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
@@ -216,6 +242,22 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn legacy_image_rejects_multikey_but_allows_single() {
+        let mut keys = ProviderKeys {
+            anthropic: Some("sk-a;sk-b".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let err = reject_multikey_for_legacy_image(&keys).expect_err("multi-key must fail");
+        assert!(err.to_string().contains("ANTHROPIC_API_KEY"));
+        assert!(
+            !err.to_string().contains("sk-a"),
+            "no key material in errors"
+        );
+        keys.anthropic = Some("sk-single".to_owned());
+        reject_multikey_for_legacy_image(&keys).expect("single key is legacy-safe");
+    }
 
     #[test]
     fn derives_pinned_slot_vector() {

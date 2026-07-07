@@ -135,6 +135,7 @@ fn mismatched_hashes_produce_error() {
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
         image_ref: None,
+        features: vec![],
     };
 
     // Phala Cloud returns DIFFERENT hashes (simulates a tampered deploy).
@@ -173,6 +174,7 @@ fn compose_mismatch_error_is_specific() {
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
         image_ref: None,
+        features: vec![],
     };
     let actual = DstackDeployResult {
         compose_sha256: "wrong-compose".to_owned(),
@@ -198,6 +200,7 @@ fn os_hash_mismatch_error_is_specific() {
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
         image_ref: None,
+        features: vec![],
     };
     let actual = DstackDeployResult {
         compose_sha256: "correct-compose".to_owned(),
@@ -223,6 +226,7 @@ fn matched_hashes_succeed() {
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
         image_ref: None,
+        features: vec![],
     };
     let actual = DstackDeployResult {
         compose_sha256: "abc123".to_owned(),

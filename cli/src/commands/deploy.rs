@@ -16,8 +16,8 @@ use gm_miner_cli::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
         parse_phala_cvm_endpoint, parse_phala_cvm_name, preflight_phala_cli, prepare_deploy_target,
         resolve_image_source, resolve_registry_credentials, select_version,
-        to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, PhalaClient,
-        PHALA_ENDPOINT_FIELD,
+        to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, ImageVersion,
+        PhalaClient, PHALA_ENDPOINT_FIELD,
     },
     node_secret, slots, terms,
     types::{MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse},
@@ -342,6 +342,18 @@ async fn phala_preflight(args: &DeployArgs) -> Result<Option<String>> {
     gm_miner_cli::phala::resolve_key(args.phala_api_key.as_deref(), args.assume_yes).await
 }
 
+/// Whether the deploy target is a slot-capable image.
+///
+/// Capability comes from the SELECTED APPROVED ROW's publish-time feature
+/// stamp. A custom `--image-ref`/`--image-repo` image is opaque to that
+/// row, so it is treated as legacy: slots are never advertised for an
+/// entrypoint the registry cannot vouch for (registration would reject
+/// the claim anyway; deciding here keeps a multi-key env from ever
+/// reaching a CVM that cannot parse it).
+fn image_is_slot_capable(args: &DeployArgs, approved: &ImageVersion) -> bool {
+    args.image_ref.is_none() && args.image_repo.is_none() && approved.slot_capable()
+}
+
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
 /// overridden by `--image-ref`, built locally for `--image-repo`), provision
 /// it, and render the compose template around the resulting digest-pinned ref.
@@ -421,6 +433,30 @@ pub(crate) async fn cmd_deploy(
     // stores all stay in lockstep (Mechanism 1 of attestation-and-identity.md).
     // Only worker #1 (`deploy`) may inherit a pre-multi-worker legacy
     // secret; a `worker add` must always mint its own.
+    // The Phala CLI + API-key gate already ran in `cmd_deploy_subcommand`,
+    // which scoped the validated key onto the `phala` client. The `phala`
+    // client passed in here carries it.
+
+    // Step 2: auth preflight. The Phala Cloud deploy is slow and
+    // irreversible for the operator (CVM created), so we refuse to start
+    // the deploy unless the registry will accept the eventual
+    // registration. The preflight is a cheap `GET /miners/me` — a missing
+    // token / 401 fails fast with an actionable message before any CVM work.
+    client.preflight_auth().await?;
+
+    // Step 3: fetch approved image versions from the registry.
+    let registry_url = cfg.api_url();
+    println!("Fetching approved image versions from {registry_url} ...");
+    let versions = fetch_supported_versions(&registry_url).await?;
+
+    // Step 4: select the target version.
+    let approved = select_version(&versions, args.version)?;
+    println!(
+        "Selected version {}  ({})",
+        approved.notes.as_deref().unwrap_or("<no notes>"),
+        format_created_at(&approved.created_at),
+    );
+
     let is_first = *registration == WorkerRegistration::First;
     // A provisional stub from a `worker add` must stay off the worker-#1
     // registration paths even before it has a worker_id; tag it so the
@@ -434,7 +470,16 @@ pub(crate) async fn cmd_deploy(
     let existing_worker_id = existing_worker_id_for(cfg, &args.app_name);
     let (node_secret, freshly_generated) =
         node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
-    let provider_slots = slots::provider_slots_for_keys(keys, &node_secret)?;
+    let provider_slots = if image_is_slot_capable(args, approved) {
+        slots::provider_slots_for_keys(keys, &node_secret)?
+    } else {
+        // The target image's entrypoint predates slots: it cannot fan out
+        // multi-key values or honor x-gm-upstream-slot. Refuse multi-key
+        // configs before any CVM launches, and advertise nothing so the
+        // worker registers as legacy.
+        slots::reject_multikey_for_legacy_image(keys)?;
+        std::collections::BTreeMap::new()
+    };
     if freshly_generated {
         println!(
             "Generated a fresh node secret for worker '{}'.",
@@ -459,30 +504,6 @@ pub(crate) async fn cmd_deploy(
             },
         )?;
     }
-
-    // The Phala CLI + API-key gate already ran in `cmd_deploy_subcommand`,
-    // which scoped the validated key onto the `phala` client. The `phala`
-    // client passed in here carries it.
-
-    // Step 2: auth preflight. The Phala Cloud deploy is slow and
-    // irreversible for the operator (CVM created), so we refuse to start
-    // the deploy unless the registry will accept the eventual
-    // registration. The preflight is a cheap `GET /miners/me` — a missing
-    // token / 401 fails fast with an actionable message before any CVM work.
-    client.preflight_auth().await?;
-
-    // Step 3: fetch approved image versions from the registry.
-    let registry_url = cfg.api_url();
-    println!("Fetching approved image versions from {registry_url} ...");
-    let versions = fetch_supported_versions(&registry_url).await?;
-
-    // Step 4: select the target version.
-    let approved = select_version(&versions, args.version)?;
-    println!(
-        "Selected version {}  ({})",
-        approved.notes.as_deref().unwrap_or("<no notes>"),
-        format_created_at(&approved.created_at),
-    );
 
     // Step 5: resolve which image to deploy (default = the gm-published ref
     // on the selected version) and render the compose around it.

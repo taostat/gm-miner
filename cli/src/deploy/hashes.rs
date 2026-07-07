@@ -115,6 +115,7 @@ mod tests {
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: None,
+            features: vec![],
         }
     }
 

@@ -21,6 +21,21 @@ pub struct ImageVersion {
     /// guidance toward `--image-ref` / `--image-repo`.
     #[serde(default)]
     pub image_ref: Option<String>,
+    /// Capability stamp from the publish pipeline
+    /// (docs/contracts/upstream-key-slots.md in the gm repo, "Slot
+    /// capability" section). Rows published before the field exists
+    /// default to empty: old images advertise no features.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl ImageVersion {
+    /// `true` when this image's entrypoint understands upstream key
+    /// slots (multi-key fan-out and the `x-gm-upstream-slot` header).
+    #[must_use]
+    pub fn slot_capable(&self) -> bool {
+        self.features.iter().any(|f| f == "upstream-key-slots")
+    }
 }
 
 /// Response body from `GET /image-versions?status=supported`.
@@ -40,6 +55,8 @@ pub struct ImageVersionOut {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 /// Fetch supported image versions from the registry.
@@ -203,6 +220,7 @@ mod tests {
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: None,
+            features: vec![],
         }
     }
 
