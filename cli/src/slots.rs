@@ -120,6 +120,17 @@ pub fn provider_slots_for_keys(
     node_secret: &str,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     validate_cloud_backend_single_keys(keys)?;
+    if let Some(backend) = keys.worker_backend() {
+        // v1: a cloud-backend worker is single-slot for EVERY provider —
+        // the registry rejects slot claims from backend workers and its
+        // control loop never probes them. Advertising slots for the
+        // direct providers (gemini, chutes, the non-backend of
+        // anthropic/openai) would 422 the registration after the CVM has
+        // already launched, and multi-key values there would sit silently
+        // unused, so both are refused up front.
+        reject_multikey_for_cloud_backend(keys, backend)?;
+        return Ok(BTreeMap::new());
+    }
 
     let mut slots = BTreeMap::new();
     if keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct" {
@@ -162,6 +173,24 @@ pub fn validate_cloud_backend_single_keys(keys: &ProviderKeys) -> Result<()> {
     Ok(())
 }
 
+/// Reject semicolon-separated direct keys when a cloud backend is
+/// selected: backend workers are single-slot in this release, so extra
+/// keys would be advertised nowhere and used never.
+///
+/// # Errors
+/// Returns an error naming the offending env var when any ACTIVE
+/// direct-provider key holds multiple segments.
+pub fn reject_multikey_for_cloud_backend(keys: &ProviderKeys, backend: &str) -> Result<()> {
+    for (var, value) in active_direct_keys(keys) {
+        if has_semicolon(value) {
+            bail!(
+                "{var} holds multiple keys but the {backend} cloud backend is selected;                  cloud-backend workers are single-slot in this release — drop the extra                  keys or the cloud backend"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Reject semicolon-separated direct keys when the deploy target image
 /// cannot fan them out.
 ///
@@ -172,11 +201,23 @@ pub fn validate_cloud_backend_single_keys(keys: &ProviderKeys) -> Result<()> {
 /// Returns an error naming the offending env var when any configured
 /// direct-provider key holds multiple segments.
 pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
-    // Keys sidelined by a cloud upstream selector are never read by the
-    // image, so a stale semicolon value there must not block the deploy.
+    for (var, value) in active_direct_keys(keys) {
+        if has_semicolon(value) {
+            bail!(
+                "{var} holds multiple keys but the selected image predates upstream                  key slots; deploy a slot-capable version (newer --version) or drop                  the extra keys"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The direct-provider key env vars the deployed image would actually
+/// read: keys sidelined by a cloud upstream selector are excluded, so a
+/// stale semicolon value there never blocks a deploy.
+fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 4] {
     let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
     let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
-    let direct = [
+    [
         (
             "ANTHROPIC_API_KEY",
             keys.anthropic.as_deref().filter(|_| anthropic_direct),
@@ -187,15 +228,7 @@ pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
         ),
         ("GOOGLE_API_KEY", keys.google.as_deref()),
         ("CHUTES_API_KEY", keys.chutes.as_deref()),
-    ];
-    for (var, value) in direct {
-        if has_semicolon(value) {
-            bail!(
-                "{var} holds multiple keys but the selected image predates upstream                  key slots; deploy a slot-capable version (newer --version) or drop                  the extra keys"
-            );
-        }
-    }
-    Ok(())
+    ]
 }
 
 #[must_use]
@@ -252,6 +285,38 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn cloud_backend_suppresses_all_slot_advertisement() {
+        let keys = ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_api_key: Some("bedrock-key".to_owned()),
+            google: Some("g-key".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("mixed setup deploys");
+        assert!(
+            slots.is_empty(),
+            "backend workers advertise no slots for any provider",
+        );
+    }
+
+    #[test]
+    fn cloud_backend_rejects_direct_multikey() {
+        let keys = ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_api_key: Some("bedrock-key".to_owned()),
+            google: Some("g-a;g-b".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let err = provider_slots_for_keys(&keys, SECRET).expect_err("multi-key must fail");
+        assert!(err.to_string().contains("GOOGLE_API_KEY"));
+        assert!(err.to_string().contains("bedrock"));
+        assert!(
+            !err.to_string().contains("g-a"),
+            "no key material in errors"
+        );
+    }
 
     #[test]
     fn legacy_image_rejects_multikey_but_allows_single() {
@@ -322,8 +387,6 @@ mod tests {
     fn direct_provider_slots_are_advertised_in_provider_order() {
         let keys = ProviderKeys {
             anthropic: Some("sk-ant-a;sk-ant-b".to_owned()),
-            openai_upstream: Some("azure".to_owned()),
-            azure_openai_api_key: Some("azure-key".to_owned()),
             google: Some("AIza".to_owned()),
             ..ProviderKeys::default()
         };
