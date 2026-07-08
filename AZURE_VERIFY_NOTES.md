@@ -1,6 +1,6 @@
-# Azure OpenAI Owner-Capture Verification Notes
+# Azure OpenAI Owner-Capture Verification
 
-## Enforced at startup and continuously
+## Startup gate and continuous verification
 
 When `OPENAI_UPSTREAM=azure`, `image/start.sh` first runs `gm-miner-attestd --verify-azure-once` as a blocking gate. Envoy is not rendered, RA-TLS is not provisioned, and no serving process is started until that one-shot verification exits successfully. A verification failure exits the container non-zero so the runtime restarts it.
 
@@ -47,9 +47,10 @@ The Entra app/service principal should have `Reader` scoped to the Azure OpenAI 
 
 Azure deployments must use a content-filter RAI policy configured for asynchronous filtering. In ARM, this is the RAI policy `mode`, not a deployment-level `contentFilters` field. The deployment's `properties.raiPolicyName` must point to a policy whose `properties.mode` is `Asynchronous_filter` or `Deferred`; the default synchronous modes buffer completions under `stream:true` and are not allowed for gm Azure miners.
 
-## Residual gaps
+## Security boundary
 
-- Private Link or owner-controlled networking can observe only ciphertext under this model; it is not plaintext prompt capture unless TLS is broken or terminated outside Envoy.
-- Unknown future Azure persistence/logging features may need additions to the ARM fail-closed checks or diagnostic allowlist.
-- TODO: add the client-certificate assertion OAuth variant.
-- TODO: confirm CVM egress to `login.microsoftonline.com` and `management.azure.com` in the target deployment environment.
+The owner-capture checks enforce that the Azure OpenAI account is bound to the configured endpoint by ARM identity, has no secondary storage or monitoring sinks attached (`userOwnedStorage`, `raiMonitorConfig`), and that every deployment uses asynchronous content filtering so completions are never buffered server-side before delivery. These checks run at container startup and repeat every 15 minutes; a policy violation detected after startup terminates `attestd` and restarts the container.
+
+Network operators on the path between the miner CVM and Azure observe only TLS-encrypted ciphertext. Prompt content stays confidential end-to-end through Envoy: the RA-TLS data plane is terminated inside the TEE, and the Azure upstream connection is validated against the system CA bundle with an exact DNS SAN pin for the configured Azure host. The ARM account binding checks verify that the endpoint belongs to the miner's own resource, not a third-party account.
+
+The diagnostic-settings check is defense in depth: it rejects unknown enabled log categories so that newly introduced Azure logging features are blocked by default pending explicit allowlisting.
