@@ -9,7 +9,6 @@ const DEFAULT_TRANSIENT_FAILURE_LIMIT: u32 = 3;
 const MIN_TRANSIENT_FAILURE_LIMIT: u32 = 1;
 const VERIFY_INTERVAL_ENV: &str = "GM_AZURE_VERIFY_INTERVAL_SECS";
 const TRANSIENT_FAILURE_LIMIT_ENV: &str = "GM_AZURE_VERIFY_TRANSIENT_FAILURE_LIMIT";
-const REQUIRE_ASYNC_FILTER_ENV: &str = "GM_AZURE_REQUIRE_ASYNC_FILTER";
 
 #[derive(Debug, Clone)]
 pub(crate) struct AzureVerifyConfig {
@@ -19,7 +18,6 @@ pub(crate) struct AzureVerifyConfig {
     pub(crate) resource_group: String,
     pub(crate) client_id: String,
     pub(crate) client_secret: String,
-    pub(crate) require_async_filter: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,7 +35,6 @@ impl AzureVerifyConfig {
             resource_group: required_env("AZURE_RESOURCE_GROUP")?,
             client_id: required_env("AZURE_CLIENT_ID")?,
             client_secret: required_env("AZURE_CLIENT_SECRET")?,
-            require_async_filter: env_bool_default(REQUIRE_ASYNC_FILTER_ENV, true)?,
         })
     }
 }
@@ -110,18 +107,6 @@ pub(crate) fn env_u32_at_least(name: &str, default: u32, minimum: u32) -> Result
                 Ok(parsed)
             }
         }
-        Err(VarError::NotPresent) => Ok(default),
-        Err(err) => Err(err).with_context(|| format!("read {name}")),
-    }
-}
-
-pub(crate) fn env_bool_default(name: &str, default: bool) -> Result<bool> {
-    match std::env::var(name) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => bail!("{name} must be a boolean: true/false, 1/0, yes/no, or on/off"),
-        },
         Err(VarError::NotPresent) => Ok(default),
         Err(err) => Err(err).with_context(|| format!("read {name}")),
     }

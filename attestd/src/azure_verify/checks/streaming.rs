@@ -79,10 +79,7 @@ pub(crate) fn rai_policy_mode_allows_streaming(mode: Option<&str>) -> bool {
     matches!(mode, Some("Asynchronous_filter" | "Deferred"))
 }
 
-pub(crate) fn log_streaming_assessment(
-    assessment: &StreamingConfigAssessment,
-    require_async_filter: bool,
-) -> Result<()> {
+pub(crate) fn log_streaming_assessment(assessment: &StreamingConfigAssessment) -> Result<()> {
     if assessment.deployment_count == 0 {
         tracing::info!("no Azure OpenAI deployments to check for streaming configuration");
         return Ok(());
@@ -103,18 +100,11 @@ pub(crate) fn log_streaming_assessment(
         .map(StreamingConfigViolation::message)
         .collect::<Vec<_>>()
         .join("; ");
-    if require_async_filter {
-        tracing::error!(
-            violations = %violation_messages,
-            "Azure OpenAI streaming configuration failed",
-        );
-        bail!("Azure OpenAI streaming configuration failed: {violation_messages}");
-    }
-    tracing::warn!(
+    tracing::error!(
         violations = %violation_messages,
-        "Azure OpenAI streaming configuration is not fully asynchronous; GM_AZURE_REQUIRE_ASYNC_FILTER=false so verification will continue",
+        "Azure OpenAI streaming configuration failed",
     );
-    Ok(())
+    bail!("Azure OpenAI streaming configuration failed: {violation_messages}");
 }
 
 impl StreamingConfigViolation {
@@ -290,5 +280,59 @@ mod tests {
         let assessment = assess_streaming_configuration(&deployments, &policy_modes);
         assert_eq!(assessment.deployment_count, 0);
         assert!(assessment.violations.is_empty(), "{assessment:?}");
+    }
+
+    #[test]
+    fn log_streaming_assessment_always_fails_on_synchronous_deployment() {
+        // Async-filter enforcement is gm policy; there is no flag to disable it.
+        let deployments = deployments_from_json(
+            r#"{
+                "value": [{
+                    "name": "gpt-5",
+                    "properties": {"raiPolicyName": "blocking-policy"}
+                }]
+            }"#,
+        );
+        let policy = rai_policy_from_json(r#"{"properties": {"mode": "Blocking"}}"#);
+        let policy_modes = BTreeMap::from([("blocking-policy".to_owned(), policy.properties.mode)]);
+        let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+
+        let err = log_streaming_assessment(&assessment)
+            .expect_err("synchronous deployment must always fail verification");
+        assert!(
+            err.to_string().contains("streaming configuration failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn log_streaming_assessment_passes_on_async_deployment() {
+        let deployments = deployments_from_json(
+            r#"{
+                "value": [{
+                    "name": "gpt-5",
+                    "properties": {"raiPolicyName": "async-policy"}
+                }]
+            }"#,
+        );
+        let policy = rai_policy_from_json(r#"{"properties": {"mode": "Asynchronous_filter"}}"#);
+        let policy_modes = BTreeMap::from([("async-policy".to_owned(), policy.properties.mode)]);
+        let assessment = assess_streaming_configuration(&deployments, &policy_modes);
+
+        assert!(
+            log_streaming_assessment(&assessment).is_ok(),
+            "Asynchronous_filter deployment must pass"
+        );
+    }
+
+    #[test]
+    fn log_streaming_assessment_passes_on_empty_deployments() {
+        let deployments = deployments_from_json(r#"{"value": []}"#);
+        let assessment = assess_streaming_configuration(&deployments, &BTreeMap::new());
+
+        assert!(
+            log_streaming_assessment(&assessment).is_ok(),
+            "zero deployments must pass"
+        );
     }
 }

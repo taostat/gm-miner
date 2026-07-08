@@ -132,5 +132,5 @@ async fn verify_async_filter_configuration(
     }
 
     let assessment = assess_streaming_configuration(&deployments, &policy_modes);
-    log_streaming_assessment(&assessment, config.require_async_filter)
+    log_streaming_assessment(&assessment)
 }
