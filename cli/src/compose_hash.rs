@@ -213,11 +213,14 @@ mod tests {
     /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
     /// keys, cloud upstream settings, and node secret).
     ///
-    /// This is the live registry-approved hash for v0.1.4, attested by the
-    /// testnet miners (read from `attested_compose_hashes` on the registry
-    /// routing-table). The anchor must track the newest supported image
-    /// version: bump it in lockstep with `TESTNET_IMAGE_REF` whenever a new
-    /// `ImageVersion` is published, then confirm live miners attest to it.
+    /// Pre-publication anchor: `ZAI_API_KEY` joined `allowed_envs`, so this
+    /// hash is not yet a live registry row.
+    ///
+    /// Rollout: rebuild the image (the template changes move the digest),
+    /// publish the new `ImageVersion` (`gmcli publish-image-version`), bump
+    /// `TESTNET_IMAGE_REF` and this anchor to the live registry row, redeploy
+    /// the live testnet miners, confirm attestation matches, then retire the
+    /// old `98307c5b` row.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
         "860c331f0fb85623edce97cc227e9df5af731dbeb6a3418a43e65775d31e3f1b";
 
