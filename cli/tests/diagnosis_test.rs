@@ -121,15 +121,16 @@ fn worker_list_decodes_suspension_and_slot_state() {
             "next_probe_at": "2026-07-11T09:02:00+00:00",
             "suspended_reprobe_attempt": 3,
             "consecutive_ok": 1,
-            "consecutive_ok_required": 2,
             "supported_models": {"openai": ["gpt-5.6"]},
             "provider_slot_status": {
                 "openai": {"BBBBBBBBBBBB": {"status": "unverified", "models": []}}
             },
         }],
+        "consecutive_ok_required": 2,
     }))
     .unwrap();
 
+    assert_eq!(list.consecutive_ok_required, 2);
     let worker = &list.workers[0];
     assert_eq!(
         worker.suspended_at.as_deref(),
@@ -140,7 +141,6 @@ fn worker_list_decodes_suspension_and_slot_state() {
         Some("2026-07-11T09:02:00+00:00")
     );
     assert_eq!(worker.consecutive_ok, 1);
-    assert_eq!(worker.consecutive_ok_required, 2);
     assert_eq!(worker.suspended_reprobe_attempt, 3);
     assert_eq!(
         worker.provider_slot_status["openai"]["BBBBBBBBBBBB"]
@@ -148,7 +148,6 @@ fn worker_list_decodes_suspension_and_slot_state() {
             .as_deref(),
         Some("unverified")
     );
-    assert_eq!(worker.supported_models["openai"], vec!["gpt-5.6"]);
 }
 
 #[test]

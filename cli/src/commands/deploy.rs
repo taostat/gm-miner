@@ -6,7 +6,7 @@
 //! deployed CVM, and `publish-image-version` computes an `ImageVersion` offline.
 
 use anyhow::{bail, Context as _, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::Parser as _;
 
 use gm_miner_cli::{
@@ -21,9 +21,8 @@ use gm_miner_cli::{
         PhalaClient, PHALA_ENDPOINT_FIELD,
     },
     node_secret, slots, terms,
-    types::{
-        MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerEntry, WorkerListResponse,
-    },
+    types::{MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse},
+    workers::worker_health_lines,
 };
 
 use crate::commands::persist::{
@@ -1103,96 +1102,13 @@ pub(crate) async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
     }
     println!("\n{} worker(s) total.", list.workers.len());
 
+    let now = Utc::now();
     for w in &list.workers {
-        for line in worker_health_lines(w, Utc::now()) {
+        for line in worker_health_lines(w, list.consecutive_ok_required, now) {
             println!("{line}");
         }
     }
     Ok(())
-}
-
-/// The recovery view for a worker that is suspended or carrying a dead key.
-///
-/// Printed under the table rather than as extra columns: a suspended worker
-/// needs three facts (when it was suspended, when it is re-probed, what
-/// restores it) plus any unverified key slots, and none of that fits a row. A
-/// healthy worker renders nothing, so the common case stays a clean table.
-pub(crate) fn worker_health_lines(worker: &WorkerEntry, now: DateTime<Utc>) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let suspended = worker.status == "suspended" || worker.suspended_at.is_some();
-    if suspended {
-        lines.push(String::new());
-        lines.push(format!("{} ({})", worker.worker_id, worker.status));
-        if let Some(since) = worker.suspended_at.as_deref() {
-            lines.push(format!("  suspended since : {since}"));
-        }
-        if let Some(seen) = worker.last_seen_at.as_deref() {
-            lines.push(format!("  last seen       : {seen}"));
-        }
-        match worker.next_probe_at.as_deref() {
-            Some(next) => lines.push(format!(
-                "  next re-probe   : {next}{}",
-                relative_suffix(next, now)
-            )),
-            None => lines.push("  next re-probe   : on the next control-loop cycle".to_owned()),
-        }
-        lines.push(format!(
-            "  to recover      : {} of {} consecutive good probes so far (re-probe attempt {})",
-            worker.consecutive_ok, worker.consecutive_ok_required, worker.suspended_reprobe_attempt,
-        ));
-        lines.push(
-            "  The registry re-probes on its own — fix the worker and it restores itself."
-                .to_owned(),
-        );
-    }
-
-    let dead = dead_slot_lines(worker);
-    if dead.is_empty() {
-        return lines;
-    }
-    if !suspended {
-        lines.push(String::new());
-        lines.push(format!("{} ({})", worker.worker_id, worker.status));
-    }
-    lines.extend(dead);
-    lines
-}
-
-/// Name the upstream key slots the registry could not verify.
-///
-/// A worker can be active and still earn nothing because one of its provider
-/// keys is dead; the slot id is HMAC-derived from the key, so the operator can
-/// re-derive it locally to identify which of its keys this is.
-fn dead_slot_lines(worker: &WorkerEntry) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (provider, slots) in &worker.provider_slot_status {
-        for (slot_id, state) in slots {
-            if state.status.as_deref() == Some("verified") {
-                continue;
-            }
-            lines.push(format!(
-                "  unverified key  : {provider} slot {slot_id} — the registry could not use this key"
-            ));
-        }
-    }
-    lines
-}
-
-/// ` (in 45s)` / ` (due now)` next to an RFC 3339 instant, or nothing when it
-/// does not parse — a display aid must never fail the command.
-fn relative_suffix(timestamp: &str, now: DateTime<Utc>) -> String {
-    let Ok(at) = DateTime::parse_from_rfc3339(timestamp) else {
-        return String::new();
-    };
-    let delta = at.with_timezone(&Utc) - now;
-    let secs = delta.num_seconds();
-    if secs <= 0 {
-        return " (due now)".to_owned();
-    }
-    if secs < 60 {
-        return format!(" (in {secs}s)");
-    }
-    format!(" (in {}m)", secs / 60)
 }
 
 /// `gmcli worker remove <id>` — deregister a worker and remind the
@@ -1315,72 +1231,5 @@ mod tests {
         });
 
         assert_eq!(register_image_backend(None, &cfg).as_deref(), Some("azure"));
-    }
-
-    fn worker_entry(status: &str) -> WorkerEntry {
-        serde_json::from_value(serde_json::json!({
-            "worker_id": "01J0A",
-            "endpoint": "https://w1.example.org:8443",
-            "status": status,
-            "last_attestation_at": null,
-        }))
-        .expect("decode minimal worker entry")
-    }
-
-    fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-07-11T09:00:00+00:00")
-            .expect("parse fixed now")
-            .with_timezone(&Utc)
-    }
-
-    #[test]
-    fn healthy_worker_renders_no_health_block() {
-        assert!(worker_health_lines(&worker_entry("active"), now()).is_empty());
-    }
-
-    #[test]
-    fn suspended_worker_reports_next_probe_and_recovery_threshold() {
-        let mut worker = worker_entry("suspended");
-        worker.suspended_at = Some("2026-07-11T08:30:00+00:00".to_owned());
-        worker.next_probe_at = Some("2026-07-11T09:02:00+00:00".to_owned());
-        worker.consecutive_ok = 1;
-        worker.consecutive_ok_required = 2;
-        worker.suspended_reprobe_attempt = 3;
-
-        let rendered = worker_health_lines(&worker, now()).join("\n");
-        assert!(rendered.contains("suspended since : 2026-07-11T08:30:00+00:00"));
-        assert!(rendered.contains("next re-probe   : 2026-07-11T09:02:00+00:00 (in 2m)"));
-        assert!(rendered.contains("1 of 2 consecutive good probes"));
-        assert!(rendered.contains("re-probe attempt 3"));
-    }
-
-    #[test]
-    fn a_due_probe_reads_due_now_and_an_unparseable_one_is_dropped() {
-        let mut worker = worker_entry("suspended");
-        worker.next_probe_at = Some("2026-07-11T08:59:00+00:00".to_owned());
-        assert!(worker_health_lines(&worker, now())
-            .join("\n")
-            .contains("(due now)"));
-
-        worker.next_probe_at = Some("not-a-timestamp".to_owned());
-        let rendered = worker_health_lines(&worker, now()).join("\n");
-        assert!(rendered.contains("next re-probe   : not-a-timestamp"));
-        assert!(!rendered.contains("(in "));
-    }
-
-    #[test]
-    fn an_active_worker_with_a_dead_key_slot_still_reports_it() {
-        let mut worker = worker_entry("active");
-        worker.provider_slot_status = serde_json::from_value(serde_json::json!({
-            "openai": {
-                "AAAAAAAAAAAA": {"status": "verified", "models": ["gpt-5.6"]},
-                "BBBBBBBBBBBB": {"status": "unverified", "models": []},
-            }
-        }))
-        .expect("decode slot status");
-
-        let rendered = worker_health_lines(&worker, now()).join("\n");
-        assert!(rendered.contains("unverified key  : openai slot BBBBBBBBBBBB"));
-        assert!(!rendered.contains("AAAAAAAAAAAA"));
     }
 }

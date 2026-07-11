@@ -16,7 +16,31 @@ pub mod products;
 pub mod streaming_check;
 pub mod wizard;
 
-use gm_miner_cli::network::Network;
+use anyhow::{Context as _, Result};
+use serde::de::DeserializeOwned;
+
+use gm_miner_cli::{client::RegistryClient, network::Network};
+
+/// GET an authenticated `/miners/me…` path and decode its JSON body, turning a
+/// non-success status into the actionable [`me_error`] rather than a raw dump.
+pub(crate) async fn get_me_json<T: DeserializeOwned>(
+    client: &mut RegistryClient,
+    path: &str,
+) -> Result<T> {
+    let network = client.config.resolved_network();
+    let resp = client
+        .get(path)
+        .await
+        .with_context(|| format!("GET {path}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(me_error(network, status));
+    }
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("parse {path} response"))
+}
 
 /// Extract a human-readable error detail from a registry JSON error body.
 ///

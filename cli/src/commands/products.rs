@@ -15,7 +15,7 @@ use gm_miner_cli::{
     },
 };
 
-use crate::commands::{me_error, status_error};
+use crate::commands::{get_me_json, status_error};
 
 /// `gmcli declare-product` — POST one (provider, model, `discount_bp`)
 /// offer to `/miners/products`. The registry treats POST as upsert, so this
@@ -203,17 +203,7 @@ pub(crate) fn filter_catalog<'a>(
 /// catalog), alongside the broader hotkey/attestation/compose view.
 pub(crate) async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     let network = client.config.resolved_network();
-    let resp = client
-        .get(gm_miner_cli::client::ME_PATH)
-        .await
-        .context("GET /miners/me")?;
-
-    let status_code = resp.status();
-    if !status_code.is_success() {
-        return Err(me_error(network, status_code));
-    }
-
-    let miner: MinerStatus = resp.json().await.context("parse status response")?;
+    let miner: MinerStatus = get_me_json(client, gm_miner_cli::client::ME_PATH).await?;
 
     println!("Miner status ({network})");
     println!("  Network    : {network} (netuid {})", network.netuid());
@@ -291,12 +281,6 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
 }
 
 /// Explain every ineligible offer beneath the table, one block each.
-///
-/// The reason string runs to 120 characters and the hint is a full sentence —
-/// neither fits a column beside a 110-char table, and widening the table to
-/// hold them would wrap every row. So the table stays the inventory ("what do
-/// I offer, at what rate, is it live") and the diagnosis is a detail block
-/// underneath, printed only for the rows that are actually broken.
 fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
     let broken: Vec<_> = products.iter().filter(|p| !p.is_eligible).collect();
     if broken.is_empty() {
@@ -323,6 +307,9 @@ fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
         }
         if let Some(hint) = p.ineligible_hint.as_deref() {
             lines.push(format!("    fix    : {hint}"));
+        }
+        if let Some(passed) = p.capability_check_passed_at.as_deref() {
+            lines.push(format!("    last ok : {passed}"));
         }
     }
     lines
@@ -370,6 +357,31 @@ mod tests {
         assert!(rendered.contains("reason : capability_probe_failed: upstream rejected key (401)"));
         assert!(rendered.contains("fix    : Set a valid key with `gmcli set-api-keys`."));
         assert!(!rendered.contains("gpt-5.6"));
+    }
+
+    #[test]
+    fn an_offer_that_was_working_shows_when_it_last_passed() {
+        let products = offers(serde_json::json!([{
+            "provider": "anthropic", "model": "claude-sonnet-4-6",
+            "is_offered": true, "is_eligible": false, "discount_bp": 500,
+            "ineligible_reason": "capability_probe_failed: upstream rejected key (401)",
+            "capability_check_passed_at": "2026-07-10T22:15:00+00:00",
+        }]));
+
+        let rendered = ineligible_detail_lines(&products).join("\n");
+        assert!(rendered.contains("last ok : 2026-07-10T22:15:00+00:00"));
+    }
+
+    #[test]
+    fn an_offer_that_never_passed_shows_no_last_ok_line() {
+        let products = offers(serde_json::json!([{
+            "provider": "anthropic", "model": "claude-sonnet-4-6",
+            "is_offered": true, "is_eligible": false, "discount_bp": 500,
+        }]));
+
+        assert!(!ineligible_detail_lines(&products)
+            .join("\n")
+            .contains("last ok"));
     }
 
     #[test]

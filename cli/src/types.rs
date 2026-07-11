@@ -250,12 +250,7 @@ pub struct WorkerEntry {
     pub suspended_reprobe_attempt: u32,
     #[serde(default)]
     pub consecutive_ok: u32,
-    #[serde(default)]
-    pub consecutive_ok_required: u32,
-    /// provider -> models the worker's Envoy listed on the last capability probe.
-    #[serde(default)]
-    pub supported_models: BTreeMap<String, Vec<String>>,
-    /// provider -> slot id -> `{status, models}`. The owner's key-health view:
+    /// provider -> slot id -> verification state. The owner's key-health view:
     /// an `unverified` slot is an upstream key the registry could not use.
     #[serde(default)]
     pub provider_slot_status: BTreeMap<String, BTreeMap<String, SlotStatus>>,
@@ -266,12 +261,14 @@ pub struct WorkerEntry {
 pub struct SlotStatus {
     #[serde(default)]
     pub status: Option<String>,
-    #[serde(default)]
-    pub models: Vec<String>,
 }
 
 /// Response from `GET /miners/{hotkey}/workers` (`WorkerListResponse`).
 #[derive(Debug, Deserialize)]
 pub struct WorkerListResponse {
     pub workers: Vec<WorkerEntry>,
+    /// Consecutive good probes that restore a suspended worker. Registry-wide
+    /// control-loop config, not per-worker state.
+    #[serde(default)]
+    pub consecutive_ok_required: u32,
 }
