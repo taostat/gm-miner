@@ -27,8 +27,15 @@ pub struct AuthConfig {
 }
 
 /// Build a one-shot HTTP client with the gmcli user-agent and a 30 s timeout —
-/// the shared shape for every direct (non-[`RegistryClient`]) request, so the
-/// timeout and user-agent are set in exactly one place.
+/// the shared shape for every gmcli request, so the timeout, user-agent, and
+/// redirect policy are set in exactly one place.
+///
+/// Redirects are never followed. The streaming probe carries the worker's
+/// `x-gm-node-key` to a miner-controlled endpoint, and `reqwest` keeps custom
+/// headers across a cross-host redirect (it only strips `Authorization` /
+/// `Cookie` / `Proxy-Authorization`). A 3xx from a compromised or MITM'd
+/// upstream would otherwise resend the node secret to the redirect target. No
+/// gmcli request — registry API or probe — has a legitimate reason to redirect.
 ///
 /// # Errors
 /// Returns an error if the TLS stack cannot be initialised.
@@ -36,6 +43,7 @@ pub fn build_http_client() -> Result<Client> {
     Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build http client")
 }
@@ -91,11 +99,8 @@ impl RegistryClient {
         reason = "only fails on TLS init — system-level misconfiguration"
     )]
     pub fn new(config: Config) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("build reqwest client — system TLS must be available");
+        let client =
+            build_http_client().expect("build reqwest client — system TLS must be available");
         Self { config, client }
     }
 
@@ -226,5 +231,52 @@ impl RegistryClient {
             .await
             .context("authentication preflight (GET /miners/me)")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions intentionally panic on unexpected values"
+)]
+mod tests {
+    use super::build_http_client;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The gmcli HTTP client must never follow a redirect. The streaming
+    /// probe sends the worker's `x-gm-node-key` to a miner-controlled
+    /// endpoint, and `reqwest` keeps custom headers across a cross-host
+    /// redirect — so a 3xx from a compromised or MITM'd upstream would
+    /// otherwise resend the node secret to the redirect target. The 307 is
+    /// surfaced verbatim and the origin is dialled exactly once (no chase to
+    /// the unroutable target the `Location` points at).
+    #[tokio::test]
+    async fn http_client_does_not_follow_redirects() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", "http://127.0.0.1:1/never"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = build_http_client()
+            .expect("build client")
+            .get(server.uri())
+            .header("x-gm-node-key", "node-secret")
+            .send()
+            .await
+            .expect("the 307 is returned, not followed");
+
+        assert_eq!(
+            response.status().as_u16(),
+            307,
+            "the redirect is surfaced verbatim, not chased"
+        );
+        // `server` drops here; the `.expect(1)` verifies the origin was hit
+        // exactly once — a followed redirect would dial the unroutable
+        // target instead and error before this assertion.
     }
 }
