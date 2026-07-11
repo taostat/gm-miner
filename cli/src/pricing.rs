@@ -138,7 +138,10 @@ pub fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> St
 /// field, plus the products only others serve.
 #[must_use]
 pub fn render_pricing(network: Network, products: &[ProductCompetitiveness]) -> Vec<String> {
-    let (yours, unsold): (Vec<_>, Vec<_>) = products.iter().partition(|p| p.offered_by_you);
+    let (yours, rest): (Vec<_>, Vec<_>) = products.iter().partition(|p| p.offered_by_you);
+    // Absent from the ranked field for two very different reasons: declared and
+    // broken (fix it) vs never declared (declare it).
+    let (broken, unsold): (Vec<_>, Vec<_>) = rest.iter().partition(|p| p.declared_by_you);
 
     let mut lines = vec![
         format!("Pricing competitiveness ({network})"),
@@ -151,6 +154,9 @@ pub fn render_pricing(network: Network, products: &[ProductCompetitiveness]) -> 
         lines.push("You have no eligible offers to rank.".to_owned());
     } else {
         lines.extend(rank_table(&yours));
+    }
+    if !broken.is_empty() {
+        lines.extend(broken_lines(&broken));
     }
     if !unsold.is_empty() {
         lines.extend(unsold_lines(&unsold));
@@ -215,21 +221,40 @@ fn rank_table(yours: &[&ProductCompetitiveness]) -> Vec<String> {
     lines
 }
 
+fn field_line(p: &ProductCompetitiveness) -> String {
+    format!(
+        "  {}/{}: {} eligible offer(s), best {}, median {}",
+        p.provider,
+        p.model,
+        p.competitor_count,
+        format_usd(p.best_cost_ndollars),
+        format_usd(p.median_cost_ndollars),
+    )
+}
+
+/// Products the caller declared but that are not in the eligible field.
+///
+/// It already ran `declare-product`; the offer is broken, not missing, so the
+/// fix is upstream and `gmcli status` is where the reason lives.
+fn broken_lines(broken: &[&ProductCompetitiveness]) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "Declared by you but not eligible — earning nothing ({}):",
+            broken.len()
+        ),
+    ];
+    lines.extend(broken.iter().copied().map(field_line));
+    lines.push("  Run `gmcli status` for the reason and the fix.".to_owned());
+    lines
+}
+
 fn unsold_lines(unsold: &[&ProductCompetitiveness]) -> Vec<String> {
     let mut lines = vec![
         String::new(),
         format!("Offered by others, not by you ({}):", unsold.len()),
     ];
-    for p in unsold {
-        lines.push(format!(
-            "  {}/{}: {} eligible offer(s), best {}, median {}",
-            p.provider,
-            p.model,
-            p.competitor_count,
-            format_usd(p.best_cost_ndollars),
-            format_usd(p.median_cost_ndollars),
-        ));
-    }
+    lines.extend(unsold.iter().copied().map(field_line));
     lines.push(
         "  Declare one with `gmcli declare-product --provider <p> --model <m> \
          --discount-pct <pct>`."
@@ -468,5 +493,32 @@ mod tests {
         assert!(rendered.contains("Offered by others, not by you (1):"));
         assert!(rendered.contains("gemini/gemini-3-pro: 4 eligible offer(s), best $8.100"));
         assert!(!rendered.contains("cheapest cost on every product"));
+    }
+
+    #[test]
+    fn a_declared_but_ineligible_offer_is_not_told_to_declare_itself_again() {
+        let rendered = render_pricing(
+            Network::Mainnet,
+            &products(serde_json::json!([{
+                "provider": "anthropic", "model": "claude-sonnet-4-6",
+                "competitor_count": 2,
+                "best_cost_ndollars": 16_200_000_000_u64,
+                "median_cost_ndollars": 18_000_000_000_u64,
+                "offered_by_you": false,
+                "declared_by_you": true,
+                "your_cost_ndollars": null,
+                "your_discount_bp": null,
+                "your_rank": null,
+            }])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("Declared by you but not eligible — earning nothing (1):"));
+        assert!(rendered.contains("anthropic/claude-sonnet-4-6: 2 eligible offer(s)"));
+        assert!(rendered.contains("`gmcli status`"));
+        // The bug this guards: it already declared the product. Telling it to
+        // declare again sends the miner at the wrong problem.
+        assert!(!rendered.contains("Offered by others, not by you"));
+        assert!(!rendered.contains("declare-product"));
     }
 }

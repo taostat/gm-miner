@@ -173,6 +173,12 @@ pub struct ProductCompetitiveness {
     pub best_cost_ndollars: u64,
     pub median_cost_ndollars: u64,
     pub offered_by_you: bool,
+    /// True when the caller has declared this product at all. The ranked field
+    /// is the *eligible* one, so an offer that went ineligible leaves
+    /// `offered_by_you` false exactly like one never declared — this tells the
+    /// two apart, so a broken offer is not nudged to declare itself again.
+    #[serde(default)]
+    pub declared_by_you: bool,
     pub your_cost_ndollars: Option<u64>,
     pub your_discount_bp: Option<u32>,
     pub your_rank: Option<u32>,
