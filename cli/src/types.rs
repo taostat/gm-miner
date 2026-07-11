@@ -147,6 +147,41 @@ pub struct ProductOfferStatus {
     /// against a registry build that predates emitting it.
     #[serde(default)]
     pub upstream_model: Option<String>,
+    /// Raw code the registry's control loop stored when the offer went
+    /// ineligible (`capability_probe_failed: upstream rejected key (401)`).
+    #[serde(default)]
+    pub ineligible_reason: Option<String>,
+    /// The same reason as one actionable sentence. Null when the registry has
+    /// no mapping for the code — render `ineligible_reason` alone then.
+    #[serde(default)]
+    pub ineligible_hint: Option<String>,
+    /// When the offer's capability probe last passed, RFC 3339.
+    #[serde(default)]
+    pub capability_check_passed_at: Option<String>,
+}
+
+/// One product's competitive field in `GET /miners/me/pricing-competitiveness`.
+///
+/// Identity-safe by construction: the registry returns aggregates over the
+/// eligible field plus the caller's own position, never a rival's hotkey.
+/// `your_*` are null when the caller does not offer the product.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProductCompetitiveness {
+    pub provider: String,
+    pub model: String,
+    pub competitor_count: u32,
+    pub best_cost_ndollars: u64,
+    pub median_cost_ndollars: u64,
+    pub offered_by_you: bool,
+    pub your_cost_ndollars: Option<u64>,
+    pub your_discount_bp: Option<u32>,
+    pub your_rank: Option<u32>,
+}
+
+/// Response from `GET /miners/me/pricing-competitiveness`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PricingCompetitiveness {
+    pub products: Vec<ProductCompetitiveness>,
 }
 
 /// Body of `POST /miners/products` (`ProductDeclarationRequest`).
@@ -194,12 +229,45 @@ pub struct WorkerCreateResponse {
 }
 
 /// One worker in the `GET /miners/{hotkey}/workers` response (`WorkerEntry`).
+///
+/// The suspension block is the recovery view for a worker the registry has
+/// stopped routing to: when it is re-probed next, and how many consecutive
+/// successful probes still restore it. Every field carries `#[serde(default)]`
+/// so an older registry that does not emit them still decodes.
 #[derive(Debug, Deserialize)]
 pub struct WorkerEntry {
     pub worker_id: String,
     pub endpoint: String,
     pub status: String,
     pub last_attestation_at: Option<String>,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub suspended_at: Option<String>,
+    #[serde(default)]
+    pub next_probe_at: Option<String>,
+    #[serde(default)]
+    pub suspended_reprobe_attempt: u32,
+    #[serde(default)]
+    pub consecutive_ok: u32,
+    #[serde(default)]
+    pub consecutive_ok_required: u32,
+    /// provider -> models the worker's Envoy listed on the last capability probe.
+    #[serde(default)]
+    pub supported_models: BTreeMap<String, Vec<String>>,
+    /// provider -> slot id -> `{status, models}`. The owner's key-health view:
+    /// an `unverified` slot is an upstream key the registry could not use.
+    #[serde(default)]
+    pub provider_slot_status: BTreeMap<String, BTreeMap<String, SlotStatus>>,
+}
+
+/// One slot's verification state in [`WorkerEntry::provider_slot_status`].
+#[derive(Debug, Deserialize)]
+pub struct SlotStatus {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// Response from `GET /miners/{hotkey}/workers` (`WorkerListResponse`).

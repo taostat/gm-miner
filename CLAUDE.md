@@ -10,7 +10,7 @@ declaration, and price management.
 ## Layout
 
 - `cli/src/main.rs` — clap surface plus the `dispatch` / `dispatch_worker` routers; pure coordination, no logic
-- `cli/src/commands/` — one module per subcommand handler (`deploy`, `products`, `hotkey`, `doctor`, `wizard`, `keys`, `earnings`, `fun`) plus `persist` (config/token persistence) and the shared `status_error`/`me_error` helpers in `commands/mod.rs`
+- `cli/src/commands/` — one module per subcommand handler (`deploy`, `products`, `pricing`, `hotkey`, `doctor`, `wizard`, `keys`, `earnings`, `fun`) plus `persist` (config/token persistence) and the shared `status_error`/`me_error` helpers in `commands/mod.rs`
 - `cli/src/lib.rs` — module declarations; re-exports for binary and tests
 - `cli/src/auth.rs` — Taostats device-code OAuth2 flow
 - `cli/src/client.rs` — `RegistryClient`: typed HTTP wrappers for registry endpoints
@@ -58,7 +58,8 @@ cargo test -p gm-miner-cli
 | `register-image` | Re-register an already-deployed image (debugging / registry resync; hidden from default help) |
 | `declare-product` | Register a single miner-product offer with a pct discount |
 | `declare-products` | Fan one discount across the catalog (or one provider) |
-| `status` | Show current registration state, per-product eligibility, and the per-Mtok rate received (`list-products` is a hidden alias) |
+| `status` | Show current registration state, per-product eligibility, and the per-Mtok rate received; every ineligible offer is explained beneath the table with the registry's reason and the fix (`list-products` is a hidden alias) |
+| `pricing` | Rank each offer against the eligible field on the scalar the gateway routes on — your rank, the field's size, its best/median cost, and the products others serve and you do not |
 | `earnings` | Read the hotkey's neuron row from the subnet metagraph (via btcli) and report UID, stake, and per-tempo emission |
 | `worker add/list/remove` | Manage the data-plane workers (Phala CVMs) attached to the hotkey |
 | `publish-image-version` | Compute the release image's `compose_hash`/`os_image_hash` offline and upsert the approved `ImageVersion` to the registry (release pipeline; needs the registry admin key) |

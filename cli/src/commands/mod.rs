@@ -11,6 +11,7 @@ pub mod fun;
 pub mod hotkey;
 pub mod keys;
 pub mod persist;
+pub mod pricing;
 pub mod products;
 pub mod streaming_check;
 pub mod wizard;

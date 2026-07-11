@@ -9,7 +9,10 @@ use gm_miner_cli::{
         effective_per_mtok_ndollars, effective_rate_summary, format_discount_pct,
         format_per_mtok_usd,
     },
-    types::{MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider},
+    types::{
+        MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest,
+        ProductOfferStatus, Provider,
+    },
 };
 
 use crate::commands::{me_error, status_error};
@@ -280,5 +283,104 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
         );
     }
     println!("\n{} offer(s) total.", miner.products.len());
+    for line in ineligible_detail_lines(&miner.products) {
+        println!("{line}");
+    }
+    println!("\nRanked against the field? `gmcli pricing`");
     Ok(())
+}
+
+/// Explain every ineligible offer beneath the table, one block each.
+///
+/// The reason string runs to 120 characters and the hint is a full sentence —
+/// neither fits a column beside a 110-char table, and widening the table to
+/// hold them would wrap every row. So the table stays the inventory ("what do
+/// I offer, at what rate, is it live") and the diagnosis is a detail block
+/// underneath, printed only for the rows that are actually broken.
+fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
+    let broken: Vec<_> = products.iter().filter(|p| !p.is_eligible).collect();
+    if broken.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "Not eligible — these earn nothing until fixed ({}):",
+            broken.len()
+        ),
+    ];
+    for p in broken {
+        lines.push(String::new());
+        lines.push(format!("  {}/{}", p.provider, p.model));
+        match p.ineligible_reason.as_deref() {
+            Some(reason) => lines.push(format!("    reason : {reason}")),
+            // The registry clears the reason the moment an offer goes eligible
+            // and writes one on every failure, so a blank reason on an
+            // ineligible offer means the control loop has not judged it yet.
+            None => lines.push(
+                "    reason : not yet checked — the control loop probes every cycle".to_owned(),
+            ),
+        }
+        if let Some(hint) = p.ineligible_hint.as_deref() {
+            lines.push(format!("    fix    : {hint}"));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions intentionally panic on unexpected values"
+)]
+mod tests {
+    use super::*;
+
+    fn offers(value: serde_json::Value) -> Vec<ProductOfferStatus> {
+        serde_json::from_value(value).expect("decode offers")
+    }
+
+    #[test]
+    fn an_all_eligible_table_prints_no_detail_block() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6",
+            "is_offered": true, "is_eligible": true, "discount_bp": 500,
+        }]));
+        assert!(ineligible_detail_lines(&products).is_empty());
+    }
+
+    #[test]
+    fn each_ineligible_offer_gets_its_reason_and_fix() {
+        let products = offers(serde_json::json!([
+            {
+                "provider": "openai", "model": "gpt-5.6",
+                "is_offered": true, "is_eligible": true, "discount_bp": 500,
+            },
+            {
+                "provider": "anthropic", "model": "claude-sonnet-4-6",
+                "is_offered": true, "is_eligible": false, "discount_bp": 500,
+                "ineligible_reason": "capability_probe_failed: upstream rejected key (401)",
+                "ineligible_hint": "Set a valid key with `gmcli set-api-keys`.",
+            },
+        ]));
+
+        let rendered = ineligible_detail_lines(&products).join("\n");
+        assert!(rendered.contains("Not eligible — these earn nothing until fixed (1):"));
+        assert!(rendered.contains("  anthropic/claude-sonnet-4-6"));
+        assert!(rendered.contains("reason : capability_probe_failed: upstream rejected key (401)"));
+        assert!(rendered.contains("fix    : Set a valid key with `gmcli set-api-keys`."));
+        assert!(!rendered.contains("gpt-5.6"));
+    }
+
+    #[test]
+    fn an_unjudged_offer_says_so_rather_than_going_blank() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6",
+            "is_offered": true, "is_eligible": false, "discount_bp": 500,
+        }]));
+
+        let rendered = ineligible_detail_lines(&products).join("\n");
+        assert!(rendered.contains("reason : not yet checked"));
+        assert!(!rendered.contains("fix    :"));
+    }
 }

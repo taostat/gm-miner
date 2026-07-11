@@ -13,6 +13,7 @@
 //!   declare-products — fan out one discount over the whole catalog, or one provider
 //!   status           — registration state + per-product eligibility and rates
 //!                      (the hidden `list-products` alias runs the same code)
+//!   pricing          — rank your offers against the eligible field
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
 //!   worker list      — list the hotkey's live workers
 //!   worker remove    — deregister a worker (CVM teardown is separate)
@@ -57,6 +58,7 @@ use crate::commands::fun::{cmd_gm, cmd_moon};
 use crate::commands::hotkey::cmd_register_hotkey;
 use crate::commands::keys::cmd_set_api_keys;
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
+use crate::commands::pricing::cmd_pricing;
 use crate::commands::products::{cmd_declare_product, cmd_declare_products, cmd_status};
 use crate::commands::streaming_check::cmd_check_streaming;
 use crate::commands::wizard::cmd_init;
@@ -404,11 +406,24 @@ enum Command {
     /// Show the miner's current registration status and per-product eligibility.
     ///
     /// Lists each declared offer with the per-Mtok rate you actually receive
-    /// after the discount, plus whether it is offered and eligible.
+    /// after the discount, plus whether it is offered and eligible. Every
+    /// ineligible offer is listed underneath the table with the registry's
+    /// reason and what to do about it.
     #[command(after_help = "Examples:\n  \
         gmcli status\n  \
         gmcli --network testnet status")]
     Status,
+
+    /// Show how your offers rank on price against the eligible field.
+    ///
+    /// Buyers route to the cheapest eligible offer, so an offer that is
+    /// eligible but dearer than the field still wins no traffic. Reports your
+    /// rank, the size of the field, and its best/median cost per product —
+    /// plus the products others serve and you do not. No other miner is named.
+    #[command(after_help = "Examples:\n  \
+        gmcli pricing\n  \
+        gmcli --network testnet pricing")]
+    Pricing,
 
     /// Show your miner's current chain emission on the subnet.
     ///
@@ -598,6 +613,10 @@ enum WorkerCommand {
 
     /// List the hotkey's live workers with per-worker status and last
     /// attestation (`GET /miners/{hotkey}/workers`).
+    ///
+    /// A suspended worker also reports when it is re-probed next and how many
+    /// consecutive successful probes restore it; a worker whose upstream key
+    /// failed to verify names the failing slot.
     List,
 
     /// Deregister a worker from the registry (`DELETE
@@ -727,6 +746,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_status(&mut client).await
+        }
+        Command::Pricing => {
+            let cfg = load_config(explicit_network, api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            let mut client = RegistryClient::new(cfg);
+            cmd_pricing(&mut client).await
         }
         Command::Earnings { yes } => {
             let cfg = load_config(explicit_network, api_url)?;
