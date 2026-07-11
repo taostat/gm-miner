@@ -1,10 +1,13 @@
-//! Discount/price conversion: decimal-percent ⇄ integer basis-points and
-//! per-Mtok nano-dollar rendering. All arithmetic is integer-only — money
-//! is nano-dollars (1 nUSD = 10⁻⁹ USD per Mtok), never a float.
+//! Discount/price conversion, plus the `gmcli pricing` competitiveness view.
+//! All arithmetic is integer-only — money is nano-dollars (1 nUSD = 10⁻⁹ USD),
+//! never a float.
+
+use std::fmt::Write as _;
 
 use anyhow::Result;
 
-use crate::types::RetailDimensions;
+use crate::network::Network;
+use crate::types::{ProductCompetitiveness, RetailDimensions};
 
 /// Inclusive upper bound on `discount_bp`. The registry's pydantic schema
 /// pins the same value (`registry/.../schemas.py::ProductDeclarationRequest`);
@@ -101,15 +104,19 @@ pub fn effective_per_mtok_ndollars(retail_ndollars: u64, discount_bp: u32) -> u6
     u64::try_from(effective).unwrap_or(retail_ndollars)
 }
 
-/// Render a per-Mtok ndollar value as a dollar amount with 3 decimal
-/// places (e.g. `3_000_000_000 → "$3.000"`, `2_685_000_000 → "$2.685"`).
-/// One nano-dollar is `10^-9` USD; 3 decimals is one-tenth of a cent
-/// per Mtok, which is the resolution the operator actually cares about.
+/// Render an ndollar amount as dollars with 3 decimal places (e.g.
+/// `2_685_000_000 → "$2.685"`). One nano-dollar is `10^-9` USD; a tenth of a
+/// cent is the resolution the operator actually cares about.
 #[must_use]
-pub fn format_per_mtok_usd(ndollars: u64) -> String {
+pub fn format_usd(ndollars: u64) -> String {
     let dollars = ndollars / 1_000_000_000;
     let millis = (ndollars % 1_000_000_000) / 1_000_000;
     format!("${dollars}.{millis:03}")
+}
+
+#[must_use]
+pub fn format_per_mtok_usd(ndollars: u64) -> String {
+    format_usd(ndollars)
 }
 
 /// One-line summary of the per-Mtok rate the miner will receive on a
@@ -127,17 +134,189 @@ pub fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> St
     )
 }
 
+/// The `gmcli pricing` view: how each of the miner's offers ranks against the
+/// field, plus the products only others serve.
+#[must_use]
+pub fn render_pricing(network: Network, products: &[ProductCompetitiveness]) -> Vec<String> {
+    let (yours, rest): (Vec<_>, Vec<_>) = products.iter().partition(|p| p.offered_by_you);
+    // Absent from the ranked field for two very different reasons: declared and
+    // broken (fix it) vs never declared (declare it).
+    let (broken, unsold): (Vec<_>, Vec<_>) = rest.iter().partition(|p| p.declared_by_you);
+
+    let mut lines = vec![
+        format!("Pricing competitiveness ({network})"),
+        "Buyers route to the cheapest eligible offer. Cost is one reference request:".to_owned(),
+        "1M input tokens + 1M output tokens at your effective price.".to_owned(),
+        String::new(),
+    ];
+
+    if yours.is_empty() {
+        lines.push("You have no eligible offers to rank.".to_owned());
+    } else {
+        lines.extend(rank_table(&yours));
+    }
+    if !broken.is_empty() {
+        lines.extend(broken_lines(&broken));
+    }
+    if !unsold.is_empty() {
+        lines.extend(unsold_lines(&unsold));
+    }
+    if !yours.is_empty() {
+        lines.extend(advice_lines(&yours));
+    }
+    lines
+}
+
+const RANK_COLUMNS: [(&str, usize); 7] = [
+    ("PROVIDER", 12),
+    ("MODEL", 32),
+    ("YOUR RANK", 12),
+    ("DISCOUNT", 10),
+    ("YOUR COST", 12),
+    ("BEST", 12),
+    ("MEDIAN", 12),
+];
+
+fn rank_row(cells: &[String; 7]) -> String {
+    let mut row = String::new();
+    for (i, ((_, width), cell)) in RANK_COLUMNS.iter().zip(cells).enumerate() {
+        if i > 0 {
+            row.push(' ');
+        }
+        let _ = write!(row, "{cell:<width$}");
+    }
+    row
+}
+
+fn rank_rule() -> String {
+    let cells: usize = RANK_COLUMNS.iter().map(|&(_, width)| width).sum();
+    "-".repeat(cells + RANK_COLUMNS.len() - 1)
+}
+
+fn rank_table(yours: &[&ProductCompetitiveness]) -> Vec<String> {
+    let header = RANK_COLUMNS.map(|(name, _)| name.to_owned());
+    let mut lines = vec![rank_row(&header), rank_rule()];
+    for p in yours {
+        let rank = p.your_rank.map_or_else(
+            || "—".to_owned(),
+            |rank| format!("{rank} of {}", p.competitor_count),
+        );
+        let discount = p.your_discount_bp.map_or_else(
+            || "—".to_owned(),
+            |bp| format!("{}%", format_discount_pct(bp)),
+        );
+        let your_cost = p
+            .your_cost_ndollars
+            .map_or_else(|| "—".to_owned(), format_usd);
+        lines.push(rank_row(&[
+            p.provider.clone(),
+            p.model.clone(),
+            rank,
+            discount,
+            your_cost,
+            format_usd(p.best_cost_ndollars),
+            format_usd(p.median_cost_ndollars),
+        ]));
+    }
+    lines
+}
+
+fn field_line(p: &ProductCompetitiveness) -> String {
+    format!(
+        "  {}/{}: {} eligible offer(s), best {}, median {}",
+        p.provider,
+        p.model,
+        p.competitor_count,
+        format_usd(p.best_cost_ndollars),
+        format_usd(p.median_cost_ndollars),
+    )
+}
+
+/// Products the caller declared but that are not in the eligible field.
+///
+/// It already ran `declare-product`; the offer is broken, not missing, so the
+/// fix is upstream and `gmcli status` is where the reason lives.
+fn broken_lines(broken: &[&ProductCompetitiveness]) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "Declared by you but not eligible — earning nothing ({}):",
+            broken.len()
+        ),
+    ];
+    lines.extend(broken.iter().copied().map(field_line));
+    lines.push("  Run `gmcli status` for the reason and the fix.".to_owned());
+    lines
+}
+
+fn unsold_lines(unsold: &[&ProductCompetitiveness]) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        format!("Offered by others, not by you ({}):", unsold.len()),
+    ];
+    lines.extend(unsold.iter().copied().map(field_line));
+    lines.push(
+        "  Declare one with `gmcli declare-product --provider <p> --model <m> \
+         --discount-pct <pct>`."
+            .to_owned(),
+    );
+    lines
+}
+
+/// Name the offers the router passes over on price, and what to do about them.
+///
+/// Only an offer *strictly* dearer than the field's best loses a route on
+/// price; rank 1 is shared by every miner that ties the best cost, so a rank-1
+/// offer is never called out here.
+fn advice_lines(yours: &[&ProductCompetitiveness]) -> Vec<String> {
+    let outranked: Vec<_> = yours
+        .iter()
+        .filter(|p| p.your_rank.is_some_and(|rank| rank > 1))
+        .collect();
+    if outranked.is_empty() {
+        return vec![
+            String::new(),
+            "You are at the cheapest cost on every product you offer.".to_owned(),
+        ];
+    }
+
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "{} offer(s) are dearer than the cheapest in their field — the router reaches",
+            outranked.len()
+        ),
+        "for those competitors first. Raise your discount to close the gap:".to_owned(),
+    ];
+    for p in outranked {
+        lines.push(format!(
+            "  gmcli declare-product --provider {} --model {} --discount-pct <above {}>",
+            p.provider,
+            p.model,
+            p.your_discount_bp
+                .map_or_else(|| "current".to_owned(), format_discount_pct),
+        ));
+    }
+    lines
+}
+
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "tests intentionally panic on unexpected values"
 )]
 mod tests {
     use super::{
-        effective_per_mtok_ndollars, effective_rate_summary, format_discount_pct,
-        format_per_mtok_usd, parse_discount_pct, MAX_DISCOUNT_BP,
+        effective_per_mtok_ndollars, effective_rate_summary, format_discount_pct, format_usd,
+        parse_discount_pct, rank_row, rank_rule, render_pricing, Network, ProductCompetitiveness,
+        MAX_DISCOUNT_BP, RANK_COLUMNS,
     };
     use crate::types::RetailDimensions;
+
+    fn products(value: serde_json::Value) -> Vec<ProductCompetitiveness> {
+        serde_json::from_value(value).expect("decode competitiveness")
+    }
 
     #[test]
     fn discount_pct_accepts_examples() {
@@ -216,11 +395,11 @@ mod tests {
     }
 
     #[test]
-    fn format_per_mtok_usd_renders_three_decimals() {
-        assert_eq!(format_per_mtok_usd(3_000_000_000), "$3.000");
-        assert_eq!(format_per_mtok_usd(2_685_000_000), "$2.685");
-        assert_eq!(format_per_mtok_usd(15_000_000), "$0.015");
-        assert_eq!(format_per_mtok_usd(0), "$0.000");
+    fn format_usd_renders_three_decimals() {
+        assert_eq!(format_usd(3_000_000_000), "$3.000");
+        assert_eq!(format_usd(2_685_000_000), "$2.685");
+        assert_eq!(format_usd(15_000_000), "$0.015");
+        assert_eq!(format_usd(0), "$0.000");
     }
 
     #[test]
@@ -237,5 +416,109 @@ mod tests {
             effective_rate_summary(&dims, 0),
             "$3.000 in / $15.000 out per Mtok"
         );
+    }
+
+    #[test]
+    fn the_rank_rule_is_exactly_as_wide_as_a_row() {
+        let row = rank_row(&RANK_COLUMNS.map(|(name, _)| name.to_owned()));
+        assert_eq!(rank_rule().chars().count(), row.chars().count());
+    }
+
+    #[test]
+    fn an_outranked_offer_is_named_with_the_command_that_fixes_it() {
+        let rendered = render_pricing(
+            Network::Mainnet,
+            &products(serde_json::json!([{
+                "provider": "anthropic", "model": "claude-sonnet-4-6",
+                "competitor_count": 5,
+                "best_cost_ndollars": 16_200_000_000_u64,
+                "median_cost_ndollars": 18_000_000_000_u64,
+                "offered_by_you": true,
+                "your_cost_ndollars": 18_000_000_000_u64,
+                "your_discount_bp": 500,
+                "your_rank": 3,
+            }])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("3 of 5"));
+        assert!(rendered.contains("$18.000"));
+        assert!(rendered.contains("$16.200"));
+        assert!(rendered.contains("1 offer(s) are dearer"));
+        assert!(rendered
+            .contains("gmcli declare-product --provider anthropic --model claude-sonnet-4-6"));
+        assert!(rendered.contains("<above 5>"));
+    }
+
+    #[test]
+    fn the_cheapest_miner_is_told_it_is_cheapest_and_gets_no_advice() {
+        let rendered = render_pricing(
+            Network::Mainnet,
+            &products(serde_json::json!([{
+                "provider": "openai", "model": "gpt-5.6",
+                "competitor_count": 3,
+                "best_cost_ndollars": 12_000_000_000_u64,
+                "median_cost_ndollars": 13_500_000_000_u64,
+                "offered_by_you": true,
+                "your_cost_ndollars": 12_000_000_000_u64,
+                "your_discount_bp": 1_000,
+                "your_rank": 1,
+            }])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("1 of 3"));
+        assert!(rendered.contains("cheapest cost on every product you offer"));
+        assert!(!rendered.contains("declare-product"));
+    }
+
+    #[test]
+    fn a_product_only_others_serve_becomes_a_nudge() {
+        let rendered = render_pricing(
+            Network::Mainnet,
+            &products(serde_json::json!([{
+                "provider": "gemini", "model": "gemini-3-pro",
+                "competitor_count": 4,
+                "best_cost_ndollars": 8_100_000_000_u64,
+                "median_cost_ndollars": 9_000_000_000_u64,
+                "offered_by_you": false,
+                "your_cost_ndollars": null,
+                "your_discount_bp": null,
+                "your_rank": null,
+            }])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("You have no eligible offers to rank."));
+        assert!(rendered.contains("Offered by others, not by you (1):"));
+        assert!(rendered.contains("gemini/gemini-3-pro: 4 eligible offer(s), best $8.100"));
+        assert!(!rendered.contains("cheapest cost on every product"));
+    }
+
+    #[test]
+    fn a_declared_but_ineligible_offer_is_not_told_to_declare_itself_again() {
+        let rendered = render_pricing(
+            Network::Mainnet,
+            &products(serde_json::json!([{
+                "provider": "anthropic", "model": "claude-sonnet-4-6",
+                "competitor_count": 2,
+                "best_cost_ndollars": 16_200_000_000_u64,
+                "median_cost_ndollars": 18_000_000_000_u64,
+                "offered_by_you": false,
+                "declared_by_you": true,
+                "your_cost_ndollars": null,
+                "your_discount_bp": null,
+                "your_rank": null,
+            }])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("Declared by you but not eligible — earning nothing (1):"));
+        assert!(rendered.contains("anthropic/claude-sonnet-4-6: 2 eligible offer(s)"));
+        assert!(rendered.contains("`gmcli status`"));
+        // The bug this guards: it already declared the product. Telling it to
+        // declare again sends the miner at the wrong problem.
+        assert!(!rendered.contains("Offered by others, not by you"));
+        assert!(!rendered.contains("declare-product"));
     }
 }

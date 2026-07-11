@@ -19,3 +19,4 @@ pub mod slots;
 pub mod terms;
 pub mod types;
 pub mod wizard;
+pub mod workers;

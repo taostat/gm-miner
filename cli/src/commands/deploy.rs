@@ -6,6 +6,7 @@
 //! deployed CVM, and `publish-image-version` computes an `ImageVersion` offline.
 
 use anyhow::{bail, Context as _, Result};
+use chrono::Utc;
 use clap::Parser as _;
 
 use gm_miner_cli::{
@@ -21,6 +22,7 @@ use gm_miner_cli::{
     },
     node_secret, slots, terms,
     types::{MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse},
+    workers::worker_health_lines,
 };
 
 use crate::commands::persist::{
@@ -1099,6 +1101,13 @@ pub(crate) async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
         );
     }
     println!("\n{} worker(s) total.", list.workers.len());
+
+    let now = Utc::now();
+    for w in &list.workers {
+        for line in worker_health_lines(w, list.consecutive_ok_required, now) {
+            println!("{line}");
+        }
+    }
     Ok(())
 }
 

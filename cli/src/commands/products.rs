@@ -9,10 +9,13 @@ use gm_miner_cli::{
         effective_per_mtok_ndollars, effective_rate_summary, format_discount_pct,
         format_per_mtok_usd,
     },
-    types::{MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest, Provider},
+    types::{
+        MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest,
+        ProductOfferStatus, Provider,
+    },
 };
 
-use crate::commands::{me_error, status_error};
+use crate::commands::{get_me_json, status_error};
 
 /// `gmcli declare-product` — POST one (provider, model, `discount_bp`)
 /// offer to `/miners/products`. The registry treats POST as upsert, so this
@@ -200,17 +203,7 @@ pub(crate) fn filter_catalog<'a>(
 /// catalog), alongside the broader hotkey/attestation/compose view.
 pub(crate) async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     let network = client.config.resolved_network();
-    let resp = client
-        .get(gm_miner_cli::client::ME_PATH)
-        .await
-        .context("GET /miners/me")?;
-
-    let status_code = resp.status();
-    if !status_code.is_success() {
-        return Err(me_error(network, status_code));
-    }
-
-    let miner: MinerStatus = resp.json().await.context("parse status response")?;
+    let miner: MinerStatus = get_me_json(client, gm_miner_cli::client::ME_PATH).await?;
 
     println!("Miner status ({network})");
     println!("  Network    : {network} (netuid {})", network.netuid());
@@ -280,5 +273,126 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
         );
     }
     println!("\n{} offer(s) total.", miner.products.len());
+    for line in ineligible_detail_lines(&miner.products) {
+        println!("{line}");
+    }
+    println!("\nRanked against the field? `gmcli pricing`");
     Ok(())
+}
+
+/// Explain every ineligible offer beneath the table, one block each.
+fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
+    let broken: Vec<_> = products.iter().filter(|p| !p.is_eligible).collect();
+    if broken.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "Not eligible — these earn nothing until fixed ({}):",
+            broken.len()
+        ),
+    ];
+    for p in broken {
+        lines.push(String::new());
+        lines.push(format!("  {}/{}", p.provider, p.model));
+        match p.ineligible_reason.as_deref() {
+            Some(reason) => lines.push(format!("    reason : {reason}")),
+            // The registry clears the reason the moment an offer goes eligible
+            // and writes one on every failure, so a blank reason on an
+            // ineligible offer means the control loop has not judged it yet.
+            None => lines.push(
+                "    reason : not yet checked — the control loop probes every cycle".to_owned(),
+            ),
+        }
+        if let Some(hint) = p.ineligible_hint.as_deref() {
+            lines.push(format!("    fix    : {hint}"));
+        }
+        if let Some(passed) = p.capability_check_passed_at.as_deref() {
+            lines.push(format!("    last ok : {passed}"));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions intentionally panic on unexpected values"
+)]
+mod tests {
+    use super::*;
+
+    fn offers(value: serde_json::Value) -> Vec<ProductOfferStatus> {
+        serde_json::from_value(value).expect("decode offers")
+    }
+
+    #[test]
+    fn an_all_eligible_table_prints_no_detail_block() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6",
+            "is_offered": true, "is_eligible": true, "discount_bp": 500,
+        }]));
+        assert!(ineligible_detail_lines(&products).is_empty());
+    }
+
+    #[test]
+    fn each_ineligible_offer_gets_its_reason_and_fix() {
+        let products = offers(serde_json::json!([
+            {
+                "provider": "openai", "model": "gpt-5.6",
+                "is_offered": true, "is_eligible": true, "discount_bp": 500,
+            },
+            {
+                "provider": "anthropic", "model": "claude-sonnet-4-6",
+                "is_offered": true, "is_eligible": false, "discount_bp": 500,
+                "ineligible_reason": "capability_probe_failed: upstream rejected key (401)",
+                "ineligible_hint": "Set a valid key with `gmcli set-api-keys`.",
+            },
+        ]));
+
+        let rendered = ineligible_detail_lines(&products).join("\n");
+        assert!(rendered.contains("Not eligible — these earn nothing until fixed (1):"));
+        assert!(rendered.contains("  anthropic/claude-sonnet-4-6"));
+        assert!(rendered.contains("reason : capability_probe_failed: upstream rejected key (401)"));
+        assert!(rendered.contains("fix    : Set a valid key with `gmcli set-api-keys`."));
+        assert!(!rendered.contains("gpt-5.6"));
+    }
+
+    #[test]
+    fn an_offer_that_was_working_shows_when_it_last_passed() {
+        let products = offers(serde_json::json!([{
+            "provider": "anthropic", "model": "claude-sonnet-4-6",
+            "is_offered": true, "is_eligible": false, "discount_bp": 500,
+            "ineligible_reason": "capability_probe_failed: upstream rejected key (401)",
+            "capability_check_passed_at": "2026-07-10T22:15:00+00:00",
+        }]));
+
+        let rendered = ineligible_detail_lines(&products).join("\n");
+        assert!(rendered.contains("last ok : 2026-07-10T22:15:00+00:00"));
+    }
+
+    #[test]
+    fn an_offer_that_never_passed_shows_no_last_ok_line() {
+        let products = offers(serde_json::json!([{
+            "provider": "anthropic", "model": "claude-sonnet-4-6",
+            "is_offered": true, "is_eligible": false, "discount_bp": 500,
+        }]));
+
+        assert!(!ineligible_detail_lines(&products)
+            .join("\n")
+            .contains("last ok"));
+    }
+
+    #[test]
+    fn an_unjudged_offer_says_so_rather_than_going_blank() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6",
+            "is_offered": true, "is_eligible": false, "discount_bp": 500,
+        }]));
+
+        let rendered = ineligible_detail_lines(&products).join("\n");
+        assert!(rendered.contains("reason : not yet checked"));
+        assert!(!rendered.contains("fix    :"));
+    }
 }
