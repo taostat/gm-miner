@@ -4,7 +4,9 @@ use anyhow::{bail, Context, Result};
 use reqwest::Url;
 use serde_json::Value;
 
-pub(crate) use self::streaming::{assess_streaming_configuration, log_streaming_assessment};
+pub(crate) use self::streaming::{
+    assess_streaming_configuration, log_streaming_assessment, split_azure_governed_deployments,
+};
 use super::arm::{ArmAccount, ArmChildResource, DiagnosticSettingsList};
 use super::config::AzureProvider;
 use super::endpoint::AzureEndpoint;

@@ -117,7 +117,24 @@ pub(crate) struct ArmDeployment {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArmDeploymentProperties {
     pub(crate) rai_policy_name: Option<String>,
+    #[serde(default)]
+    pub(crate) model: ArmDeploymentModel,
 }
+
+/// `format` is the publisher of the deployed model — `OpenAI`, `Anthropic`, …
+/// (`Azure-Samples/claude` deploys Claude with `format: 'Anthropic'`). It is a
+/// free-form string in the ARM schema, not an enum, so unknown values must be
+/// treated as "might be governed by Azure's RAI filter" and checked.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArmDeploymentModel {
+    pub(crate) format: Option<String>,
+}
+
+/// Deployments with this model format are served by Anthropic, not by Azure's
+/// own inference stack, so Azure's RAI content filter is not in their request
+/// path and its mode says nothing about whether they stream.
+pub(crate) const ANTHROPIC_MODEL_FORMAT: &str = "Anthropic";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ArmRaiPolicy {
