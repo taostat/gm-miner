@@ -10,8 +10,29 @@ const MIN_TRANSIENT_FAILURE_LIMIT: u32 = 1;
 const VERIFY_INTERVAL_ENV: &str = "GM_AZURE_VERIFY_INTERVAL_SECS";
 const TRANSIENT_FAILURE_LIMIT_ENV: &str = "GM_AZURE_VERIFY_TRANSIENT_FAILURE_LIMIT";
 
+/// Which upstream a verified Azure account backs. The owner-capture checks are
+/// shared; what differs is the account kind, the endpoint suffix, and whether
+/// Azure's RAI content filter is the mechanism that governs streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AzureProvider {
+    /// `OPENAI_UPSTREAM=azure` — Azure `OpenAI`.
+    OpenAi,
+    /// `ANTHROPIC_UPSTREAM=foundry` — Claude on Microsoft Foundry.
+    Foundry,
+}
+
+impl AzureProvider {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "Azure OpenAI",
+            Self::Foundry => "Microsoft Foundry",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AzureVerifyConfig {
+    pub(crate) provider: AzureProvider,
     pub(crate) endpoint: String,
     pub(crate) tenant_id: String,
     pub(crate) subscription_id: String,
@@ -27,8 +48,9 @@ pub(crate) struct PeriodicAzureVerifySettings {
 }
 
 impl AzureVerifyConfig {
-    pub(crate) fn from_env() -> Result<Self> {
+    fn openai_from_env() -> Result<Self> {
         Ok(Self {
+            provider: AzureProvider::OpenAi,
             endpoint: required_env("AZURE_OPENAI_ENDPOINT")?,
             tenant_id: required_env("AZURE_TENANT_ID")?,
             subscription_id: required_env("AZURE_SUBSCRIPTION_ID")?,
@@ -37,6 +59,44 @@ impl AzureVerifyConfig {
             client_secret: required_env("AZURE_CLIENT_SECRET")?,
         })
     }
+
+    /// Foundry carries its own ARM coordinates rather than reusing the Azure
+    /// `OpenAI` ones: a miner may hold the Foundry account in a different tenant,
+    /// subscription, resource group, or under a different service principal
+    /// than an Azure `OpenAI` account on the same worker.
+    fn foundry_from_env() -> Result<Self> {
+        Ok(Self {
+            provider: AzureProvider::Foundry,
+            endpoint: required_env("AZURE_FOUNDRY_ENDPOINT")?,
+            tenant_id: required_env("AZURE_FOUNDRY_TENANT_ID")?,
+            subscription_id: required_env("AZURE_FOUNDRY_SUBSCRIPTION_ID")?,
+            resource_group: required_env("AZURE_FOUNDRY_RESOURCE_GROUP")?,
+            client_id: required_env("AZURE_FOUNDRY_CLIENT_ID")?,
+            client_secret: required_env("AZURE_FOUNDRY_CLIENT_SECRET")?,
+        })
+    }
+}
+
+/// Every Azure account this worker's upstream selectors put in the request
+/// path. A worker may run both (`ANTHROPIC_UPSTREAM=foundry` alongside
+/// `OPENAI_UPSTREAM=azure`); each is verified independently and either one
+/// failing is fatal.
+///
+/// # Errors
+/// Returns an error when a selected upstream is missing a required env var.
+pub(crate) fn configured_targets_from_env() -> Result<Vec<AzureVerifyConfig>> {
+    let mut targets = Vec::new();
+    if upstream("ANTHROPIC_UPSTREAM") == "foundry" {
+        targets.push(AzureVerifyConfig::foundry_from_env()?);
+    }
+    if upstream("OPENAI_UPSTREAM") == "azure" {
+        targets.push(AzureVerifyConfig::openai_from_env()?);
+    }
+    Ok(targets)
+}
+
+fn upstream(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| "direct".to_owned())
 }
 
 impl PeriodicAzureVerifySettings {

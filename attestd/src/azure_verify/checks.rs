@@ -5,10 +5,14 @@ use reqwest::Url;
 use serde_json::Value;
 
 pub(crate) use self::streaming::{assess_streaming_configuration, log_streaming_assessment};
-use super::arm::{ArmAccount, DiagnosticLog, DiagnosticSettingsList};
+use super::arm::{ArmAccount, ArmChildResource, DiagnosticLog, DiagnosticSettingsList};
+use super::config::AzureProvider;
 use super::endpoint::AzureEndpoint;
 
-const ALLOWED_ACCOUNT_KINDS: [&str; 2] = ["OpenAI", "AIServices"];
+const ALLOWED_OPENAI_ACCOUNT_KINDS: [&str; 2] = ["OpenAI", "AIServices"];
+/// Foundry serves Claude only from an `AIServices` account (Microsoft's own
+/// Claude reference templates create exactly that kind), so accept nothing else.
+const ALLOWED_FOUNDRY_ACCOUNT_KINDS: [&str; 1] = ["AIServices"];
 const ALLOWED_DIAGNOSTIC_LOG_CATEGORIES: [&str; 4] = [
     "Audit",
     "RequestResponse",
@@ -18,14 +22,20 @@ const ALLOWED_DIAGNOSTIC_LOG_CATEGORIES: [&str; 4] = [
 const ALLOWED_DIAGNOSTIC_LOG_CATEGORY_GROUPS: [&str; 2] = ["allLogs", "audit"];
 
 pub(crate) fn assert_account_binding<'account>(
+    provider: AzureProvider,
     endpoint: &AzureEndpoint,
     account: &'account ArmAccount,
 ) -> Result<&'account str> {
-    if !ALLOWED_ACCOUNT_KINDS.contains(&account.kind.as_str()) {
+    let allowed_kinds: &[&str] = match provider {
+        AzureProvider::OpenAi => &ALLOWED_OPENAI_ACCOUNT_KINDS,
+        AzureProvider::Foundry => &ALLOWED_FOUNDRY_ACCOUNT_KINDS,
+    };
+    if !allowed_kinds.contains(&account.kind.as_str()) {
         bail!(
-            "Azure account kind '{}' is not allowed; expected one of {}",
+            "{} account kind '{}' is not allowed; expected one of {}",
+            provider.label(),
             account.kind,
-            ALLOWED_ACCOUNT_KINDS.join(", ")
+            allowed_kinds.join(", ")
         );
     }
     let custom_subdomain = account
@@ -68,7 +78,8 @@ pub(crate) fn assert_account_binding<'account>(
     }
     if arm_host != endpoint.host {
         bail!(
-            "Azure account endpoint host '{arm_host}' does not match configured AZURE_OPENAI_ENDPOINT host '{}'",
+            "{} account endpoint host '{arm_host}' does not match the configured endpoint host '{}'",
+            provider.label(),
             endpoint.host
         );
     }
@@ -102,6 +113,92 @@ pub(crate) fn non_empty_json_value(value: &Value) -> bool {
         Value::String(value) => !value.trim().is_empty(),
         Value::Bool(_) | Value::Number(_) => true,
     }
+}
+
+/// A Foundry account backing a gm miner is inference-only: it exports nothing.
+/// Reject *any* enabled log or metric category and *any* configured
+/// destination, rather than allowlisting the categories that look benign today.
+///
+/// This is deliberately stricter than the Azure `OpenAI` path. Microsoft does not
+/// publish a field-level schema for the `RequestResponse` category, so whether
+/// it can ever carry request bodies for this resource kind is not settled by the
+/// docs — and a future capture feature would arrive as a category we have never
+/// heard of. Requiring the settings list to be empty makes both questions moot.
+pub(crate) fn assert_no_diagnostic_capture(settings: &DiagnosticSettingsList) -> Result<()> {
+    for setting in &settings.value {
+        let enabled_logs: Vec<&str> = setting
+            .properties
+            .logs
+            .iter()
+            .filter(|log| log.enabled)
+            .map(|log| {
+                log.category
+                    .as_deref()
+                    .or(log.category_group.as_deref())
+                    .unwrap_or("<unnamed>")
+            })
+            .collect();
+        if !enabled_logs.is_empty() {
+            bail!(
+                "Microsoft Foundry account has enabled diagnostic log categories ({}); \
+                 a gm Foundry account must export no logs",
+                enabled_logs.join(", ")
+            );
+        }
+        let enabled_metrics: Vec<&str> = setting
+            .properties
+            .metrics
+            .iter()
+            .filter(|metric| metric.enabled)
+            .map(|metric| metric.category.as_deref().unwrap_or("<unnamed>"))
+            .collect();
+        if !enabled_metrics.is_empty() {
+            bail!(
+                "Microsoft Foundry account has enabled diagnostic metric categories ({}); \
+                 a gm Foundry account must export no metrics",
+                enabled_metrics.join(", ")
+            );
+        }
+        let destinations = setting.properties.destination_count();
+        if destinations > 0 {
+            bail!(
+                "Microsoft Foundry account has {destinations} diagnostic-setting destination(s); \
+                 a gm Foundry account must export to none"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject every child resource in a capture-capable collection.
+///
+/// Connections are how an operator attaches a sink to a Foundry account or
+/// project — and an `AppInsights` connection alone is enough for Foundry to
+/// trace prompt content server-side with no code change on the caller's part.
+/// Capability hosts redirect Agent-Service storage to operator-owned stores.
+/// An inference-only account needs neither, so the safe rule is "none", which
+/// also fails closed on connection categories that do not exist yet.
+pub(crate) fn assert_no_capture_children(
+    scope: &str,
+    collection: &str,
+    children: &[ArmChildResource],
+) -> Result<()> {
+    if children.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = children
+        .iter()
+        .map(|child| match child.properties.category.as_deref() {
+            Some(category) => format!("{} ({category})", child.name),
+            None => child.name.clone(),
+        })
+        .collect();
+    bail!(
+        "Microsoft Foundry {scope} has {} {collection} ({}); a gm Foundry account must have none — \
+         they are the sinks prompt content would be captured to",
+        children.len(),
+        named.join(", ")
+    )
 }
 
 pub(crate) fn warn_on_unexpected_diagnostic_logs(settings: &DiagnosticSettingsList) {
@@ -138,10 +235,10 @@ pub(crate) fn diagnostic_log_is_allowed(log: &DiagnosticLog) -> bool {
 mod tests {
     use super::*;
     use crate::azure_verify::arm::ArmAccount;
-    use crate::azure_verify::endpoint::parse_azure_openai_endpoint;
+    use crate::azure_verify::endpoint::parse_azure_endpoint;
 
     fn valid_endpoint() -> AzureEndpoint {
-        parse_azure_openai_endpoint("https://acct.openai.azure.com/")
+        parse_azure_endpoint(AzureProvider::OpenAi, "https://acct.openai.azure.com/")
             .expect("valid endpoint must parse")
     }
 
@@ -166,13 +263,14 @@ mod tests {
     fn account_binding_accepts_allowed_kind_matching_endpoint_and_no_storage() {
         let endpoint = valid_endpoint();
         let account = account_from_json(valid_account_json());
-        assert!(assert_account_binding(&endpoint, &account).is_ok());
+        assert!(assert_account_binding(AzureProvider::OpenAi, &endpoint, &account).is_ok());
     }
 
     #[test]
     fn account_binding_accepts_services_ai_suffix_matching_endpoint() {
-        let endpoint = parse_azure_openai_endpoint("https://acct.services.ai.azure.com/")
-            .expect("valid endpoint must parse");
+        let endpoint =
+            parse_azure_endpoint(AzureProvider::OpenAi, "https://acct.services.ai.azure.com/")
+                .expect("valid endpoint must parse");
         let account = account_from_json(
             r#"{
                 "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct",
@@ -185,7 +283,7 @@ mod tests {
                 }
             }"#,
         );
-        assert!(assert_account_binding(&endpoint, &account).is_ok());
+        assert!(assert_account_binding(AzureProvider::OpenAi, &endpoint, &account).is_ok());
     }
 
     #[test]
@@ -201,7 +299,7 @@ mod tests {
                 }
             }"#,
         );
-        let err = assert_account_binding(&endpoint, &account)
+        let err = assert_account_binding(AzureProvider::OpenAi, &endpoint, &account)
             .expect_err("custom subdomain mismatch must fail")
             .to_string();
         assert!(err.contains("customSubDomainName"), "{err}");
@@ -209,10 +307,11 @@ mod tests {
 
     #[test]
     fn account_binding_rejects_endpoint_host_mismatch() {
-        let endpoint = parse_azure_openai_endpoint("https://other.openai.azure.com/")
-            .expect("valid endpoint must parse");
+        let endpoint =
+            parse_azure_endpoint(AzureProvider::OpenAi, "https://other.openai.azure.com/")
+                .expect("valid endpoint must parse");
         let account = account_from_json(valid_account_json());
-        let err = assert_account_binding(&endpoint, &account)
+        let err = assert_account_binding(AzureProvider::OpenAi, &endpoint, &account)
             .expect_err("host mismatch must fail")
             .to_string();
         assert!(err.contains("does not match configured"), "{err}");
@@ -239,7 +338,7 @@ mod tests {
             let endpoint = valid_endpoint();
             let account = account_from_json(&json);
             assert!(
-                assert_account_binding(&endpoint, &account).is_err(),
+                assert_account_binding(AzureProvider::OpenAi, &endpoint, &account).is_err(),
                 "{properties} must fail"
             );
         }
@@ -257,7 +356,7 @@ mod tests {
                 }
             }"#,
         );
-        let err = assert_account_binding(&valid_endpoint(), &account)
+        let err = assert_account_binding(AzureProvider::OpenAi, &valid_endpoint(), &account)
             .expect_err("kind must fail")
             .to_string();
         assert!(
@@ -302,5 +401,131 @@ mod tests {
             enabled: true,
         };
         assert!(!diagnostic_log_is_allowed(&log));
+    }
+
+    fn foundry_endpoint() -> AzureEndpoint {
+        parse_azure_endpoint(
+            AzureProvider::Foundry,
+            "https://acct.services.ai.azure.com/",
+        )
+        .expect("valid Foundry endpoint must parse")
+    }
+
+    fn foundry_account_json(kind: &str) -> String {
+        format!(
+            r#"{{
+                "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct",
+                "kind": "{kind}",
+                "properties": {{
+                    "customSubDomainName": "acct",
+                    "endpoint": "https://acct.services.ai.azure.com/",
+                    "raiMonitorConfig": null,
+                    "userOwnedStorage": []
+                }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn foundry_account_binding_requires_ai_services_kind() {
+        let endpoint = foundry_endpoint();
+        let account = account_from_json(&foundry_account_json("AIServices"));
+        assert!(assert_account_binding(AzureProvider::Foundry, &endpoint, &account).is_ok());
+
+        // `OpenAI` is a legal kind for the Azure OpenAI upstream but never
+        // serves Claude, so Foundry must reject it.
+        let account = account_from_json(&foundry_account_json("OpenAI"));
+        let err = assert_account_binding(AzureProvider::Foundry, &endpoint, &account)
+            .expect_err("OpenAI kind must fail for Foundry")
+            .to_string();
+        assert!(
+            err.contains("Microsoft Foundry account kind 'OpenAI'"),
+            "{err}"
+        );
+    }
+
+    fn diagnostics_from_json(json: &str) -> DiagnosticSettingsList {
+        serde_json::from_str(json).expect("fixture must parse")
+    }
+
+    #[test]
+    fn foundry_accepts_an_account_that_exports_nothing() {
+        let settings = diagnostics_from_json(r#"{"value": []}"#);
+        assert!(assert_no_diagnostic_capture(&settings).is_ok());
+
+        let disabled = diagnostics_from_json(
+            r#"{"value": [{"properties": {
+                "logs": [{"category": "Audit", "enabled": false}],
+                "metrics": [{"category": "AllMetrics", "enabled": false}]
+            }}]}"#,
+        );
+        assert!(assert_no_diagnostic_capture(&disabled).is_ok());
+    }
+
+    #[test]
+    fn foundry_rejects_every_enabled_export_and_destination() {
+        // A category the Azure OpenAI path allows as "metadata-only" — Foundry
+        // rejects it, because Microsoft publishes no field-level schema saying
+        // RequestResponse can never carry bodies for this resource kind.
+        let logs = diagnostics_from_json(
+            r#"{"value": [{"properties": {"logs": [{"category": "RequestResponse", "enabled": true}]}}]}"#,
+        );
+        let err = assert_no_diagnostic_capture(&logs)
+            .expect_err("enabled log category must fail")
+            .to_string();
+        assert!(err.contains("RequestResponse"), "{err}");
+
+        let metrics = diagnostics_from_json(
+            r#"{"value": [{"properties": {"metrics": [{"category": "AllMetrics", "enabled": true}]}}]}"#,
+        );
+        assert!(assert_no_diagnostic_capture(&metrics).is_err());
+
+        // A destination with no enabled category is still an export sink.
+        let destination = diagnostics_from_json(
+            r#"{"value": [{"properties": {
+                "logs": [],
+                "storageAccountId": "/subscriptions/sub/../storageAccounts/exfil"
+            }}]}"#,
+        );
+        let err = assert_no_diagnostic_capture(&destination)
+            .expect_err("configured destination must fail")
+            .to_string();
+        assert!(err.contains("destination"), "{err}");
+    }
+
+    fn children_from_json(json: &str) -> Vec<ArmChildResource> {
+        serde_json::from_str(json).expect("fixture must parse")
+    }
+
+    #[test]
+    fn foundry_rejects_any_connection_including_app_insights() {
+        assert!(assert_no_capture_children("account", "connections", &[]).is_ok());
+
+        let app_insights = children_from_json(
+            r#"[{"name": "telemetry", "properties": {"category": "AppInsights"}}]"#,
+        );
+        let err = assert_no_capture_children("project 'p1'", "connections", &app_insights)
+            .expect_err("an AppInsights connection must fail")
+            .to_string();
+        assert!(err.contains("AppInsights"), "{err}");
+        assert!(err.contains("project 'p1'"), "{err}");
+
+        // Not just AppInsights: any sink category, and any category we have
+        // never seen, must fail closed too.
+        let blob =
+            children_from_json(r#"[{"name": "store", "properties": {"category": "AzureBlob"}}]"#);
+        assert!(assert_no_capture_children("account", "connections", &blob).is_err());
+        let unknown =
+            children_from_json(r#"[{"name": "x", "properties": {"category": "FutureSink2027"}}]"#);
+        assert!(assert_no_capture_children("account", "connections", &unknown).is_err());
+    }
+
+    #[test]
+    fn foundry_rejects_capability_hosts() {
+        let hosts = children_from_json(r#"[{"name": "agents", "properties": {}}]"#);
+        let err = assert_no_capture_children("project 'p1'", "capabilityHosts", &hosts)
+            .expect_err("a capability host must fail")
+            .to_string();
+        assert!(err.contains("capabilityHosts"), "{err}");
     }
 }

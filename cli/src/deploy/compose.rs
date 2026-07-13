@@ -52,6 +52,34 @@ pub fn render_env_file(
         ("ANTHROPIC_UPSTREAM", env_vars.anthropic_upstream.as_deref()),
         ("BEDROCK_REGION", env_vars.bedrock_region.as_deref()),
         ("BEDROCK_API_KEY", env_vars.bedrock_api_key.as_deref()),
+        (
+            "AZURE_FOUNDRY_ENDPOINT",
+            env_vars.azure_foundry_endpoint.as_deref(),
+        ),
+        (
+            "AZURE_FOUNDRY_API_KEY",
+            env_vars.azure_foundry_api_key.as_deref(),
+        ),
+        (
+            "AZURE_FOUNDRY_TENANT_ID",
+            env_vars.azure_foundry_tenant_id.as_deref(),
+        ),
+        (
+            "AZURE_FOUNDRY_SUBSCRIPTION_ID",
+            env_vars.azure_foundry_subscription_id.as_deref(),
+        ),
+        (
+            "AZURE_FOUNDRY_RESOURCE_GROUP",
+            env_vars.azure_foundry_resource_group.as_deref(),
+        ),
+        (
+            "AZURE_FOUNDRY_CLIENT_ID",
+            env_vars.azure_foundry_client_id.as_deref(),
+        ),
+        (
+            "AZURE_FOUNDRY_CLIENT_SECRET",
+            env_vars.azure_foundry_client_secret.as_deref(),
+        ),
         ("OPENAI_API_KEY", env_vars.openai.as_deref()),
         ("OPENAI_UPSTREAM", env_vars.openai_upstream.as_deref()),
         (
@@ -363,6 +391,13 @@ mod tests {
                 "ANTHROPIC_UPSTREAM",
                 "BEDROCK_REGION",
                 "BEDROCK_API_KEY",
+                "AZURE_FOUNDRY_ENDPOINT",
+                "AZURE_FOUNDRY_API_KEY",
+                "AZURE_FOUNDRY_TENANT_ID",
+                "AZURE_FOUNDRY_SUBSCRIPTION_ID",
+                "AZURE_FOUNDRY_RESOURCE_GROUP",
+                "AZURE_FOUNDRY_CLIENT_ID",
+                "AZURE_FOUNDRY_CLIENT_SECRET",
                 "OPENAI_API_KEY",
                 "OPENAI_UPSTREAM",
                 "AZURE_OPENAI_ENDPOINT",

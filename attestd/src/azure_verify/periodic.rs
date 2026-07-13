@@ -2,59 +2,85 @@ use tokio::sync::oneshot;
 
 use super::config::{AzureVerifyConfig, PeriodicAzureVerifySettings};
 use super::error::{classify_verification_error, VerificationFailureKind};
-use super::verify_azure_openai_config;
+use super::verify_azure_target;
 
-pub(crate) async fn run_periodic_azure_openai_verification(
+/// One configured Azure account plus its own consecutive-transient-failure
+/// count. The counters are per target on purpose: a healthy Azure `OpenAI`
+/// account must not clear a Foundry account's failures, or a worker running
+/// both could ride out an indefinite Foundry outage.
+struct TargetState {
     config: AzureVerifyConfig,
+    transient_failures: u32,
+}
+
+pub(crate) async fn run_periodic_azure_verification(
+    targets: Vec<AzureVerifyConfig>,
     settings: PeriodicAzureVerifySettings,
     fatal_shutdown: oneshot::Sender<String>,
 ) {
-    let mut transient_failures = 0_u32;
+    let mut states: Vec<TargetState> = targets
+        .into_iter()
+        .map(|config| TargetState {
+            config,
+            transient_failures: 0,
+        })
+        .collect();
+
     loop {
         tokio::time::sleep(settings.interval).await;
-        match verify_azure_openai_config(&config).await {
-            Ok(()) => {
-                if transient_failures > 0 {
-                    tracing::info!(
-                        recovered_after = transient_failures,
-                        "periodic Azure OpenAI owner-capture verification recovered",
-                    );
-                    transient_failures = 0;
+        for state in &mut states {
+            let provider = state.config.provider.label();
+            match verify_azure_target(&state.config).await {
+                Ok(()) => {
+                    if state.transient_failures > 0 {
+                        tracing::info!(
+                            provider,
+                            recovered_after = state.transient_failures,
+                            "periodic Azure owner-capture verification recovered",
+                        );
+                        state.transient_failures = 0;
+                    }
                 }
-            }
-            Err(err) => match classify_verification_error(&err) {
-                VerificationFailureKind::Definitive => {
-                    let reason = format!(
-                        "definitive Azure OpenAI owner-capture verification failure: {err:#}"
-                    );
-                    tracing::error!(error = %err, "periodic Azure OpenAI owner-capture verification failed definitively");
-                    let _ = fatal_shutdown.send(reason);
-                    return;
-                }
-                VerificationFailureKind::Transient => {
-                    transient_failures = transient_failures.saturating_add(1);
-                    if transient_failures >= settings.transient_failure_limit {
+                Err(err) => match classify_verification_error(&err) {
+                    VerificationFailureKind::Definitive => {
                         let reason = format!(
-                            "Azure OpenAI owner-capture verification had {transient_failures} consecutive transient failures (limit {}): {err:#}",
-                            settings.transient_failure_limit
+                            "definitive {provider} owner-capture verification failure: {err:#}"
                         );
                         tracing::error!(
+                            provider,
                             error = %err,
-                            transient_failures,
-                            transient_failure_limit = settings.transient_failure_limit,
-                            "periodic Azure OpenAI owner-capture verification exceeded transient failure tolerance",
+                            "periodic Azure owner-capture verification failed definitively",
                         );
                         let _ = fatal_shutdown.send(reason);
                         return;
                     }
-                    tracing::warn!(
-                        error = %err,
-                        transient_failures,
-                        transient_failure_limit = settings.transient_failure_limit,
-                        "periodic Azure OpenAI owner-capture verification hit a transient error",
-                    );
-                }
-            },
+                    VerificationFailureKind::Transient => {
+                        state.transient_failures = state.transient_failures.saturating_add(1);
+                        if state.transient_failures >= settings.transient_failure_limit {
+                            let reason = format!(
+                                "{provider} owner-capture verification had {} consecutive transient failures (limit {}): {err:#}",
+                                state.transient_failures, settings.transient_failure_limit
+                            );
+                            tracing::error!(
+                                provider,
+                                error = %err,
+                                transient_failures = state.transient_failures,
+                                transient_failure_limit = settings.transient_failure_limit,
+                                "periodic Azure owner-capture verification exceeded transient failure tolerance",
+                            );
+                            let _ = fatal_shutdown.send(reason);
+                            return;
+                        }
+                        tracing::warn!(
+                            provider,
+                            error = %err,
+                            transient_failures = state.transient_failures,
+                            transient_failure_limit = settings.transient_failure_limit,
+                            "periodic Azure owner-capture verification hit a transient error",
+                        );
+                    }
+                },
+            }
         }
     }
 }

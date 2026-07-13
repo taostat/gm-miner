@@ -20,56 +20,70 @@ use reqwest::Client;
 use tokio::sync::oneshot;
 
 use self::arm::{
-    fetch_arm_account, fetch_arm_deployments, fetch_arm_rai_policy, fetch_diagnostic_settings,
-    fetch_entra_token,
+    fetch_account_children, fetch_arm_account, fetch_arm_deployments, fetch_arm_rai_policy,
+    fetch_diagnostic_settings, fetch_entra_token, fetch_project_children,
 };
 use self::checks::{
-    assert_account_binding, assess_streaming_configuration, log_streaming_assessment,
-    warn_on_unexpected_diagnostic_logs,
+    assert_account_binding, assert_no_capture_children, assert_no_diagnostic_capture,
+    assess_streaming_configuration, log_streaming_assessment, warn_on_unexpected_diagnostic_logs,
 };
-use self::config::{AzureVerifyConfig, PeriodicAzureVerifySettings};
-use self::endpoint::{parse_azure_openai_endpoint, AzureEndpoint};
-use self::periodic::run_periodic_azure_openai_verification;
+use self::config::{
+    configured_targets_from_env, AzureProvider, AzureVerifyConfig, PeriodicAzureVerifySettings,
+};
+use self::endpoint::{parse_azure_endpoint, AzureEndpoint};
+use self::periodic::run_periodic_azure_verification;
 
-/// Verify the Azure `OpenAI` upstream configuration from process env.
+/// Verify every Azure account this worker's upstream selectors put in the
+/// request path (`OPENAI_UPSTREAM=azure`, `ANTHROPIC_UPSTREAM=foundry`).
 ///
 /// # Errors
-/// Returns an error when any required env var is missing, the endpoint is not
-/// an allowed Azure `OpenAI` host, ARM cannot be queried, or the ARM resource
-/// is not bound to the configured TLS destination with content-to-storage
-/// persistence disabled.
-pub async fn verify_azure_openai_config_from_env() -> Result<()> {
-    let config = AzureVerifyConfig::from_env()?;
-    verify_azure_openai_config(&config).await
+/// Returns an error when any required env var is missing, an endpoint is not an
+/// allowed Azure host, ARM cannot be queried, or any configured account is not
+/// bound to its TLS destination with every observable capture surface off.
+pub async fn verify_azure_config_from_env() -> Result<()> {
+    let targets = configured_targets_from_env()?;
+    if targets.is_empty() {
+        tracing::info!("no Azure-backed upstream configured; nothing to verify");
+        return Ok(());
+    }
+    for target in &targets {
+        verify_azure_target(target).await?;
+    }
+    Ok(())
 }
 
-/// Start periodic Azure `OpenAI` owner-capture verification from process env.
+/// Start periodic owner-capture verification for every configured Azure target.
 ///
 /// On definitive verification failure, or too many consecutive transient
-/// failures, the task sends a shutdown reason through `fatal_shutdown`.
+/// failures on any one target, the task sends a shutdown reason through
+/// `fatal_shutdown`.
 ///
 /// # Errors
 /// Returns an error if verifier env is invalid or periodic settings cannot be
 /// parsed.
-pub fn spawn_periodic_azure_openai_verification_from_env(
+pub fn spawn_periodic_azure_verification_from_env(
     fatal_shutdown: oneshot::Sender<String>,
-) -> Result<tokio::task::JoinHandle<()>> {
-    let config = AzureVerifyConfig::from_env()?;
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    let targets = configured_targets_from_env()?;
+    if targets.is_empty() {
+        return Ok(None);
+    }
     let settings = PeriodicAzureVerifySettings::from_env()?;
     tracing::info!(
         interval_secs = settings.interval.as_secs(),
         transient_failure_limit = settings.transient_failure_limit,
-        "starting periodic Azure OpenAI owner-capture verification",
+        targets = targets.len(),
+        "starting periodic Azure owner-capture verification",
     );
-    Ok(tokio::spawn(run_periodic_azure_openai_verification(
-        config,
+    Ok(Some(tokio::spawn(run_periodic_azure_verification(
+        targets,
         settings,
         fatal_shutdown,
-    )))
+    ))))
 }
 
-async fn verify_azure_openai_config(config: &AzureVerifyConfig) -> Result<()> {
-    let endpoint = parse_azure_openai_endpoint(&config.endpoint)?;
+pub(crate) async fn verify_azure_target(config: &AzureVerifyConfig) -> Result<()> {
+    let endpoint = parse_azure_endpoint(config.provider, &config.endpoint)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -79,15 +93,112 @@ async fn verify_azure_openai_config(config: &AzureVerifyConfig) -> Result<()> {
     // that do not want a client secret in the encrypted CVM env.
     let token = fetch_entra_token(&client, config).await?;
     let account = fetch_arm_account(&client, config, &endpoint, &token).await?;
-    let resource_id = assert_account_binding(&endpoint, &account)?;
-    let diagnostics = fetch_diagnostic_settings(&client, resource_id, &token).await?;
-    warn_on_unexpected_diagnostic_logs(&diagnostics);
-    verify_async_filter_configuration(&client, config, &endpoint, &token).await?;
+    let resource_id = assert_account_binding(config.provider, &endpoint, &account)?;
+
+    match config.provider {
+        AzureProvider::OpenAi => {
+            let diagnostics = fetch_diagnostic_settings(&client, resource_id, &token).await?;
+            warn_on_unexpected_diagnostic_logs(&diagnostics);
+            verify_async_filter_configuration(&client, config, &endpoint, &token).await?;
+        }
+        AzureProvider::Foundry => {
+            verify_foundry_capture_surfaces(&client, config, &endpoint, resource_id, &token)
+                .await?;
+        }
+    }
+
     tracing::info!(
+        provider = config.provider.label(),
         azure_host = %endpoint.host,
         resource_id = %resource_id,
-        "Azure OpenAI owner-capture verification passed",
+        "Azure owner-capture verification passed",
     );
+    Ok(())
+}
+
+/// Foundry's capture surfaces are child resources and diagnostic exports, not
+/// an RAI policy: Azure's content filter is not in Claude's inference path, so
+/// there is no `raiPolicyName` mode to read and the verifier never consults one
+/// (Microsoft's own Claude templates do set `raiPolicyName`, and it is inert
+/// here — reading it would prove nothing either way).
+async fn verify_foundry_capture_surfaces(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    resource_id: &str,
+    token: &str,
+) -> Result<()> {
+    let diagnostics = fetch_diagnostic_settings(client, resource_id, token).await?;
+    assert_no_diagnostic_capture(&diagnostics)?;
+
+    let connections = fetch_account_children(
+        client,
+        config,
+        endpoint,
+        "connections",
+        token,
+        "Azure Foundry account connections",
+    )
+    .await?;
+    assert_no_capture_children("account", "connections", &connections)?;
+
+    let capability_hosts = fetch_account_children(
+        client,
+        config,
+        endpoint,
+        "capabilityHosts",
+        token,
+        "Azure Foundry account capability hosts",
+    )
+    .await?;
+    assert_no_capture_children("account", "capabilityHosts", &capability_hosts)?;
+
+    let projects = fetch_account_children(
+        client,
+        config,
+        endpoint,
+        "projects",
+        token,
+        "Azure Foundry projects",
+    )
+    .await?;
+    tracing::info!(
+        project_count = projects.len(),
+        "sweeping Foundry projects for capture surfaces",
+    );
+    for project in &projects {
+        let connections = fetch_project_children(
+            client,
+            config,
+            endpoint,
+            &project.name,
+            "connections",
+            token,
+            "Azure Foundry project connections",
+        )
+        .await?;
+        assert_no_capture_children(
+            &format!("project '{}'", project.name),
+            "connections",
+            &connections,
+        )?;
+
+        let capability_hosts = fetch_project_children(
+            client,
+            config,
+            endpoint,
+            &project.name,
+            "capabilityHosts",
+            token,
+            "Azure Foundry project capability hosts",
+        )
+        .await?;
+        assert_no_capture_children(
+            &format!("project '{}'", project.name),
+            "capabilityHosts",
+            &capability_hosts,
+        )?;
+    }
     Ok(())
 }
 

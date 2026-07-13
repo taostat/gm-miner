@@ -8,7 +8,11 @@ use super::config::AzureVerifyConfig;
 use super::endpoint::AzureEndpoint;
 
 const MANAGEMENT_SCOPE: &str = "https://management.azure.com/.default";
-const ARM_API_VERSION: &str = "2024-10-01";
+/// Newest stable `Microsoft.CognitiveServices` version. Needed at >= 2025-06-01
+/// for `accounts/projects`, which the Foundry capture-surface sweep enumerates.
+const ARM_API_VERSION: &str = "2026-05-01";
+/// `Microsoft.Insights/diagnosticSettings` has only ever shipped as this
+/// preview version; there is no stable one.
 const DIAGNOSTIC_SETTINGS_API_VERSION: &str = "2021-05-01-preview";
 
 #[derive(Debug, Deserialize)]
@@ -50,9 +54,12 @@ pub(crate) struct DiagnosticSetting {
 pub(crate) struct DiagnosticProperties {
     #[serde(default)]
     pub(crate) logs: Vec<DiagnosticLog>,
+    #[serde(default)]
+    pub(crate) metrics: Vec<DiagnosticMetric>,
     pub(crate) workspace_id: Option<String>,
     pub(crate) storage_account_id: Option<String>,
     pub(crate) event_hub_authorization_rule_id: Option<String>,
+    pub(crate) service_bus_rule_id: Option<String>,
     pub(crate) marketplace_partner_id: Option<String>,
 }
 
@@ -63,6 +70,41 @@ pub(crate) struct DiagnosticLog {
     pub(crate) category_group: Option<String>,
     #[serde(default)]
     pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DiagnosticMetric {
+    pub(crate) category: Option<String>,
+    #[serde(default)]
+    pub(crate) enabled: bool,
+}
+
+/// A `Microsoft.CognitiveServices` child resource the Foundry sweep only needs
+/// to *count* and name: projects, connections, capability hosts. Any of them
+/// existing on an inference-only account is a capture surface we reject, so the
+/// verifier never needs to interpret their bodies.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmChildResource {
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) properties: ArmChildProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArmChildProperties {
+    /// Present on connections (`AppInsights`, `AzureBlob`, …).
+    pub(crate) category: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmChildList {
+    #[serde(default)]
+    pub(crate) value: Vec<ArmChildResource>,
+    #[serde(rename = "nextLink")]
+    pub(crate) next_link: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,10 +153,12 @@ impl DiagnosticProperties {
             self.workspace_id.as_ref(),
             self.storage_account_id.as_ref(),
             self.event_hub_authorization_rule_id.as_ref(),
+            self.service_bus_rule_id.as_ref(),
             self.marketplace_partner_id.as_ref(),
         ]
         .into_iter()
         .flatten()
+        .filter(|id| !id.trim().is_empty())
         .count()
     }
 }
@@ -216,6 +260,66 @@ pub(crate) async fn fetch_arm_deployments(
         value: deployments,
         next_link: None,
     })
+}
+
+/// Enumerate a `Microsoft.CognitiveServices` child collection under the
+/// account (`projects`, `connections`, `capabilityHosts`) or under one of its
+/// projects, following `nextLink` to the end.
+pub(crate) async fn fetch_account_children(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    collection: &str,
+    token: &str,
+    label: &'static str,
+) -> Result<Vec<ArmChildResource>> {
+    let url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/{collection}?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+    );
+    fetch_children_paged(client, url, token, label).await
+}
+
+pub(crate) async fn fetch_project_children(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    project: &str,
+    collection: &str,
+    token: &str,
+    label: &'static str,
+) -> Result<Vec<ArmChildResource>> {
+    let url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/projects/{}/{collection}?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+        encode_path_segment(project),
+    );
+    fetch_children_paged(client, url, token, label).await
+}
+
+async fn fetch_children_paged(
+    client: &Client,
+    mut url: String,
+    token: &str,
+    label: &'static str,
+) -> Result<Vec<ArmChildResource>> {
+    let mut items = Vec::new();
+    loop {
+        let page: ArmChildList = get_json(client, &url, token, label).await?;
+        items.extend(page.value);
+        let Some(next_link) = page.next_link else {
+            break;
+        };
+        if next_link.trim().is_empty() {
+            bail!("{label} response had an empty nextLink");
+        }
+        url = next_link;
+    }
+    Ok(items)
 }
 
 pub(crate) async fn fetch_arm_rai_policy(

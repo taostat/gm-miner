@@ -27,6 +27,71 @@ fn validate_selector(name: &str, value: &str, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The `ANTHROPIC_UPSTREAM=foundry` flag group: the Claude-on-Azure data-plane
+/// endpoint and key, plus the read-only Entra service principal `attestd` uses
+/// to verify the Foundry account carries no owner-capture controls. Grouped so
+/// the seven flags travel as one argument instead of widening an already-long
+/// handler signature.
+#[derive(Debug, Default)]
+pub(crate) struct FoundryArgs {
+    pub(crate) endpoint: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) tenant_id: Option<String>,
+    pub(crate) subscription_id: Option<String>,
+    pub(crate) resource_group: Option<String>,
+    pub(crate) client_id: Option<String>,
+    pub(crate) client_secret: Option<String>,
+}
+
+impl FoundryArgs {
+    fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("azure-foundry-endpoint", self.endpoint.as_deref()),
+            ("azure-foundry-api-key", self.api_key.as_deref()),
+            ("azure-foundry-tenant-id", self.tenant_id.as_deref()),
+            (
+                "azure-foundry-subscription-id",
+                self.subscription_id.as_deref(),
+            ),
+            (
+                "azure-foundry-resource-group",
+                self.resource_group.as_deref(),
+            ),
+            ("azure-foundry-client-id", self.client_id.as_deref()),
+            ("azure-foundry-client-secret", self.client_secret.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_key(name, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_into(self, keys: &mut ProviderKeys) {
+        if let Some(v) = self.endpoint {
+            keys.azure_foundry_endpoint = Some(v);
+        }
+        if let Some(v) = self.api_key {
+            keys.azure_foundry_api_key = Some(v);
+        }
+        if let Some(v) = self.tenant_id {
+            keys.azure_foundry_tenant_id = Some(v);
+        }
+        if let Some(v) = self.subscription_id {
+            keys.azure_foundry_subscription_id = Some(v);
+        }
+        if let Some(v) = self.resource_group {
+            keys.azure_foundry_resource_group = Some(v);
+        }
+        if let Some(v) = self.client_id {
+            keys.azure_foundry_client_id = Some(v);
+        }
+        if let Some(v) = self.client_secret {
+            keys.azure_foundry_client_secret = Some(v);
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single CLI command handler validates, persists, and reports all provider settings"
@@ -37,6 +102,7 @@ pub(crate) fn cmd_set_api_keys(
     anthropic_upstream: Option<String>,
     bedrock_region: Option<String>,
     bedrock_api_key: Option<String>,
+    foundry: FoundryArgs,
     openai: Option<String>,
     openai_upstream: Option<String>,
     azure_openai_endpoint: Option<String>,
@@ -55,8 +121,9 @@ pub(crate) fn cmd_set_api_keys(
         validate_key("anthropic", k)?;
     }
     if let Some(ref v) = anthropic_upstream {
-        validate_selector("anthropic-upstream", v, &["direct", "bedrock"])?;
+        validate_selector("anthropic-upstream", v, &["direct", "bedrock", "foundry"])?;
     }
+    foundry.validate()?;
     if let Some(ref v) = bedrock_region {
         validate_key("bedrock-region", v)?;
     }
@@ -103,86 +170,102 @@ pub(crate) fn cmd_set_api_keys(
     // Load → mutate → save under the lock so a concurrent `deploy` save can't
     // be clobbered, and re-read fresh inside the lock so we merge onto the
     // latest on-disk state rather than a snapshot taken before the lock.
-    let (has_anthropic, has_bedrock, has_openai, has_azure, has_google, has_chutes, has_zai) =
-        config::with_config_lock(|| {
-            let mut cfg = config::load()
-                .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
+    let (
+        has_anthropic,
+        has_bedrock,
+        has_foundry,
+        has_openai,
+        has_azure,
+        has_google,
+        has_chutes,
+        has_zai,
+    ) = config::with_config_lock(|| {
+        let mut cfg = config::load()
+            .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
 
-            // Provider keys are network-independent, but an explicit --network here
-            // is still the user's sticky selection — persist it so the promise holds
-            // even when set-api-keys is the command that carries the flag.
-            if let Some(network) = explicit_network {
-                cfg.set_network(network);
-            }
+        // Provider keys are network-independent, but an explicit --network here
+        // is still the user's sticky selection — persist it so the promise holds
+        // even when set-api-keys is the command that carries the flag.
+        if let Some(network) = explicit_network {
+            cfg.set_network(network);
+        }
 
-            let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
-            if let Some(k) = anthropic {
-                keys.anthropic = Some(k);
-            }
-            if let Some(v) = anthropic_upstream {
-                keys.anthropic_upstream = Some(v);
-            }
-            if let Some(v) = bedrock_region {
-                keys.bedrock_region = Some(v);
-            }
-            if let Some(k) = bedrock_api_key {
-                keys.bedrock_api_key = Some(k);
-            }
-            if let Some(k) = openai {
-                keys.openai = Some(k);
-            }
-            if let Some(v) = openai_upstream {
-                keys.openai_upstream = Some(v);
-            }
-            if let Some(v) = azure_openai_endpoint {
-                keys.azure_openai_endpoint = Some(v);
-            }
-            if let Some(k) = azure_openai_api_key {
-                keys.azure_openai_api_key = Some(k);
-            }
-            if let Some(v) = azure_tenant_id {
-                keys.azure_tenant_id = Some(v);
-            }
-            if let Some(v) = azure_subscription_id {
-                keys.azure_subscription_id = Some(v);
-            }
-            if let Some(v) = azure_resource_group {
-                keys.azure_resource_group = Some(v);
-            }
-            if let Some(v) = azure_client_id {
-                keys.azure_client_id = Some(v);
-            }
-            if let Some(v) = azure_client_secret {
-                keys.azure_client_secret = Some(v);
-            }
-            if let Some(k) = google {
-                keys.google = Some(k);
-            }
-            if let Some(k) = chutes {
-                keys.chutes = Some(k);
-            }
-            if let Some(k) = zai {
-                keys.zai = Some(k);
-            }
-            let snapshot = (
-                keys.anthropic.is_some(),
-                keys.bedrock_api_key.is_some(),
-                keys.openai.is_some(),
-                keys.azure_openai_api_key.is_some()
-                    || keys.azure_openai_endpoint.is_some()
-                    || keys.azure_tenant_id.is_some()
-                    || keys.azure_subscription_id.is_some()
-                    || keys.azure_resource_group.is_some()
-                    || keys.azure_client_id.is_some()
-                    || keys.azure_client_secret.is_some(),
-                keys.google.is_some(),
-                keys.chutes.is_some(),
-                keys.zai.is_some(),
-            );
+        let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
+        if let Some(k) = anthropic {
+            keys.anthropic = Some(k);
+        }
+        if let Some(v) = anthropic_upstream {
+            keys.anthropic_upstream = Some(v);
+        }
+        if let Some(v) = bedrock_region {
+            keys.bedrock_region = Some(v);
+        }
+        if let Some(k) = bedrock_api_key {
+            keys.bedrock_api_key = Some(k);
+        }
+        foundry.merge_into(keys);
+        if let Some(k) = openai {
+            keys.openai = Some(k);
+        }
+        if let Some(v) = openai_upstream {
+            keys.openai_upstream = Some(v);
+        }
+        if let Some(v) = azure_openai_endpoint {
+            keys.azure_openai_endpoint = Some(v);
+        }
+        if let Some(k) = azure_openai_api_key {
+            keys.azure_openai_api_key = Some(k);
+        }
+        if let Some(v) = azure_tenant_id {
+            keys.azure_tenant_id = Some(v);
+        }
+        if let Some(v) = azure_subscription_id {
+            keys.azure_subscription_id = Some(v);
+        }
+        if let Some(v) = azure_resource_group {
+            keys.azure_resource_group = Some(v);
+        }
+        if let Some(v) = azure_client_id {
+            keys.azure_client_id = Some(v);
+        }
+        if let Some(v) = azure_client_secret {
+            keys.azure_client_secret = Some(v);
+        }
+        if let Some(k) = google {
+            keys.google = Some(k);
+        }
+        if let Some(k) = chutes {
+            keys.chutes = Some(k);
+        }
+        if let Some(k) = zai {
+            keys.zai = Some(k);
+        }
+        let snapshot = (
+            keys.anthropic.is_some(),
+            keys.bedrock_api_key.is_some(),
+            keys.azure_foundry_api_key.is_some()
+                || keys.azure_foundry_endpoint.is_some()
+                || keys.azure_foundry_tenant_id.is_some()
+                || keys.azure_foundry_subscription_id.is_some()
+                || keys.azure_foundry_resource_group.is_some()
+                || keys.azure_foundry_client_id.is_some()
+                || keys.azure_foundry_client_secret.is_some(),
+            keys.openai.is_some(),
+            keys.azure_openai_api_key.is_some()
+                || keys.azure_openai_endpoint.is_some()
+                || keys.azure_tenant_id.is_some()
+                || keys.azure_subscription_id.is_some()
+                || keys.azure_resource_group.is_some()
+                || keys.azure_client_id.is_some()
+                || keys.azure_client_secret.is_some(),
+            keys.google.is_some(),
+            keys.chutes.is_some(),
+            keys.zai.is_some(),
+        );
 
-            config::save(&cfg).context("save config")?;
-            Ok(snapshot)
-        })?;
+        config::save(&cfg).context("save config")?;
+        Ok(snapshot)
+    })?;
 
     let mut set_names: Vec<&str> = Vec::new();
     if has_anthropic {
@@ -190,6 +273,9 @@ pub(crate) fn cmd_set_api_keys(
     }
     if has_bedrock {
         set_names.push("bedrock");
+    }
+    if has_foundry {
+        set_names.push("azure-foundry");
     }
     if has_openai {
         set_names.push("openai");

@@ -56,7 +56,7 @@ use crate::commands::doctor::cmd_doctor;
 use crate::commands::earnings::cmd_earnings;
 use crate::commands::fun::{cmd_gm, cmd_moon};
 use crate::commands::hotkey::cmd_register_hotkey;
-use crate::commands::keys::cmd_set_api_keys;
+use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::pricing::cmd_pricing;
 use crate::commands::products::{cmd_declare_product, cmd_declare_products, cmd_status};
@@ -144,13 +144,18 @@ enum Command {
         gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
           --bedrock-api-key brk-...\n  \
         gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
-          --azure-openai-api-key ...")]
+          --azure-openai-api-key ...\n  \
+        gmcli set-api-keys --anthropic-upstream foundry \\\n  \
+          --azure-foundry-endpoint https://my-resource.services.ai.azure.com \\\n  \
+          --azure-foundry-api-key ... --azure-foundry-tenant-id ... \\\n  \
+          --azure-foundry-subscription-id ... --azure-foundry-resource-group ... \\\n  \
+          --azure-foundry-client-id ... --azure-foundry-client-secret ...")]
     SetApiKeys {
         /// Anthropic API key (sk-ant-...).
         #[arg(long)]
         anthropic: Option<String>,
 
-        /// Anthropic upstream selector: direct or bedrock.
+        /// Anthropic upstream selector: direct, bedrock, or foundry.
         #[arg(long)]
         anthropic_upstream: Option<String>,
 
@@ -161,6 +166,35 @@ enum Command {
         /// AWS Bedrock API key for `ANTHROPIC_UPSTREAM=bedrock`.
         #[arg(long)]
         bedrock_api_key: Option<String>,
+
+        /// Microsoft Foundry endpoint for `ANTHROPIC_UPSTREAM=foundry`
+        /// (`https://<resource>.services.ai.azure.com`).
+        #[arg(long)]
+        azure_foundry_endpoint: Option<String>,
+
+        /// Microsoft Foundry API key for `ANTHROPIC_UPSTREAM=foundry`.
+        #[arg(long)]
+        azure_foundry_api_key: Option<String>,
+
+        /// Azure tenant ID for Foundry ARM verification.
+        #[arg(long)]
+        azure_foundry_tenant_id: Option<String>,
+
+        /// Azure subscription ID for Foundry ARM verification.
+        #[arg(long)]
+        azure_foundry_subscription_id: Option<String>,
+
+        /// Azure resource group for Foundry ARM verification.
+        #[arg(long)]
+        azure_foundry_resource_group: Option<String>,
+
+        /// Azure client ID for Foundry ARM verification.
+        #[arg(long)]
+        azure_foundry_client_id: Option<String>,
+
+        /// Azure client secret for Foundry ARM verification.
+        #[arg(long)]
+        azure_foundry_client_secret: Option<String>,
 
         /// `OpenAI` API key (sk-...).
         #[arg(long)]
@@ -659,6 +693,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
             anthropic_upstream,
             bedrock_region,
             bedrock_api_key,
+            azure_foundry_endpoint,
+            azure_foundry_api_key,
+            azure_foundry_tenant_id,
+            azure_foundry_subscription_id,
+            azure_foundry_resource_group,
+            azure_foundry_client_id,
+            azure_foundry_client_secret,
             openai,
             openai_upstream,
             azure_openai_endpoint,
@@ -677,6 +718,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
             anthropic_upstream,
             bedrock_region,
             bedrock_api_key,
+            FoundryArgs {
+                endpoint: azure_foundry_endpoint,
+                api_key: azure_foundry_api_key,
+                tenant_id: azure_foundry_tenant_id,
+                subscription_id: azure_foundry_subscription_id,
+                resource_group: azure_foundry_resource_group,
+                client_id: azure_foundry_client_id,
+                client_secret: azure_foundry_client_secret,
+            },
             openai,
             openai_upstream,
             azure_openai_endpoint,

@@ -65,11 +65,18 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// (`DSTACK_DOCKER_*`) are
 /// excluded: the gm image is public and those vars do not appear in
 /// `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 17] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 24] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
     "BEDROCK_API_KEY",
+    "AZURE_FOUNDRY_ENDPOINT",
+    "AZURE_FOUNDRY_API_KEY",
+    "AZURE_FOUNDRY_TENANT_ID",
+    "AZURE_FOUNDRY_SUBSCRIPTION_ID",
+    "AZURE_FOUNDRY_RESOURCE_GROUP",
+    "AZURE_FOUNDRY_CLIENT_ID",
+    "AZURE_FOUNDRY_CLIENT_SECRET",
     "OPENAI_API_KEY",
     "OPENAI_UPSTREAM",
     "AZURE_OPENAI_ENDPOINT",

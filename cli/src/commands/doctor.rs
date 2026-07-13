@@ -334,4 +334,53 @@ mod tests {
         assert!(check.status == Status::Pass);
         assert!(check.note.contains("upstream config valid"));
     }
+
+    fn complete_foundry_keys() -> ProviderKeys {
+        ProviderKeys {
+            anthropic_upstream: Some("foundry".to_owned()),
+            azure_foundry_endpoint: Some("https://acct.services.ai.azure.com".to_owned()),
+            azure_foundry_api_key: Some("foundry-key".to_owned()),
+            azure_foundry_tenant_id: Some("tenant".to_owned()),
+            azure_foundry_subscription_id: Some("sub".to_owned()),
+            azure_foundry_resource_group: Some("rg".to_owned()),
+            azure_foundry_client_id: Some("client".to_owned()),
+            azure_foundry_client_secret: Some("secret".to_owned()),
+            ..ProviderKeys::default()
+        }
+    }
+
+    #[test]
+    fn complete_foundry_config_passes() {
+        let check = provider_keys_check(&cfg(complete_foundry_keys()));
+        assert!(check.status == Status::Pass);
+        assert!(check.note.contains("upstream config valid"));
+    }
+
+    #[test]
+    fn foundry_without_arm_credentials_fails_upstream_validation() {
+        let mut keys = complete_foundry_keys();
+        keys.azure_foundry_client_secret = None;
+        let check = provider_keys_check(&cfg(keys));
+
+        assert!(check.status == Status::Fail);
+        assert!(
+            check.note.contains("--azure-foundry-client-secret"),
+            "{}",
+            check.note
+        );
+    }
+
+    #[test]
+    fn foundry_endpoint_outside_services_ai_fails_upstream_validation() {
+        let mut keys = complete_foundry_keys();
+        keys.azure_foundry_endpoint = Some("https://acct.openai.azure.com".to_owned());
+        let check = provider_keys_check(&cfg(keys));
+
+        assert!(check.status == Status::Fail);
+        assert!(
+            check.note.contains("services.ai.azure.com"),
+            "{}",
+            check.note
+        );
+    }
 }

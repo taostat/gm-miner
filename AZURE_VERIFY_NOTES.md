@@ -53,4 +53,86 @@ The owner-capture checks enforce that the Azure OpenAI account is bound to the c
 
 Network operators on the path between the miner CVM and Azure observe only TLS-encrypted ciphertext. Prompt content stays confidential end-to-end through Envoy: the RA-TLS data plane is terminated inside the TEE, and the Azure upstream connection is validated against the system CA bundle with an exact DNS SAN pin for the configured Azure host. The ARM account binding checks verify that the endpoint belongs to the miner's own resource, not a third-party account.
 
-The diagnostic-settings check is defense in depth: it rejects unknown enabled log categories so that newly introduced Azure logging features are blocked by default pending explicit allowlisting.
+The diagnostic-settings check is defense in depth. For the Azure `OpenAI` target it is advisory: enabled categories outside the native metadata allowlist are logged as warnings, not rejected. A newly introduced Azure logging feature would therefore be *reported*, not blocked, on an Azure `OpenAI` account. The Foundry target does not inherit that gap — see below.
+
+## Microsoft Foundry (`ANTHROPIC_UPSTREAM=foundry`)
+
+Claude on Foundry is served over Anthropic's own Messages API
+(`https://<resource>.services.ai.azure.com/anthropic/v1/messages`), so the data
+plane is a host/path/header rewrite with no body translation. What differs is
+verification.
+
+Azure's Responsible-AI content filter is **not** in Claude's inference path on
+Foundry ("Foundry doesn't provide built-in content filtering for Claude models at
+deployment time"), so the async-filter check that proves non-buffered streaming
+for Azure `OpenAI` has no equivalent here and the verifier does not consult
+`raiPolicyName` at all. Microsoft's own Claude reference templates *do* set
+`raiPolicyName: Microsoft.DefaultV2` on Claude deployments, and it is inert —
+reading it would prove nothing in either direction. Streaming for Foundry offers
+is therefore established empirically by the registry's inference probe, not
+attested from ARM. This is stated plainly rather than dressed up as an
+attestation.
+
+The Foundry account must be **inference-only**, and the checks are strict rather
+than allowlist-based:
+
+- account `kind` must be exactly `AIServices`
+- `properties.customSubDomainName` binds the ARM account to the configured host
+- `properties.raiMonitorConfig` must be null, `properties.userOwnedStorage` empty
+- the diagnostic-settings list must be **empty**: no enabled log category, no
+  enabled metric category, no destination. Microsoft publishes no field-level
+  schema for the `RequestResponse` category, so whether it can carry request
+  bodies for this resource kind is not settled by the docs — requiring zero
+  exports makes the question moot, and fails closed on categories that do not
+  exist yet.
+- the account's and every project's `connections` must be empty. An `AppInsights`
+  connection alone is enough for Foundry to trace **prompt content** server-side
+  with no code change by the caller ("Foundry enables it for you automatically
+  once you connect an Application Insights resource to your project"). Rejecting
+  every connection category — not just `AppInsights` — also fails closed on sink
+  categories Azure adds later.
+- the account's and every project's `capabilityHosts` must be empty (they
+  redirect Agent-Service storage to operator-owned stores).
+
+Foundry's "online evaluation / continuous monitoring" of sampled live traffic is
+**not** an independent capture surface: it is downstream of captured data, and
+every Microsoft how-to lists a connected Application Insights resource as a
+prerequisite. With no connection and an uninstrumented caller, it has nothing to
+read. The connection gate above is what neutralizes it.
+
+### What Foundry verification does NOT cover
+
+- **Anthropic-side retention.** Anthropic is an independent data processor on
+  Foundry and retains prompts and outputs for 30 days, with exceptions-only Trust
+  & Safety review; Foundry ZDR is a separate contractual arrangement. No ARM
+  property represents any of this. It is not a gap in the verifier — Azure does
+  not expose it at all — and it is the same posture the `direct` Anthropic
+  backend already carries.
+- **The polling window.** Boot-time plus periodic ARM verification is detection,
+  not prevention: the operator owns the subscription and can enable a capture
+  surface after a poll and remove it before the next. The re-verification
+  interval bounds the exposure window; it does not eliminate it. Closing this
+  properly needs a control outside the operator's authority (e.g. a gm-owned
+  management-group deny assignment). This applies equally to the Azure `OpenAI`
+  backend and is not specific to Foundry.
+
+### Required miner configuration
+
+`ANTHROPIC_UPSTREAM=foundry`, `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_API_KEY`,
+plus a read-only Entra service principal for ARM: `AZURE_FOUNDRY_TENANT_ID`,
+`AZURE_FOUNDRY_SUBSCRIPTION_ID`, `AZURE_FOUNDRY_RESOURCE_GROUP`,
+`AZURE_FOUNDRY_CLIENT_ID`, `AZURE_FOUNDRY_CLIENT_SECRET`. These are separate from
+the `AZURE_*` Azure `OpenAI` variables on purpose: a worker may hold the two
+accounts in different tenants, subscriptions, or resource groups.
+
+Offers are declared with `--upstream-model <deployment-name>`: Foundry routes on
+the *deployment* name, which defaults to the model id but does not have to match
+it.
+
+### Verified from specs, not from a live resource
+
+The ARM request/response shapes here were built from
+`Azure/azure-rest-api-specs` (stable `2026-05-01`) and Microsoft's own
+`Azure-Samples/claude` templates, not from a live Foundry account. The design
+deliberately depends on no fact that those sources leave unsettled: every check
+is either a spec-confirmed field read or an emptiness assertion.

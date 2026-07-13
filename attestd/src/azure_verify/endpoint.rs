@@ -1,11 +1,18 @@
 use anyhow::{bail, Context, Result};
 use reqwest::Url;
 
+use super::config::AzureProvider;
+
 pub(crate) const AZURE_OPENAI_ALLOWED_SUFFIXES: [&str; 3] = [
     ".openai.azure.com",
     ".services.ai.azure.com",
     ".cognitiveservices.azure.com",
 ];
+
+/// Microsoft and Anthropic document Foundry's Anthropic-native passthrough on
+/// exactly one host shape: `https://<resource>.services.ai.azure.com`. Nothing
+/// else is accepted — a wider allowlist would be an assumption, not a fact.
+pub(crate) const AZURE_FOUNDRY_ALLOWED_SUFFIXES: [&str; 1] = [".services.ai.azure.com"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AzureEndpoint {
@@ -14,36 +21,44 @@ pub(crate) struct AzureEndpoint {
     pub(crate) suffix: &'static str,
 }
 
-pub(crate) fn parse_azure_openai_endpoint(endpoint: &str) -> Result<AzureEndpoint> {
-    let url = Url::parse(endpoint)
-        .with_context(|| format!("parse AZURE_OPENAI_ENDPOINT {endpoint:?}"))?;
+pub(crate) fn parse_azure_endpoint(
+    provider: AzureProvider,
+    endpoint: &str,
+) -> Result<AzureEndpoint> {
+    let (var, allowed): (&str, &[&str]) = match provider {
+        AzureProvider::OpenAi => ("AZURE_OPENAI_ENDPOINT", &AZURE_OPENAI_ALLOWED_SUFFIXES),
+        AzureProvider::Foundry => ("AZURE_FOUNDRY_ENDPOINT", &AZURE_FOUNDRY_ALLOWED_SUFFIXES),
+    };
+    let url = Url::parse(endpoint).with_context(|| format!("parse {var} {endpoint:?}"))?;
     if url.scheme() != "https" {
-        bail!("AZURE_OPENAI_ENDPOINT must use https");
+        bail!("{var} must use https");
     }
     if !url.username().is_empty() || url.password().is_some() {
-        bail!("AZURE_OPENAI_ENDPOINT must not contain userinfo");
+        bail!("{var} must not contain userinfo");
     }
     let host = url
         .host_str()
-        .context("AZURE_OPENAI_ENDPOINT must include a DNS host")?
+        .with_context(|| format!("{var} must include a DNS host"))?
         .to_ascii_lowercase();
-    validate_dns_host("AZURE_OPENAI_ENDPOINT host", &host)?;
-    let suffix = AZURE_OPENAI_ALLOWED_SUFFIXES
+    validate_dns_host(&format!("{var} host"), &host)?;
+    let suffix = allowed
         .iter()
         .copied()
         .find(|suffix| host_allowed_by_suffix(&host, suffix));
     let Some(suffix) = suffix else {
         bail!(
-            "AZURE_OPENAI_ENDPOINT host '{host}' is not in the allowed suffix set: {}",
-            AZURE_OPENAI_ALLOWED_SUFFIXES
+            "{var} host '{host}' is not in the allowed suffix set: {}",
+            allowed
+                .iter()
                 .map(|suffix| &suffix[1..])
+                .collect::<Vec<_>>()
                 .join(", ")
         );
     };
     let account_name = host
         .split('.')
         .next()
-        .context("AZURE_OPENAI_ENDPOINT host must contain an account label")?
+        .with_context(|| format!("{var} host must contain an account label"))?
         .to_owned();
     Ok(AzureEndpoint {
         host,
@@ -83,7 +98,7 @@ mod tests {
             "https://acct.cognitiveservices.azure.com/openai",
         ] {
             assert!(
-                parse_azure_openai_endpoint(endpoint).is_ok(),
+                parse_azure_endpoint(AzureProvider::OpenAi, endpoint).is_ok(),
                 "{endpoint} should be accepted"
             );
         }
@@ -99,8 +114,28 @@ mod tests {
             "https://api.evil.example",
         ] {
             assert!(
-                parse_azure_openai_endpoint(endpoint).is_err(),
+                parse_azure_endpoint(AzureProvider::OpenAi, endpoint).is_err(),
                 "{endpoint} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn foundry_allowlist_accepts_only_the_documented_services_ai_host() {
+        assert!(
+            parse_azure_endpoint(AzureProvider::Foundry, "https://acct.services.ai.azure.com")
+                .is_ok()
+        );
+        for endpoint in [
+            // Valid for Azure OpenAI, but Foundry's Claude passthrough is not
+            // documented on either of these hosts.
+            "https://acct.openai.azure.com",
+            "https://acct.cognitiveservices.azure.com",
+            "https://acct.services.ai.azure.com.evil.example",
+        ] {
+            assert!(
+                parse_azure_endpoint(AzureProvider::Foundry, endpoint).is_err(),
+                "{endpoint} should be rejected for Foundry"
             );
         }
     }
