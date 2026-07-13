@@ -329,6 +329,20 @@ pub struct ProviderKeys {
     pub bedrock_region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bedrock_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_foundry_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_foundry_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_foundry_tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_foundry_subscription_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_foundry_resource_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_foundry_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_foundry_client_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -416,37 +430,58 @@ fn host_allowed_by_suffix(host: &str, suffix: &str) -> bool {
         && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
 }
 
-fn validate_azure_openai_endpoint(endpoint: &str) -> Result<()> {
+/// The only host suffix that serves Microsoft Foundry's Anthropic-native
+/// passthrough (`/anthropic/v1/messages`). Narrower than the Azure `OpenAI`
+/// set on purpose: Microsoft and Anthropic document the Claude endpoint
+/// solely as `https://<resource>.services.ai.azure.com`, so anything else
+/// is rejected rather than assumed to work.
+const AZURE_FOUNDRY_ALLOWED_SUFFIXES: [&str; 1] = ["services.ai.azure.com"];
+
+fn validate_azure_endpoint(flag: &str, endpoint: &str, allowed_suffixes: &[&str]) -> Result<()> {
     let Some(rest) = endpoint.strip_prefix("https://") else {
-        if endpoint.starts_with("http://") {
-            anyhow::bail!("--azure-openai-endpoint must use https");
-        } else if endpoint.contains("://") {
-            anyhow::bail!("--azure-openai-endpoint has unsupported URL scheme");
+        if endpoint.contains("://") && !endpoint.starts_with("http://") {
+            anyhow::bail!("{flag} has unsupported URL scheme");
         }
-        anyhow::bail!("--azure-openai-endpoint must use https");
+        anyhow::bail!("{flag} must use https");
     };
 
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.contains('@') {
-        anyhow::bail!("--azure-openai-endpoint must not contain userinfo");
+        anyhow::bail!("{flag} must not contain userinfo");
     }
     let host = authority
         .split_once(':')
         .map_or(authority, |(host, _)| host)
         .to_ascii_lowercase();
-    validate_dns_host("--azure-openai-endpoint host", &host)?;
+    validate_dns_host(&format!("{flag} host"), &host)?;
 
-    if AZURE_OPENAI_ALLOWED_SUFFIXES
+    if allowed_suffixes
         .iter()
         .any(|suffix| host_allowed_by_suffix(&host, suffix))
     {
         Ok(())
     } else {
         anyhow::bail!(
-            "--azure-openai-endpoint host '{host}' is not in the allowed suffix set: {}",
-            AZURE_OPENAI_ALLOWED_SUFFIXES.join(", ")
+            "{flag} host '{host}' is not in the allowed suffix set: {}",
+            allowed_suffixes.join(", ")
         )
     }
+}
+
+fn validate_azure_openai_endpoint(endpoint: &str) -> Result<()> {
+    validate_azure_endpoint(
+        "--azure-openai-endpoint",
+        endpoint,
+        &AZURE_OPENAI_ALLOWED_SUFFIXES,
+    )
+}
+
+fn validate_azure_foundry_endpoint(endpoint: &str) -> Result<()> {
+    validate_azure_endpoint(
+        "--azure-foundry-endpoint",
+        endpoint,
+        &AZURE_FOUNDRY_ALLOWED_SUFFIXES,
+    )
 }
 
 impl ProviderKeys {
@@ -456,7 +491,9 @@ impl ProviderKeys {
         let anthropic_upstream = self.anthropic_upstream.as_deref().unwrap_or("direct");
         let openai_upstream = self.openai_upstream.as_deref().unwrap_or("direct");
         ((anthropic_upstream == "direct" && non_empty(self.anthropic.as_deref()))
-            || (anthropic_upstream == "bedrock" && non_empty(self.bedrock_api_key.as_deref())))
+            || (anthropic_upstream == "bedrock" && non_empty(self.bedrock_api_key.as_deref()))
+            || (anthropic_upstream == "foundry"
+                && non_empty(self.azure_foundry_api_key.as_deref())))
             || ((openai_upstream == "direct" && non_empty(self.openai.as_deref()))
                 || (openai_upstream == "azure" && non_empty(self.azure_openai_api_key.as_deref())))
             || non_empty(self.google.as_deref())
@@ -486,8 +523,48 @@ impl ProviderKeys {
                 )?;
                 validate_bedrock_region(self.bedrock_region.as_deref().unwrap_or_default())?;
             }
+            "foundry" => {
+                require_present(
+                    "anthropic-upstream=foundry",
+                    &[
+                        (
+                            "--azure-foundry-endpoint",
+                            self.azure_foundry_endpoint.as_deref(),
+                        ),
+                        (
+                            "--azure-foundry-api-key",
+                            self.azure_foundry_api_key.as_deref(),
+                        ),
+                        (
+                            "--azure-foundry-tenant-id",
+                            self.azure_foundry_tenant_id.as_deref(),
+                        ),
+                        (
+                            "--azure-foundry-subscription-id",
+                            self.azure_foundry_subscription_id.as_deref(),
+                        ),
+                        (
+                            "--azure-foundry-resource-group",
+                            self.azure_foundry_resource_group.as_deref(),
+                        ),
+                        (
+                            "--azure-foundry-client-id",
+                            self.azure_foundry_client_id.as_deref(),
+                        ),
+                        (
+                            "--azure-foundry-client-secret",
+                            self.azure_foundry_client_secret.as_deref(),
+                        ),
+                    ],
+                )?;
+                validate_azure_foundry_endpoint(
+                    self.azure_foundry_endpoint.as_deref().unwrap_or_default(),
+                )?;
+            }
             other => {
-                anyhow::bail!("anthropic-upstream must be 'direct' or 'bedrock' (got '{other}')")
+                anyhow::bail!(
+                    "anthropic-upstream must be 'direct', 'bedrock', or 'foundry' (got '{other}')"
+                )
             }
         }
         match self.openai_upstream.as_deref().unwrap_or("direct") {
@@ -527,17 +604,17 @@ impl ProviderKeys {
     }
 
     /// Registry worker provenance is a single optional backend marker. If both
-    /// cloud upstreams are configured, Bedrock takes precedence; the registry
-    /// only needs "cloud-backed, use the inference probe" here, while each
-    /// offer's `upstream_model` carries the per-model translation detail.
+    /// cloud upstreams are configured, the Anthropic-side backend takes
+    /// precedence; the registry only needs "cloud-backed, use the inference
+    /// probe" here, while each offer's `upstream_model` carries the per-model
+    /// translation detail.
     #[must_use]
     pub fn worker_backend(&self) -> Option<&'static str> {
-        if self.anthropic_upstream.as_deref() == Some("bedrock") {
-            Some("bedrock")
-        } else if self.openai_upstream.as_deref() == Some("azure") {
-            Some("azure")
-        } else {
-            None
+        match self.anthropic_upstream.as_deref() {
+            Some("bedrock") => Some("bedrock"),
+            Some("foundry") => Some("foundry"),
+            _ if self.openai_upstream.as_deref() == Some("azure") => Some("azure"),
+            _ => None,
         }
     }
 }
@@ -792,7 +869,7 @@ pub fn with_config_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{Config, HotkeyRecord, NetworkEntry, TokenEntry, WorkerRecord};
+    use super::{Config, HotkeyRecord, NetworkEntry, ProviderKeys, TokenEntry, WorkerRecord};
     use std::collections::HashMap;
 
     fn worker(worker_id: &str, app_name: &str, secret: &str) -> WorkerRecord {
@@ -863,6 +940,59 @@ mod tests {
         cloud.backend = Some("bedrock".to_owned());
         let cloud_json = serde_json::to_value(&cloud).expect("serialize cloud worker");
         assert_eq!(cloud_json["backend"], "bedrock");
+    }
+
+    #[test]
+    fn foundry_reports_the_anthropic_side_cloud_backend() {
+        let foundry = ProviderKeys {
+            anthropic_upstream: Some("foundry".to_owned()),
+            ..ProviderKeys::default()
+        };
+        assert_eq!(foundry.worker_backend(), Some("foundry"));
+
+        // The registry worker record carries one backend marker. When both
+        // cloud upstreams are configured the Anthropic side wins, matching the
+        // existing Bedrock-over-Azure precedence.
+        let both = ProviderKeys {
+            anthropic_upstream: Some("foundry".to_owned()),
+            openai_upstream: Some("azure".to_owned()),
+            ..ProviderKeys::default()
+        };
+        assert_eq!(both.worker_backend(), Some("foundry"));
+    }
+
+    #[test]
+    fn config_without_foundry_fields_still_loads_and_omits_them() {
+        let json = r#"{"provider_keys":{"anthropic":"sk-ant-x"}}"#;
+        let cfg: Config = serde_json::from_str(json).expect("legacy config must parse");
+        let keys = cfg.provider_keys.expect("provider keys present");
+        assert_eq!(keys.azure_foundry_endpoint, None);
+
+        let resaved = serde_json::to_string(&keys).expect("serialize keys");
+        assert!(
+            !resaved.contains("azure_foundry"),
+            "absent Foundry fields must stay omitted: {resaved}"
+        );
+    }
+
+    #[test]
+    fn foundry_key_is_usable_and_single_slot() {
+        let keys = ProviderKeys {
+            anthropic_upstream: Some("foundry".to_owned()),
+            azure_foundry_api_key: Some("foundry-key".to_owned()),
+            ..ProviderKeys::default()
+        };
+        assert!(keys.any_set());
+
+        let multi = ProviderKeys {
+            azure_foundry_api_key: Some("key-one;key-two".to_owned()),
+            ..keys
+        };
+        let err = multi
+            .validate_upstreams()
+            .expect_err("multi-slot Foundry key must be rejected")
+            .to_string();
+        assert!(err.contains("single-slot"), "{err}");
     }
 
     #[test]

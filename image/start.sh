@@ -151,6 +151,18 @@ require_host_suffix() {
   exit 1
 }
 
+## Cloud backend keys are single-slot in this release: a ';'-separated value
+## would advertise slots the registry never probes.
+require_single_slot() {
+  local name="$1"
+  local value="$2"
+  local upstream="$3"
+  if [[ "${value}" == *";"* ]]; then
+    log "error: ${name} cannot contain ';' when ${upstream}; cloud backends are single-slot in this release"
+    exit 1
+  fi
+}
+
 matched_host_suffix() {
   local host="$1"
   shift
@@ -164,21 +176,24 @@ matched_host_suffix() {
   return 1
 }
 
+## Extract the host from an Azure endpoint URL. `name` is the env var the
+## endpoint came from, so the error names what the operator must fix.
 parse_azure_host() {
-  local endpoint="$1"
+  local name="$1"
+  local endpoint="$2"
   local rest="${endpoint}"
   case "${endpoint}" in
     https://*) rest="${endpoint#https://}" ;;
     http://*)
-      log "error: AZURE_OPENAI_ENDPOINT must use https when a scheme is provided"
+      log "error: ${name} must use https when a scheme is provided"
       exit 1
       ;;
     *://*)
-      log "error: AZURE_OPENAI_ENDPOINT has unsupported URL scheme"
+      log "error: ${name} has unsupported URL scheme"
       exit 1
       ;;
     *)
-      log "error: AZURE_OPENAI_ENDPOINT must use https"
+      log "error: ${name} must use https"
       exit 1
       ;;
   esac
@@ -186,7 +201,7 @@ parse_azure_host() {
   rest="${rest%%\?*}"
   rest="${rest%%#*}"
   if [[ "${rest}" == *"@"* ]]; then
-    log "error: AZURE_OPENAI_ENDPOINT must not contain userinfo"
+    log "error: ${name} must not contain userinfo"
     exit 1
   fi
   if [[ "${rest}" == *:* ]]; then
@@ -218,10 +233,7 @@ case "${ANTHROPIC_UPSTREAM}" in
       log "error: BEDROCK_API_KEY must be set when ANTHROPIC_UPSTREAM=bedrock"
       exit 1
     fi
-    if [[ "${BEDROCK_API_KEY}" == *";"* ]]; then
-      log "error: BEDROCK_API_KEY cannot contain ';' when ANTHROPIC_UPSTREAM=bedrock; cloud backends are single-slot in this release"
-      exit 1
-    fi
+    require_single_slot BEDROCK_API_KEY "${BEDROCK_API_KEY}" "ANTHROPIC_UPSTREAM=bedrock"
     if [[ ! "${BEDROCK_REGION}" =~ ^[A-Za-z0-9-]+$ ]]; then
       log "error: BEDROCK_REGION must contain only letters, numbers, and hyphens"
       exit 1
@@ -244,8 +256,36 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_STATIC_AUTH=1
     ANTHROPIC_CLOUD=1
     ;;
+  foundry)
+    ## Microsoft Foundry serves Claude on an Anthropic-native passthrough:
+    ## POST https://<resource>.services.ai.azure.com/anthropic/v1/messages,
+    ## same Messages body, same `anthropic-version` header, `x-api-key` auth.
+    ## The path rewrite is identical to Bedrock's, so the envoy route needs no
+    ## Foundry-specific block. `services.ai.azure.com` is the only host
+    ## Microsoft and Anthropic document for this endpoint — do not widen it.
+    if [[ -z "${AZURE_FOUNDRY_ENDPOINT:-}" ]]; then
+      log "error: AZURE_FOUNDRY_ENDPOINT must be set when ANTHROPIC_UPSTREAM=foundry"
+      exit 1
+    fi
+    if [[ -z "${AZURE_FOUNDRY_API_KEY:-}" ]]; then
+      log "error: AZURE_FOUNDRY_API_KEY must be set when ANTHROPIC_UPSTREAM=foundry"
+      exit 1
+    fi
+    require_single_slot AZURE_FOUNDRY_API_KEY "${AZURE_FOUNDRY_API_KEY}" "ANTHROPIC_UPSTREAM=foundry"
+    ANTHROPIC_HOST="$(parse_azure_host AZURE_FOUNDRY_ENDPOINT "${AZURE_FOUNDRY_ENDPOINT}")"
+    validate_hostname "Microsoft Foundry" "${ANTHROPIC_HOST}"
+    require_host_suffix "Microsoft Foundry" "${ANTHROPIC_HOST}" services.ai.azure.com
+    ANTHROPIC_PATH_REWRITE=1
+    ANTHROPIC_AUTH_HEADER=x-api-key
+    ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(AZURE_FOUNDRY_API_KEY)%"
+    ANTHROPIC_VERSION_APPEND_ACTION=OVERWRITE_IF_EXISTS_OR_ADD
+    ANTHROPIC_SAN_MATCH=suffix
+    ANTHROPIC_SAN_VALUE=.services.ai.azure.com
+    ANTHROPIC_STATIC_AUTH=1
+    ANTHROPIC_CLOUD=1
+    ;;
   *)
-    log "error: ANTHROPIC_UPSTREAM must be 'direct' or 'bedrock' (got '${ANTHROPIC_UPSTREAM}')"
+    log "error: ANTHROPIC_UPSTREAM must be 'direct', 'bedrock', or 'foundry' (got '${ANTHROPIC_UPSTREAM}')"
     exit 1
     ;;
 esac
@@ -272,11 +312,8 @@ case "${OPENAI_UPSTREAM}" in
       log "error: AZURE_OPENAI_API_KEY must be set when OPENAI_UPSTREAM=azure"
       exit 1
     fi
-    if [[ "${AZURE_OPENAI_API_KEY}" == *";"* ]]; then
-      log "error: AZURE_OPENAI_API_KEY cannot contain ';' when OPENAI_UPSTREAM=azure; cloud backends are single-slot in this release"
-      exit 1
-    fi
-    OPENAI_HOST="$(parse_azure_host "${AZURE_OPENAI_ENDPOINT}")"
+    require_single_slot AZURE_OPENAI_API_KEY "${AZURE_OPENAI_API_KEY}" "OPENAI_UPSTREAM=azure"
+    OPENAI_HOST="$(parse_azure_host AZURE_OPENAI_ENDPOINT "${AZURE_OPENAI_ENDPOINT}")"
     validate_hostname "Azure OpenAI" "${OPENAI_HOST}"
     require_host_suffix "Azure OpenAI" "${OPENAI_HOST}" \
       openai.azure.com \
@@ -310,6 +347,10 @@ fi
 if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" && -n "${BEDROCK_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "BEDROCK_API_KEY set"
+fi
+if [[ "${ANTHROPIC_UPSTREAM}" == "foundry" && -n "${AZURE_FOUNDRY_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "AZURE_FOUNDRY_API_KEY set"
 fi
 if [[ "${OPENAI_UPSTREAM}" == "direct" && -n "${OPENAI_API_KEY:-}" ]]; then
   HAS_KEY=1
@@ -425,10 +466,11 @@ fi
 # real Azure startup, fail closed before rendering/provisioning/launching
 # any serving process: a failed owner-capture check must restart the
 # container rather than allowing Envoy to proxy Azure traffic.
-if [[ "${OPENAI_UPSTREAM}" == "azure" && "${GM_START_RENDER_ONLY:-}" != "1" ]]; then
-  log "verifying Azure OpenAI owner-capture controls before starting data plane"
+if [[ "${GM_START_RENDER_ONLY:-}" != "1" ]] &&
+  [[ "${OPENAI_UPSTREAM}" == "azure" || "${ANTHROPIC_UPSTREAM}" == "foundry" ]]; then
+  log "verifying Azure owner-capture controls before starting data plane"
   gm-miner-attestd --verify-azure-once
-  log "Azure OpenAI owner-capture verification passed"
+  log "Azure owner-capture verification passed"
 fi
 
 # ── Render the envoy config ───────────────────────────────────────────

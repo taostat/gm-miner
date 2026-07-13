@@ -38,6 +38,15 @@ const DEFAULT_MINER_ID: &str = "gm-miner";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8081";
 const VERIFY_AZURE_ONCE_ARG: &str = "--verify-azure-once";
 
+/// True when either upstream selector routes through an Azure account whose
+/// owner-capture controls `attestd` must verify before the data plane serves.
+fn env_selects_azure() -> bool {
+    let selected = |name: &str, value: &str| {
+        std::env::var(name).unwrap_or_else(|_| "direct".to_owned()) == value
+    };
+    selected("OPENAI_UPSTREAM", "azure") || selected("ANTHROPIC_UPSTREAM", "foundry")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Log to stderr, not stdout: the container entrypoint (start.sh)
@@ -54,10 +63,10 @@ async fn main() -> Result<()> {
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args == [VERIFY_AZURE_ONCE_ARG] {
-        tracing::info!("running one-shot Azure OpenAI owner-capture verification");
-        azure_verify::verify_azure_openai_config_from_env()
+        tracing::info!("running one-shot Azure owner-capture verification");
+        azure_verify::verify_azure_config_from_env()
             .await
-            .context("Azure OpenAI owner-capture verification failed")?;
+            .context("Azure owner-capture verification failed")?;
         return Ok(());
     }
     if !args.is_empty() {
@@ -97,12 +106,14 @@ async fn main() -> Result<()> {
             .context("bootstrap dstack attestation provider")?,
     );
 
-    let azure_upstream =
-        std::env::var("OPENAI_UPSTREAM").unwrap_or_else(|_| "direct".to_owned()) == "azure";
+    // Every Azure-backed upstream this worker routes through: Azure OpenAI
+    // (`OPENAI_UPSTREAM=azure`) and Claude on Microsoft Foundry
+    // (`ANTHROPIC_UPSTREAM=foundry`). Either may be configured, or both.
+    let azure_upstream = env_selects_azure();
     if azure_upstream {
-        tracing::info!("verifying Azure OpenAI owner-capture controls");
-        if let Err(err) = azure_verify::verify_azure_openai_config_from_env().await {
-            anyhow::bail!("Azure OpenAI owner-capture verification failed: {err:#}");
+        tracing::info!("verifying Azure owner-capture controls");
+        if let Err(err) = azure_verify::verify_azure_config_from_env().await {
+            anyhow::bail!("Azure owner-capture verification failed: {err:#}");
         }
     }
 
@@ -117,10 +128,9 @@ async fn main() -> Result<()> {
 
     let (_periodic_azure_verify_task, azure_shutdown_rx) = if azure_upstream {
         let (fatal_shutdown_tx, fatal_shutdown_rx) = oneshot::channel();
-        let task =
-            azure_verify::spawn_periodic_azure_openai_verification_from_env(fatal_shutdown_tx)
-                .context("start periodic Azure OpenAI owner-capture verification")?;
-        (Some(task), Some(fatal_shutdown_rx))
+        let task = azure_verify::spawn_periodic_azure_verification_from_env(fatal_shutdown_tx)
+            .context("start periodic Azure owner-capture verification")?;
+        (task, Some(fatal_shutdown_rx))
     } else {
         (None, None)
     };
@@ -129,18 +139,16 @@ async fn main() -> Result<()> {
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let reason = azure_shutdown_rx.await.unwrap_or_else(|_| {
-                    "periodic Azure OpenAI owner-capture verification task ended".to_owned()
+                    "periodic Azure owner-capture verification task ended".to_owned()
                 });
                 tracing::error!(
                     reason = %reason,
-                    "stopping attestd after Azure OpenAI owner-capture verification failure",
+                    "stopping attestd after Azure owner-capture verification failure",
                 );
             })
             .await
             .context("attestation server terminated")?;
-        anyhow::bail!(
-            "attestd stopped after periodic Azure OpenAI owner-capture verification failure"
-        );
+        anyhow::bail!("attestd stopped after periodic Azure owner-capture verification failure");
     }
 
     axum::serve(listener, app)

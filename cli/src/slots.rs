@@ -163,6 +163,14 @@ pub fn validate_cloud_backend_single_keys(keys: &ProviderKeys) -> Result<()> {
              cloud backends are single-slot in this release"
         );
     }
+    if keys.anthropic_upstream.as_deref() == Some("foundry")
+        && has_semicolon(keys.azure_foundry_api_key.as_deref())
+    {
+        bail!(
+            "AZURE_FOUNDRY_API_KEY cannot contain ';' when ANTHROPIC_UPSTREAM=foundry; \
+             cloud backends are single-slot in this release"
+        );
+    }
     if keys.openai_upstream.as_deref() == Some("azure")
         && has_semicolon(keys.azure_openai_api_key.as_deref())
     {

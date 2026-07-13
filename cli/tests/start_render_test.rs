@@ -160,6 +160,84 @@ fn bedrock_and_azure_render_cloud_upstreams() {
 }
 
 #[test]
+fn foundry_renders_anthropic_native_passthrough() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "foundry"),
+        (
+            "AZURE_FOUNDRY_ENDPOINT",
+            "https://gm-resource.services.ai.azure.com/",
+        ),
+        ("AZURE_FOUNDRY_API_KEY", "foundry-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    assert!(rendered.contains("host_rewrite_literal: gm-resource.services.ai.azure.com"));
+    assert!(rendered.contains("address: gm-resource.services.ai.azure.com"));
+    assert!(rendered.contains("sni: gm-resource.services.ai.azure.com"));
+    assert!(rendered.contains("suffix: .services.ai.azure.com"));
+    assert!(!rendered.contains("exact: gm-resource.services.ai.azure.com"));
+    // Foundry's Anthropic passthrough takes the same path rewrite as Bedrock.
+    assert!(rendered.contains("substitution: \"/anthropic/v1/messages\""));
+    assert!(rendered.contains("key: x-api-key"));
+    assert!(rendered.contains("value: \"%ENVIRONMENT(AZURE_FOUNDRY_API_KEY)%\""));
+    assert!(rendered.contains("append_action: OVERWRITE_IF_EXISTS_OR_ADD"));
+    // Cloud backends are single-slot: no slot fan-out Lua.
+    assert!(!rendered.contains("local function json_error"));
+    // The key never reaches the rendered config or the logs.
+    assert!(!rendered.contains("foundry-key"));
+    assert!(!stderr.contains("foundry-key"));
+}
+
+#[test]
+fn foundry_rejects_endpoint_outside_the_documented_host_suffix() {
+    for endpoint in [
+        "https://gm-resource.openai.azure.com/",
+        "https://gm-resource.cognitiveservices.azure.com/",
+        "https://services.ai.azure.com.evil.example/",
+        "http://gm-resource.services.ai.azure.com/",
+    ] {
+        let (status, _, stderr, _) = render_envoy([
+            ("ANTHROPIC_UPSTREAM", "foundry"),
+            ("AZURE_FOUNDRY_ENDPOINT", endpoint),
+            ("AZURE_FOUNDRY_API_KEY", "foundry-key"),
+        ]);
+        assert!(!status.success(), "{endpoint} should be rejected");
+        assert!(
+            stderr.contains("Microsoft Foundry") || stderr.contains("AZURE_FOUNDRY_ENDPOINT"),
+            "unexpected stderr for {endpoint}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn foundry_requires_endpoint_and_single_slot_key() {
+    let (status, _, stderr, _) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "foundry"),
+        ("AZURE_FOUNDRY_API_KEY", "foundry-key"),
+    ]);
+    assert!(!status.success(), "missing endpoint should fail");
+    assert!(
+        stderr.contains("AZURE_FOUNDRY_ENDPOINT must be set"),
+        "unexpected stderr: {stderr}"
+    );
+
+    let (status, _, stderr, _) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "foundry"),
+        (
+            "AZURE_FOUNDRY_ENDPOINT",
+            "https://gm-resource.services.ai.azure.com/",
+        ),
+        ("AZURE_FOUNDRY_API_KEY", "key-one;key-two"),
+    ]);
+    assert!(!status.success(), "multi-slot Foundry key should fail");
+    assert!(
+        stderr.contains("cloud backends are single-slot"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(!stderr.contains("key-one"), "key leaked: {stderr}");
+}
+
+#[test]
 fn azure_render_uses_suffix_san_for_each_allowed_endpoint_suffix() {
     for (endpoint, host, suffix) in [
         (

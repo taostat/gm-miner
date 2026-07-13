@@ -74,6 +74,17 @@ services:
       - ANTHROPIC_UPSTREAM
       - BEDROCK_REGION
       - BEDROCK_API_KEY
+      ## Microsoft Foundry (Claude on Azure) — data-plane endpoint/key plus
+      ## the read-only Entra service principal `attestd` uses to verify the
+      ## account carries no owner-capture controls. Required when
+      ## ANTHROPIC_UPSTREAM=foundry.
+      - AZURE_FOUNDRY_ENDPOINT
+      - AZURE_FOUNDRY_API_KEY
+      - AZURE_FOUNDRY_TENANT_ID
+      - AZURE_FOUNDRY_SUBSCRIPTION_ID
+      - AZURE_FOUNDRY_RESOURCE_GROUP
+      - AZURE_FOUNDRY_CLIENT_ID
+      - AZURE_FOUNDRY_CLIENT_SECRET
       - OPENAI_API_KEY
       - OPENAI_UPSTREAM
       - AZURE_OPENAI_ENDPOINT

@@ -8,7 +8,11 @@ use super::config::AzureVerifyConfig;
 use super::endpoint::AzureEndpoint;
 
 const MANAGEMENT_SCOPE: &str = "https://management.azure.com/.default";
-const ARM_API_VERSION: &str = "2024-10-01";
+/// Newest stable `Microsoft.CognitiveServices` version. Needed at >= 2025-06-01
+/// for `accounts/projects`, which the Foundry capture-surface sweep enumerates.
+const ARM_API_VERSION: &str = "2026-05-01";
+/// `Microsoft.Insights/diagnosticSettings` has only ever shipped as this
+/// preview version; there is no stable one.
 const DIAGNOSTIC_SETTINGS_API_VERSION: &str = "2021-05-01-preview";
 
 #[derive(Debug, Deserialize)]
@@ -33,27 +37,31 @@ pub(crate) struct ArmAccountProperties {
     pub(crate) user_owned_storage: Option<Value>,
 }
 
+/// `value` is deliberately NOT `#[serde(default)]`: an ARM list response whose
+/// `value` key is missing or renamed must be a hard parse failure, not an empty
+/// list that silently passes every capture check. Azure returns `{"value": []}`
+/// for an empty collection, so this only fires on a shape we do not model.
 #[derive(Debug, Deserialize)]
 pub(crate) struct DiagnosticSettingsList {
-    #[serde(default)]
     pub(crate) value: Vec<DiagnosticSetting>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DiagnosticSetting {
     #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
     pub(crate) properties: DiagnosticProperties,
 }
 
+/// Only `logs` is modelled: the check is that the settings list is EMPTY, so
+/// the destination fields never need reading — which also means a destination
+/// field Azure adds later cannot quietly widen what passes.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DiagnosticProperties {
     #[serde(default)]
     pub(crate) logs: Vec<DiagnosticLog>,
-    pub(crate) workspace_id: Option<String>,
-    pub(crate) storage_account_id: Option<String>,
-    pub(crate) event_hub_authorization_rule_id: Option<String>,
-    pub(crate) marketplace_partner_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,9 +73,34 @@ pub(crate) struct DiagnosticLog {
     pub(crate) enabled: bool,
 }
 
+/// A `Microsoft.CognitiveServices` child resource the Foundry sweep only needs
+/// to *count* and name: projects, connections, capability hosts. Any of them
+/// existing on an inference-only account is a capture surface we reject, so the
+/// verifier never needs to interpret their bodies.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmChildResource {
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) properties: ArmChildProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArmChildProperties {
+    /// Present on connections (`AppInsights`, `AzureBlob`, …).
+    pub(crate) category: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ArmChildList {
+    pub(crate) value: Vec<ArmChildResource>,
+    #[serde(rename = "nextLink")]
+    pub(crate) next_link: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ArmDeploymentList {
-    #[serde(default)]
     pub(crate) value: Vec<ArmDeployment>,
     #[serde(rename = "nextLink")]
     pub(crate) next_link: Option<String>,
@@ -103,20 +136,6 @@ pub(crate) struct AzureHttpStatusError {
     pub(crate) label: &'static str,
     pub(crate) status: StatusCode,
     pub(crate) body: String,
-}
-
-impl DiagnosticProperties {
-    pub(crate) fn destination_count(&self) -> usize {
-        [
-            self.workspace_id.as_ref(),
-            self.storage_account_id.as_ref(),
-            self.event_hub_authorization_rule_id.as_ref(),
-            self.marketplace_partner_id.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .count()
-    }
 }
 
 pub(crate) async fn fetch_entra_token(
@@ -193,29 +212,111 @@ pub(crate) async fn fetch_arm_deployments(
     endpoint: &AzureEndpoint,
     token: &str,
 ) -> Result<ArmDeploymentList> {
-    let mut url = format!(
+    let url = format!(
         "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/deployments?api-version={ARM_API_VERSION}",
         encode_path_segment(&config.subscription_id),
         encode_path_segment(&config.resource_group),
         encode_path_segment(&endpoint.account_name),
     );
-    let mut deployments = Vec::new();
-    loop {
-        let page: ArmDeploymentList =
-            get_json(client, &url, token, "Azure OpenAI deployments").await?;
-        deployments.extend(page.value);
-        let Some(next_link) = page.next_link else {
-            break;
+    Ok(ArmDeploymentList {
+        value: fetch_paged::<ArmDeploymentList>(client, url, token, "Azure OpenAI deployments")
+            .await?,
+        next_link: None,
+    })
+}
+
+/// An ARM list response: a page of items plus an optional `nextLink`.
+pub(crate) trait ArmPage: for<'de> Deserialize<'de> {
+    type Item;
+
+    fn into_parts(self) -> (Vec<Self::Item>, Option<String>);
+}
+
+impl ArmPage for ArmDeploymentList {
+    type Item = ArmDeployment;
+
+    fn into_parts(self) -> (Vec<Self::Item>, Option<String>) {
+        (self.value, self.next_link)
+    }
+}
+
+impl ArmPage for ArmChildList {
+    type Item = ArmChildResource;
+
+    fn into_parts(self) -> (Vec<Self::Item>, Option<String>) {
+        (self.value, self.next_link)
+    }
+}
+
+/// Drain every page of an ARM list endpoint, following `nextLink`.
+/// Upper bound on `nextLink` follows. A server that keeps handing back a link
+/// would otherwise wedge the verifier: at boot it never returns, and in the
+/// periodic loop it would stall every later target while envoy keeps serving.
+/// Far above any real ARM collection on one account.
+const MAX_ARM_PAGES: usize = 100;
+
+async fn fetch_paged<P: ArmPage>(
+    client: &Client,
+    mut url: String,
+    token: &str,
+    label: &'static str,
+) -> Result<Vec<P::Item>> {
+    let mut items = Vec::new();
+    for _ in 0..MAX_ARM_PAGES {
+        let page: P = get_json(client, &url, token, label).await?;
+        let (value, next_link) = page.into_parts();
+        items.extend(value);
+        let Some(next_link) = next_link else {
+            return Ok(items);
         };
         if next_link.trim().is_empty() {
-            bail!("Azure OpenAI deployments response had an empty nextLink");
+            bail!("{label} response had an empty nextLink");
         }
         url = next_link;
     }
-    Ok(ArmDeploymentList {
-        value: deployments,
-        next_link: None,
-    })
+    bail!("{label} paginated past {MAX_ARM_PAGES} pages; refusing to follow further")
+}
+
+/// Which `Microsoft.CognitiveServices` scope a child collection hangs off:
+/// the account itself, or one of its Foundry projects.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ArmScope<'a> {
+    Account,
+    Project(&'a str),
+}
+
+impl ArmScope<'_> {
+    /// How the scope is named in a verification failure the operator reads.
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Account => "account".to_owned(),
+            Self::Project(project) => format!("project '{project}'"),
+        }
+    }
+}
+
+/// Enumerate a `Microsoft.CognitiveServices` child collection (`projects`,
+/// `connections`, `capabilityHosts`) under the account or one of its projects,
+/// following `nextLink` to the end.
+pub(crate) async fn fetch_children(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    scope: ArmScope<'_>,
+    collection: &str,
+    token: &str,
+) -> Result<Vec<ArmChildResource>> {
+    let project_segment = match scope {
+        ArmScope::Account => String::new(),
+        ArmScope::Project(project) => format!("/projects/{}", encode_path_segment(project)),
+    };
+    let url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}{project_segment}/{collection}?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+    );
+    fetch_paged::<ArmChildList>(client, url, token, "Azure Foundry child resources").await
 }
 
 pub(crate) async fn fetch_arm_rai_policy(

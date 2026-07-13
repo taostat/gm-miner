@@ -2,7 +2,7 @@
 
 ## Startup gate and continuous verification
 
-When `OPENAI_UPSTREAM=azure`, `image/start.sh` first runs `gm-miner-attestd --verify-azure-once` as a blocking gate. Envoy is not rendered, RA-TLS is not provisioned, and no serving process is started until that one-shot verification exits successfully. A verification failure exits the container non-zero so the runtime restarts it.
+When `OPENAI_UPSTREAM=azure` or `ANTHROPIC_UPSTREAM=foundry`, `image/start.sh` first runs `gm-miner-attestd --verify-azure-once` as a blocking gate. Both accounts are verified when both are configured; either failing is fatal. Envoy is not rendered, RA-TLS is not provisioned, and no serving process is started until that one-shot verification exits successfully. A verification failure exits the container non-zero so the runtime restarts it.
 
 The gate fails closed if:
 
@@ -24,7 +24,7 @@ The verifier reads `value[].properties.raiPolicyName` from the deployment list, 
 
 Asynchronous content filtering (streaming-safe, no completion buffering) is required and enforced as gm policy. Any synchronous or buffering deployment fails the startup gate and continuous verification; there is no operator override.
 
-Diagnostic settings are checked as defense in depth. Enabled native metadata categories are allowed: `Audit`, `RequestResponse`, `Trace`, `AzureOpenAIRequestUsage`; category groups `allLogs` and `audit` are allowed. Unknown enabled categories are logged as warnings, not fatal.
+The account's diagnostic-settings list must be empty. Presence of any setting fails the gate — enabled or not, whatever its categories, whatever its destination. There is no allowlist of "safe" categories: a disabled setting can be enabled between two polls, and a sink using a destination field this verifier does not model would otherwise pass. See the Security boundary section for the operator migration note.
 
 After the startup gate passes and the listener binds, `attestd` re-runs the same Azure owner-capture verification periodically, including the deployment streaming-mode check. The default re-verification interval is 900 seconds; values below 60 seconds are clamped to 60 seconds. Transient verification errors such as Azure management/login network errors, timeouts, HTTP 408/429/5xx responses, or response decode failures are tolerated for 3 consecutive checks by default. A definitive verification failure, such as `raiMonitorConfig` becoming non-null, endpoint binding changing, account kind changing, async filtering being disabled, or other policy mismatch, stops `attestd` immediately with a non-zero exit so the container restarts and the boot-time gate blocks serving.
 
@@ -53,4 +53,92 @@ The owner-capture checks enforce that the Azure OpenAI account is bound to the c
 
 Network operators on the path between the miner CVM and Azure observe only TLS-encrypted ciphertext. Prompt content stays confidential end-to-end through Envoy: the RA-TLS data plane is terminated inside the TEE, and the Azure upstream connection is validated against the system CA bundle with an exact DNS SAN pin for the configured Azure host. The ARM account binding checks verify that the endpoint belongs to the miner's own resource, not a third-party account.
 
-The diagnostic-settings check is defense in depth: it rejects unknown enabled log categories so that newly introduced Azure logging features are blocked by default pending explicit allowlisting.
+The account must export nothing. The diagnostic-settings list must be **empty** — presence of any setting is the failure, enabled or not, whatever its categories, whatever its destination. This is a property of the account, not of the upstream it serves, so it applies to Azure `OpenAI` and Foundry alike. `AIServices` accounts additionally must have no connections and no capability hosts, on the account and on every project.
+
+Earlier releases only *warned* on unexpected Azure `OpenAI` log categories. That was weaker than this document claimed, and it is now enforced.
+
+**Operator migration.** The gate lives in the miner image, so an already-running miner is unaffected until it deploys a newer image version. A miner that redeploys — including for an unrelated reason, such as adding a provider key — picks up the newest approved image and will fail the boot gate if its Azure account has a diagnostic setting attached. The failure names the setting and prints the `az monitor diagnostic-settings delete` command to remove it. Operators should clear their account before upgrading.
+
+## Microsoft Foundry (`ANTHROPIC_UPSTREAM=foundry`)
+
+Claude on Foundry is served over Anthropic's own Messages API
+(`https://<resource>.services.ai.azure.com/anthropic/v1/messages`), so the data
+plane is a host/path/header rewrite with no body translation. What differs is
+verification.
+
+Azure's Responsible-AI content filter is **not** in Claude's inference path on
+Foundry ("Foundry doesn't provide built-in content filtering for Claude models at
+deployment time"), so the async-filter check that proves non-buffered streaming
+for Azure `OpenAI` has no equivalent here and the verifier does not consult
+`raiPolicyName` at all. Microsoft's own Claude reference templates *do* set
+`raiPolicyName: Microsoft.DefaultV2` on Claude deployments, and it is inert —
+reading it would prove nothing in either direction. Streaming for Foundry offers
+is therefore established empirically by the registry's inference probe, not
+attested from ARM. This is stated plainly rather than dressed up as an
+attestation.
+
+The account must be **inference-only**, and the checks are strict rather than
+allowlist-based (the same sweep runs for Azure `OpenAI`; the project/connection
+checks apply to `AIServices` accounts, which are the only kind that has them):
+
+- account `kind` must be exactly `AIServices`
+- `properties.customSubDomainName` binds the ARM account to the configured host
+- `properties.raiMonitorConfig` must be null, `properties.userOwnedStorage` empty
+- the diagnostic-settings list must be **empty** — on the account and on every
+  project. Presence is the failure, not the fields: a disabled setting can be
+  enabled between two polls, and a sink using a destination field this verifier
+  does not model would otherwise pass. Microsoft publishes no field-level schema
+  for the `RequestResponse` category either, so whether it can carry request
+  bodies for this resource kind is unsettled. Requiring zero settings moots all
+  three questions.
+- the account's and every project's `connections` must be empty. An `AppInsights`
+  connection alone is enough for Foundry to trace **prompt content** server-side
+  with no code change by the caller ("Foundry enables it for you automatically
+  once you connect an Application Insights resource to your project"). Rejecting
+  every connection category — not just `AppInsights` — also fails closed on sink
+  categories Azure adds later.
+- the account's and every project's `capabilityHosts` must be empty (they
+  redirect Agent-Service storage to operator-owned stores).
+
+Foundry's "online evaluation / continuous monitoring" of sampled live traffic is
+**not** an independent capture surface: it is downstream of captured data, and
+every Microsoft how-to lists a connected Application Insights resource as a
+prerequisite. With no connection and an uninstrumented caller, it has nothing to
+read. The connection gate above is what neutralizes it.
+
+### What Foundry verification does NOT cover
+
+- **Anthropic-side retention.** Anthropic is an independent data processor on
+  Foundry and retains prompts and outputs for 30 days, with exceptions-only Trust
+  & Safety review; Foundry ZDR is a separate contractual arrangement. No ARM
+  property represents any of this. It is not a gap in the verifier — Azure does
+  not expose it at all — and it is the same posture the `direct` Anthropic
+  backend already carries.
+- **The polling window.** Boot-time plus periodic ARM verification is detection,
+  not prevention: the operator owns the subscription and can enable a capture
+  surface after a poll and remove it before the next. The re-verification
+  interval bounds the exposure window; it does not eliminate it. Closing this
+  properly needs a control outside the operator's authority (e.g. a gm-owned
+  management-group deny assignment). This applies equally to the Azure `OpenAI`
+  backend and is not specific to Foundry.
+
+### Required miner configuration
+
+`ANTHROPIC_UPSTREAM=foundry`, `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_API_KEY`,
+plus a read-only Entra service principal for ARM: `AZURE_FOUNDRY_TENANT_ID`,
+`AZURE_FOUNDRY_SUBSCRIPTION_ID`, `AZURE_FOUNDRY_RESOURCE_GROUP`,
+`AZURE_FOUNDRY_CLIENT_ID`, `AZURE_FOUNDRY_CLIENT_SECRET`. These are separate from
+the `AZURE_*` Azure `OpenAI` variables on purpose: a worker may hold the two
+accounts in different tenants, subscriptions, or resource groups.
+
+Offers are declared with `--upstream-model <deployment-name>`: Foundry routes on
+the *deployment* name, which defaults to the model id but does not have to match
+it.
+
+### Verified from specs, not from a live resource
+
+The ARM request/response shapes here were built from
+`Azure/azure-rest-api-specs` (stable `2026-05-01`) and Microsoft's own
+`Azure-Samples/claude` templates, not from a live Foundry account. The design
+deliberately depends on no fact that those sources leave unsettled: every check
+is either a spec-confirmed field read or an emptiness assertion.

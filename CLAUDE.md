@@ -50,7 +50,7 @@ cargo test -p gm-miner-cli
 | Command | Purpose |
 |---|---|
 | `init` | Guided onboarding wizard: register hotkey → login → set keys → deploy → declare products, skipping steps already done |
-| `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai) to `~/.gmcli/config.json` |
+| `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai) and cloud-upstream selectors (Bedrock, Microsoft Foundry, Azure OpenAI) to `~/.gmcli/config.json` |
 | `deploy` | Full trust-correct deploy: build/push image + Phala Cloud deploy + hash verification + image registration |
 | `login` | Device-code OAuth flow; stores access token in config |
 | `register-hotkey` | Record the serving hotkey: `--hotkey-ss58` records one registered elsewhere; otherwise (`--wallet`/`--hotkey`) resolves the local btcli hotkey, checks the metagraph, and prints the `btcli subnet register` command for the operator to run — gmcli never signs |
@@ -70,6 +70,7 @@ carries each network's `netuid`, chain websocket, and default registry URL.
 
 ## Key conventions
 
+- Anthropic offers can be served from three upstreams: `direct` (api.anthropic.com), `bedrock`, or `foundry` (Claude on Microsoft Foundry — an Anthropic-native passthrough at `https://<resource>.services.ai.azure.com/anthropic/v1/messages`, so envoy needs only the same host/path/header rewrite Bedrock uses). Cloud upstreams are single-slot and carry a registry `backend` marker; Foundry routes on the *deployment* name, declared per-offer with `--upstream-model`. `attestd` verifies each configured Azure account's owner-capture controls at boot and periodically — see `AZURE_VERIFY_NOTES.md`, including what that verification does *not* cover.
 - Prices are declared as a `--discount-pct` in `[0, 99.90]` with up to two decimal places. The CLI converts to integer basis-points (no floats) before sending to the registry. The miner receives `(100 - pct)%` of retail per Mtok.
 - Each worker (Phala CVM) carries its own node secret, generated fresh on first deploy and reused on re-deploys of the same `--app-name`. The secret is embedded in the compose env, enforced by envoy, and stored in the registry — all three must stay in lockstep across re-deploys.
 - `--network` / `--testnet` are sticky: an explicit choice is persisted as `active_network`, so later commands target it until a different one is passed. `--api-url` is *not* sticky — it overrides the registry URL for a single run only (as does `GM_REGISTRY_URL`).
