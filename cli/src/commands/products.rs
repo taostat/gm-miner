@@ -226,21 +226,14 @@ pub(crate) async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     // Banner first, detail after the table: a miner piping this to a pager sees
     // the alarm without scrolling, and still gets the per-offer fix in context.
     let dead = dead_offers(&miner.products);
-    for line in alarm_banner(&dead) {
+    let offered = miner.products.iter().filter(|p| p.is_offered).count();
+    for line in alarm_banner(&dead, offered) {
         println!("{line}");
     }
 
     print_product_table(client, &miner, &dead).await?;
 
-    if dead.is_empty() {
-        return Ok(());
-    }
-    // Non-zero exit so a miner running `gmcli status` from cron or a monitor
-    // gets a signal without scraping stdout.
-    bail!(
-        "{} offered product(s) ineligible — serving nothing, earning nothing",
-        dead.len()
-    )
+    status_exit(&dead, offered)
 }
 
 /// Render the per-offer table joining `/miners/me` offers against the public
@@ -313,20 +306,36 @@ fn dead_offers(products: &[ProductOfferStatus]) -> Vec<&ProductOfferStatus> {
         .collect()
 }
 
+/// The one-line verdict, shared by the banner and the non-zero exit so the two
+/// cannot drift. Scoped to the dead offers: a miner with one dead offer and six
+/// live ones is still earning, and telling them otherwise would be a false alarm.
+fn dead_offer_summary(dead: usize, offered: usize) -> String {
+    format!(
+        "{dead} of {offered} offered product(s) ineligible — these serve nothing and earn nothing"
+    )
+}
+
 /// The headline that opens `status` when an offered product is dead.
-fn alarm_banner(dead: &[&ProductOfferStatus]) -> Vec<String> {
+fn alarm_banner(dead: &[&ProductOfferStatus], offered: usize) -> Vec<String> {
     if dead.is_empty() {
         return Vec::new();
     }
     vec![
         String::new(),
-        format!(
-            "!! {} OFFERED PRODUCT(S) INELIGIBLE — serving nothing, earning nothing.",
-            dead.len()
-        ),
+        format!("!! {}.", dead_offer_summary(dead.len(), offered)),
         "!! Your TEE can be healthy and attesting while these earn zero.".to_owned(),
         "!! Reason and fix for each are listed below the table.".to_owned(),
     ]
+}
+
+/// The `status` exit contract: a dead offer is an error, so a miner running
+/// `gmcli status` from cron or a monitor gets a signal without scraping stdout.
+/// Withdrawn offers never reach here, so a deliberate withdrawal cannot trip it.
+fn status_exit(dead: &[&ProductOfferStatus], offered: usize) -> Result<()> {
+    if dead.is_empty() {
+        return Ok(());
+    }
+    bail!("{}", dead_offer_summary(dead.len(), offered))
 }
 
 /// Explain every dead offer beneath the table, one block each.
@@ -379,6 +388,14 @@ mod tests {
         ineligible_detail_lines(&dead_offers(products)).join("\n")
     }
 
+    fn offered_count(products: &[ProductOfferStatus]) -> usize {
+        products.iter().filter(|p| p.is_offered).count()
+    }
+
+    fn rendered_banner(products: &[ProductOfferStatus]) -> String {
+        alarm_banner(&dead_offers(products), offered_count(products)).join("\n")
+    }
+
     #[test]
     fn an_all_eligible_table_raises_no_alarm() {
         let products = offers(serde_json::json!([{
@@ -386,7 +403,7 @@ mod tests {
             "is_offered": true, "is_eligible": true, "discount_bp": 500,
         }]));
         assert!(dead_offers(&products).is_empty());
-        assert!(alarm_banner(&dead_offers(&products)).is_empty());
+        assert!(rendered_banner(&products).is_empty());
         assert!(rendered_detail(&products).is_empty());
     }
 
@@ -397,9 +414,9 @@ mod tests {
             "is_offered": true, "is_eligible": false, "discount_bp": 500,
         }]));
 
-        let banner = alarm_banner(&dead_offers(&products)).join("\n");
-        assert!(banner.contains("1 OFFERED PRODUCT(S) INELIGIBLE"));
-        assert!(banner.contains("serving nothing, earning nothing"));
+        let banner = rendered_banner(&products);
+        assert!(banner.contains("!! 1 of 1 offered product(s) ineligible"));
+        assert!(banner.contains("these serve nothing and earn nothing"));
     }
 
     /// The incident that motivated this: an Azure key started 401-ing, every
@@ -428,9 +445,12 @@ mod tests {
         assert!(rendered.contains(
             "reason : capability_probe_failed: cloud inference probe rejected key (401)"
         ));
-        // The remedy is the registry's, verbatim — rotating the key alone is not
+        // The remedy is the registry's hint, verbatim — rotating the key alone is not
         // enough (it is baked into the TEE at deploy), so the fix names the redeploy.
-        assert!(rendered.contains("redeploy the worker with `gmcli deploy`"));
+        assert!(rendered.contains(
+            "fix    : Your upstream provider key was rejected (401). Set a valid key \
+             with `gmcli set-api-keys` and redeploy the worker with `gmcli deploy`."
+        ));
     }
 
     /// A withdrawn offer is ineligible by the miner's own choice. Counting it
@@ -444,7 +464,7 @@ mod tests {
         }]));
 
         assert!(dead_offers(&products).is_empty());
-        assert!(alarm_banner(&dead_offers(&products)).is_empty());
+        assert!(rendered_banner(&products).is_empty());
         assert!(rendered_detail(&products).is_empty());
     }
 
@@ -466,9 +486,8 @@ mod tests {
         let dead = dead_offers(&products);
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].model, "gpt-5.6-sol");
-        assert!(alarm_banner(&dead)
-            .join("\n")
-            .contains("1 OFFERED PRODUCT(S)"));
+        // One dead of one offered: the withdrawn offer is not counted on either side.
+        assert!(rendered_banner(&products).contains("!! 1 of 1 offered product(s) ineligible"));
     }
 
     #[test]
@@ -517,5 +536,53 @@ mod tests {
         let rendered = rendered_detail(&products);
         assert!(rendered.contains("reason : some_future_code: a detail we cannot explain"));
         assert!(!rendered.contains("fix    :"));
+    }
+
+    #[test]
+    fn a_clean_status_exits_zero() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6",
+            "is_offered": true, "is_eligible": true, "discount_bp": 500,
+        }]));
+
+        assert!(status_exit(&dead_offers(&products), offered_count(&products)).is_ok());
+    }
+
+    #[test]
+    fn a_dead_offer_exits_non_zero_with_the_banner_verdict() {
+        let products = offers(serde_json::json!([
+            {
+                "provider": "openai", "model": "gpt-5.6",
+                "is_offered": true, "is_eligible": true, "discount_bp": 500,
+            },
+            {
+                "provider": "openai", "model": "gpt-5.6-sol",
+                "is_offered": true, "is_eligible": false, "discount_bp": 500,
+                "ineligible_reason": "capability_probe_failed: upstream rejected key (401)",
+            },
+        ]));
+
+        let err = status_exit(&dead_offers(&products), offered_count(&products))
+            .expect_err("a dead offer must exit non-zero");
+        // The exit message and the banner state the same verdict, and it is scoped
+        // to the dead offer: the other offer is still eligible and still earning.
+        assert_eq!(
+            err.to_string(),
+            "1 of 2 offered product(s) ineligible — these serve nothing and earn nothing"
+        );
+        assert!(rendered_banner(&products).contains(&err.to_string()));
+    }
+
+    /// A withdrawal is the miner's own choice — tripping the exit on it would make
+    /// the signal worthless to anyone running `gmcli status` from a monitor.
+    #[test]
+    fn a_withdrawn_offer_exits_zero() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6",
+            "is_offered": false, "is_eligible": false, "discount_bp": 500,
+            "ineligible_reason": "withdrawn_by_miner",
+        }]));
+
+        assert!(status_exit(&dead_offers(&products), offered_count(&products)).is_ok());
     }
 }
