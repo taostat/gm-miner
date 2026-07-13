@@ -32,14 +32,35 @@ fn validate_selector(name: &str, value: &str, allowed: &[&str]) -> Result<()> {
 /// to verify the Foundry account carries no owner-capture controls. Grouped so
 /// the seven flags travel as one argument instead of widening an already-long
 /// handler signature.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, clap::Args)]
 pub(crate) struct FoundryArgs {
+    /// Microsoft Foundry endpoint for `ANTHROPIC_UPSTREAM=foundry`
+    /// (`https://<resource>.services.ai.azure.com`).
+    #[arg(long = "azure-foundry-endpoint")]
     pub(crate) endpoint: Option<String>,
+
+    /// Microsoft Foundry API key for `ANTHROPIC_UPSTREAM=foundry`.
+    #[arg(long = "azure-foundry-api-key")]
     pub(crate) api_key: Option<String>,
+
+    /// Azure tenant ID for Foundry ARM verification.
+    #[arg(long = "azure-foundry-tenant-id")]
     pub(crate) tenant_id: Option<String>,
+
+    /// Azure subscription ID for Foundry ARM verification.
+    #[arg(long = "azure-foundry-subscription-id")]
     pub(crate) subscription_id: Option<String>,
+
+    /// Azure resource group for Foundry ARM verification.
+    #[arg(long = "azure-foundry-resource-group")]
     pub(crate) resource_group: Option<String>,
+
+    /// Azure client ID for Foundry ARM verification.
+    #[arg(long = "azure-foundry-client-id")]
     pub(crate) client_id: Option<String>,
+
+    /// Azure client secret for Foundry ARM verification.
+    #[arg(long = "azure-foundry-client-secret")]
     pub(crate) client_secret: Option<String>,
 }
 

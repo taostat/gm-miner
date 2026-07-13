@@ -2,7 +2,7 @@ use tokio::sync::oneshot;
 
 use super::config::{AzureVerifyConfig, PeriodicAzureVerifySettings};
 use super::error::{classify_verification_error, VerificationFailureKind};
-use super::verify_azure_target;
+use super::{arm_client, verify_azure_target};
 
 /// One configured Azure account plus its own consecutive-transient-failure
 /// count. The counters are per target on purpose: a healthy Azure `OpenAI`
@@ -26,11 +26,21 @@ pub(crate) async fn run_periodic_azure_verification(
         })
         .collect();
 
+    // Built once and reused for the lifetime of the loop: a fresh client per
+    // cycle would discard the connection pool every interval, forever.
+    let client = match arm_client() {
+        Ok(client) => client,
+        Err(err) => {
+            let _ = fatal_shutdown.send(format!("build Azure verification HTTP client: {err:#}"));
+            return;
+        }
+    };
+
     loop {
         tokio::time::sleep(settings.interval).await;
         for state in &mut states {
             let provider = state.config.provider.label();
-            match verify_azure_target(&state.config).await {
+            match verify_azure_target(&client, &state.config).await {
                 Ok(()) => {
                     if state.transient_failures > 0 {
                         tracing::info!(

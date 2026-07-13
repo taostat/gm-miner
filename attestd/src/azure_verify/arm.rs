@@ -46,6 +46,8 @@ pub(crate) struct DiagnosticSettingsList {
 #[derive(Debug, Deserialize)]
 pub(crate) struct DiagnosticSetting {
     #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
     pub(crate) properties: DiagnosticProperties,
 }
 
@@ -54,8 +56,6 @@ pub(crate) struct DiagnosticSetting {
 pub(crate) struct DiagnosticProperties {
     #[serde(default)]
     pub(crate) logs: Vec<DiagnosticLog>,
-    #[serde(default)]
-    pub(crate) metrics: Vec<DiagnosticMetric>,
     pub(crate) workspace_id: Option<String>,
     pub(crate) storage_account_id: Option<String>,
     pub(crate) event_hub_authorization_rule_id: Option<String>,
@@ -68,14 +68,6 @@ pub(crate) struct DiagnosticProperties {
 pub(crate) struct DiagnosticLog {
     pub(crate) category: Option<String>,
     pub(crate) category_group: Option<String>,
-    #[serde(default)]
-    pub(crate) enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DiagnosticMetric {
-    pub(crate) category: Option<String>,
     #[serde(default)]
     pub(crate) enabled: bool,
 }
@@ -237,89 +229,111 @@ pub(crate) async fn fetch_arm_deployments(
     endpoint: &AzureEndpoint,
     token: &str,
 ) -> Result<ArmDeploymentList> {
-    let mut url = format!(
+    let url = format!(
         "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/deployments?api-version={ARM_API_VERSION}",
         encode_path_segment(&config.subscription_id),
         encode_path_segment(&config.resource_group),
         encode_path_segment(&endpoint.account_name),
     );
-    let mut deployments = Vec::new();
-    loop {
-        let page: ArmDeploymentList =
-            get_json(client, &url, token, "Azure OpenAI deployments").await?;
-        deployments.extend(page.value);
-        let Some(next_link) = page.next_link else {
-            break;
-        };
-        if next_link.trim().is_empty() {
-            bail!("Azure OpenAI deployments response had an empty nextLink");
-        }
-        url = next_link;
-    }
     Ok(ArmDeploymentList {
-        value: deployments,
+        value: fetch_paged::<ArmDeploymentList>(client, url, token, "Azure OpenAI deployments")
+            .await?,
         next_link: None,
     })
 }
 
-/// Enumerate a `Microsoft.CognitiveServices` child collection under the
-/// account (`projects`, `connections`, `capabilityHosts`) or under one of its
-/// projects, following `nextLink` to the end.
-pub(crate) async fn fetch_account_children(
-    client: &Client,
-    config: &AzureVerifyConfig,
-    endpoint: &AzureEndpoint,
-    collection: &str,
-    token: &str,
-    label: &'static str,
-) -> Result<Vec<ArmChildResource>> {
-    let url = format!(
-        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/{collection}?api-version={ARM_API_VERSION}",
-        encode_path_segment(&config.subscription_id),
-        encode_path_segment(&config.resource_group),
-        encode_path_segment(&endpoint.account_name),
-    );
-    fetch_children_paged(client, url, token, label).await
+/// An ARM list response: a page of items plus an optional `nextLink`.
+pub(crate) trait ArmPage: for<'de> Deserialize<'de> {
+    type Item;
+
+    fn into_parts(self) -> (Vec<Self::Item>, Option<String>);
 }
 
-pub(crate) async fn fetch_project_children(
-    client: &Client,
-    config: &AzureVerifyConfig,
-    endpoint: &AzureEndpoint,
-    project: &str,
-    collection: &str,
-    token: &str,
-    label: &'static str,
-) -> Result<Vec<ArmChildResource>> {
-    let url = format!(
-        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/projects/{}/{collection}?api-version={ARM_API_VERSION}",
-        encode_path_segment(&config.subscription_id),
-        encode_path_segment(&config.resource_group),
-        encode_path_segment(&endpoint.account_name),
-        encode_path_segment(project),
-    );
-    fetch_children_paged(client, url, token, label).await
+impl ArmPage for ArmDeploymentList {
+    type Item = ArmDeployment;
+
+    fn into_parts(self) -> (Vec<Self::Item>, Option<String>) {
+        (self.value, self.next_link)
+    }
 }
 
-async fn fetch_children_paged(
+impl ArmPage for ArmChildList {
+    type Item = ArmChildResource;
+
+    fn into_parts(self) -> (Vec<Self::Item>, Option<String>) {
+        (self.value, self.next_link)
+    }
+}
+
+/// Drain every page of an ARM list endpoint, following `nextLink`.
+/// Upper bound on `nextLink` follows. A server that keeps handing back a link
+/// would otherwise wedge the verifier: at boot it never returns, and in the
+/// periodic loop it would stall every later target while envoy keeps serving.
+/// Far above any real ARM collection on one account.
+const MAX_ARM_PAGES: usize = 100;
+
+async fn fetch_paged<P: ArmPage>(
     client: &Client,
     mut url: String,
     token: &str,
     label: &'static str,
-) -> Result<Vec<ArmChildResource>> {
+) -> Result<Vec<P::Item>> {
     let mut items = Vec::new();
-    loop {
-        let page: ArmChildList = get_json(client, &url, token, label).await?;
-        items.extend(page.value);
-        let Some(next_link) = page.next_link else {
-            break;
+    for _ in 0..MAX_ARM_PAGES {
+        let page: P = get_json(client, &url, token, label).await?;
+        let (value, next_link) = page.into_parts();
+        items.extend(value);
+        let Some(next_link) = next_link else {
+            return Ok(items);
         };
         if next_link.trim().is_empty() {
             bail!("{label} response had an empty nextLink");
         }
         url = next_link;
     }
-    Ok(items)
+    bail!("{label} paginated past {MAX_ARM_PAGES} pages; refusing to follow further")
+}
+
+/// Which `Microsoft.CognitiveServices` scope a child collection hangs off:
+/// the account itself, or one of its Foundry projects.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ArmScope<'a> {
+    Account,
+    Project(&'a str),
+}
+
+impl ArmScope<'_> {
+    /// How the scope is named in a verification failure the operator reads.
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Account => "account".to_owned(),
+            Self::Project(project) => format!("project '{project}'"),
+        }
+    }
+}
+
+/// Enumerate a `Microsoft.CognitiveServices` child collection (`projects`,
+/// `connections`, `capabilityHosts`) under the account or one of its projects,
+/// following `nextLink` to the end.
+pub(crate) async fn fetch_children(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    scope: ArmScope<'_>,
+    collection: &str,
+    token: &str,
+) -> Result<Vec<ArmChildResource>> {
+    let project_segment = match scope {
+        ArmScope::Account => String::new(),
+        ArmScope::Project(project) => format!("/projects/{}", encode_path_segment(project)),
+    };
+    let url = format!(
+        "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}{project_segment}/{collection}?api-version={ARM_API_VERSION}",
+        encode_path_segment(&config.subscription_id),
+        encode_path_segment(&config.resource_group),
+        encode_path_segment(&endpoint.account_name),
+    );
+    fetch_paged::<ArmChildList>(client, url, token, "Azure Foundry child resources").await
 }
 
 pub(crate) async fn fetch_arm_rai_policy(

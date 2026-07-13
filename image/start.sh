@@ -151,6 +151,18 @@ require_host_suffix() {
   exit 1
 }
 
+## Cloud backend keys are single-slot in this release: a ';'-separated value
+## would advertise slots the registry never probes.
+require_single_slot() {
+  local name="$1"
+  local value="$2"
+  local upstream="$3"
+  if [[ "${value}" == *";"* ]]; then
+    log "error: ${name} cannot contain ';' when ${upstream}; cloud backends are single-slot in this release"
+    exit 1
+  fi
+}
+
 matched_host_suffix() {
   local host="$1"
   shift
@@ -221,10 +233,7 @@ case "${ANTHROPIC_UPSTREAM}" in
       log "error: BEDROCK_API_KEY must be set when ANTHROPIC_UPSTREAM=bedrock"
       exit 1
     fi
-    if [[ "${BEDROCK_API_KEY}" == *";"* ]]; then
-      log "error: BEDROCK_API_KEY cannot contain ';' when ANTHROPIC_UPSTREAM=bedrock; cloud backends are single-slot in this release"
-      exit 1
-    fi
+    require_single_slot BEDROCK_API_KEY "${BEDROCK_API_KEY}" "ANTHROPIC_UPSTREAM=bedrock"
     if [[ ! "${BEDROCK_REGION}" =~ ^[A-Za-z0-9-]+$ ]]; then
       log "error: BEDROCK_REGION must contain only letters, numbers, and hyphens"
       exit 1
@@ -262,10 +271,7 @@ case "${ANTHROPIC_UPSTREAM}" in
       log "error: AZURE_FOUNDRY_API_KEY must be set when ANTHROPIC_UPSTREAM=foundry"
       exit 1
     fi
-    if [[ "${AZURE_FOUNDRY_API_KEY}" == *";"* ]]; then
-      log "error: AZURE_FOUNDRY_API_KEY cannot contain ';' when ANTHROPIC_UPSTREAM=foundry; cloud backends are single-slot in this release"
-      exit 1
-    fi
+    require_single_slot AZURE_FOUNDRY_API_KEY "${AZURE_FOUNDRY_API_KEY}" "ANTHROPIC_UPSTREAM=foundry"
     ANTHROPIC_HOST="$(parse_azure_host AZURE_FOUNDRY_ENDPOINT "${AZURE_FOUNDRY_ENDPOINT}")"
     validate_hostname "Microsoft Foundry" "${ANTHROPIC_HOST}"
     require_host_suffix "Microsoft Foundry" "${ANTHROPIC_HOST}" services.ai.azure.com
@@ -306,10 +312,7 @@ case "${OPENAI_UPSTREAM}" in
       log "error: AZURE_OPENAI_API_KEY must be set when OPENAI_UPSTREAM=azure"
       exit 1
     fi
-    if [[ "${AZURE_OPENAI_API_KEY}" == *";"* ]]; then
-      log "error: AZURE_OPENAI_API_KEY cannot contain ';' when OPENAI_UPSTREAM=azure; cloud backends are single-slot in this release"
-      exit 1
-    fi
+    require_single_slot AZURE_OPENAI_API_KEY "${AZURE_OPENAI_API_KEY}" "OPENAI_UPSTREAM=azure"
     OPENAI_HOST="$(parse_azure_host AZURE_OPENAI_ENDPOINT "${AZURE_OPENAI_ENDPOINT}")"
     validate_hostname "Azure OpenAI" "${OPENAI_HOST}"
     require_host_suffix "Azure OpenAI" "${OPENAI_HOST}" \

@@ -115,59 +115,54 @@ pub(crate) fn non_empty_json_value(value: &Value) -> bool {
     }
 }
 
-/// A Foundry account backing a gm miner is inference-only: it exports nothing.
-/// Reject *any* enabled log or metric category and *any* configured
-/// destination, rather than allowlisting the categories that look benign today.
+/// A Foundry scope backing a gm miner is inference-only: it exports nothing, so
+/// the diagnostic-settings list must be EMPTY. Presence is the failure —
+/// enabled or not, whatever its categories, whatever its destination.
 ///
-/// This is deliberately stricter than the Azure `OpenAI` path. Microsoft does not
-/// publish a field-level schema for the `RequestResponse` category, so whether
-/// it can ever carry request bodies for this resource kind is not settled by the
-/// docs — and a future capture feature would arrive as a category we have never
-/// heard of. Requiring the settings list to be empty makes both questions moot.
-pub(crate) fn assert_no_diagnostic_capture(settings: &DiagnosticSettingsList) -> Result<()> {
-    for setting in &settings.value {
-        let enabled_logs: Vec<&str> = setting
-            .properties
-            .logs
-            .iter()
-            .filter(|log| log.enabled)
-            .map(|log| {
-                log.category
-                    .as_deref()
-                    .or(log.category_group.as_deref())
-                    .unwrap_or("<unnamed>")
-            })
-            .collect();
-        if !enabled_logs.is_empty() {
-            bail!(
-                "Microsoft Foundry account has enabled diagnostic log categories ({}); \
-                 a gm Foundry account must export no logs",
-                enabled_logs.join(", ")
-            );
-        }
-        let enabled_metrics: Vec<&str> = setting
-            .properties
-            .metrics
-            .iter()
-            .filter(|metric| metric.enabled)
-            .map(|metric| metric.category.as_deref().unwrap_or("<unnamed>"))
-            .collect();
-        if !enabled_metrics.is_empty() {
-            bail!(
-                "Microsoft Foundry account has enabled diagnostic metric categories ({}); \
-                 a gm Foundry account must export no metrics",
-                enabled_metrics.join(", ")
-            );
-        }
-        let destinations = setting.properties.destination_count();
-        if destinations > 0 {
-            bail!(
-                "Microsoft Foundry account has {destinations} diagnostic-setting destination(s); \
-                 a gm Foundry account must export to none"
-            );
-        }
+/// This is deliberately stricter than the Azure `OpenAI` path, and stricter
+/// than inspecting the fields. Microsoft publishes no field-level schema for
+/// the `RequestResponse` category, so whether it can carry request bodies for
+/// this resource kind is unsettled; a future sink would arrive as a destination
+/// field this verifier does not model; and a *disabled* setting can be enabled
+/// between two polls without ever failing a check. Requiring zero settings
+/// moots all three.
+pub(crate) fn assert_no_diagnostic_capture(
+    scope: &str,
+    settings: &DiagnosticSettingsList,
+) -> Result<()> {
+    if settings.value.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let named: Vec<String> = settings
+        .value
+        .iter()
+        .map(|setting| {
+            let categories: Vec<&str> = setting
+                .properties
+                .logs
+                .iter()
+                .filter(|log| log.enabled)
+                .map(|log| {
+                    log.category
+                        .as_deref()
+                        .or(log.category_group.as_deref())
+                        .unwrap_or("<unnamed>")
+                })
+                .collect();
+            if categories.is_empty() {
+                setting.name.clone()
+            } else {
+                format!("{} ({})", setting.name, categories.join(", "))
+            }
+        })
+        .collect();
+    bail!(
+        "Microsoft Foundry {scope} has {} diagnostic setting(s) ({}); a gm Foundry account must \
+         have none — a diagnostic setting is an export sink, and a disabled one can be enabled \
+         between two verification polls",
+        settings.value.len(),
+        named.join(", ")
+    )
 }
 
 /// Reject every child resource in a capture-capable collection.
@@ -449,48 +444,52 @@ mod tests {
     }
 
     #[test]
-    fn foundry_accepts_an_account_that_exports_nothing() {
+    fn foundry_accepts_a_scope_with_no_diagnostic_settings_at_all() {
         let settings = diagnostics_from_json(r#"{"value": []}"#);
-        assert!(assert_no_diagnostic_capture(&settings).is_ok());
-
-        let disabled = diagnostics_from_json(
-            r#"{"value": [{"properties": {
-                "logs": [{"category": "Audit", "enabled": false}],
-                "metrics": [{"category": "AllMetrics", "enabled": false}]
-            }}]}"#,
-        );
-        assert!(assert_no_diagnostic_capture(&disabled).is_ok());
+        assert!(assert_no_diagnostic_capture("account", &settings).is_ok());
     }
 
     #[test]
-    fn foundry_rejects_every_enabled_export_and_destination() {
+    fn foundry_rejects_any_diagnostic_setting_however_it_is_shaped() {
         // A category the Azure OpenAI path allows as "metadata-only" — Foundry
         // rejects it, because Microsoft publishes no field-level schema saying
         // RequestResponse can never carry bodies for this resource kind.
         let logs = diagnostics_from_json(
-            r#"{"value": [{"properties": {"logs": [{"category": "RequestResponse", "enabled": true}]}}]}"#,
+            r#"{"value": [{"name": "export", "properties": {"logs": [{"category": "RequestResponse", "enabled": true}]}}]}"#,
         );
-        let err = assert_no_diagnostic_capture(&logs)
+        let err = assert_no_diagnostic_capture("account", &logs)
             .expect_err("enabled log category must fail")
             .to_string();
         assert!(err.contains("RequestResponse"), "{err}");
 
-        let metrics = diagnostics_from_json(
-            r#"{"value": [{"properties": {"metrics": [{"category": "AllMetrics", "enabled": true}]}}]}"#,
-        );
-        assert!(assert_no_diagnostic_capture(&metrics).is_err());
-
-        // A destination with no enabled category is still an export sink.
-        let destination = diagnostics_from_json(
-            r#"{"value": [{"properties": {
-                "logs": [],
-                "storageAccountId": "/subscriptions/sub/../storageAccounts/exfil"
+        // A DISABLED setting must fail too: the operator can flip it on between
+        // two verification polls without ever failing a check.
+        let disabled = diagnostics_from_json(
+            r#"{"value": [{"name": "dormant", "properties": {
+                "logs": [{"category": "Audit", "enabled": false}],
+                "metrics": [{"category": "AllMetrics", "enabled": false}]
             }}]}"#,
         );
-        let err = assert_no_diagnostic_capture(&destination)
-            .expect_err("configured destination must fail")
+        let err = assert_no_diagnostic_capture("account", &disabled)
+            .expect_err("a dormant diagnostic setting must fail")
             .to_string();
-        assert!(err.contains("destination"), "{err}");
+        assert!(err.contains("dormant"), "{err}");
+
+        // A setting whose sink is a destination field this verifier does not
+        // model must still fail — presence is the failure, not the fields.
+        let unknown_sink = diagnostics_from_json(
+            r#"{"value": [{"name": "future", "properties": {
+                "logs": [],
+                "dataCollectionRuleId": "/subscriptions/sub/../rules/exfil"
+            }}]}"#,
+        );
+        assert!(assert_no_diagnostic_capture("account", &unknown_sink).is_err());
+
+        // And the scope is named, so a project-attached export is diagnosable.
+        let err = assert_no_diagnostic_capture("project 'p1'", &logs)
+            .expect_err("project export must fail")
+            .to_string();
+        assert!(err.contains("project 'p1'"), "{err}");
     }
 
     fn children_from_json(json: &str) -> Vec<ArmChildResource> {

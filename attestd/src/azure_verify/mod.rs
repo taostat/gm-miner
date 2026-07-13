@@ -20,8 +20,8 @@ use reqwest::Client;
 use tokio::sync::oneshot;
 
 use self::arm::{
-    fetch_account_children, fetch_arm_account, fetch_arm_deployments, fetch_arm_rai_policy,
-    fetch_diagnostic_settings, fetch_entra_token, fetch_project_children,
+    fetch_arm_account, fetch_arm_deployments, fetch_arm_rai_policy, fetch_children,
+    fetch_diagnostic_settings, fetch_entra_token, ArmScope,
 };
 use self::checks::{
     assert_account_binding, assert_no_capture_children, assert_no_diagnostic_capture,
@@ -46,10 +46,21 @@ pub async fn verify_azure_config_from_env() -> Result<()> {
         tracing::info!("no Azure-backed upstream configured; nothing to verify");
         return Ok(());
     }
+    let client = arm_client()?;
     for target in &targets {
-        verify_azure_target(target).await?;
+        verify_azure_target(&client, target).await?;
     }
     Ok(())
+}
+
+/// One HTTP client, reused across targets and across every periodic cycle:
+/// rebuilding it per call would throw away the connection pool and re-read the
+/// system trust store on each verification.
+pub(crate) fn arm_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build Azure verification HTTP client")
 }
 
 /// Start periodic owner-capture verification for every configured Azure target.
@@ -82,28 +93,23 @@ pub fn spawn_periodic_azure_verification_from_env(
     ))))
 }
 
-pub(crate) async fn verify_azure_target(config: &AzureVerifyConfig) -> Result<()> {
+pub(crate) async fn verify_azure_target(client: &Client, config: &AzureVerifyConfig) -> Result<()> {
     let endpoint = parse_azure_endpoint(config.provider, &config.endpoint)?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("build Azure verification HTTP client")?;
 
     // TODO: add the client-certificate assertion auth variant for deployments
     // that do not want a client secret in the encrypted CVM env.
-    let token = fetch_entra_token(&client, config).await?;
-    let account = fetch_arm_account(&client, config, &endpoint, &token).await?;
+    let token = fetch_entra_token(client, config).await?;
+    let account = fetch_arm_account(client, config, &endpoint, &token).await?;
     let resource_id = assert_account_binding(config.provider, &endpoint, &account)?;
 
     match config.provider {
         AzureProvider::OpenAi => {
-            let diagnostics = fetch_diagnostic_settings(&client, resource_id, &token).await?;
+            let diagnostics = fetch_diagnostic_settings(client, resource_id, &token).await?;
             warn_on_unexpected_diagnostic_logs(&diagnostics);
-            verify_async_filter_configuration(&client, config, &endpoint, &token).await?;
+            verify_async_filter_configuration(client, config, &endpoint, &token).await?;
         }
         AzureProvider::Foundry => {
-            verify_foundry_capture_surfaces(&client, config, &endpoint, resource_id, &token)
-                .await?;
+            verify_foundry_capture_surfaces(client, config, &endpoint, resource_id, &token).await?;
         }
     }
 
@@ -115,6 +121,10 @@ pub(crate) async fn verify_azure_target(config: &AzureVerifyConfig) -> Result<()
     );
     Ok(())
 }
+
+/// The child collections an operator can attach a prompt-content sink to. Both
+/// must be empty on the account and on every project.
+const CAPTURE_COLLECTIONS: [&str; 2] = ["connections", "capabilityHosts"];
 
 /// Foundry's capture surfaces are child resources and diagnostic exports, not
 /// an RAI policy: Azure's content filter is not in Claude's inference path, so
@@ -128,76 +138,65 @@ async fn verify_foundry_capture_surfaces(
     resource_id: &str,
     token: &str,
 ) -> Result<()> {
-    let diagnostics = fetch_diagnostic_settings(client, resource_id, token).await?;
-    assert_no_diagnostic_capture(&diagnostics)?;
+    // These reads are independent, and they gate the data plane from starting —
+    // run them concurrently rather than paying a round trip each in sequence.
+    let ((), projects) = tokio::try_join!(
+        assert_scope_is_inference_only(
+            client,
+            config,
+            endpoint,
+            ArmScope::Account,
+            resource_id,
+            token
+        ),
+        fetch_children(
+            client,
+            config,
+            endpoint,
+            ArmScope::Account,
+            "projects",
+            token
+        ),
+    )?;
 
-    let connections = fetch_account_children(
-        client,
-        config,
-        endpoint,
-        "connections",
-        token,
-        "Azure Foundry account connections",
-    )
-    .await?;
-    assert_no_capture_children("account", "connections", &connections)?;
-
-    let capability_hosts = fetch_account_children(
-        client,
-        config,
-        endpoint,
-        "capabilityHosts",
-        token,
-        "Azure Foundry account capability hosts",
-    )
-    .await?;
-    assert_no_capture_children("account", "capabilityHosts", &capability_hosts)?;
-
-    let projects = fetch_account_children(
-        client,
-        config,
-        endpoint,
-        "projects",
-        token,
-        "Azure Foundry projects",
-    )
-    .await?;
     tracing::info!(
         project_count = projects.len(),
         "sweeping Foundry projects for capture surfaces",
     );
+    // A project is an ARM resource in its own right and carries its OWN
+    // diagnostic settings, so sweeping only the account would miss an export
+    // attached to the project the data plane actually routes through.
     for project in &projects {
-        let connections = fetch_project_children(
+        let project_resource_id = format!("{resource_id}/projects/{}", project.name);
+        assert_scope_is_inference_only(
             client,
             config,
             endpoint,
-            &project.name,
-            "connections",
+            ArmScope::Project(&project.name),
+            &project_resource_id,
             token,
-            "Azure Foundry project connections",
         )
         .await?;
-        assert_no_capture_children(
-            &format!("project '{}'", project.name),
-            "connections",
-            &connections,
-        )?;
+    }
+    Ok(())
+}
 
-        let capability_hosts = fetch_project_children(
-            client,
-            config,
-            endpoint,
-            &project.name,
-            "capabilityHosts",
-            token,
-            "Azure Foundry project capability hosts",
-        )
-        .await?;
-        assert_no_capture_children(
-            &format!("project '{}'", project.name),
-            "capabilityHosts",
-            &capability_hosts,
-        )?;
+/// One scope — the account, or one of its projects — must export nothing and
+/// hold no sink: no diagnostic settings, no connections, no capability hosts.
+async fn assert_scope_is_inference_only(
+    client: &Client,
+    config: &AzureVerifyConfig,
+    endpoint: &AzureEndpoint,
+    scope: ArmScope<'_>,
+    resource_id: &str,
+    token: &str,
+) -> Result<()> {
+    let diagnostics = fetch_diagnostic_settings(client, resource_id, token).await?;
+    assert_no_diagnostic_capture(&scope.label(), &diagnostics)?;
+
+    for collection in CAPTURE_COLLECTIONS {
+        let children = fetch_children(client, config, endpoint, scope, collection, token).await?;
+        assert_no_capture_children(&scope.label(), collection, &children)?;
     }
     Ok(())
 }

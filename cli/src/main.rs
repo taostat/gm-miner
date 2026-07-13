@@ -167,34 +167,9 @@ enum Command {
         #[arg(long)]
         bedrock_api_key: Option<String>,
 
-        /// Microsoft Foundry endpoint for `ANTHROPIC_UPSTREAM=foundry`
-        /// (`https://<resource>.services.ai.azure.com`).
-        #[arg(long)]
-        azure_foundry_endpoint: Option<String>,
-
-        /// Microsoft Foundry API key for `ANTHROPIC_UPSTREAM=foundry`.
-        #[arg(long)]
-        azure_foundry_api_key: Option<String>,
-
-        /// Azure tenant ID for Foundry ARM verification.
-        #[arg(long)]
-        azure_foundry_tenant_id: Option<String>,
-
-        /// Azure subscription ID for Foundry ARM verification.
-        #[arg(long)]
-        azure_foundry_subscription_id: Option<String>,
-
-        /// Azure resource group for Foundry ARM verification.
-        #[arg(long)]
-        azure_foundry_resource_group: Option<String>,
-
-        /// Azure client ID for Foundry ARM verification.
-        #[arg(long)]
-        azure_foundry_client_id: Option<String>,
-
-        /// Azure client secret for Foundry ARM verification.
-        #[arg(long)]
-        azure_foundry_client_secret: Option<String>,
+        /// Microsoft Foundry (Claude on Azure) upstream settings.
+        #[command(flatten)]
+        foundry: FoundryArgs,
 
         /// `OpenAI` API key (sk-...).
         #[arg(long)]
@@ -693,13 +668,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             anthropic_upstream,
             bedrock_region,
             bedrock_api_key,
-            azure_foundry_endpoint,
-            azure_foundry_api_key,
-            azure_foundry_tenant_id,
-            azure_foundry_subscription_id,
-            azure_foundry_resource_group,
-            azure_foundry_client_id,
-            azure_foundry_client_secret,
+            foundry,
             openai,
             openai_upstream,
             azure_openai_endpoint,
@@ -718,15 +687,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             anthropic_upstream,
             bedrock_region,
             bedrock_api_key,
-            FoundryArgs {
-                endpoint: azure_foundry_endpoint,
-                api_key: azure_foundry_api_key,
-                tenant_id: azure_foundry_tenant_id,
-                subscription_id: azure_foundry_subscription_id,
-                resource_group: azure_foundry_resource_group,
-                client_id: azure_foundry_client_id,
-                client_secret: azure_foundry_client_secret,
-            },
+            foundry,
             openai,
             openai_upstream,
             azure_openai_endpoint,
