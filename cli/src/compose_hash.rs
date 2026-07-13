@@ -214,14 +214,14 @@ mod tests {
     /// image version: when a new `ImageVersion` is published, bump both this
     /// ref and `REGISTRY_TESTNET_COMPOSE_HASH` to the live registry row.
     const TESTNET_IMAGE_REF: &str =
-        "ghcr.io/taostat/gm-miner@sha256:69caccfa4e5ed433d9e7c82d5ba80c452af24eede4a4df1fc1dfbcfb915e281c";
+        "ghcr.io/taostat/gm-miner@sha256:bd83b9d26ee942c5df9c88438b3267dcfa1324f20a6d73e4c93c32543619565e";
 
     /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
     /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
     /// keys, cloud upstream settings, and node secret).
     ///
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "e8434f469bb1829371f109eda34755cc9fd8c90f2c8b4e30a59a9c447b16735b";
+        "8b1412f199a6de7628b5cc4066840e5a6c212c75a27a80f46b721b8987eb31b0";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
