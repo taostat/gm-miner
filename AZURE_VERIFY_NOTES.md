@@ -53,7 +53,11 @@ The owner-capture checks enforce that the Azure OpenAI account is bound to the c
 
 Network operators on the path between the miner CVM and Azure observe only TLS-encrypted ciphertext. Prompt content stays confidential end-to-end through Envoy: the RA-TLS data plane is terminated inside the TEE, and the Azure upstream connection is validated against the system CA bundle with an exact DNS SAN pin for the configured Azure host. The ARM account binding checks verify that the endpoint belongs to the miner's own resource, not a third-party account.
 
-The diagnostic-settings check is defense in depth. For the Azure `OpenAI` target it is advisory: enabled categories outside the native metadata allowlist are logged as warnings, not rejected. A newly introduced Azure logging feature would therefore be *reported*, not blocked, on an Azure `OpenAI` account. The Foundry target does not inherit that gap — see below.
+The account must export nothing. The diagnostic-settings list must be **empty** — presence of any setting is the failure, enabled or not, whatever its categories, whatever its destination. This is a property of the account, not of the upstream it serves, so it applies to Azure `OpenAI` and Foundry alike. `AIServices` accounts additionally must have no connections and no capability hosts, on the account and on every project.
+
+Earlier releases only *warned* on unexpected Azure `OpenAI` log categories. That was weaker than this document claimed, and it is now enforced.
+
+**Operator migration.** The gate lives in the miner image, so an already-running miner is unaffected until it deploys a newer image version. A miner that redeploys — including for an unrelated reason, such as adding a provider key — picks up the newest approved image and will fail the boot gate if its Azure account has a diagnostic setting attached. The failure names the setting and prints the `az monitor diagnostic-settings delete` command to remove it. Operators should clear their account before upgrading.
 
 ## Microsoft Foundry (`ANTHROPIC_UPSTREAM=foundry`)
 
@@ -73,18 +77,20 @@ is therefore established empirically by the registry's inference probe, not
 attested from ARM. This is stated plainly rather than dressed up as an
 attestation.
 
-The Foundry account must be **inference-only**, and the checks are strict rather
-than allowlist-based:
+The account must be **inference-only**, and the checks are strict rather than
+allowlist-based (the same sweep runs for Azure `OpenAI`; the project/connection
+checks apply to `AIServices` accounts, which are the only kind that has them):
 
 - account `kind` must be exactly `AIServices`
 - `properties.customSubDomainName` binds the ARM account to the configured host
 - `properties.raiMonitorConfig` must be null, `properties.userOwnedStorage` empty
-- the diagnostic-settings list must be **empty**: no enabled log category, no
-  enabled metric category, no destination. Microsoft publishes no field-level
-  schema for the `RequestResponse` category, so whether it can carry request
-  bodies for this resource kind is not settled by the docs — requiring zero
-  exports makes the question moot, and fails closed on categories that do not
-  exist yet.
+- the diagnostic-settings list must be **empty** — on the account and on every
+  project. Presence is the failure, not the fields: a disabled setting can be
+  enabled between two polls, and a sink using a destination field this verifier
+  does not model would otherwise pass. Microsoft publishes no field-level schema
+  for the `RequestResponse` category either, so whether it can carry request
+  bodies for this resource kind is unsettled. Requiring zero settings moots all
+  three questions.
 - the account's and every project's `connections` must be empty. An `AppInsights`
   connection alone is enough for Foundry to trace **prompt content** server-side
   with no code change by the caller ("Foundry enables it for you automatically

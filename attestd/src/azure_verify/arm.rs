@@ -54,16 +54,14 @@ pub(crate) struct DiagnosticSetting {
     pub(crate) properties: DiagnosticProperties,
 }
 
+/// Only `logs` is modelled: the check is that the settings list is EMPTY, so
+/// the destination fields never need reading — which also means a destination
+/// field Azure adds later cannot quietly widen what passes.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DiagnosticProperties {
     #[serde(default)]
     pub(crate) logs: Vec<DiagnosticLog>,
-    pub(crate) workspace_id: Option<String>,
-    pub(crate) storage_account_id: Option<String>,
-    pub(crate) event_hub_authorization_rule_id: Option<String>,
-    pub(crate) service_bus_rule_id: Option<String>,
-    pub(crate) marketplace_partner_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,22 +136,6 @@ pub(crate) struct AzureHttpStatusError {
     pub(crate) label: &'static str,
     pub(crate) status: StatusCode,
     pub(crate) body: String,
-}
-
-impl DiagnosticProperties {
-    pub(crate) fn destination_count(&self) -> usize {
-        [
-            self.workspace_id.as_ref(),
-            self.storage_account_id.as_ref(),
-            self.event_hub_authorization_rule_id.as_ref(),
-            self.service_bus_rule_id.as_ref(),
-            self.marketplace_partner_id.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|id| !id.trim().is_empty())
-        .count()
-    }
 }
 
 pub(crate) async fn fetch_entra_token(

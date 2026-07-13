@@ -25,7 +25,7 @@ use self::arm::{
 };
 use self::checks::{
     assert_account_binding, assert_no_capture_children, assert_no_diagnostic_capture,
-    assess_streaming_configuration, log_streaming_assessment, warn_on_unexpected_diagnostic_logs,
+    assess_streaming_configuration, log_streaming_assessment, AI_SERVICES_KIND,
 };
 use self::config::{
     configured_targets_from_env, AzureProvider, AzureVerifyConfig, PeriodicAzureVerifySettings,
@@ -102,15 +102,31 @@ pub(crate) async fn verify_azure_target(client: &Client, config: &AzureVerifyCon
     let account = fetch_arm_account(client, config, &endpoint, &token).await?;
     let resource_id = assert_account_binding(config.provider, &endpoint, &account)?;
 
-    match config.provider {
-        AzureProvider::OpenAi => {
-            let diagnostics = fetch_diagnostic_settings(client, resource_id, &token).await?;
-            warn_on_unexpected_diagnostic_logs(&diagnostics);
-            verify_async_filter_configuration(client, config, &endpoint, &token).await?;
-        }
-        AzureProvider::Foundry => {
-            verify_foundry_capture_surfaces(client, config, &endpoint, resource_id, &token).await?;
-        }
+    // The capture sweep is a property of the ACCOUNT, not of the provider: an
+    // Azure OpenAI account exporting request logs to an operator-owned
+    // workspace is the same surface as a Foundry one doing it. Both are swept.
+    //
+    // Projects, connections, and capability hosts only exist on `AIServices`
+    // accounts. A classic `kind: OpenAI` account has no such child collections,
+    // and asking ARM for them would fail the verification on an account that has
+    // nothing to hide — so its sweep is the diagnostic settings alone.
+    verify_capture_surfaces(
+        client,
+        config,
+        &endpoint,
+        resource_id,
+        account.kind == AI_SERVICES_KIND,
+        &token,
+    )
+    .await?;
+
+    // Only Azure OpenAI has an ARM-observable streaming control. Azure's RAI
+    // content filter is not in Claude's inference path on Foundry, so there is
+    // no `raiPolicyName` mode to read there and the verifier never consults one
+    // (Microsoft's own Claude templates do set `raiPolicyName`, and it is inert
+    // — reading it would prove nothing either way).
+    if config.provider == AzureProvider::OpenAi {
+        verify_async_filter_configuration(client, config, &endpoint, &token).await?;
     }
 
     tracing::info!(
@@ -126,18 +142,24 @@ pub(crate) async fn verify_azure_target(client: &Client, config: &AzureVerifyCon
 /// must be empty on the account and on every project.
 const CAPTURE_COLLECTIONS: [&str; 2] = ["connections", "capabilityHosts"];
 
-/// Foundry's capture surfaces are child resources and diagnostic exports, not
-/// an RAI policy: Azure's content filter is not in Claude's inference path, so
-/// there is no `raiPolicyName` mode to read and the verifier never consults one
-/// (Microsoft's own Claude templates do set `raiPolicyName`, and it is inert
-/// here — reading it would prove nothing either way).
-async fn verify_foundry_capture_surfaces(
+async fn verify_capture_surfaces(
     client: &Client,
     config: &AzureVerifyConfig,
     endpoint: &AzureEndpoint,
     resource_id: &str,
+    has_child_collections: bool,
     token: &str,
 ) -> Result<()> {
+    if !has_child_collections {
+        let diagnostics = fetch_diagnostic_settings(client, resource_id, token).await?;
+        return assert_no_diagnostic_capture(
+            config.provider,
+            &ArmScope::Account.label(),
+            resource_id,
+            &diagnostics,
+        );
+    }
+
     // These reads are independent, and they gate the data plane from starting —
     // run them concurrently rather than paying a round trip each in sequence.
     let ((), projects) = tokio::try_join!(
@@ -161,7 +183,7 @@ async fn verify_foundry_capture_surfaces(
 
     tracing::info!(
         project_count = projects.len(),
-        "sweeping Foundry projects for capture surfaces",
+        "sweeping projects for capture surfaces",
     );
     // A project is an ARM resource in its own right and carries its OWN
     // diagnostic settings, so sweeping only the account would miss an export
@@ -192,11 +214,11 @@ async fn assert_scope_is_inference_only(
     token: &str,
 ) -> Result<()> {
     let diagnostics = fetch_diagnostic_settings(client, resource_id, token).await?;
-    assert_no_diagnostic_capture(&scope.label(), &diagnostics)?;
+    assert_no_diagnostic_capture(config.provider, &scope.label(), resource_id, &diagnostics)?;
 
     for collection in CAPTURE_COLLECTIONS {
         let children = fetch_children(client, config, endpoint, scope, collection, token).await?;
-        assert_no_capture_children(&scope.label(), collection, &children)?;
+        assert_no_capture_children(config.provider, &scope.label(), collection, &children)?;
     }
     Ok(())
 }

@@ -5,21 +5,18 @@ use reqwest::Url;
 use serde_json::Value;
 
 pub(crate) use self::streaming::{assess_streaming_configuration, log_streaming_assessment};
-use super::arm::{ArmAccount, ArmChildResource, DiagnosticLog, DiagnosticSettingsList};
+use super::arm::{ArmAccount, ArmChildResource, DiagnosticSettingsList};
 use super::config::AzureProvider;
 use super::endpoint::AzureEndpoint;
 
-const ALLOWED_OPENAI_ACCOUNT_KINDS: [&str; 2] = ["OpenAI", "AIServices"];
+/// The account kind that carries Foundry projects, connections, and capability
+/// hosts. A classic `kind: OpenAI` account has none of those child collections.
+pub(crate) const AI_SERVICES_KIND: &str = "AIServices";
+
+const ALLOWED_OPENAI_ACCOUNT_KINDS: [&str; 2] = ["OpenAI", AI_SERVICES_KIND];
 /// Foundry serves Claude only from an `AIServices` account (Microsoft's own
 /// Claude reference templates create exactly that kind), so accept nothing else.
-const ALLOWED_FOUNDRY_ACCOUNT_KINDS: [&str; 1] = ["AIServices"];
-const ALLOWED_DIAGNOSTIC_LOG_CATEGORIES: [&str; 4] = [
-    "Audit",
-    "RequestResponse",
-    "Trace",
-    "AzureOpenAIRequestUsage",
-];
-const ALLOWED_DIAGNOSTIC_LOG_CATEGORY_GROUPS: [&str; 2] = ["allLogs", "audit"];
+const ALLOWED_FOUNDRY_ACCOUNT_KINDS: [&str; 1] = [AI_SERVICES_KIND];
 
 pub(crate) fn assert_account_binding<'account>(
     provider: AzureProvider,
@@ -115,19 +112,24 @@ pub(crate) fn non_empty_json_value(value: &Value) -> bool {
     }
 }
 
-/// A Foundry scope backing a gm miner is inference-only: it exports nothing, so
-/// the diagnostic-settings list must be EMPTY. Presence is the failure —
+/// An Azure account backing a gm miner is inference-only: it exports nothing,
+/// so the diagnostic-settings list must be EMPTY. Presence is the failure —
 /// enabled or not, whatever its categories, whatever its destination.
 ///
-/// This is deliberately stricter than the Azure `OpenAI` path, and stricter
-/// than inspecting the fields. Microsoft publishes no field-level schema for
-/// the `RequestResponse` category, so whether it can carry request bodies for
-/// this resource kind is unsettled; a future sink would arrive as a destination
-/// field this verifier does not model; and a *disabled* setting can be enabled
-/// between two polls without ever failing a check. Requiring zero settings
-/// moots all three.
+/// Stricter than inspecting the fields, deliberately. Microsoft publishes no
+/// field-level schema for the `RequestResponse` category, so whether it can
+/// carry request bodies for this resource kind is unsettled; a future sink would
+/// arrive as a destination field this verifier does not model; and a *disabled*
+/// setting can be enabled between two polls without ever failing a check.
+/// Requiring zero settings moots all three.
+///
+/// This applies to Azure `OpenAI` accounts as well as Foundry ones: an account
+/// shipping request logs to an operator-owned workspace is the same capture
+/// surface whichever upstream it serves.
 pub(crate) fn assert_no_diagnostic_capture(
+    provider: AzureProvider,
     scope: &str,
+    resource_id: &str,
     settings: &DiagnosticSettingsList,
 ) -> Result<()> {
     if settings.value.is_empty() {
@@ -156,24 +158,32 @@ pub(crate) fn assert_no_diagnostic_capture(
             }
         })
         .collect();
+    let first = settings
+        .value
+        .first()
+        .map_or("<unnamed>", |s| s.name.as_str());
     bail!(
-        "Microsoft Foundry {scope} has {} diagnostic setting(s) ({}); a gm Foundry account must \
-         have none — a diagnostic setting is an export sink, and a disabled one can be enabled \
-         between two verification polls",
+        "{} {scope} has {} diagnostic setting(s) ({}). A gm miner's Azure account must export \
+         nothing: a diagnostic setting is a sink for request data, and a disabled one can be \
+         enabled between two verification polls. Remove them, then redeploy:\n  \
+         az monitor diagnostic-settings delete --name '{first}' --resource '{resource_id}'\n  \
+         az monitor diagnostic-settings list --resource '{resource_id}'   # expect: []",
+        provider.label(),
         settings.value.len(),
-        named.join(", ")
+        named.join(", "),
     )
 }
 
 /// Reject every child resource in a capture-capable collection.
 ///
-/// Connections are how an operator attaches a sink to a Foundry account or
-/// project — and an `AppInsights` connection alone is enough for Foundry to
-/// trace prompt content server-side with no code change on the caller's part.
-/// Capability hosts redirect Agent-Service storage to operator-owned stores.
-/// An inference-only account needs neither, so the safe rule is "none", which
-/// also fails closed on connection categories that do not exist yet.
+/// Connections are how an operator attaches a sink to an account or project —
+/// and an `AppInsights` connection alone is enough for Foundry to trace prompt
+/// content server-side with no code change on the caller's part. Capability
+/// hosts redirect Agent-Service storage to operator-owned stores. An
+/// inference-only account needs neither, so the safe rule is "none", which also
+/// fails closed on connection categories that do not exist yet.
 pub(crate) fn assert_no_capture_children(
+    provider: AzureProvider,
     scope: &str,
     collection: &str,
     children: &[ArmChildResource],
@@ -189,37 +199,12 @@ pub(crate) fn assert_no_capture_children(
         })
         .collect();
     bail!(
-        "Microsoft Foundry {scope} has {} {collection} ({}); a gm Foundry account must have none — \
-         they are the sinks prompt content would be captured to",
+        "{} {scope} has {} {collection} ({}). A gm miner's Azure account must have none — they \
+         are the sinks prompt content would be captured to. Remove them, then redeploy.",
+        provider.label(),
         children.len(),
-        named.join(", ")
+        named.join(", "),
     )
-}
-
-pub(crate) fn warn_on_unexpected_diagnostic_logs(settings: &DiagnosticSettingsList) {
-    for setting in &settings.value {
-        let destination_count = setting.properties.destination_count();
-        for log in &setting.properties.logs {
-            if log.enabled && !diagnostic_log_is_allowed(log) {
-                tracing::warn!(
-                    category = log.category.as_deref().unwrap_or("<none>"),
-                    category_group = log.category_group.as_deref().unwrap_or("<none>"),
-                    destinations = destination_count,
-                    "Azure diagnostic setting has an enabled unknown log category; not fatal because native categories are metadata-only",
-                );
-            }
-        }
-    }
-}
-
-pub(crate) fn diagnostic_log_is_allowed(log: &DiagnosticLog) -> bool {
-    log.category
-        .as_deref()
-        .is_some_and(|category| ALLOWED_DIAGNOSTIC_LOG_CATEGORIES.contains(&category))
-        || log
-            .category_group
-            .as_deref()
-            .is_some_and(|group| ALLOWED_DIAGNOSTIC_LOG_CATEGORY_GROUPS.contains(&group))
 }
 
 #[cfg(test)]
@@ -360,44 +345,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn diagnostic_category_allowlist_accepts_known_metadata_logs() {
-        for log in [
-            DiagnosticLog {
-                category: Some("Audit".to_owned()),
-                category_group: None,
-                enabled: true,
-            },
-            DiagnosticLog {
-                category: Some("RequestResponse".to_owned()),
-                category_group: None,
-                enabled: true,
-            },
-            DiagnosticLog {
-                category: None,
-                category_group: Some("allLogs".to_owned()),
-                enabled: true,
-            },
-            DiagnosticLog {
-                category: None,
-                category_group: Some("audit".to_owned()),
-                enabled: true,
-            },
-        ] {
-            assert!(diagnostic_log_is_allowed(&log));
-        }
-    }
-
-    #[test]
-    fn diagnostic_category_allowlist_flags_unknown_enabled_logs() {
-        let log = DiagnosticLog {
-            category: Some("FutureContentLog".to_owned()),
-            category_group: None,
-            enabled: true,
-        };
-        assert!(!diagnostic_log_is_allowed(&log));
-    }
-
     fn foundry_endpoint() -> AzureEndpoint {
         parse_azure_endpoint(
             AzureProvider::Foundry,
@@ -446,7 +393,7 @@ mod tests {
     #[test]
     fn foundry_accepts_a_scope_with_no_diagnostic_settings_at_all() {
         let settings = diagnostics_from_json(r#"{"value": []}"#);
-        assert!(assert_no_diagnostic_capture("account", &settings).is_ok());
+        assert!(assert_no_diagnostic_capture(AzureProvider::Foundry, "account", "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct", &settings).is_ok());
     }
 
     /// An ARM list response we cannot parse must fail the verification, not
@@ -476,7 +423,7 @@ mod tests {
         let logs = diagnostics_from_json(
             r#"{"value": [{"name": "export", "properties": {"logs": [{"category": "RequestResponse", "enabled": true}]}}]}"#,
         );
-        let err = assert_no_diagnostic_capture("account", &logs)
+        let err = assert_no_diagnostic_capture(AzureProvider::Foundry, "account", "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct", &logs)
             .expect_err("enabled log category must fail")
             .to_string();
         assert!(err.contains("RequestResponse"), "{err}");
@@ -489,7 +436,7 @@ mod tests {
                 "metrics": [{"category": "AllMetrics", "enabled": false}]
             }}]}"#,
         );
-        let err = assert_no_diagnostic_capture("account", &disabled)
+        let err = assert_no_diagnostic_capture(AzureProvider::Foundry, "account", "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct", &disabled)
             .expect_err("a dormant diagnostic setting must fail")
             .to_string();
         assert!(err.contains("dormant"), "{err}");
@@ -502,10 +449,10 @@ mod tests {
                 "dataCollectionRuleId": "/subscriptions/sub/../rules/exfil"
             }}]}"#,
         );
-        assert!(assert_no_diagnostic_capture("account", &unknown_sink).is_err());
+        assert!(assert_no_diagnostic_capture(AzureProvider::Foundry, "account", "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct", &unknown_sink).is_err());
 
         // And the scope is named, so a project-attached export is diagnosable.
-        let err = assert_no_diagnostic_capture("project 'p1'", &logs)
+        let err = assert_no_diagnostic_capture(AzureProvider::Foundry, "project 'p1'", "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct", &logs)
             .expect_err("project export must fail")
             .to_string();
         assert!(err.contains("project 'p1'"), "{err}");
@@ -517,14 +464,22 @@ mod tests {
 
     #[test]
     fn foundry_rejects_any_connection_including_app_insights() {
-        assert!(assert_no_capture_children("account", "connections", &[]).is_ok());
+        assert!(
+            assert_no_capture_children(AzureProvider::Foundry, "account", "connections", &[])
+                .is_ok()
+        );
 
         let app_insights = children_from_json(
             r#"[{"name": "telemetry", "properties": {"category": "AppInsights"}}]"#,
         );
-        let err = assert_no_capture_children("project 'p1'", "connections", &app_insights)
-            .expect_err("an AppInsights connection must fail")
-            .to_string();
+        let err = assert_no_capture_children(
+            AzureProvider::Foundry,
+            "project 'p1'",
+            "connections",
+            &app_insights,
+        )
+        .expect_err("an AppInsights connection must fail")
+        .to_string();
         assert!(err.contains("AppInsights"), "{err}");
         assert!(err.contains("project 'p1'"), "{err}");
 
@@ -532,18 +487,61 @@ mod tests {
         // never seen, must fail closed too.
         let blob =
             children_from_json(r#"[{"name": "store", "properties": {"category": "AzureBlob"}}]"#);
-        assert!(assert_no_capture_children("account", "connections", &blob).is_err());
+        assert!(assert_no_capture_children(
+            AzureProvider::Foundry,
+            "account",
+            "connections",
+            &blob
+        )
+        .is_err());
         let unknown =
             children_from_json(r#"[{"name": "x", "properties": {"category": "FutureSink2027"}}]"#);
-        assert!(assert_no_capture_children("account", "connections", &unknown).is_err());
+        assert!(assert_no_capture_children(
+            AzureProvider::Foundry,
+            "account",
+            "connections",
+            &unknown
+        )
+        .is_err());
+    }
+
+    /// The capture rule is a property of the account, not of the upstream: an
+    /// Azure `OpenAI` account exporting request logs is the same surface, and the
+    /// old warn-only allowlist let it through.
+    #[test]
+    fn azure_openai_is_held_to_the_same_export_rule_and_the_error_is_actionable() {
+        let logs = diagnostics_from_json(
+            r#"{"value": [{"name": "to-log-analytics", "properties": {"logs": [{"category": "RequestResponse", "enabled": true}]}}]}"#,
+        );
+        let err = assert_no_diagnostic_capture(
+            AzureProvider::OpenAi,
+            "account",
+            "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct",
+            &logs,
+        )
+        .expect_err("an Azure OpenAI export must fail, not warn")
+        .to_string();
+        assert!(err.contains("Azure OpenAI"), "{err}");
+        // The operator must be told exactly what to remove — this fires at CVM
+        // boot, so a vague message is a crashloop with no way out.
+        assert!(err.contains("to-log-analytics"), "{err}");
+        assert!(
+            err.contains("az monitor diagnostic-settings delete"),
+            "{err}"
+        );
     }
 
     #[test]
     fn foundry_rejects_capability_hosts() {
         let hosts = children_from_json(r#"[{"name": "agents", "properties": {}}]"#);
-        let err = assert_no_capture_children("project 'p1'", "capabilityHosts", &hosts)
-            .expect_err("a capability host must fail")
-            .to_string();
+        let err = assert_no_capture_children(
+            AzureProvider::Foundry,
+            "project 'p1'",
+            "capabilityHosts",
+            &hosts,
+        )
+        .expect_err("a capability host must fail")
+        .to_string();
         assert!(err.contains("capabilityHosts"), "{err}");
     }
 }
