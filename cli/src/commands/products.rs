@@ -223,7 +223,24 @@ pub(crate) async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
         return Ok(());
     }
 
-    print_product_table(client, &miner).await
+    // Banner first, detail after the table: a miner piping this to a pager sees
+    // the alarm without scrolling, and still gets the per-offer fix in context.
+    let dead = dead_offers(&miner.products);
+    for line in alarm_banner(&dead) {
+        println!("{line}");
+    }
+
+    print_product_table(client, &miner).await?;
+
+    if dead.is_empty() {
+        return Ok(());
+    }
+    // Non-zero exit so a miner running `gmcli status` from cron or a monitor
+    // gets a signal without scraping stdout.
+    bail!(
+        "{} offered product(s) ineligible — serving nothing, earning nothing",
+        dead.len()
+    )
 }
 
 /// Render the per-offer table joining `/miners/me` offers against the public
@@ -273,27 +290,54 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
         );
     }
     println!("\n{} offer(s) total.", miner.products.len());
-    for line in ineligible_detail_lines(&miner.products) {
+    for line in ineligible_detail_lines(&dead_offers(&miner.products)) {
         println!("{line}");
     }
     println!("\nRanked against the field? `gmcli pricing`");
     Ok(())
 }
 
-/// Explain every ineligible offer beneath the table, one block each.
-fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
-    let broken: Vec<_> = products.iter().filter(|p| !p.is_eligible).collect();
-    if broken.is_empty() {
+/// The offers costing the miner money: still advertised, but the registry will
+/// not route to them.
+///
+/// A withdrawn offer is ineligible too, but deliberately so — folding it in
+/// here would cry wolf and make the non-zero exit worthless for monitoring.
+fn dead_offers(products: &[ProductOfferStatus]) -> Vec<&ProductOfferStatus> {
+    products
+        .iter()
+        .filter(|p| p.is_offered && !p.is_eligible)
+        .collect()
+}
+
+/// The headline that opens `status` when an offered product is dead.
+fn alarm_banner(dead: &[&ProductOfferStatus]) -> Vec<String> {
+    if dead.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        String::new(),
+        format!(
+            "!! {} OFFERED PRODUCT(S) INELIGIBLE — serving nothing, earning nothing.",
+            dead.len()
+        ),
+        "!! Your TEE can be healthy and attesting while these earn zero.".to_owned(),
+        "!! Reason and fix for each are listed below the table.".to_owned(),
+    ]
+}
+
+/// Explain every dead offer beneath the table, one block each.
+fn ineligible_detail_lines(dead: &[&ProductOfferStatus]) -> Vec<String> {
+    if dead.is_empty() {
         return Vec::new();
     }
     let mut lines = vec![
         String::new(),
         format!(
             "Not eligible — these earn nothing until fixed ({}):",
-            broken.len()
+            dead.len()
         ),
     ];
-    for p in broken {
+    for p in dead {
         lines.push(String::new());
         lines.push(format!("  {}/{}", p.provider, p.model));
         match p.ineligible_reason.as_deref() {
@@ -327,36 +371,100 @@ mod tests {
         serde_json::from_value(value).expect("decode offers")
     }
 
+    fn rendered_detail(products: &[ProductOfferStatus]) -> String {
+        ineligible_detail_lines(&dead_offers(products)).join("\n")
+    }
+
     #[test]
-    fn an_all_eligible_table_prints_no_detail_block() {
+    fn an_all_eligible_table_raises_no_alarm() {
         let products = offers(serde_json::json!([{
             "provider": "openai", "model": "gpt-5.6",
             "is_offered": true, "is_eligible": true, "discount_bp": 500,
         }]));
-        assert!(ineligible_detail_lines(&products).is_empty());
+        assert!(dead_offers(&products).is_empty());
+        assert!(alarm_banner(&dead_offers(&products)).is_empty());
+        assert!(rendered_detail(&products).is_empty());
     }
 
     #[test]
-    fn each_ineligible_offer_gets_its_reason_and_fix() {
+    fn an_offered_ineligible_offer_raises_the_alarm() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6-sol",
+            "is_offered": true, "is_eligible": false, "discount_bp": 500,
+        }]));
+
+        let banner = alarm_banner(&dead_offers(&products)).join("\n");
+        assert!(banner.contains("1 OFFERED PRODUCT(S) INELIGIBLE"));
+        assert!(banner.contains("serving nothing, earning nothing"));
+    }
+
+    /// The incident that motivated this: an Azure key started 401-ing, every
+    /// offer went ineligible, and the miner was told nothing.
+    #[test]
+    fn a_rejected_cloud_key_reports_the_registry_reason_and_fix() {
         let products = offers(serde_json::json!([
             {
                 "provider": "openai", "model": "gpt-5.6",
                 "is_offered": true, "is_eligible": true, "discount_bp": 500,
             },
             {
-                "provider": "anthropic", "model": "claude-sonnet-4-6",
+                "provider": "openai", "model": "gpt-5.6-sol",
                 "is_offered": true, "is_eligible": false, "discount_bp": 500,
-                "ineligible_reason": "capability_probe_failed: upstream rejected key (401)",
-                "ineligible_hint": "Set a valid key with `gmcli set-api-keys`.",
+                "ineligible_reason":
+                    "capability_probe_failed: cloud inference probe rejected key (401)",
+                "ineligible_hint":
+                    "Your upstream provider key was rejected (401). Set a valid key with \
+                     `gmcli set-api-keys` and redeploy the worker with `gmcli deploy`.",
             },
         ]));
 
-        let rendered = ineligible_detail_lines(&products).join("\n");
+        let rendered = rendered_detail(&products);
         assert!(rendered.contains("Not eligible — these earn nothing until fixed (1):"));
-        assert!(rendered.contains("  anthropic/claude-sonnet-4-6"));
-        assert!(rendered.contains("reason : capability_probe_failed: upstream rejected key (401)"));
-        assert!(rendered.contains("fix    : Set a valid key with `gmcli set-api-keys`."));
-        assert!(!rendered.contains("gpt-5.6"));
+        assert!(rendered.contains("  openai/gpt-5.6-sol"));
+        assert!(rendered.contains(
+            "reason : capability_probe_failed: cloud inference probe rejected key (401)"
+        ));
+        // The remedy is the registry's, verbatim — rotating the key alone is not
+        // enough (it is baked into the TEE at deploy), so the fix names the redeploy.
+        assert!(rendered.contains("redeploy the worker with `gmcli deploy`"));
+    }
+
+    /// A withdrawn offer is ineligible by the miner's own choice. Counting it
+    /// would cry wolf and make the non-zero exit useless for monitoring.
+    #[test]
+    fn a_withdrawn_offer_raises_no_alarm() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6",
+            "is_offered": false, "is_eligible": false, "discount_bp": 500,
+            "ineligible_reason": "withdrawn_by_miner",
+        }]));
+
+        assert!(dead_offers(&products).is_empty());
+        assert!(alarm_banner(&dead_offers(&products)).is_empty());
+        assert!(rendered_detail(&products).is_empty());
+    }
+
+    #[test]
+    fn only_offered_products_are_counted_when_both_kinds_are_present() {
+        let products = offers(serde_json::json!([
+            {
+                "provider": "openai", "model": "gpt-5.6",
+                "is_offered": false, "is_eligible": false, "discount_bp": 500,
+                "ineligible_reason": "withdrawn_by_miner",
+            },
+            {
+                "provider": "openai", "model": "gpt-5.6-sol",
+                "is_offered": true, "is_eligible": false, "discount_bp": 500,
+                "ineligible_reason": "capability_probe_failed: upstream rejected key (401)",
+            },
+        ]));
+
+        let dead = dead_offers(&products);
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].model, "gpt-5.6-sol");
+        assert!(alarm_banner(&dead)
+            .join("\n")
+            .contains("1 OFFERED PRODUCT(S)"));
     }
 
     #[test]
@@ -368,8 +476,7 @@ mod tests {
             "capability_check_passed_at": "2026-07-10T22:15:00+00:00",
         }]));
 
-        let rendered = ineligible_detail_lines(&products).join("\n");
-        assert!(rendered.contains("last ok : 2026-07-10T22:15:00+00:00"));
+        assert!(rendered_detail(&products).contains("last ok : 2026-07-10T22:15:00+00:00"));
     }
 
     #[test]
@@ -379,9 +486,7 @@ mod tests {
             "is_offered": true, "is_eligible": false, "discount_bp": 500,
         }]));
 
-        assert!(!ineligible_detail_lines(&products)
-            .join("\n")
-            .contains("last ok"));
+        assert!(!rendered_detail(&products).contains("last ok"));
     }
 
     #[test]
@@ -391,8 +496,22 @@ mod tests {
             "is_offered": true, "is_eligible": false, "discount_bp": 500,
         }]));
 
-        let rendered = ineligible_detail_lines(&products).join("\n");
+        let rendered = rendered_detail(&products);
         assert!(rendered.contains("reason : not yet checked"));
+        assert!(!rendered.contains("fix    :"));
+    }
+
+    /// An unmapped reason still reaches the miner, unexplained rather than swallowed.
+    #[test]
+    fn an_unmapped_reason_is_still_shown_verbatim() {
+        let products = offers(serde_json::json!([{
+            "provider": "openai", "model": "gpt-5.6",
+            "is_offered": true, "is_eligible": false, "discount_bp": 500,
+            "ineligible_reason": "some_future_code: a detail we cannot explain",
+        }]));
+
+        let rendered = rendered_detail(&products);
+        assert!(rendered.contains("reason : some_future_code: a detail we cannot explain"));
         assert!(!rendered.contains("fix    :"));
     }
 }
