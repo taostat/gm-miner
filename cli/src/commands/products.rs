@@ -310,8 +310,15 @@ fn dead_offers(products: &[ProductOfferStatus]) -> Vec<&ProductOfferStatus> {
 /// cannot drift. Scoped to the dead offers: a miner with one dead offer and six
 /// live ones is still earning, and telling them otherwise would be a false alarm.
 fn dead_offer_summary(dead: usize, offered: usize) -> String {
+    let noun = if offered == 1 { "product" } else { "products" };
+    let (verb, subject, serves, earns) = if dead == 1 {
+        ("is", "it", "serves", "earns")
+    } else {
+        ("are", "they", "serve", "earn")
+    };
     format!(
-        "{dead} of {offered} offered product(s) ineligible — these serve nothing and earn nothing"
+        "{dead} of {offered} offered {noun} {verb} ineligible — \
+         {subject} {serves} nothing and {earns} nothing"
     )
 }
 
@@ -323,7 +330,7 @@ fn alarm_banner(dead: &[&ProductOfferStatus], offered: usize) -> Vec<String> {
     vec![
         String::new(),
         format!("!! {}.", dead_offer_summary(dead.len(), offered)),
-        "!! Your TEE can be healthy and attesting while these earn zero.".to_owned(),
+        "!! A healthy, attesting TEE still earns zero on an ineligible offer.".to_owned(),
         "!! Reason and fix for each are listed below the table.".to_owned(),
     ]
 }
@@ -346,7 +353,7 @@ fn ineligible_detail_lines(dead: &[&ProductOfferStatus]) -> Vec<String> {
     let mut lines = vec![
         String::new(),
         format!(
-            "Not eligible — these earn nothing until fixed ({}):",
+            "Not eligible — earning nothing until fixed ({}):",
             dead.len()
         ),
     ];
@@ -415,8 +422,8 @@ mod tests {
         }]));
 
         let banner = rendered_banner(&products);
-        assert!(banner.contains("!! 1 of 1 offered product(s) ineligible"));
-        assert!(banner.contains("these serve nothing and earn nothing"));
+        assert!(banner.contains("!! 1 of 1 offered product is ineligible"));
+        assert!(banner.contains("it serves nothing and earns nothing"));
     }
 
     /// The incident that motivated this: an Azure key started 401-ing, every
@@ -440,7 +447,7 @@ mod tests {
         ]));
 
         let rendered = rendered_detail(&products);
-        assert!(rendered.contains("Not eligible — these earn nothing until fixed (1):"));
+        assert!(rendered.contains("Not eligible — earning nothing until fixed (1):"));
         assert!(rendered.contains("  openai/gpt-5.6-sol"));
         assert!(rendered.contains(
             "reason : capability_probe_failed: cloud inference probe rejected key (401)"
@@ -487,7 +494,7 @@ mod tests {
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].model, "gpt-5.6-sol");
         // One dead of one offered: the withdrawn offer is not counted on either side.
-        assert!(rendered_banner(&products).contains("!! 1 of 1 offered product(s) ineligible"));
+        assert!(rendered_banner(&products).contains("!! 1 of 1 offered product is ineligible"));
     }
 
     #[test]
@@ -568,7 +575,7 @@ mod tests {
         // to the dead offer: the other offer is still eligible and still earning.
         assert_eq!(
             err.to_string(),
-            "1 of 2 offered product(s) ineligible — these serve nothing and earn nothing"
+            "1 of 2 offered products is ineligible — it serves nothing and earns nothing"
         );
         assert!(rendered_banner(&products).contains(&err.to_string()));
     }
