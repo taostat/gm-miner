@@ -33,7 +33,7 @@ declaration, and price management.
 cd cli   # or from repo root
 
 # build
-cargo build --release -p gm-miner-cli
+cargo build --release -p gmcli
 
 # lint
 cargo clippy --all-targets --all-features -- -D warnings
@@ -42,7 +42,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 
 # tests (wiremock for registry HTTP; no real Phala Cloud / docker required)
-cargo test -p gm-miner-cli
+cargo test -p gmcli
 ```
 
 ## Subcommands
@@ -58,7 +58,7 @@ cargo test -p gm-miner-cli
 | `register-image` | Re-register an already-deployed image (debugging / registry resync; hidden from default help) |
 | `declare-product` | Register a single miner-product offer with a pct discount |
 | `declare-products` | Fan one discount across the catalog (or one provider) |
-| `status` | Show current registration state, per-product eligibility, and the per-Mtok rate received; every ineligible offer is explained beneath the table with the registry's reason and the fix (`list-products` is a hidden alias) |
+| `status` | Show current registration state, per-product eligibility, and the per-Mtok rate received; an offer that is still offered but ineligible earns nothing, so it opens the output with an alarm banner, is explained beneath the table with the registry's reason and fix, and exits non-zero so cron/monitoring sees it. A withdrawn offer is ineligible by choice and raises no alarm (`list-products` is a hidden alias) |
 | `pricing` | Rank each offer against the eligible field on the scalar the gateway routes on — your rank, the field's size, its best/median cost, and the products others serve and you do not |
 | `earnings` | Read the hotkey's neuron row from the subnet metagraph (via btcli) and report UID, stake, and per-tempo emission |
 | `worker add/list/remove` | Manage the data-plane workers (Phala CVMs) attached to the hotkey |

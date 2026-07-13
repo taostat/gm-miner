@@ -230,7 +230,7 @@ pub(crate) async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
         println!("{line}");
     }
 
-    print_product_table(client, &miner).await?;
+    print_product_table(client, &miner, &dead).await?;
 
     if dead.is_empty() {
         return Ok(());
@@ -245,7 +245,11 @@ pub(crate) async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
 
 /// Render the per-offer table joining `/miners/me` offers against the public
 /// catalog so each row shows the effective per-Mtok rate the miner receives.
-async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -> Result<()> {
+async fn print_product_table(
+    client: &mut RegistryClient,
+    miner: &MinerStatus,
+    dead: &[&ProductOfferStatus],
+) -> Result<()> {
     // The catalog is the single source of truth for retail; join here rather
     // than adding a retail block to `/miners/me` on the registry side.
     let catalog = fetch_catalog(client).await?;
@@ -290,7 +294,7 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
         );
     }
     println!("\n{} offer(s) total.", miner.products.len());
-    for line in ineligible_detail_lines(&dead_offers(&miner.products)) {
+    for line in ineligible_detail_lines(dead) {
         println!("{line}");
     }
     println!("\nRanked against the field? `gmcli pricing`");
