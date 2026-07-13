@@ -449,6 +449,25 @@ mod tests {
         assert!(assert_no_diagnostic_capture("account", &settings).is_ok());
     }
 
+    /// An ARM list response we cannot parse must fail the verification, not
+    /// deserialize into an empty list that passes every capture check. Without
+    /// this, a renamed or missing `value` key would silently disable the sweep.
+    #[test]
+    fn an_unparseable_arm_list_response_is_not_an_empty_list() {
+        for body in ["{}", r#"{"settings": []}"#] {
+            assert!(
+                serde_json::from_str::<DiagnosticSettingsList>(body).is_err(),
+                "{body} must not deserialize to an empty diagnostic-settings list"
+            );
+        }
+        for body in ["{}", r#"{"items": []}"#] {
+            assert!(
+                serde_json::from_str::<super::super::arm::ArmChildList>(body).is_err(),
+                "{body} must not deserialize to an empty child list"
+            );
+        }
+    }
+
     #[test]
     fn foundry_rejects_any_diagnostic_setting_however_it_is_shaped() {
         // A category the Azure OpenAI path allows as "metadata-only" — Foundry

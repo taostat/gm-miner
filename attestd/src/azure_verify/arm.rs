@@ -37,9 +37,12 @@ pub(crate) struct ArmAccountProperties {
     pub(crate) user_owned_storage: Option<Value>,
 }
 
+/// `value` is deliberately NOT `#[serde(default)]`: an ARM list response whose
+/// `value` key is missing or renamed must be a hard parse failure, not an empty
+/// list that silently passes every capture check. Azure returns `{"value": []}`
+/// for an empty collection, so this only fires on a shape we do not model.
 #[derive(Debug, Deserialize)]
 pub(crate) struct DiagnosticSettingsList {
-    #[serde(default)]
     pub(crate) value: Vec<DiagnosticSetting>,
 }
 
@@ -93,7 +96,6 @@ pub(crate) struct ArmChildProperties {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ArmChildList {
-    #[serde(default)]
     pub(crate) value: Vec<ArmChildResource>,
     #[serde(rename = "nextLink")]
     pub(crate) next_link: Option<String>,
@@ -101,7 +103,6 @@ pub(crate) struct ArmChildList {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ArmDeploymentList {
-    #[serde(default)]
     pub(crate) value: Vec<ArmDeployment>,
     #[serde(rename = "nextLink")]
     pub(crate) next_link: Option<String>,
