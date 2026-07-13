@@ -25,7 +25,8 @@ use self::arm::{
 };
 use self::checks::{
     assert_account_binding, assert_no_capture_children, assert_no_diagnostic_capture,
-    assess_streaming_configuration, log_streaming_assessment, AI_SERVICES_KIND,
+    assess_streaming_configuration, log_streaming_assessment, split_azure_governed_deployments,
+    AI_SERVICES_KIND,
 };
 use self::config::{
     configured_targets_from_env, AzureProvider, AzureVerifyConfig, PeriodicAzureVerifySettings,
@@ -229,7 +230,15 @@ async fn verify_async_filter_configuration(
     endpoint: &AzureEndpoint,
     token: &str,
 ) -> Result<()> {
-    let deployments = fetch_arm_deployments(client, config, endpoint, token).await?;
+    let all = fetch_arm_deployments(client, config, endpoint, token).await?;
+    let (deployments, skipped) = split_azure_governed_deployments(all);
+    if skipped > 0 {
+        tracing::info!(
+            skipped,
+            "skipping Anthropic-format deployments in the Azure OpenAI streaming check; \
+             Azure's RAI filter does not govern them",
+        );
+    }
     tracing::info!(
         deployment_count = deployments.value.len(),
         "checking Azure OpenAI deployment streaming configuration",
