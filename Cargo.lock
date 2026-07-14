@@ -1887,7 +1887,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gm-miner-attestd"
-version = "0.3.3-dev"
+version = "0.3.4-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "gmcli"
-version = "0.3.3-dev"
+version = "0.3.4-dev"
 dependencies = [
  "anyhow",
  "base64",
