@@ -222,7 +222,13 @@ async fn assert_scope_is_inference_only(
 
     for collection in CAPTURE_COLLECTIONS {
         let children = fetch_children(client, config, endpoint, scope, collection, token).await?;
-        assert_no_capture_children(config.provider, &scope.label(), collection, &children)?;
+        assert_no_capture_children(
+            config.provider,
+            &scope.label(),
+            resource_id,
+            collection,
+            &children,
+        )?;
     }
     Ok(())
 }
