@@ -135,10 +135,26 @@ Offers are declared with `--upstream-model <deployment-name>`: Foundry routes on
 the *deployment* name, which defaults to the model id but does not have to match
 it.
 
-### Verified from specs, not from a live resource
+The operator procedure for satisfying these checks — which resource kind to
+create, the `az` calls that list and clear the connections, capability hosts and
+diagnostic settings on the account and its projects, and the read-only service
+principal — is in [`docs/foundry-setup.md`](docs/foundry-setup.md). The step
+operators most often miss is the Application Insights connection Azure attaches
+to any Foundry resource created through the portal: it is the connection this
+gate rejects, and it is present by default.
+
+### Provenance of the ARM shapes
 
 The ARM request/response shapes here were built from
 `Azure/azure-rest-api-specs` (stable `2026-05-01`) and Microsoft's own
-`Azure-Samples/claude` templates, not from a live Foundry account. The design
-deliberately depends on no fact that those sources leave unsettled: every check
-is either a spec-confirmed field read or an emptiness assertion.
+`Azure-Samples/claude` templates. The design deliberately depends on no fact
+those sources leave unsettled: every check is either a spec-confirmed field read
+or an emptiness assertion.
+
+Since then the connection sweep has been exercised against a live Foundry
+account. A portal-created resource carried an `AppInsights` connection nobody
+asked for; the account failed verification while it existed and passed once it
+was deleted. The Anthropic-native passthrough
+(`/anthropic/v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01`) was
+confirmed on the same resource, streaming included, and routing was confirmed to
+be on the deployment name rather than the canonical model id.
