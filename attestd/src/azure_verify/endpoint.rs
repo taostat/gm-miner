@@ -55,11 +55,26 @@ pub(crate) fn parse_azure_endpoint(
                 .join(", ")
         );
     };
+    // The account label is the WHOLE host minus the suffix, and it must be one
+    // label. Azure gives an account exactly one name under the service zone —
+    // `<customSubDomainName>.services.ai.azure.com` — and the binding rests on
+    // that: a globally unique label under a zone only Azure can answer for is
+    // proof the endpoint is the account we verified. A host like
+    // `acct.extra.services.ai.azure.com` still ends with the suffix and still
+    // starts with `acct`, so reading the label as "the first component" would
+    // accept a name Azure never issued and the proof would no longer describe
+    // what the code accepts. Nobody can provision DNS beneath Microsoft's zone,
+    // so this closes no known attack — it makes the check say what it means.
     let account_name = host
-        .split('.')
-        .next()
-        .with_context(|| format!("{var} host must contain an account label"))?
+        .strip_suffix(suffix)
+        .with_context(|| format!("{var} host must end with '{suffix}'"))?
         .to_owned();
+    if account_name.is_empty() || account_name.contains('.') {
+        bail!(
+            "{var} host '{host}' is not '<account>{suffix}' — an Azure account has exactly one \
+             name under that zone",
+        );
+    }
     Ok(AzureEndpoint {
         host,
         account_name,
@@ -87,6 +102,10 @@ pub(crate) fn host_allowed_by_suffix(host: &str, suffix: &str) -> bool {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests intentionally fail hard on malformed fixtures"
+)]
 mod tests {
     use super::*;
 
@@ -118,6 +137,22 @@ mod tests {
                 "{endpoint} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn a_host_with_more_than_the_account_label_is_refused() {
+        // Ends with the suffix and starts with a plausible label, so a
+        // first-component reading would take `acct` and bind it to an account
+        // whose real host is `acct.services.ai.azure.com`. Azure issues exactly
+        // one name under the zone; anything else is not that account's host.
+        let err = parse_azure_endpoint(
+            AzureProvider::Foundry,
+            "https://acct.extra.services.ai.azure.com",
+        )
+        .expect_err("a multi-label account name must be refused")
+        .to_string();
+
+        assert!(err.contains("exactly one"), "{err}");
     }
 
     #[test]
