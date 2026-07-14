@@ -32,6 +32,12 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
+# `gm-azure-verify` is an in-workspace path dependency of two unpublished
+# crates, so it carries no version requirement to pin. That is a wildcard by
+# cargo-deny's reckoning, but not a supply-chain one — there is no registry
+# fetch and nothing a third party can publish into. Wildcards on anything that
+# does come from a registry stay denied.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

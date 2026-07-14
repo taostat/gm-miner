@@ -14,7 +14,7 @@ const TRANSIENT_FAILURE_LIMIT_ENV: &str = "GM_AZURE_VERIFY_TRANSIENT_FAILURE_LIM
 /// shared; what differs is the account kind, the endpoint suffix, and whether
 /// Azure's RAI content filter is the mechanism that governs streaming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AzureProvider {
+pub enum AzureProvider {
     /// `OPENAI_UPSTREAM=azure` — Azure `OpenAI`.
     OpenAi,
     /// `ANTHROPIC_UPSTREAM=foundry` — Claude on Microsoft Foundry.
@@ -22,7 +22,9 @@ pub(crate) enum AzureProvider {
 }
 
 impl AzureProvider {
-    pub(crate) fn label(self) -> &'static str {
+    /// How the provider is named in operator-facing output.
+    #[must_use]
+    pub fn label(self) -> &'static str {
         match self {
             Self::OpenAi => "Azure OpenAI",
             Self::Foundry => "Microsoft Foundry",
@@ -30,15 +32,21 @@ impl AzureProvider {
     }
 }
 
+/// One Azure account to verify: where its data plane lives, and the ARM
+/// service-principal coordinates to read its control plane with.
+///
+/// `attestd` builds this from the CVM's env; `gmcli doctor` builds it from the
+/// operator's `~/.gmcli/config.json` — the same fields either way, because both
+/// come from the same `gmcli set-api-keys` run.
 #[derive(Debug, Clone)]
-pub(crate) struct AzureVerifyConfig {
-    pub(crate) provider: AzureProvider,
-    pub(crate) endpoint: String,
-    pub(crate) tenant_id: String,
-    pub(crate) subscription_id: String,
-    pub(crate) resource_group: String,
-    pub(crate) client_id: String,
-    pub(crate) client_secret: String,
+pub struct AzureVerifyConfig {
+    pub provider: AzureProvider,
+    pub endpoint: String,
+    pub tenant_id: String,
+    pub subscription_id: String,
+    pub resource_group: String,
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 #[derive(Debug, Clone, Copy)]

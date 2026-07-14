@@ -201,8 +201,13 @@ baked into the miner container at deploy time and stay inside the TEE. The
 Foundry API key is single-slot — semicolon-separated multi-key lists are not
 accepted for it.
 
-Run `gmcli doctor` to confirm the group is complete and the endpoint has the
-expected suffix before spending a deploy on it.
+Run `gmcli doctor` before spending a deploy on it. Doctor does not merely check
+that the group is complete: it runs the *same* owner-capture sweep `attestd` runs
+at boot — the `gm-azure-verify` crate, one implementation, so the two cannot
+disagree — against your account and every project on it. If a connection,
+capability host or diagnostic setting is still attached, doctor names it and
+prints the `az` command that clears it, here rather than after you have paid for
+a CVM that crashloops.
 
 ## 8. Deploy and declare offers
 
@@ -242,7 +247,7 @@ deployment name.
 
 | Symptom | Cause and fix |
 |---|---|
-| Miner boots, exits non-zero, restarts in a loop right after deploy | A connection, capability host or diagnostic setting on the account or a project. The container log names it; clear it (steps 3–4) and restart |
+| Miner boots, exits non-zero, restarts in a loop right after deploy | A connection, capability host or diagnostic setting on the account or a project. The container log names it; clear it (steps 3–4) and restart. `gmcli doctor` finds the same thing without a deploy |
 | `gmcli set-api-keys` rejects the endpoint | The endpoint must end in `.services.ai.azure.com`. The `cognitiveservices.azure.com` host ARM reports is not the Foundry passthrough (step 2) |
 | Verification fails on account kind | The resource is `kind=OpenAI` (classic Azure OpenAI), not `kind=AIServices`. Create a Foundry resource (step 1) |
 | ARM read fails at boot | The service principal cannot see the account. Confirm the `Reader` assignment is scoped to `<ACCOUNT_ID>` and the tenant/subscription/resource-group fields match it (step 5) |

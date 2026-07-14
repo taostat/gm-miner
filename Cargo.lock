@@ -1886,6 +1886,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "gm-azure-verify"
+version = "0.3.4-dev"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "gm-miner-attestd"
 version = "0.3.4-dev"
 dependencies = [
@@ -1896,6 +1910,7 @@ dependencies = [
  "chrono",
  "dstack-sdk",
  "ed25519-dalek",
+ "gm-azure-verify",
  "hex",
  "reqwest",
  "serde",
@@ -1918,6 +1933,7 @@ dependencies = [
  "data-encoding",
  "dirs",
  "fd-lock",
+ "gm-azure-verify",
  "hex",
  "hmac 0.13.0",
  "open",

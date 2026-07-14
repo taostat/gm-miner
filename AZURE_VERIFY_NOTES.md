@@ -1,5 +1,32 @@
 # Azure OpenAI Owner-Capture Verification
 
+## One implementation, two callers
+
+The checks live in the `gm-azure-verify` workspace crate (`azure-verify/`), and both callers run *that* code:
+
+- `attestd` runs it inside the CVM as a fail-closed boot gate, and then periodically.
+- `gmcli doctor` runs it on the operator's machine as a preflight, before a CVM is paid for.
+
+The two cannot drift, which is the reason for the crate. A doctor `[ok]` is a promise the boot gate keeps; a doctor `[!!]` names the same violation the enclave would refuse to boot on, with the same `az` command to clear it. The only difference is where the sweep stops: `AzureVerifier::audit_target` collects *every* finding so doctor can print them all at once, and `verify_target` — what `attestd` calls — collapses that same audit into the gate's pass/fail, where any one finding is fatal. Doctor audits the credentials verbatim, exactly as `render_env_file` ships them into the CVM, and issues read-only ARM requests just as the enclave does.
+
+With no Azure-backed upstream selected, doctor prints no Azure line at all: the check is skipped, not failed.
+
+### A finding always outranks a transport error
+
+The sweep keeps reading ARM after it records a violation, because doctor wants every finding and not just the first. That makes the ordering of the two failure kinds a safety property, not a detail:
+
+- **A policy violation is definitive.** It fails the gate, and the periodic loop shuts the miner down.
+- **A transport error (timeout, 408/429/5xx, decode failure) is transient.** The periodic loop tolerates a few in a row, because a genuine Azure hiccup on a clean account must not kill an honest miner.
+
+So a later transport error must never be allowed to replace a finding already recorded. Otherwise an operator could attach a capture sink and then induce throttling on the *next* ARM read: the gate would see a 429, rate it transient, tolerate it, and envoy would keep streaming prompts into the sink for the whole tolerance window.
+
+Two rules, and both are needed — the first is useless without the second:
+
+1. **A recorded finding outranks a transport error.** `AzureAudit::findings_outrank` is the single place this is decided: once `findings` is non-empty a transport failure cannot win, and the audit comes back with `swept_completely: false` to say the list is a floor rather than the whole story.
+2. **Record a violation the moment it is observable, before making another fallible call.** A gate can only prefer a finding that exists. `fetch_paged` therefore returns the pages it *did* read alongside the failure that stopped it (`PagedRead`), and the caller asserts over those items and records before letting the failure through — otherwise an App Insights connection on page 1 would be discarded by a 429 on page 2, nothing would be recorded, and rule 1 would have nothing to prefer. The same applies to the RAI path: a deployment with no `raiPolicyName` is a violation on sight and is recorded even if a later policy read throttles.
+
+The converse of rule 2 matters just as much: a deployment whose RAI policy we never managed to read is **dropped**, not judged (`retain_observable_deployments`). Assessing it against an absent mode would manufacture a definitive finding out of a transient failure — the mirror image of the bug — and would kill honest miners on an Azure hiccup. Transport errors are never converted into findings; the asymmetry is the point.
+
 ## Startup gate and continuous verification
 
 When `OPENAI_UPSTREAM=azure` or `ANTHROPIC_UPSTREAM=foundry`, `image/start.sh` first runs `gm-miner-attestd --verify-azure-once` as a blocking gate. Both accounts are verified when both are configured; either failing is fatal. Envoy is not rendered, RA-TLS is not provisioned, and no serving process is started until that one-shot verification exits successfully. A verification failure exits the container non-zero so the runtime restarts it.

@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use reqwest::Url;
 
-use super::config::AzureProvider;
+use crate::config::AzureProvider;
 
 pub(crate) const AZURE_OPENAI_ALLOWED_SUFFIXES: [&str; 3] = [
     ".openai.azure.com",
