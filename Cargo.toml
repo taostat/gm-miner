@@ -3,7 +3,7 @@ resolver = "2"
 members = ["attestd", "azure-verify", "cli"]
 
 [workspace.package]
-version = "0.3.5-dev"
+version = "0.3.6"
 edition = "2021"
 # 1.88 is the floor of the locked dependency tree: the dstack-sdk ->
 # alloy chain (pulled in by the attestd crate) requires rustc 1.88+
