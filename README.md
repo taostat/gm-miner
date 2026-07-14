@@ -135,13 +135,36 @@ gmcli set-api-keys \
   --azure-openai-api-key <azure-api-key>
 ```
 
+To serve the existing `anthropic` route through Claude on Microsoft Foundry, select Foundry and
+provide the resource endpoint, its API key, and a read-only Azure service principal that
+`attestd` uses to verify the account from ARM:
+
+```sh
+gmcli set-api-keys \
+  --anthropic-upstream foundry \
+  --azure-foundry-endpoint https://<resource>.services.ai.azure.com \
+  --azure-foundry-api-key <foundry-api-key> \
+  --azure-foundry-tenant-id <tenant> \
+  --azure-foundry-subscription-id <subscription> \
+  --azure-foundry-resource-group <rg> \
+  --azure-foundry-client-id <appId> \
+  --azure-foundry-client-secret <password>
+```
+
+Foundry needs Azure-side setup before this works, and one step is easy to miss: Azure attaches an
+Application Insights connection to any Foundry resource created through the portal, and the miner
+refuses to boot while it exists. Follow [Serving Claude through Microsoft
+Foundry](docs/foundry-setup.md) before your first Foundry deploy. Foundry routes on the Azure
+*deployment* name, so declare each offer with `--upstream-model <deployment-name>`.
+
 Azure OpenAI must have deployments named exactly like the gm model id, for example `gpt-4o`;
 the miner does not rewrite Azure model ids. Bedrock model-id translation is handled by the
 gateway before requests reach the miner. Worker backend provenance is auto-derived from these
-selectors when you deploy: `anthropic-upstream=bedrock` registers `bedrock`, otherwise
-`openai-upstream=azure` registers `azure`, and direct workers omit the backend field. Bedrock and
-Azure keys are single-slot in this release; semicolons in `BEDROCK_API_KEY` or
-`AZURE_OPENAI_API_KEY` are rejected.
+selectors when you deploy: the Anthropic-side upstream wins, so `anthropic-upstream=bedrock`
+registers `bedrock` and `anthropic-upstream=foundry` registers `foundry`; otherwise
+`openai-upstream=azure` registers `azure`, and direct workers omit the backend field. Bedrock,
+Azure and Foundry keys are single-slot in this release; semicolons in `BEDROCK_API_KEY`,
+`AZURE_OPENAI_API_KEY` or `AZURE_FOUNDRY_API_KEY` are rejected.
 
 ### 4. Deploy your miner
 
@@ -289,6 +312,7 @@ deploy needs and names the command that fixes each red item.
 | "no Phala credential" | Set `PHALA_API_KEY` or run `gmcli deploy` and paste the key at the prompt |
 | "no credit balance" from Phala | Top up at <https://cloud.phala.network> (Dashboard → Deposit) |
 | "hotkey isn't registered" | Run `gmcli register-hotkey`, then re-deploy |
+| Foundry miner restart-loops right after deploy | Azure attached an Application Insights connection to the resource; delete it — see [Foundry setup](docs/foundry-setup.md) |
 | Token expired prompt on every command | Run `gmcli login` to refresh |
 | Wrong network (testnet vs mainnet) | Pass `--network mainnet` or `--network testnet` |
 
