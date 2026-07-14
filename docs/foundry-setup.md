@@ -107,11 +107,16 @@ project blocks the whole account.
 
 Enumerate the projects first, then check each collection at both scopes:
 
+ARM qualifies a project's `name` with the account that owns it: a project `p1` on
+account `acct` comes back as `acct/p1`, not `p1`. The URL wants the last segment
+alone — pasting the name back verbatim addresses a resource that does not exist,
+and every project-scope check below would silently target the wrong URL.
+
 ```sh
-# projects on the account
+# projects on the account — strip ARM's "<account>/" qualifier
 az rest --method get \
   --url "https://management.azure.com<ACCOUNT_ID>/projects?api-version=2026-05-01" \
-  --query "value[].name" -o table
+  --query "value[].name" -o tsv | cut -d/ -f2
 
 # connections and capability hosts — expect [] for the account and each project
 az rest --method get \
