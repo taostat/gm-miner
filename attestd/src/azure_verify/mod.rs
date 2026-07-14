@@ -190,12 +190,15 @@ async fn verify_capture_surfaces(
     // diagnostic settings, so sweeping only the account would miss an export
     // attached to the project the data plane actually routes through.
     for project in &projects {
-        let project_resource_id = format!("{resource_id}/projects/{}", project.name);
+        // ARM qualifies a project's `name` with its account (`acct/proj`); the
+        // URL wants the leaf alone. See `ArmChildResource::leaf_name`.
+        let project_name = project.leaf_name();
+        let project_resource_id = format!("{resource_id}/projects/{project_name}");
         assert_scope_is_inference_only(
             client,
             config,
             endpoint,
-            ArmScope::Project(&project.name),
+            ArmScope::Project(project_name),
             &project_resource_id,
             token,
         )

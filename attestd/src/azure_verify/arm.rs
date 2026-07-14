@@ -85,6 +85,19 @@ pub(crate) struct ArmChildResource {
     pub(crate) properties: ArmChildProperties,
 }
 
+impl ArmChildResource {
+    /// The child's own name, without the parent qualifier ARM prefixes it with.
+    ///
+    /// ARM returns a nested child's `name` qualified by its parent — a project
+    /// of account `acct` comes back as `acct/proj`, not `proj`. Interpolating
+    /// that straight into a URL builds `/accounts/acct/projects/acct/proj`,
+    /// which addresses nothing; percent-encoding it builds `acct%2Fproj`, which
+    /// addresses nothing either. The path segment is the last component.
+    pub(crate) fn leaf_name(&self) -> &str {
+        self.name.rsplit('/').next().unwrap_or(&self.name)
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArmChildProperties {
@@ -397,4 +410,33 @@ pub(crate) fn encode_path_segment(input: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests intentionally fail hard on malformed fixtures"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_project_name_drops_the_account_arm_qualifies_it_with() {
+        // Verbatim from a live account: ARM returns a project's `name` as
+        // `<account>/<project>`. Interpolated whole, this addresses nothing.
+        let project: ArmChildResource =
+            serde_json::from_str(r#"{"name": "hello-0323-resource/hello-0323", "properties": {}}"#)
+                .expect("ARM project row must parse");
+
+        assert_eq!(project.leaf_name(), "hello-0323");
+    }
+
+    #[test]
+    fn an_unqualified_name_is_left_alone() {
+        let child: ArmChildResource =
+            serde_json::from_str(r#"{"name": "store", "properties": {}}"#)
+                .expect("ARM child row must parse");
+
+        assert_eq!(child.leaf_name(), "store");
+    }
 }
