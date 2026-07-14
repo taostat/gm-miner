@@ -41,6 +41,19 @@ pub trait PhalaClient {
         registry_creds: Option<&RegistryCredentials>,
         boot_timeout_secs: u64,
     ) -> Result<DeployOutcome>;
+
+    /// The Phala Cloud `app_id` of a CVM already deployed under this client's
+    /// `--name`, or `None` when the workspace has no such CVM.
+    ///
+    /// `phala deploy` refuses to reuse a CVM name ("A CVM with name '<name>'
+    /// already exists in this workspace"), so `deploy` / `worker add` probe
+    /// this *before* the image build and stop with the exact teardown command
+    /// rather than failing minutes later inside `phala deploy`.
+    ///
+    /// # Errors
+    /// Returns an error if `phala` cannot be spawned, or it exits successfully
+    /// but emits output that is not valid `cvms get --json` JSON.
+    fn existing_cvm_app_id(&self) -> Result<Option<String>>;
 }
 
 /// Shells out to `phala deploy` and parses the resulting
@@ -169,6 +182,33 @@ pub fn parse_phala_cvm_app_id(succeeded: bool, stdout: &[u8]) -> Result<Option<S
         serde_json::from_slice(stdout).context("parse phala cvms get --json output")?;
 
     Ok(detail.app_id.filter(|id| !id.is_empty()))
+}
+
+/// Find a CVM by its operator-chosen `name` in `phala cvms list --json` output
+/// and return its `app_id`.
+///
+/// `Ok(None)` means the list was read and holds no CVM under that name — the
+/// name is free. A list that could not be read is an error at the call site, not
+/// an absent CVM, so an unreadable workspace never reads as an empty one.
+pub fn parse_phala_cvm_app_id_by_name(stdout: &[u8], app_name: &str) -> Result<Option<String>> {
+    let listed: Vec<PhalaCvmListRow> =
+        serde_json::from_slice(stdout).context("parse phala cvms list --json output")?;
+
+    Ok(listed
+        .into_iter()
+        .find(|row| row.name.as_deref() == Some(app_name))
+        .and_then(|row| row.app_id)
+        .filter(|id| !id.is_empty()))
+}
+
+/// One row of `phala cvms list --json`. Only the two fields the collision
+/// preflight needs are modelled; everything else on the row is ignored.
+#[derive(Debug, serde::Deserialize)]
+struct PhalaCvmListRow {
+    #[serde(alias = "app_id", alias = "appId")]
+    app_id: Option<String>,
+    #[serde(alias = "name", alias = "cvm")]
+    name: Option<String>,
 }
 
 /// Parse the CVM's operator-chosen `name` (the `phala deploy --name` value)
@@ -494,6 +534,31 @@ impl PhalaClient for RealPhalaClient {
 
         poll_phala_cvm_outcome(&self.app_name, self.api_key.as_deref(), boot_timeout_secs)
     }
+
+    fn existing_cvm_app_id(&self) -> Result<Option<String>> {
+        // Ask for the whole list rather than `cvms get <name>`. `get` exits
+        // non-zero both when the name is free and when the CLI could not ask at
+        // all — an expired session, no network — and the two are not
+        // distinguishable from the exit code. Reading "could not ask" as "free"
+        // skips the collision preflight silently and hands the operator back the
+        // raw `phala deploy` failure this exists to prevent. A LIST that
+        // succeeds and omits the name is proof the name is free; a list that
+        // fails is an error, and says so.
+        let out = phala_command(self.api_key.as_deref())
+            .args(["cvms", "list", "--json"])
+            .output()
+            .context("run phala cvms list — is the phala CLI installed? (npm i -g phala)")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "could not list Phala CVMs, so `{}` cannot be checked for a name collision: {}",
+                self.app_name,
+                stderr.trim()
+            );
+        }
+
+        parse_phala_cvm_app_id_by_name(&out.stdout, &self.app_name)
+    }
 }
 
 /// Poll `phala cvms get <cvm-id> --json` every [`POLL_INTERVAL_SECS`]
@@ -766,6 +831,47 @@ mod tests {
     }
 
     // ── phala cvms get app_id parsing ─────────────────────────────────────────
+
+    #[test]
+    fn a_listed_cvm_is_found_by_its_operator_chosen_name() {
+        let stdout = br#"[
+            {"app_id":"app_other","name":"gm-testnet-other"},
+            {"app_id":"app_mine","name":"gm-testnet-zai-a"}
+        ]"#;
+
+        let found = parse_phala_cvm_app_id_by_name(stdout, "gm-testnet-zai-a")
+            .expect("a readable list must parse");
+
+        assert_eq!(found.as_deref(), Some("app_mine"));
+    }
+
+    #[test]
+    fn a_name_absent_from_a_readable_list_is_free() {
+        let stdout = br#"[{"app_id":"app_other","name":"gm-testnet-other"}]"#;
+
+        let found =
+            parse_phala_cvm_app_id_by_name(stdout, "gm-testnet-zai-a").expect("list must parse");
+
+        assert_eq!(found, None, "a name nobody holds is free");
+    }
+
+    #[test]
+    fn an_empty_workspace_leaves_every_name_free() {
+        let found = parse_phala_cvm_app_id_by_name(b"[]", "gm-testnet-zai-a")
+            .expect("an empty list must parse");
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn an_unreadable_list_is_an_error_not_an_empty_one() {
+        // The whole point: "could not ask" must never read as "name is free",
+        // or the collision preflight skips itself exactly when it is needed.
+        let err = parse_phala_cvm_app_id_by_name(b"not json", "gm-testnet-zai-a")
+            .expect_err("an unparseable list must not read as an absent CVM");
+
+        assert!(err.to_string().contains("phala cvms list"), "{err}");
+    }
 
     #[test]
     fn parse_phala_cvm_app_id_reads_top_level_field() {

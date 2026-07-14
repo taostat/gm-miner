@@ -21,8 +21,10 @@ use gm_miner_cli::{
         PhalaClient, PHALA_ENDPOINT_FIELD,
     },
     node_secret, slots, terms,
-    types::{MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerListResponse},
-    workers::worker_health_lines,
+    types::{
+        MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerEntry, WorkerListResponse,
+    },
+    workers::{is_secondary_live, worker_health_lines},
 };
 
 use crate::commands::persist::{
@@ -145,13 +147,12 @@ pub(crate) async fn cmd_deploy_subcommand(
 ///
 /// Three checks run *before* any CVM work so a misuse fails fast rather than
 /// after a multi-minute deploy:
-///   1. Worker #1 must already be tracked locally. The first record in
-///      `workers` *is* worker #1 — every `is_primary_worker*` decision rests
-///      on that. If this network has no tracked workers (a fresh machine, or
-///      a legacy `node_secret` config not yet migrated by a `deploy`), the
-///      added worker would become `workers[0]` and be mistaken for worker #1;
-///      the provisional upsert would also clear the legacy secret before
-///      worker #1 was ever migrated. Require a `deploy` first.
+///   1. Worker #1 must already be tracked locally. If this network has no
+///      tracked workers (a fresh machine, or a legacy `node_secret` config not
+///      yet migrated by a `deploy`), `worker add` would attach a secondary
+///      worker to a hotkey whose worker #1 the CLI cannot even name; the
+///      provisional upsert would also clear the legacy secret before worker #1
+///      was ever migrated. Require a `deploy` first.
 ///   2. The `--app-name` must not already name a *registered* worker.
 ///      Reusing the default `gm-miner-1` (or any registered name) would make
 ///      [`node_secret::for_worker`] reuse that worker's secret and the
@@ -291,21 +292,44 @@ fn git_short_sha(repo_root: &std::path::Path) -> String {
 /// Reject a plain `gmcli deploy` aimed at a registered *secondary* worker.
 ///
 /// `deploy` registers worker #1 via `/miners/register`, which refreshes the
-/// miner's first worker. Pointed at the `--app-name` of a registered secondary
-/// worker it would overwrite worker #1 in the registry and corrupt the local
-/// mapping. A re-deploy of worker #1 (or a brand-new, untracked `--app-name`,
-/// or a provisional record from an in-flight/failed deploy being retried) is
-/// fine.
-pub(crate) fn reject_secondary_worker_deploy(
+/// miner's oldest *live* worker. Pointed at the `--app-name` of a live
+/// secondary worker it would overwrite worker #1 in the registry and corrupt
+/// the mapping. A re-deploy of worker #1 (or a brand-new, untracked
+/// `--app-name`, or a provisional record from an in-flight/failed deploy being
+/// retried) is fine.
+///
+/// Which worker is #1 is read from the registry (`GET /miners/{hotkey}/workers`
+/// via [`fetch_live_workers`]), never from a local record's position: local
+/// records are never pruned when the registry deregisters a worker, so a dead
+/// CVM can sit at local position 1 indefinitely while the registry's worker #1
+/// is a later record. A positional guard called that live worker "secondary"
+/// and refused to redeploy the operator's only serving worker.
+pub(crate) async fn reject_secondary_worker_deploy(
     cfg: &Config,
+    client: &mut RegistryClient,
     registration: &WorkerRegistration,
     app_name: &str,
 ) -> Result<()> {
-    let is_secondary = *registration == WorkerRegistration::First
-        && cfg
-            .active_network_entry()
-            .is_some_and(|e| e.is_secondary_by_app_name(app_name));
-    if is_secondary {
+    if *registration != WorkerRegistration::First {
+        return Ok(());
+    }
+    // An untracked `--app-name` is a fresh worker #1 (or a replacement for it):
+    // nothing to overwrite, and no reason to call the registry.
+    let Some(tracked) = cfg
+        .active_network_entry()
+        .and_then(|e| e.worker_by_app_name(app_name))
+    else {
+        return Ok(());
+    };
+    // A record the registry has never seen (no `worker_id`) is classified by
+    // its local flag alone — no round-trip can say anything about it.
+    let live = if tracked.worker_id.is_empty() {
+        Vec::new()
+    } else {
+        fetch_live_workers(client).await?
+    };
+
+    if is_secondary_live(tracked, &live) {
         bail!(
             "'{app_name}' is a secondary worker; `deploy` and `register-image` \
              only (re-)register worker #1. To replace this worker, \
@@ -314,6 +338,86 @@ pub(crate) fn reject_secondary_worker_deploy(
         );
     }
     Ok(())
+}
+
+/// The hotkey's live workers, as the registry sees them.
+///
+/// The source of truth for which workers exist: the registry deregisters
+/// workers (and the operator removes them) without the local `workers` list
+/// ever being pruned, so only this list can say which worker is #1.
+///
+/// An operator with no miner row yet (404 on `/miners/me`) — or a hotkey the
+/// registry lists no workers for — has no live workers, which is an empty list,
+/// not an error. Any other failure is propagated: `deploy` cannot proceed
+/// without the registry anyway, and guessing here is what corrupts worker #1.
+async fn fetch_live_workers(client: &mut RegistryClient) -> Result<Vec<WorkerEntry>> {
+    let resp = client
+        .get(gm_miner_cli::client::ME_PATH)
+        .await
+        .context("GET /miners/me")?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!(
+            "could not read your miner record from {} ({status}): {body}",
+            gm_miner_cli::client::ME_PATH
+        );
+    }
+    let miner: MinerStatus = resp.json().await.context("parse /miners/me response")?;
+
+    let path = format!("/miners/{}/workers", miner.hotkey);
+    let resp = client
+        .get(&path)
+        .await
+        .with_context(|| format!("GET {path}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("could not list your registered workers ({status}): {body}");
+    }
+    let list: WorkerListResponse = resp.json().await.context("parse worker list response")?;
+    Ok(list.workers)
+}
+
+/// Reject a deploy whose `--app-name` already names a CVM in the operator's
+/// Phala Cloud workspace.
+///
+/// `phala deploy --name` refuses to reuse a name (`A CVM with name '<name>'
+/// already exists in this workspace`), so such a deploy dies *after* the image
+/// build and the provider keys have been staged. Catching it up front turns
+/// that into one actionable instruction.
+///
+/// gmcli never deletes the CVM itself: the delete destroys a running worker and
+/// its encrypted env, so it stays the operator's explicit act.
+pub(crate) fn reject_existing_cvm(app_name: &str, existing_app_id: Option<&str>) -> Result<()> {
+    let Some(app_id) = existing_app_id else {
+        return Ok(());
+    };
+    bail!(
+        "a Phala CVM named '{app_name}' already exists (app_id {app_id}), and \
+         `phala deploy` cannot reuse a CVM name — this deploy would fail.\n  \
+         Tear the old CVM down first (this destroys that CVM and its encrypted \
+         env, and it stops serving until the redeploy finishes; gmcli re-uploads \
+         your provider keys and reuses the worker's node secret):\n    \
+         phala cvms delete {app_id}\n  \
+         then re-run this command."
+    );
+}
+
+/// Probe Phala Cloud for a CVM already using this deploy's `--app-name` and
+/// reject the deploy if there is one. Runs before any image build or terms
+/// prompt, so the failure costs nothing.
+fn preflight_cvm_name(phala: &dyn PhalaClient, app_name: &str) -> Result<()> {
+    let existing = phala
+        .existing_cvm_app_id()
+        .with_context(|| format!("check whether a Phala CVM named '{app_name}' already exists"))?;
+    reject_existing_cvm(app_name, existing.as_deref())
 }
 
 /// The registry `worker_id` of the record already tracked under `app_name`,
@@ -413,10 +517,21 @@ pub(crate) async fn cmd_deploy(
     args: &DeployArgs,
     registration: &WorkerRegistration,
 ) -> Result<()> {
-    // Step 0: a plain `deploy` may only target worker #1 (see guard).
-    reject_secondary_worker_deploy(cfg, registration, &args.app_name)?;
+    // Step 0: auth preflight. Every later step needs the registry — the
+    // worker-#1 guard below reads the live worker list from it, and the
+    // eventual registration must be accepted after minutes of irreversible CVM
+    // work. A missing token / 401 fails fast here with an actionable message.
+    client.preflight_auth().await?;
 
-    // Step 0b: the one-time provider-ToS acceptable-use gate. Only the first
+    // Step 0a: a plain `deploy` may only target worker #1 (see guard).
+    reject_secondary_worker_deploy(cfg, client, registration, &args.app_name).await?;
+
+    // Step 0b: the `--app-name` must not already name a CVM in the operator's
+    // Phala workspace — `phala deploy` would reject it minutes from now, after
+    // the image build. Fails with the `phala cvms delete` to run.
+    preflight_cvm_name(phala, &args.app_name)?;
+
+    // Step 0c: the one-time provider-ToS acceptable-use gate. Only the first
     // deploy gates — it is the registration that creates the hotkey identity
     // and carries the accepted version onto the registry's miner row. A
     // `worker add` runs only after a first deploy already accepted, so
@@ -455,13 +570,6 @@ pub(crate) async fn cmd_deploy(
     // The Phala CLI + API-key gate already ran in `cmd_deploy_subcommand`,
     // which scoped the validated key onto the `phala` client. The `phala`
     // client passed in here carries it.
-
-    // Step 2: auth preflight. The Phala Cloud deploy is slow and
-    // irreversible for the operator (CVM created), so we refuse to start
-    // the deploy unless the registry will accept the eventual
-    // registration. The preflight is a cheap `GET /miners/me` — a missing
-    // token / 401 fails fast with an actionable message before any CVM work.
-    client.preflight_auth().await?;
 
     // Step 3: fetch approved image versions from the registry.
     let registry_url = cfg.api_url();
@@ -706,18 +814,18 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
     // enforces, and its `app_name` preserves the operator's original
     // `--app-name`. A worker not tracked locally has neither — the registry
     // then leaves any stored secret untouched.
-    let RegisterImageContext {
-        node_secret,
-        existing_app_name,
-        backend: register_backend,
-        provider_slots,
-    } = register_image_context(&cfg, app_id)?;
     let network = cfg.active_network().to_owned();
     // Scope the same Phala key deploy would use (env or saved config key) onto
     // register-image's `phala cvms get`, so a recovery run works off the key
     // the deploy prompt persisted — not only a separate CLI login / env var.
     let phala_key = gm_miner_cli::phala::stored_key(cfg.phala_api_key.as_deref());
-    let mut client = RegistryClient::new(cfg);
+    let mut client = RegistryClient::new(cfg.clone());
+    let RegisterImageContext {
+        node_secret,
+        existing_app_name,
+        backend: register_backend,
+        provider_slots,
+    } = register_image_context(&cfg, &mut client, app_id).await?;
 
     // register-image is a hidden re-registration path (debug / registry
     // resync), not the guided deploy: a check-only preflight with an install
@@ -839,12 +947,24 @@ struct RegisterImageContext {
     provider_slots: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
-fn register_image_context(cfg: &Config, app_id: &str) -> Result<RegisterImageContext> {
+/// Resolve what `register-image` re-sends for the CVM `app_id`, rejecting a
+/// secondary worker.
+///
+/// Secondary is decided against the registry's live worker list, exactly as
+/// `deploy`'s guard is (see [`reject_secondary_worker_deploy`]): a local
+/// record's position says nothing once a sibling has been deregistered.
+async fn register_image_context(
+    cfg: &Config,
+    client: &mut RegistryClient,
+    app_id: &str,
+) -> Result<RegisterImageContext> {
     let entry = cfg.active_network_entry();
     let tracked = entry.and_then(|n| n.worker_by_app_id(app_id));
-    if let Some(tracked) =
-        tracked.filter(|_| entry.is_some_and(|n| n.is_secondary_by_app_id(app_id)))
-    {
+    let live = match tracked {
+        Some(tracked) if !tracked.worker_id.is_empty() => fetch_live_workers(client).await?,
+        _ => Vec::new(),
+    };
+    if let Some(tracked) = tracked.filter(|tracked| is_secondary_live(tracked, &live)) {
         // A provisional secondary has no worker_id yet; point `worker remove`
         // at the app_id, which it also accepts, so the command is runnable in
         // every case.
@@ -1231,5 +1351,78 @@ mod tests {
         });
 
         assert_eq!(register_image_backend(None, &cfg).as_deref(), Some("azure"));
+    }
+
+    // ── CVM-name collision preflight ─────────────────────────────────────────
+
+    /// A [`PhalaClient`] whose workspace already holds a CVM under the deploy's
+    /// `--app-name`. `deploy` is never reached: no Phala Cloud, no docker.
+    struct CollidingPhala;
+
+    impl PhalaClient for CollidingPhala {
+        fn deploy(
+            &self,
+            _compose_yaml: &str,
+            _env_vars: &ProviderKeys,
+            _node_secret: &str,
+            _registry_creds: Option<&gm_miner_cli::deploy::RegistryCredentials>,
+            _boot_timeout_secs: u64,
+        ) -> Result<gm_miner_cli::deploy::DeployOutcome> {
+            anyhow::bail!("the name-collision preflight must bail before `phala deploy`")
+        }
+
+        fn existing_cvm_app_id(&self) -> Result<Option<String>> {
+            Ok(Some("app_0a1b2c".to_owned()))
+        }
+    }
+
+    /// A workspace with no CVM under this name — the free-name case.
+    struct FreeNamePhala;
+
+    impl PhalaClient for FreeNamePhala {
+        fn deploy(
+            &self,
+            _compose_yaml: &str,
+            _env_vars: &ProviderKeys,
+            _node_secret: &str,
+            _registry_creds: Option<&gm_miner_cli::deploy::RegistryCredentials>,
+            _boot_timeout_secs: u64,
+        ) -> Result<gm_miner_cli::deploy::DeployOutcome> {
+            anyhow::bail!("not exercised")
+        }
+
+        fn existing_cvm_app_id(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    /// Regression (live testnet): `worker add --app-name <existing>` died inside
+    /// `phala deploy` with `A CVM with name '<name>' already exists in this
+    /// workspace` — after the image build, with no hint about what to do. The
+    /// preflight must catch the collision and name the exact teardown command
+    /// (gmcli never deletes the CVM itself: that destroys a running worker).
+    #[test]
+    fn an_existing_cvm_name_is_rejected_with_the_delete_command() {
+        let err = preflight_cvm_name(&CollidingPhala, "gm-testnet-zai-a")
+            .expect_err("a colliding CVM name must be rejected before the build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gm-testnet-zai-a") && msg.contains("already exists"),
+            "must name the colliding CVM: {msg}"
+        );
+        assert!(
+            msg.contains("phala cvms delete app_0a1b2c"),
+            "must name the exact teardown command, with the app_id: {msg}"
+        );
+        assert!(
+            msg.contains("destroys"),
+            "must say what the delete destroys: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_free_cvm_name_passes_the_preflight() {
+        preflight_cvm_name(&FreeNamePhala, "gm-miner-1").expect("a free CVM name must deploy");
+        reject_existing_cvm("gm-miner-1", None).expect("no existing CVM, nothing to reject");
     }
 }

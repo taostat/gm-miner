@@ -1246,10 +1246,134 @@ mod tests {
         assert_eq!(existing_worker_id_for(&cfg, "gm-miner-2"), "");
     }
 
+    // ── The worker-#1 guard (`deploy` / `register-image`) ────────────────────
+    //
+    // Which worker is #1 comes from the registry's live list, never from a
+    // local record's position: local records are never pruned when a worker is
+    // deregistered. These drive the real guard against a wiremock registry, so
+    // no Phala Cloud, docker, or real network is involved.
+
+    /// A local config holding `workers`, logged in against `registry_uri`.
+    fn cfg_with_workers(
+        registry_uri: Option<String>,
+        workers: Vec<gm_miner_cli::config::WorkerRecord>,
+    ) -> gm_miner_cli::config::Config {
+        use gm_miner_cli::config::{Config, NetworkEntry, TokenEntry};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                api_url: registry_uri,
+                tokens: Some(TokenEntry {
+                    access_token: Some("test-token".to_owned()),
+                    token_expires_at: None,
+                    refresh_token: None,
+                }),
+                workers,
+                ..Default::default()
+            },
+        );
+        Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            provider_keys: None,
+            phala_api_key: None,
+            api_url_override: None,
+            accepted_terms: None,
+        }
+    }
+
+    fn worker_record(worker_id: &str, app_name: &str) -> gm_miner_cli::config::WorkerRecord {
+        gm_miner_cli::config::WorkerRecord {
+            worker_id: worker_id.to_owned(),
+            app_id: format!("app_{app_name}"),
+            app_name: app_name.to_owned(),
+            node_secret: format!("secret-{app_name}"),
+            ..Default::default()
+        }
+    }
+
+    /// Mount `GET /miners/me` + `GET /miners/{hotkey}/workers` returning
+    /// exactly `live` — the workers the registry still knows about.
+    async fn mock_registry_workers(live: &[(&str, &str)]) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/miners/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hotkey": "5HK",
+                "status": "active",
+                "last_attestation_at": null,
+                "image_compose_hash": null,
+                "products": [],
+            })))
+            .mount(&server)
+            .await;
+
+        let workers: Vec<serde_json::Value> = live
+            .iter()
+            .map(|(worker_id, created_at)| {
+                serde_json::json!({
+                    "worker_id": worker_id,
+                    "endpoint": format!("https://{worker_id}.example.org"),
+                    "status": "active",
+                    "last_attestation_at": null,
+                    "created_at": created_at,
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/miners/5HK/workers"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "workers": workers })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Regression (live testnet): a hotkey whose local config holds two
+    /// deregistered workers ahead of the one live worker. `deploy` must accept
+    /// a redeploy of that live worker — it *is* the registry's worker #1, even
+    /// though it sits at local position 3. The old positional check called it
+    /// "secondary" and left the operator's only serving worker un-redeployable.
+    #[tokio::test]
+    async fn deploy_allows_redeploying_the_live_worker_behind_dead_local_records() {
+        use super::{reject_secondary_worker_deploy, RegistryClient, WorkerRegistration};
+
+        // Only gm-testnet-zai-a is still registered.
+        let server = mock_registry_workers(&[("01J0Z", "2026-07-03T00:00:00Z")]).await;
+        let cfg = cfg_with_workers(
+            Some(server.uri()),
+            vec![
+                worker_record("01J0A", "gm-testnet-miner-2"), // deregistered
+                worker_record("01J0B", "gm-testnet-slots-c"), // deregistered
+                worker_record("01J0Z", "gm-testnet-zai-a"),   // the live worker
+            ],
+        );
+        let mut client = RegistryClient::new(cfg.clone());
+
+        reject_secondary_worker_deploy(
+            &cfg,
+            &mut client,
+            &WorkerRegistration::First,
+            "gm-testnet-zai-a",
+        )
+        .await
+        .expect("the only live worker is worker #1 whatever its local position");
+    }
+
+    /// The invariant the guard exists for, preserved: `/miners/register`
+    /// refreshes the oldest live worker, so a deploy aimed at a *live*
+    /// secondary would overwrite worker #1. It must still be rejected — and
+    /// before any CVM work.
     #[tokio::test]
     async fn deploy_rejects_a_secondary_worker_app_name() {
         use super::{cmd_deploy, DeployArgs, RegistryClient, WorkerRegistration};
-        use gm_miner_cli::config::{Config, NetworkEntry, ProviderKeys, WorkerRecord};
+        use gm_miner_cli::config::ProviderKeys;
         use gm_miner_cli::deploy::{DeployOutcome, PhalaClient, RegistryCredentials};
 
         struct UnusedPhala;
@@ -1262,45 +1386,28 @@ mod tests {
                 _registry_creds: Option<&RegistryCredentials>,
                 _boot_timeout_secs: u64,
             ) -> anyhow::Result<DeployOutcome> {
-                anyhow::bail!("the step-0 guard must bail before any CVM work")
+                anyhow::bail!("the worker-#1 guard must bail before any CVM work")
+            }
+
+            fn existing_cvm_app_id(&self) -> anyhow::Result<Option<String>> {
+                anyhow::bail!("the worker-#1 guard must bail before probing Phala")
             }
         }
 
-        let mut networks = std::collections::HashMap::new();
-        networks.insert(
-            "testnet".to_owned(),
-            NetworkEntry {
-                workers: vec![
-                    WorkerRecord {
-                        worker_id: "01J0A".to_owned(),
-                        app_id: "app_01J0A".to_owned(),
-                        app_name: "gm-miner-1".to_owned(),
-                        node_secret: "secret-1".to_owned(),
-                        ..Default::default()
-                    },
-                    WorkerRecord {
-                        worker_id: "01J0B".to_owned(),
-                        app_id: "app_01J0B".to_owned(),
-                        app_name: "gm-miner-2".to_owned(),
-                        node_secret: "secret-2".to_owned(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
+        // Both workers are live; gm-miner-2 is the younger one — a secondary.
+        let server = mock_registry_workers(&[
+            ("01J0A", "2026-07-01T00:00:00Z"),
+            ("01J0B", "2026-07-02T00:00:00Z"),
+        ])
+        .await;
+        let cfg = cfg_with_workers(
+            Some(server.uri()),
+            vec![
+                worker_record("01J0A", "gm-miner-1"),
+                worker_record("01J0B", "gm-miner-2"),
+            ],
         );
-        let cfg = Config {
-            networks,
-            active_network: Some("testnet".to_owned()),
-            provider_keys: None,
-            phala_api_key: None,
-            api_url_override: None,
-            accepted_terms: None,
-        };
 
-        // --app-name gm-miner-2 is a secondary worker; a plain `deploy`
-        // would refresh worker #1 and corrupt the mapping. The step-0 guard
-        // must bail before provider-key checks, auth, or any CVM work.
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
             image_ref: None,
@@ -1334,96 +1441,80 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deploy_allows_retrying_a_provisional_primary_redeploy() {
-        use super::{reject_secondary_worker_deploy, WorkerRegistration};
-        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+    #[tokio::test]
+    async fn deploy_allows_retrying_a_provisional_primary_redeploy() {
+        use super::{reject_secondary_worker_deploy, RegistryClient, WorkerRegistration};
 
         // A worker #1 redeploy under a new --app-name appended a provisional
         // stub after the registered primary, then failed. Retrying that same
         // deploy must NOT be rejected as secondary — the stub has no
         // worker_id, so it's an in-flight worker #1, recoverable on retry.
-        let mut networks = std::collections::HashMap::new();
-        networks.insert(
-            "testnet".to_owned(),
-            NetworkEntry {
-                workers: vec![
-                    WorkerRecord {
-                        worker_id: "01J0A".to_owned(),
-                        app_id: "app_01J0A".to_owned(),
-                        app_name: "gm-miner-1".to_owned(),
-                        node_secret: "secret-1".to_owned(),
-                        ..Default::default()
-                    },
-                    WorkerRecord {
-                        worker_id: String::new(),
-                        app_id: "app_new".to_owned(),
-                        app_name: "gm-miner-1b".to_owned(),
-                        node_secret: "provisional".to_owned(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
+        // The registry has never seen it, so the guard makes no call at all:
+        // the config below points at no registry, and the test still passes.
+        let cfg = cfg_with_workers(
+            None,
+            vec![
+                worker_record("01J0A", "gm-miner-1"),
+                worker_record("", "gm-miner-1b"),
+            ],
         );
-        let cfg = Config {
-            networks,
-            active_network: Some("testnet".to_owned()),
-            provider_keys: None,
-            phala_api_key: None,
-            api_url_override: None,
-            accepted_terms: None,
-        };
+        let mut client = RegistryClient::new(cfg.clone());
 
-        reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-1b")
-            .expect("a provisional primary redeploy must be retryable");
+        reject_secondary_worker_deploy(
+            &cfg,
+            &mut client,
+            &WorkerRegistration::First,
+            "gm-miner-1b",
+        )
+        .await
+        .expect("a provisional primary redeploy must be retryable");
     }
 
-    #[test]
-    fn deploy_rejects_a_provisional_worker_add_stub() {
-        use super::{reject_secondary_worker_deploy, WorkerRegistration};
-        use gm_miner_cli::config::{Config, NetworkEntry, WorkerRecord};
+    #[tokio::test]
+    async fn deploy_rejects_a_provisional_worker_add_stub() {
+        use super::{reject_secondary_worker_deploy, RegistryClient, WorkerRegistration};
+        use gm_miner_cli::config::WorkerRecord;
 
         // A `worker add` that launched a CVM then failed to register left a
         // provisional secondary stub. A plain `deploy --app-name` against it
         // must still be rejected — routing it through /miners/register would
         // overwrite worker #1 with the failed secondary's endpoint/secret.
-        let mut networks = std::collections::HashMap::new();
-        networks.insert(
-            "testnet".to_owned(),
-            NetworkEntry {
-                workers: vec![
-                    WorkerRecord {
-                        worker_id: "01J0A".to_owned(),
-                        app_id: "app_01J0A".to_owned(),
-                        app_name: "gm-miner-1".to_owned(),
-                        node_secret: "secret-1".to_owned(),
-                        ..Default::default()
-                    },
-                    WorkerRecord {
-                        worker_id: String::new(),
-                        app_id: "app_add".to_owned(),
-                        app_name: "gm-miner-2".to_owned(),
-                        node_secret: "provisional".to_owned(),
-                        provisional_secondary: true,
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
+        let cfg = cfg_with_workers(
+            None,
+            vec![
+                worker_record("01J0A", "gm-miner-1"),
+                WorkerRecord {
+                    worker_id: String::new(),
+                    provisional_secondary: true,
+                    ..worker_record("", "gm-miner-2")
+                },
+            ],
         );
-        let cfg = Config {
-            networks,
-            active_network: Some("testnet".to_owned()),
-            provider_keys: None,
-            phala_api_key: None,
-            api_url_override: None,
-            accepted_terms: None,
-        };
+        let mut client = RegistryClient::new(cfg.clone());
 
-        let err = reject_secondary_worker_deploy(&cfg, &WorkerRegistration::First, "gm-miner-2")
-            .expect_err("a provisional worker-add stub must stay off the worker-#1 path");
+        let err = reject_secondary_worker_deploy(
+            &cfg,
+            &mut client,
+            &WorkerRegistration::First,
+            "gm-miner-2",
+        )
+        .await
+        .expect_err("a provisional worker-add stub must stay off the worker-#1 path");
         assert!(err.to_string().contains("secondary worker"), "got: {err}");
+    }
+
+    /// An untracked `--app-name` is a fresh worker #1 (or a replacement): the
+    /// guard passes without asking the registry anything.
+    #[tokio::test]
+    async fn deploy_allows_an_untracked_app_name_without_a_registry_call() {
+        use super::{reject_secondary_worker_deploy, RegistryClient, WorkerRegistration};
+
+        let cfg = cfg_with_workers(None, vec![worker_record("01J0A", "gm-miner-1")]);
+        let mut client = RegistryClient::new(cfg.clone());
+
+        reject_secondary_worker_deploy(&cfg, &mut client, &WorkerRegistration::First, "gm-miner-9")
+            .await
+            .expect("an untracked app name is never secondary");
     }
 
     #[test]

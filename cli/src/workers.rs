@@ -1,9 +1,56 @@
-//! Render the health view for a hotkey's workers: suspension recovery state and
-//! upstream key slots the registry could not verify.
+//! The hotkey's workers as the registry sees them: which of them is worker #1,
+//! and the health view for the rest (suspension recovery state and upstream key
+//! slots the registry could not verify).
 
 use chrono::{DateTime, Utc};
 
+use crate::config::WorkerRecord;
 use crate::types::WorkerEntry;
+
+/// The miner's worker #1: the oldest worker the registry still lists as live.
+///
+/// `POST /miners/register` — what `deploy` and `register-image` call — refreshes
+/// *this* worker's row, so it is the only worker those two commands may target.
+/// The registry deregisters workers without the CLI ever hearing about it, so
+/// worker #1 can only be read from the live list, never from a local record's
+/// position.
+///
+/// Oldest is `created_at`, tie-broken by the ULID `worker_id` — ULIDs are
+/// lexicographically time-ordered, so the tiebreak is also the fallback for a
+/// registry build that does not emit `created_at`.
+#[must_use]
+pub fn first_live_worker_id(live: &[WorkerEntry]) -> Option<&str> {
+    live.iter()
+        .min_by_key(|w| (w.created_at.as_deref().unwrap_or(""), w.worker_id.as_str()))
+        .map(|w| w.worker_id.as_str())
+}
+
+/// Whether the locally-tracked `tracked` is a *secondary* worker — one that
+/// `deploy` / `register-image` must refuse, because routing it through
+/// `POST /miners/register` would overwrite worker #1's endpoint and secret.
+///
+/// `live` is the registry's current worker list (`GET /miners/{hotkey}/workers`)
+/// and is the only source of truth here. Three cases:
+///
+/// * **Not yet registered** (empty `worker_id`) — the registry has never seen
+///   it, so only the local `provisional_secondary` flag can tell a failed
+///   `worker add` from an in-flight worker-#1 (re)deploy.
+/// * **Registered but no longer live** — the registry deregistered it. Local
+///   records are never pruned, so this record is a ghost: a deploy under its
+///   name registers a fresh worker exactly as an untracked `--app-name` would,
+///   and there is nothing to overwrite. Not secondary.
+/// * **Live** — secondary iff it is not the oldest live worker
+///   ([`first_live_worker_id`]).
+#[must_use]
+pub fn is_secondary_live(tracked: &WorkerRecord, live: &[WorkerEntry]) -> bool {
+    if tracked.worker_id.is_empty() {
+        return tracked.provisional_secondary;
+    }
+    if !live.iter().any(|w| w.worker_id == tracked.worker_id) {
+        return false;
+    }
+    first_live_worker_id(live) != Some(tracked.worker_id.as_str())
+}
 
 /// The recovery view for a worker that is suspended or carrying a dead key.
 /// A healthy worker renders nothing, so the common case stays a clean table.
@@ -105,7 +152,10 @@ pub fn relative_suffix(timestamp: &str, now: DateTime<Utc>) -> String {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{worker_health_lines, DateTime, Utc, WorkerEntry};
+    use super::{
+        first_live_worker_id, is_secondary_live, worker_health_lines, DateTime, Utc, WorkerEntry,
+        WorkerRecord,
+    };
 
     fn worker_entry(status: &str) -> WorkerEntry {
         serde_json::from_value(serde_json::json!({
@@ -115,6 +165,107 @@ mod tests {
             "last_attestation_at": null,
         }))
         .expect("decode minimal worker entry")
+    }
+
+    /// A live worker row as `GET /miners/{hotkey}/workers` returns it.
+    fn live(worker_id: &str, created_at: &str) -> WorkerEntry {
+        serde_json::from_value(serde_json::json!({
+            "worker_id": worker_id,
+            "endpoint": format!("https://{worker_id}.example.org"),
+            "status": "active",
+            "last_attestation_at": null,
+            "created_at": created_at,
+        }))
+        .expect("decode live worker entry")
+    }
+
+    fn record(worker_id: &str, app_name: &str) -> WorkerRecord {
+        WorkerRecord {
+            worker_id: worker_id.to_owned(),
+            app_id: format!("app_{app_name}"),
+            app_name: app_name.to_owned(),
+            node_secret: "s".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn first_live_worker_is_the_oldest_row_not_the_first_returned() {
+        let workers = vec![
+            live("01J0C", "2026-07-03T00:00:00Z"),
+            live("01J0A", "2026-07-01T00:00:00Z"),
+            live("01J0B", "2026-07-02T00:00:00Z"),
+        ];
+        assert_eq!(first_live_worker_id(&workers), Some("01J0A"));
+        assert_eq!(first_live_worker_id(&[]), None);
+    }
+
+    #[test]
+    fn first_live_worker_falls_back_to_the_ulid_without_created_at() {
+        // A registry build that omits `created_at` still orders correctly:
+        // ULIDs are lexicographically time-ordered.
+        let workers = vec![worker_entry("active"), {
+            let mut older = worker_entry("active");
+            older.worker_id = "01J00".to_owned();
+            older
+        }];
+        assert_eq!(first_live_worker_id(&workers), Some("01J00"));
+    }
+
+    /// Regression: the deregistered workers ahead of the live one in the local
+    /// list must not make the live one look secondary.
+    ///
+    /// The operator's config held three testnet records — two whose registry
+    /// rows were deregistered, then the one live worker. A positional check
+    /// called the live worker "worker #2" and refused to redeploy the only
+    /// worker actually serving.
+    #[test]
+    fn the_only_live_worker_is_never_secondary_whatever_its_local_position() {
+        let workers = vec![live("01J0Z", "2026-07-03T00:00:00Z")];
+
+        // Position 1 and 2 locally, both deregistered: ghosts, not worker #1.
+        assert!(!is_secondary_live(&record("01J0A", "gm-miner-2"), &workers));
+        assert!(!is_secondary_live(
+            &record("01J0B", "gm-miner-slots"),
+            &workers
+        ));
+        // Position 3 locally, and the registry's only live worker.
+        assert!(!is_secondary_live(
+            &record("01J0Z", "gm-miner-zai"),
+            &workers
+        ));
+    }
+
+    /// The invariant the guard exists for: a genuinely-secondary *live* worker
+    /// must stay off `/miners/register`, which would overwrite worker #1.
+    #[test]
+    fn a_live_worker_that_is_not_the_oldest_is_secondary() {
+        let workers = vec![
+            live("01J0A", "2026-07-01T00:00:00Z"),
+            live("01J0B", "2026-07-02T00:00:00Z"),
+        ];
+        assert!(!is_secondary_live(&record("01J0A", "gm-miner-1"), &workers));
+        assert!(is_secondary_live(&record("01J0B", "gm-miner-2"), &workers));
+    }
+
+    #[test]
+    fn provisional_stubs_are_classified_by_their_flag_alone() {
+        let workers = vec![live("01J0A", "2026-07-01T00:00:00Z")];
+
+        // An in-flight worker-#1 (re)deploy: retryable through `deploy`.
+        let primary_stub = record("", "gm-miner-1b");
+        assert!(!is_secondary_live(&primary_stub, &workers));
+
+        // A `worker add` that launched a CVM but never registered: still must
+        // not be routed through the worker-#1 path.
+        let secondary_stub = WorkerRecord {
+            provisional_secondary: true,
+            ..record("", "gm-miner-3")
+        };
+        assert!(is_secondary_live(&secondary_stub, &workers));
+        // …and with no live workers at all (a wiped registry), unchanged.
+        assert!(is_secondary_live(&secondary_stub, &[]));
+        assert!(!is_secondary_live(&primary_stub, &[]));
     }
 
     fn now() -> DateTime<Utc> {
