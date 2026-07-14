@@ -191,10 +191,11 @@ pub fn parse_phala_cvm_app_id(succeeded: bool, stdout: &[u8]) -> Result<Option<S
 /// name is free. A list that could not be read is an error at the call site, not
 /// an absent CVM, so an unreadable workspace never reads as an empty one.
 pub fn parse_phala_cvm_app_id_by_name(stdout: &[u8], app_name: &str) -> Result<Option<String>> {
-    let listed: Vec<PhalaCvmListRow> =
+    let listed: PhalaCvmList =
         serde_json::from_slice(stdout).context("parse phala cvms list --json output")?;
 
     Ok(listed
+        .items
         .into_iter()
         .find(|row| row.name.as_deref() == Some(app_name))
         .and_then(|row| row.app_id)
@@ -209,6 +210,16 @@ struct PhalaCvmListRow {
     app_id: Option<String>,
     #[serde(alias = "name", alias = "cvm")]
     name: Option<String>,
+}
+
+/// `phala cvms list --json` wraps the rows in a paginated envelope
+/// (`{ success, page, pageSize, total, totalPages, items: [...] }`), not a bare
+/// array. `total`/`totalPages` are carried so a caller can tell when the name it
+/// is looking for could sit on a page it has not fetched.
+#[derive(Debug, serde::Deserialize)]
+struct PhalaCvmList {
+    #[serde(default)]
+    items: Vec<PhalaCvmListRow>,
 }
 
 /// Parse the CVM's operator-chosen `name` (the `phala deploy --name` value)
@@ -834,10 +845,10 @@ mod tests {
 
     #[test]
     fn a_listed_cvm_is_found_by_its_operator_chosen_name() {
-        let stdout = br#"[
+        let stdout = br#"{"success":true,"page":1,"pageSize":10,"total":2,"totalPages":1,"items":[
             {"app_id":"app_other","name":"gm-testnet-other"},
             {"app_id":"app_mine","name":"gm-testnet-zai-a"}
-        ]"#;
+        ]}"#;
 
         let found = parse_phala_cvm_app_id_by_name(stdout, "gm-testnet-zai-a")
             .expect("a readable list must parse");
@@ -847,7 +858,7 @@ mod tests {
 
     #[test]
     fn a_name_absent_from_a_readable_list_is_free() {
-        let stdout = br#"[{"app_id":"app_other","name":"gm-testnet-other"}]"#;
+        let stdout = br#"{"items":[{"app_id":"app_other","name":"gm-testnet-other"}]}"#;
 
         let found =
             parse_phala_cvm_app_id_by_name(stdout, "gm-testnet-zai-a").expect("list must parse");
@@ -857,7 +868,7 @@ mod tests {
 
     #[test]
     fn an_empty_workspace_leaves_every_name_free() {
-        let found = parse_phala_cvm_app_id_by_name(b"[]", "gm-testnet-zai-a")
+        let found = parse_phala_cvm_app_id_by_name(br#"{"items":[]}"#, "gm-testnet-zai-a")
             .expect("an empty list must parse");
 
         assert_eq!(found, None);
