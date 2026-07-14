@@ -52,7 +52,21 @@ pub(crate) fn assert_account_binding<'account>(
             endpoint.account_name
         );
     }
-    let expected_host = format!("{custom_subdomain}{}", endpoint.suffix);
+    // An account advertises ONE endpoint through ARM — its classic data-plane
+    // host — but it answers on several. A Foundry account reports
+    // `<subdomain>.cognitiveservices.azure.com` here while serving the
+    // Anthropic-native passthrough from `<subdomain>.services.ai.azure.com`,
+    // which is the host the miner actually calls. Requiring the two to be equal
+    // rejects every Foundry account in existence.
+    //
+    // The binding does not need them to be equal. `customSubDomainName` is
+    // globally unique across Cognitive Services, and the endpoint's suffix is
+    // already confined to Azure-operated hosts (`parse_azure_endpoint`). So a
+    // configured host whose label equals the subdomain of the account this
+    // service principal just authenticated against IS that account — nobody
+    // else can hold the label, and nobody but Azure can answer for the suffix.
+    // Checking the ARM host's own label guards only against ARM handing back a
+    // record for some other account.
     let arm_endpoint = account
         .properties
         .endpoint
@@ -70,16 +84,12 @@ pub(crate) fn assert_account_binding<'account>(
         .host_str()
         .context("Azure account properties.endpoint must include a DNS host")?
         .to_ascii_lowercase();
-    if arm_host != expected_host {
+    let arm_label = arm_host.split('.').next().unwrap_or_default();
+    if arm_label != custom_subdomain {
         bail!(
-            "Azure account properties.endpoint host '{arm_host}' did not match expected '{expected_host}'",
-        );
-    }
-    if arm_host != endpoint.host {
-        bail!(
-            "{} account endpoint host '{arm_host}' does not match the configured endpoint host '{}'",
+            "{} account properties.endpoint host '{arm_host}' is not a host of the account with \
+             customSubDomainName '{custom_subdomain}'",
             provider.label(),
-            endpoint.host
         );
     }
     if account
@@ -355,6 +365,14 @@ mod tests {
         .expect("valid Foundry endpoint must parse")
     }
 
+    /// A real `AIServices` account as ARM actually returns it.
+    ///
+    /// `properties.endpoint` is the account's CLASSIC data-plane host —
+    /// `cognitiveservices.azure.com` — even though the Anthropic passthrough the
+    /// miner calls is served from `services.ai.azure.com`. Fixtures used to
+    /// claim ARM echoed the Foundry host back, which is what let a binding check
+    /// that compared the two hosts pass its tests and then reject every real
+    /// account. Verified against a live Foundry resource.
     fn foundry_account_json(kind: &str) -> String {
         format!(
             r#"{{
@@ -362,12 +380,42 @@ mod tests {
                 "kind": "{kind}",
                 "properties": {{
                     "customSubDomainName": "acct",
-                    "endpoint": "https://acct.services.ai.azure.com/",
+                    "endpoint": "https://acct.cognitiveservices.azure.com/",
                     "raiMonitorConfig": null,
                     "userOwnedStorage": []
                 }}
             }}"#
         )
+    }
+
+    #[test]
+    fn foundry_binds_an_account_whose_arm_endpoint_is_the_classic_host() {
+        // The case every Foundry deploy hits: ARM says cognitiveservices, the
+        // configured passthrough says services.ai. Same account, two hosts.
+        let endpoint = foundry_endpoint();
+        let account = account_from_json(&foundry_account_json("AIServices"));
+
+        let resource_id = assert_account_binding(AzureProvider::Foundry, &endpoint, &account)
+            .expect("a live Foundry account must bind");
+
+        assert!(resource_id.ends_with("/accounts/acct"), "{resource_id}");
+    }
+
+    #[test]
+    fn an_arm_endpoint_for_a_different_account_is_refused() {
+        // ARM handing back a record for someone else's account is the only thing
+        // the endpoint host still guards against.
+        let endpoint = foundry_endpoint();
+        let account = account_from_json(
+            &foundry_account_json("AIServices")
+                .replace("acct.cognitiveservices", "someone-else.cognitiveservices"),
+        );
+
+        let err = assert_account_binding(AzureProvider::Foundry, &endpoint, &account)
+            .expect_err("an endpoint for another account must be refused")
+            .to_string();
+
+        assert!(err.contains("customSubDomainName 'acct'"), "{err}");
     }
 
     #[test]
