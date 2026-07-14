@@ -32,6 +32,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY cli/Cargo.toml ./cli/
 COPY attestd/Cargo.toml ./attestd/
+COPY azure-verify/Cargo.toml ./azure-verify/
 
 ## Copy dstack assets required by include_str! at compile time.
 COPY dstack/ ./dstack/
@@ -39,22 +40,24 @@ COPY dstack/ ./dstack/
 ## Pre-build a dummy workspace to cache dependencies. The attestd crate
 ## ships a lib and two bins (gm-miner-attestd, gm-miner-ratls), so the
 ## dummy tree needs an entry file for each declared target.
-RUN mkdir -p cli/src attestd/src/bin \
+RUN mkdir -p cli/src attestd/src/bin azure-verify/src \
   && echo "fn main() {}" > cli/src/main.rs \
   && echo "fn main() {}" > attestd/src/main.rs \
   && echo "fn main() {}" > attestd/src/bin/ratls.rs \
   && echo "" > attestd/src/lib.rs \
+  && echo "" > azure-verify/src/lib.rs \
   && cargo build --release --workspace 2>/dev/null || true \
-  && rm -rf cli/src attestd/src
+  && rm -rf cli/src attestd/src azure-verify/src
 
 ## Copy real sources.
 COPY cli/ ./cli/
 COPY attestd/ ./attestd/
+COPY azure-verify/ ./azure-verify/
 
 ## Build the workspace. Touch the entry points to invalidate the dummy
 ## build cache so the real sources compile.
 RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
-    attestd/src/bin/ratls.rs \
+    attestd/src/bin/ratls.rs azure-verify/src/lib.rs \
   && cargo build --release --workspace \
   && strip target/release/gmcli target/release/gm-miner-attestd \
     target/release/gm-miner-ratls

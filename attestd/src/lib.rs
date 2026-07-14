@@ -9,7 +9,6 @@
 //! — the same one the gm gateway's attestation surface produces, so the
 //! registry's single attestation checker verifies both services.
 
-pub mod azure_verify;
 pub mod identity;
 pub mod info;
 pub mod keypair;

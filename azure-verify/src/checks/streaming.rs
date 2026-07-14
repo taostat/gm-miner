@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 
-use crate::azure_verify::arm::{ArmDeploymentList, ANTHROPIC_MODEL_FORMAT};
+use crate::arm::{ArmDeploymentList, ANTHROPIC_MODEL_FORMAT};
 
 /// Split a deployment list into the deployments Azure's RAI content filter
 /// actually governs, and the Anthropic-format ones it does not.
@@ -30,6 +30,38 @@ pub(crate) fn split_azure_governed_deployments(
         },
         skipped.len(),
     )
+}
+
+/// Drop the deployments whose verdict is not yet observable, keeping the ones
+/// that already prove something:
+///
+/// - a deployment with NO `raiPolicyName` is a violation on sight — no read is
+///   pending, so it is kept and reported even if the sweep was cut short;
+/// - a deployment whose policy we DID resolve is judged on that policy's mode;
+/// - a deployment whose policy read never happened (throttled, or never reached
+///   because an earlier one throttled) is dropped. Keeping it would assess it
+///   against an absent mode and report a violation Azure never told us about —
+///   manufacturing a definitive finding out of a transient failure, and killing
+///   miners on an Azure hiccup.
+///
+/// On a complete sweep every referenced policy is resolved, so this drops
+/// nothing and the assessment is exactly what it always was.
+pub(crate) fn retain_observable_deployments(
+    deployments: &mut ArmDeploymentList,
+    policy_modes: &BTreeMap<String, Option<String>>,
+) {
+    deployments.value.retain(|deployment| {
+        match deployment
+            .properties
+            .rai_policy_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            None => true,
+            Some(policy) => policy_modes.contains_key(policy),
+        }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +195,7 @@ impl StreamingConfigViolation {
 )]
 mod tests {
     use super::*;
-    use crate::azure_verify::arm::{ArmDeploymentList, ArmRaiPolicy};
+    use crate::arm::{ArmDeploymentList, ArmRaiPolicy};
 
     fn deployments_from_json(json: &str) -> ArmDeploymentList {
         serde_json::from_str(json).expect("deployment fixture must parse")

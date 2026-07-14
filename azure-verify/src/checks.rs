@@ -5,11 +5,12 @@ use reqwest::Url;
 use serde_json::Value;
 
 pub(crate) use self::streaming::{
-    assess_streaming_configuration, log_streaming_assessment, split_azure_governed_deployments,
+    assess_streaming_configuration, log_streaming_assessment, retain_observable_deployments,
+    split_azure_governed_deployments,
 };
-use super::arm::{ArmAccount, ArmChildResource, DiagnosticSettingsList, ARM_API_VERSION};
-use super::config::AzureProvider;
-use super::endpoint::AzureEndpoint;
+use crate::arm::{ArmAccount, ArmChildResource, DiagnosticSettingsList, ARM_API_VERSION};
+use crate::config::AzureProvider;
+use crate::endpoint::AzureEndpoint;
 
 /// The account kind that carries Foundry projects, connections, and capability
 /// hosts. A classic `kind: OpenAI` account has none of those child collections.
@@ -251,8 +252,8 @@ pub(crate) fn assert_no_capture_children(
 )]
 mod tests {
     use super::*;
-    use crate::azure_verify::arm::ArmAccount;
-    use crate::azure_verify::endpoint::parse_azure_endpoint;
+    use crate::arm::ArmAccount;
+    use crate::endpoint::parse_azure_endpoint;
 
     fn valid_endpoint() -> AzureEndpoint {
         parse_azure_endpoint(AzureProvider::OpenAi, "https://acct.openai.azure.com/")

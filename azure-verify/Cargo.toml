@@ -1,12 +1,16 @@
 [package]
-name = "gm-miner-attestd"
+# The single source of truth for Azure owner-capture verification: `attestd`
+# runs it as a fail-closed boot gate inside the CVM, and `gmcli doctor` runs the
+# same code as a preflight on the operator's machine. One crate, so doctor can
+# never promise a PASS that attestd then refuses to boot on.
+name = "gm-azure-verify"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
-description = "gm miner attestation server — serves GET /attestation/info with a fresh TDX quote from the dstack guest agent. Runs alongside Envoy inside the miner's TEE container."
+description = "Azure owner-capture verification shared by the gm miner's attestd boot gate and `gmcli doctor`."
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -27,38 +31,19 @@ mem_forget = "deny"
 module_name_repetitions = "allow"
 similar_names = "allow"
 
-[[bin]]
-name = "gm-miner-attestd"
-path = "src/main.rs"
-
-# One-shot RA-TLS certificate provisioner. start.sh runs it before
-# Envoy to mint the data-plane TLS cert via dstack's get_tls_key.
-[[bin]]
-name = "gm-miner-ratls"
-path = "src/bin/ratls.rs"
-
 [lib]
-name = "gm_miner_attestd"
+name = "gm_azure_verify"
 path = "src/lib.rs"
 
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-axum = { workspace = true }
-async-trait = { workspace = true }
-base64 = { workspace = true }
-ed25519-dalek = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
-chrono = { workspace = true }
-dstack-sdk = { workspace = true }
-gm-azure-verify = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+wiremock = "0.6"

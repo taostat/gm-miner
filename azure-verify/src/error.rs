@@ -1,6 +1,6 @@
 use reqwest::StatusCode;
 
-use super::arm::AzureHttpStatusError;
+use crate::arm::AzureHttpStatusError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VerificationFailureKind {
@@ -41,7 +41,7 @@ pub(crate) fn status_is_transient(status: StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::azure_verify::arm::AzureHttpStatusError;
+    use crate::arm::AzureHttpStatusError;
 
     #[test]
     fn verification_error_classification_separates_transient_from_definitive() {

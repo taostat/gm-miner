@@ -24,7 +24,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::routing::get;
 use axum::Router;
-use gm_miner_attestd::azure_verify;
+use gm_azure_verify::{spawn_periodic_azure_verification_from_env, verify_azure_config_from_env};
 use gm_miner_attestd::info::AppState;
 use gm_miner_attestd::{
     attestation_info, validate_miner_id, DstackAttestationProvider, SigningKeypair,
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args == [VERIFY_AZURE_ONCE_ARG] {
         tracing::info!("running one-shot Azure owner-capture verification");
-        azure_verify::verify_azure_config_from_env()
+        verify_azure_config_from_env()
             .await
             .context("Azure owner-capture verification failed")?;
         return Ok(());
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     let azure_upstream = env_selects_azure();
     if azure_upstream {
         tracing::info!("verifying Azure owner-capture controls");
-        if let Err(err) = azure_verify::verify_azure_config_from_env().await {
+        if let Err(err) = verify_azure_config_from_env().await {
             anyhow::bail!("Azure owner-capture verification failed: {err:#}");
         }
     }
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
 
     let (_periodic_azure_verify_task, azure_shutdown_rx) = if azure_upstream {
         let (fatal_shutdown_tx, fatal_shutdown_rx) = oneshot::channel();
-        let task = azure_verify::spawn_periodic_azure_verification_from_env(fatal_shutdown_tx)
+        let task = spawn_periodic_azure_verification_from_env(fatal_shutdown_tx)
             .context("start periodic Azure owner-capture verification")?;
         (task, Some(fatal_shutdown_rx))
     } else {
