@@ -127,12 +127,15 @@ pub struct WorkerRecord {
     /// The worker's `x-gm-node-key` pre-shared credential (Mechanism 1 of
     /// `docs/plans/attestation-and-identity.md`).
     pub node_secret: String,
-    /// Registry worker provenance derived from the provider upstream selectors
-    /// active when this worker was deployed. Stored per worker so
-    /// `register-image` recovery preserves the deployed backend instead of
-    /// relabeling from whatever global config is current later.
+    /// Registry worker provenance as a `provider -> adapter` map, derived from
+    /// the provider upstream selectors active when this worker was deployed.
+    /// Stored per worker so `register-image` recovery re-sends the deployed
+    /// backends instead of relabeling from whatever global config is current
+    /// later. `None` (omitted) means either a fully-direct worker or a record
+    /// written before the per-provider map — in both cases `register-image`
+    /// omits the field and the registry keeps its authoritative stored value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
+    pub backends: Option<std::collections::BTreeMap<String, String>>,
     /// The provider slot ids advertised at deploy time, derived from the
     /// keys baked into this CVM. Stored per worker so `register-image`
     /// recovery re-sends what the worker actually holds instead of
@@ -569,19 +572,30 @@ impl ProviderKeys {
         Ok(())
     }
 
-    /// Registry worker provenance is a single optional backend marker. If both
-    /// cloud upstreams are configured, the Anthropic-side backend takes
-    /// precedence; the registry only needs "cloud-backed, use the inference
-    /// probe" here, while each offer's `upstream_model` carries the per-model
-    /// translation detail.
+    /// Registry worker provenance as a per-provider `provider -> adapter` map.
+    ///
+    /// Each configured cloud upstream contributes one entry, so a worker that
+    /// serves Claude on Foundry *and* GPT on Azure declares both
+    /// (`{anthropic: foundry, openai: azure}`) instead of collapsing to a
+    /// single scalar. An empty map means a fully-direct worker. The registry
+    /// derives the legacy scalar `backend` itself; each offer's `upstream_model`
+    /// still carries the per-model translation detail.
     #[must_use]
-    pub fn worker_backend(&self) -> Option<&'static str> {
+    pub fn worker_backends(&self) -> std::collections::BTreeMap<String, String> {
+        let mut backends = std::collections::BTreeMap::new();
         match self.anthropic_upstream.as_deref() {
-            Some("bedrock") => Some("bedrock"),
-            Some("foundry") => Some("foundry"),
-            _ if self.openai_upstream.as_deref() == Some("azure") => Some("azure"),
-            _ => None,
+            Some("bedrock") => {
+                backends.insert("anthropic".to_owned(), "bedrock".to_owned());
+            }
+            Some("foundry") => {
+                backends.insert("anthropic".to_owned(), "foundry".to_owned());
+            }
+            _ => {}
         }
+        if self.openai_upstream.as_deref() == Some("azure") {
+            backends.insert("openai".to_owned(), "azure".to_owned());
+        }
+        backends
     }
 }
 
@@ -836,7 +850,7 @@ pub fn with_config_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 )]
 mod tests {
     use super::{Config, HotkeyRecord, NetworkEntry, ProviderKeys, TokenEntry, WorkerRecord};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn worker(worker_id: &str, app_name: &str, secret: &str) -> WorkerRecord {
         WorkerRecord {
@@ -891,40 +905,64 @@ mod tests {
     }
 
     #[test]
-    fn worker_backend_defaults_and_omits_when_absent() {
+    fn worker_backends_default_and_omit_when_absent() {
         let json = r#"{"worker_id":"01J0A","app_id":"app_01J0A","app_name":"gm-miner-1","node_secret":"secret"}"#;
         let worker: WorkerRecord = serde_json::from_str(json).expect("parse legacy worker record");
-        assert_eq!(worker.backend, None);
+        assert_eq!(worker.backends, None);
 
         let resaved = serde_json::to_string(&worker).expect("serialize worker record");
         assert!(
             !resaved.contains("backend"),
-            "absent worker backend must stay omitted: {resaved}"
+            "absent worker backends must stay omitted: {resaved}"
         );
 
         let mut cloud = worker;
-        cloud.backend = Some("bedrock".to_owned());
+        cloud.backends = Some(BTreeMap::from([(
+            "anthropic".to_owned(),
+            "bedrock".to_owned(),
+        )]));
         let cloud_json = serde_json::to_value(&cloud).expect("serialize cloud worker");
-        assert_eq!(cloud_json["backend"], "bedrock");
+        assert_eq!(cloud_json["backends"]["anthropic"], "bedrock");
     }
 
     #[test]
-    fn foundry_reports_the_anthropic_side_cloud_backend() {
+    fn a_legacy_scalar_backend_key_deserialises_harmlessly() {
+        // Records written before the per-provider map carry `"backend":"foundry"`.
+        // Serde ignores the unknown key, leaving `backends` unset: `register-image`
+        // then omits the field and the registry keeps its authoritative stored
+        // map, rather than the CLI re-sending a lossy expansion that could narrow
+        // a mixed worker back to one provider.
+        let json = r#"{"worker_id":"01J0A","app_id":"app_01J0A","app_name":"gm-miner-1","node_secret":"secret","backend":"foundry"}"#;
+        let worker: WorkerRecord = serde_json::from_str(json).expect("parse legacy worker record");
+        assert_eq!(worker.backends, None);
+    }
+
+    #[test]
+    fn worker_backends_carry_every_configured_cloud_upstream() {
         let foundry = ProviderKeys {
             anthropic_upstream: Some("foundry".to_owned()),
             ..ProviderKeys::default()
         };
-        assert_eq!(foundry.worker_backend(), Some("foundry"));
+        assert_eq!(
+            foundry.worker_backends(),
+            BTreeMap::from([("anthropic".to_owned(), "foundry".to_owned())])
+        );
 
-        // The registry worker record carries one backend marker. When both
-        // cloud upstreams are configured the Anthropic side wins, matching the
-        // existing Bedrock-over-Azure precedence.
+        // A mixed worker declares both providers instead of collapsing to one.
         let both = ProviderKeys {
             anthropic_upstream: Some("foundry".to_owned()),
             openai_upstream: Some("azure".to_owned()),
             ..ProviderKeys::default()
         };
-        assert_eq!(both.worker_backend(), Some("foundry"));
+        assert_eq!(
+            both.worker_backends(),
+            BTreeMap::from([
+                ("anthropic".to_owned(), "foundry".to_owned()),
+                ("openai".to_owned(), "azure".to_owned()),
+            ])
+        );
+
+        assert!(ProviderKeys::default().worker_backends().is_empty());
     }
 
     #[test]

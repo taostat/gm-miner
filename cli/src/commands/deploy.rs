@@ -556,8 +556,11 @@ pub(crate) async fn cmd_deploy(
         })?;
     keys.validate_upstreams()?;
     // Derive once so the registry worker-create body and the local
-    // WorkerRecord persist exactly the same backend provenance.
-    let worker_backend = keys.worker_backend().map(str::to_owned);
+    // WorkerRecord persist exactly the same backend provenance. The registry
+    // body always sends the map (authoritative full state); the local record
+    // omits it when empty (a fully-direct worker).
+    let worker_backends = keys.worker_backends();
+    let recorded_backends = (!worker_backends.is_empty()).then(|| worker_backends.clone());
 
     // Step 1b: resolve the per-worker node secret. Each worker (CVM)
     // carries its own `x-gm-node-key` secret, never shared with a sibling
@@ -625,7 +628,7 @@ pub(crate) async fn cmd_deploy(
                 app_id: String::new(),
                 app_name: args.app_name.clone(),
                 node_secret: node_secret.clone(),
-                backend: worker_backend.clone(),
+                backends: recorded_backends.clone(),
                 provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
                 provisional_secondary,
             },
@@ -676,7 +679,7 @@ pub(crate) async fn cmd_deploy(
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
             node_secret: node_secret.clone(),
-            backend: worker_backend.clone(),
+            backends: recorded_backends.clone(),
             provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
             provisional_secondary,
         },
@@ -703,7 +706,7 @@ pub(crate) async fn cmd_deploy(
             os_image_hash: &verified.os_image_hash,
             endpoint: &actual.endpoint,
             node_secret: Some(&node_secret),
-            backend: worker_backend.as_deref(),
+            backends: Some(&worker_backends),
             provider_slots: (!provider_slots.is_empty()).then_some(&provider_slots),
             accepted_terms_version: Some(terms::CURRENT_TERMS_VERSION),
         },
@@ -722,7 +725,7 @@ pub(crate) async fn cmd_deploy(
             app_id: actual.app_id.clone(),
             app_name: args.app_name.clone(),
             node_secret: node_secret.clone(),
-            backend: worker_backend,
+            backends: recorded_backends,
             provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
             // Registered: role is read from position, never this flag.
             provisional_secondary: false,
@@ -823,7 +826,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
     let RegisterImageContext {
         node_secret,
         existing_app_name,
-        backend: register_backend,
+        backends: register_backends,
         provider_slots,
     } = register_image_context(&cfg, &mut client, app_id).await?;
 
@@ -888,11 +891,11 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
             endpoint: &endpoint,
             node_secret: node_secret.as_deref(),
             // register-image re-registers an already-existing worker. Reuse
-            // the backend recorded at deploy time so a recovery or resync
+            // the backends recorded at deploy time so a recovery or resync
             // preserves the worker's provenance instead of relabeling it from
             // whatever global config is current later. If no local record
             // exists, current config is only a best-effort fallback.
-            backend: register_backend.as_deref(),
+            backends: register_backends.as_ref(),
             provider_slots: provider_slots.as_ref(),
             // A register-image resync re-asserts the image, not the terms; the
             // registry keeps whatever acceptance the first deploy recorded.
@@ -919,7 +922,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
                 app_id: app_id.to_owned(),
                 app_name,
                 node_secret: secret,
-                backend: register_backend,
+                backends: register_backends,
                 provider_slots: provider_slots.clone(),
                 provisional_secondary: false,
             },
@@ -930,20 +933,27 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
     Ok(())
 }
 
-fn register_image_backend(record: Option<&WorkerRecord>, cfg: &Config) -> Option<String> {
+/// The backends `register-image` re-sends for a CVM: the recorded map for a
+/// tracked worker, else the current config's map. `None` (omitted) for a
+/// fully-direct worker, or for a record written before the per-provider map —
+/// in both cases the registry keeps its authoritative stored value rather than
+/// the CLI re-asserting a lossy guess that could narrow a mixed worker.
+fn register_image_backends(
+    record: Option<&WorkerRecord>,
+    cfg: &Config,
+) -> Option<std::collections::BTreeMap<String, String>> {
     if let Some(record) = record {
-        record.backend.clone()
+        record.backends.clone()
     } else {
-        cfg.provider_keys
-            .as_ref()
-            .and_then(|keys| keys.worker_backend().map(str::to_owned))
+        let backends = cfg.provider_keys.as_ref()?.worker_backends();
+        (!backends.is_empty()).then_some(backends)
     }
 }
 
 struct RegisterImageContext {
     node_secret: Option<String>,
     existing_app_name: Option<String>,
-    backend: Option<String>,
+    backends: Option<std::collections::BTreeMap<String, String>>,
     provider_slots: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
@@ -1001,7 +1011,7 @@ async fn register_image_context(
     Ok(RegisterImageContext {
         node_secret,
         existing_app_name: tracked.map(|w| w.app_name.clone()),
-        backend: register_image_backend(tracked, cfg),
+        backends: register_image_backends(tracked, cfg),
         provider_slots,
     })
 }
@@ -1070,8 +1080,11 @@ struct WorkerImageArgs<'a> {
     /// registry leaves any stored value untouched (a `register-image` for
     /// a worker whose secret the CLI does not track locally).
     node_secret: Option<&'a str>,
-    /// Worker provenance derived from configured upstream selectors.
-    backend: Option<&'a str>,
+    /// Per-provider cloud backends (`provider -> adapter`) derived from the
+    /// configured upstream selectors. `None` omits the field so the registry
+    /// keeps its stored value (a `register-image` resync of an untracked
+    /// direct worker); `deploy` always sends the map, even `{}`.
+    backends: Option<&'a std::collections::BTreeMap<String, String>>,
     /// Direct-upstream provider slot ids advertised to the registry.
     provider_slots: Option<&'a std::collections::BTreeMap<String, Vec<String>>>,
     /// The gm-miner-terms version the operator accepted, sent on the
@@ -1099,7 +1112,7 @@ async fn post_register_image(
         compose_hash: args.compose_hash,
         os_image_hash: args.os_image_hash,
         node_secret: args.node_secret,
-        backend: args.backend,
+        backends: args.backends,
         provider_slots: args.provider_slots,
     })
     .context("serialize register body")?;
@@ -1155,7 +1168,7 @@ async fn post_add_worker(
         compose_hash: args.compose_hash,
         os_image_hash: args.os_image_hash,
         node_secret: args.node_secret,
-        backend: args.backend,
+        backends: args.backends,
         provider_slots: args.provider_slots,
     })
     .context("serialize worker-add body")?;
@@ -1311,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn register_image_backend_uses_recorded_backend_over_current_config() {
+    fn register_image_backends_use_recorded_backends_over_current_config() {
         let cfg = cfg_with_keys(ProviderKeys {
             openai_upstream: Some("azure".to_owned()),
             azure_openai_api_key: Some("azure-key".to_owned()),
@@ -1322,12 +1335,21 @@ mod tests {
             app_id: "app_01J0A".to_owned(),
             app_name: "gm-miner-1".to_owned(),
             node_secret: "secret".to_owned(),
-            backend: Some("bedrock".to_owned()),
+            backends: Some(std::collections::BTreeMap::from([(
+                "anthropic".to_owned(),
+                "bedrock".to_owned(),
+            )])),
             ..Default::default()
         };
 
-        let backend = register_image_backend(Some(&record), &cfg);
-        assert_eq!(backend.as_deref(), Some("bedrock"));
+        let backends = register_image_backends(Some(&record), &cfg);
+        assert_eq!(
+            backends,
+            Some(std::collections::BTreeMap::from([(
+                "anthropic".to_owned(),
+                "bedrock".to_owned()
+            )]))
+        );
 
         let body = serde_json::to_value(WorkerCreateRequest {
             endpoint: "https://app_01J0A-8080s.dstack-prod5.phala.network",
@@ -1335,22 +1357,35 @@ mod tests {
             compose_hash: "a".repeat(64).as_str(),
             os_image_hash: "b".repeat(64).as_str(),
             node_secret: Some("secret"),
-            backend: backend.as_deref(),
+            backends: backends.as_ref(),
             provider_slots: None,
         })
         .expect("serialize register-image request");
-        assert_eq!(body["backend"], "bedrock");
+        assert_eq!(body["backends"]["anthropic"], "bedrock");
     }
 
     #[test]
-    fn register_image_backend_falls_back_to_current_config_without_record() {
+    fn register_image_backends_fall_back_to_current_config_without_record() {
         let cfg = cfg_with_keys(ProviderKeys {
+            anthropic_upstream: Some("foundry".to_owned()),
+            azure_foundry_api_key: Some("foundry-key".to_owned()),
             openai_upstream: Some("azure".to_owned()),
             azure_openai_api_key: Some("azure-key".to_owned()),
             ..ProviderKeys::default()
         });
 
-        assert_eq!(register_image_backend(None, &cfg).as_deref(), Some("azure"));
+        // A mixed worker with no local record re-derives both providers.
+        assert_eq!(
+            register_image_backends(None, &cfg),
+            Some(std::collections::BTreeMap::from([
+                ("anthropic".to_owned(), "foundry".to_owned()),
+                ("openai".to_owned(), "azure".to_owned()),
+            ]))
+        );
+
+        // A fully-direct config sends nothing so the registry keeps its stored value.
+        let direct = cfg_with_keys(ProviderKeys::default());
+        assert_eq!(register_image_backends(None, &direct), None);
     }
 
     // ── CVM-name collision preflight ─────────────────────────────────────────

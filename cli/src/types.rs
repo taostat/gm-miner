@@ -220,8 +220,13 @@ pub struct WorkerCreateRequest<'a> {
     /// `worker add` always carries the freshly-generated per-worker secret.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_secret: Option<&'a str>,
+    /// Per-provider `provider -> adapter` cloud backends. Sent explicitly on a
+    /// deploy — even as `{}` for a fully-direct worker — so the registry stores
+    /// authoritative state (a cloud→direct re-deploy narrows cleanly). `None`
+    /// omits the field: a `register-image` resync of a worker whose backends the
+    /// CLI does not track locally, leaving the registry's stored value untouched.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backend: Option<&'a str>,
+    pub backends: Option<&'a BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_slots: Option<&'a BTreeMap<String, Vec<String>>>,
 }

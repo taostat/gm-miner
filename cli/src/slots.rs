@@ -120,15 +120,17 @@ pub fn provider_slots_for_keys(
     node_secret: &str,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     validate_cloud_backend_single_keys(keys)?;
-    if let Some(backend) = keys.worker_backend() {
-        // v1: a cloud-backend worker is single-slot for EVERY provider —
-        // the registry rejects slot claims from backend workers and its
-        // control loop never probes them. Advertising slots for the
-        // direct providers (gemini, chutes, zai, the non-backend of
-        // anthropic/openai) would 422 the registration after the CVM has
-        // already launched, and multi-key values there would sit silently
-        // unused, so both are refused up front.
-        reject_multikey_for_cloud_backend(keys, backend)?;
+    let backends = keys.worker_backends();
+    if !backends.is_empty() {
+        // v1: a worker with any cloud backend is single-slot for EVERY provider
+        // — the registry rejects slot claims from backend workers and its
+        // control loop never probes them. Advertising slots for the direct
+        // providers (gemini, chutes, zai, the non-backend of anthropic/openai)
+        // would 422 the registration after the CVM has already launched, and
+        // multi-key values there would sit silently unused, so both are refused
+        // up front. A mixed worker (Claude on Foundry + GPT on Azure) is two
+        // cloud providers, so it too advertises no slots.
+        reject_multikey_for_cloud_backend(keys, &backends)?;
         return Ok(BTreeMap::new());
     }
 
@@ -189,11 +191,21 @@ pub fn validate_cloud_backend_single_keys(keys: &ProviderKeys) -> Result<()> {
 /// # Errors
 /// Returns an error naming the offending env var when any ACTIVE
 /// direct-provider key holds multiple segments.
-pub fn reject_multikey_for_cloud_backend(keys: &ProviderKeys, backend: &str) -> Result<()> {
+pub fn reject_multikey_for_cloud_backend(
+    keys: &ProviderKeys,
+    backends: &BTreeMap<String, String>,
+) -> Result<()> {
     for (var, value) in active_direct_keys(keys) {
         if has_semicolon(value) {
+            let adapters = backends
+                .values()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("/");
             bail!(
-                "{var} holds multiple keys but the {backend} cloud backend is selected;                  cloud-backend workers are single-slot in this release — drop the extra                  keys or the cloud backend"
+                "{var} holds multiple keys but the {adapters} cloud backend is selected;                  cloud-backend workers are single-slot in this release — drop the extra                  keys or the cloud backend"
             );
         }
     }

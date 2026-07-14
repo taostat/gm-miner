@@ -4,7 +4,7 @@
 //! Covers:
 //!   * `WorkerCreateRequest` serialises to the exact
 //!     `{endpoint, attestation_endpoint, compose_hash, os_image_hash,
-//!     node_secret, backend?}` body `POST /miners/{hotkey}/workers` expects.
+//!     node_secret, backends?}` body `POST /miners/{hotkey}/workers` expects.
 //!   * A wiremock-backed round-trip proves the body actually put on the
 //!     wire for `worker add` matches that shape and carries the per-worker
 //!     node secret.
@@ -39,7 +39,7 @@ fn worker_create_request_serialises_to_registry_shape() {
         compose_hash: "a".repeat(64).as_str(),
         os_image_hash: "b".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
-        backend: None,
+        backends: None,
         provider_slots: None,
     })
     .unwrap();
@@ -70,7 +70,7 @@ fn worker_create_request_omits_absent_node_secret() {
         compose_hash: "c".repeat(64).as_str(),
         os_image_hash: "d".repeat(64).as_str(),
         node_secret: None,
-        backend: None,
+        backends: None,
         provider_slots: None,
     })
     .unwrap();
@@ -93,24 +93,30 @@ fn worker_create_request_omits_absent_node_secret() {
 }
 
 #[test]
-fn worker_create_request_carries_bedrock_backend_from_config() {
+fn worker_create_request_carries_a_mixed_cloud_backends_map() {
+    // A worker serving Claude on Foundry AND GPT on Azure declares both
+    // providers — the case a single scalar could not express.
     let keys = ProviderKeys {
-        anthropic_upstream: Some("bedrock".to_owned()),
+        anthropic_upstream: Some("foundry".to_owned()),
         openai_upstream: Some("azure".to_owned()),
         ..ProviderKeys::default()
     };
+    let backends = keys.worker_backends();
     let body = serde_json::to_value(WorkerCreateRequest {
-        endpoint: "https://app_bedrock-8080s.dstack-prod5.phala.network",
-        attestation_endpoint: "https://app_bedrock-8080s.dstack-prod5.phala.network",
+        endpoint: "https://app_mixed-8080s.dstack-prod5.phala.network",
+        attestation_endpoint: "https://app_mixed-8080s.dstack-prod5.phala.network",
         compose_hash: "e".repeat(64).as_str(),
         os_image_hash: "f".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
-        backend: keys.worker_backend(),
+        backends: Some(&backends),
         provider_slots: None,
     })
     .unwrap();
 
-    assert_eq!(body["backend"], serde_json::json!("bedrock"));
+    assert_eq!(
+        body["backends"],
+        serde_json::json!({"anthropic": "foundry", "openai": "azure"})
+    );
 }
 
 #[test]
@@ -119,43 +125,45 @@ fn worker_create_request_carries_azure_backend_from_config() {
         openai_upstream: Some("azure".to_owned()),
         ..ProviderKeys::default()
     };
+    let backends = keys.worker_backends();
     let body = serde_json::to_value(WorkerCreateRequest {
         endpoint: "https://app_azure-8080s.dstack-prod5.phala.network",
         attestation_endpoint: "https://app_azure-8080s.dstack-prod5.phala.network",
         compose_hash: "1".repeat(64).as_str(),
         os_image_hash: "2".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
-        backend: keys.worker_backend(),
+        backends: Some(&backends),
         provider_slots: None,
     })
     .unwrap();
 
-    assert_eq!(body["backend"], serde_json::json!("azure"));
+    assert_eq!(body["backends"], serde_json::json!({"openai": "azure"}));
 }
 
 #[test]
-fn worker_create_request_omits_direct_backend_from_config() {
+fn worker_create_request_sends_empty_backends_for_direct_config() {
+    // A deploy sends the map authoritatively even when it is empty, so a
+    // later cloud→direct re-deploy narrows the registry's stored map cleanly
+    // instead of being read as "no map sent, keep what you have".
     let keys = ProviderKeys {
         anthropic_upstream: Some("direct".to_owned()),
         openai_upstream: Some("direct".to_owned()),
         ..ProviderKeys::default()
     };
+    let backends = keys.worker_backends();
+    assert!(backends.is_empty());
     let body = serde_json::to_value(WorkerCreateRequest {
         endpoint: "https://app_direct-8080s.dstack-prod5.phala.network",
         attestation_endpoint: "https://app_direct-8080s.dstack-prod5.phala.network",
         compose_hash: "3".repeat(64).as_str(),
         os_image_hash: "4".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
-        backend: keys.worker_backend(),
+        backends: Some(&backends),
         provider_slots: None,
     })
     .unwrap();
 
-    let obj = body.as_object().expect("body serialises to a JSON object");
-    assert!(
-        !obj.contains_key("backend"),
-        "direct workers omit backend instead of serialising null: {body}"
-    );
+    assert_eq!(body["backends"], serde_json::json!({}));
 }
 
 #[test]
@@ -173,7 +181,7 @@ fn worker_create_request_serialises_provider_slots_when_present() {
         compose_hash: "5".repeat(64).as_str(),
         os_image_hash: "6".repeat(64).as_str(),
         node_secret: Some("deadbeef"),
-        backend: None,
+        backends: None,
         provider_slots: Some(&provider_slots),
     })
     .unwrap();
@@ -294,7 +302,7 @@ async fn worker_add_puts_exact_body_with_per_worker_secret_on_the_wire() {
         compose_hash: "a".repeat(64).as_str(),
         os_image_hash: "b".repeat(64).as_str(),
         node_secret: Some("per-worker-secret"),
-        backend: None,
+        backends: None,
         provider_slots: None,
     })
     .unwrap();
