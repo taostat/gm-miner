@@ -113,6 +113,72 @@ impl FoundryArgs {
     }
 }
 
+/// True when any field in a settings group carries a value.
+fn any_set(fields: &[Option<&String>]) -> bool {
+    fields.iter().any(Option::is_some)
+}
+
+/// The `name: state` lines the summary prints, one per settings group that
+/// `set-api-keys` persists.
+///
+/// Every group this command can write appears here, so nothing is saved without
+/// being acknowledged. A group counts as configured when *any* of its fields is
+/// set — a partial group (`--bedrock-region` with no key yet) is reported, not
+/// silently swallowed. Selectors print their value (they are not secrets); keys
+/// only ever print `set`.
+fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut group = |name: &str, fields: &[Option<&String>]| {
+        if any_set(fields) {
+            lines.push(format!("  {name}: set"));
+        }
+    };
+
+    group("anthropic", &[keys.anthropic.as_ref()]);
+    group(
+        "bedrock",
+        &[keys.bedrock_region.as_ref(), keys.bedrock_api_key.as_ref()],
+    );
+    group(
+        "azure-foundry",
+        &[
+            keys.azure_foundry_endpoint.as_ref(),
+            keys.azure_foundry_api_key.as_ref(),
+            keys.azure_foundry_tenant_id.as_ref(),
+            keys.azure_foundry_subscription_id.as_ref(),
+            keys.azure_foundry_resource_group.as_ref(),
+            keys.azure_foundry_client_id.as_ref(),
+            keys.azure_foundry_client_secret.as_ref(),
+        ],
+    );
+    group("openai", &[keys.openai.as_ref()]);
+    group(
+        "azure-openai",
+        &[
+            keys.azure_openai_endpoint.as_ref(),
+            keys.azure_openai_api_key.as_ref(),
+            keys.azure_tenant_id.as_ref(),
+            keys.azure_subscription_id.as_ref(),
+            keys.azure_resource_group.as_ref(),
+            keys.azure_client_id.as_ref(),
+            keys.azure_client_secret.as_ref(),
+        ],
+    );
+    group("google", &[keys.google.as_ref()]);
+    group("chutes", &[keys.chutes.as_ref()]);
+    group("zai", &[keys.zai.as_ref()]);
+
+    for (name, selector) in [
+        ("anthropic-upstream", keys.anthropic_upstream.as_ref()),
+        ("openai-upstream", keys.openai_upstream.as_ref()),
+    ] {
+        if let Some(value) = selector {
+            lines.push(format!("  {name}: {value}"));
+        }
+    }
+    lines
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single CLI command handler validates, persists, and reports all provider settings"
@@ -191,16 +257,7 @@ pub(crate) fn cmd_set_api_keys(
     // Load → mutate → save under the lock so a concurrent `deploy` save can't
     // be clobbered, and re-read fresh inside the lock so we merge onto the
     // latest on-disk state rather than a snapshot taken before the lock.
-    let (
-        has_anthropic,
-        has_bedrock,
-        has_foundry,
-        has_openai,
-        has_azure,
-        has_google,
-        has_chutes,
-        has_zai,
-    ) = config::with_config_lock(|| {
+    let lines = config::with_config_lock(|| {
         let mut cfg = config::load()
             .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
 
@@ -261,71 +318,108 @@ pub(crate) fn cmd_set_api_keys(
         if let Some(k) = zai {
             keys.zai = Some(k);
         }
-        let snapshot = (
-            keys.anthropic.is_some(),
-            keys.bedrock_api_key.is_some(),
-            keys.azure_foundry_api_key.is_some()
-                || keys.azure_foundry_endpoint.is_some()
-                || keys.azure_foundry_tenant_id.is_some()
-                || keys.azure_foundry_subscription_id.is_some()
-                || keys.azure_foundry_resource_group.is_some()
-                || keys.azure_foundry_client_id.is_some()
-                || keys.azure_foundry_client_secret.is_some(),
-            keys.openai.is_some(),
-            keys.azure_openai_api_key.is_some()
-                || keys.azure_openai_endpoint.is_some()
-                || keys.azure_tenant_id.is_some()
-                || keys.azure_subscription_id.is_some()
-                || keys.azure_resource_group.is_some()
-                || keys.azure_client_id.is_some()
-                || keys.azure_client_secret.is_some(),
-            keys.google.is_some(),
-            keys.chutes.is_some(),
-            keys.zai.is_some(),
-        );
+        let lines = summary_lines(keys);
 
         config::save(&cfg).context("save config")?;
-        Ok(snapshot)
+        Ok(lines)
     })?;
 
-    let mut set_names: Vec<&str> = Vec::new();
-    if has_anthropic {
-        set_names.push("anthropic");
-    }
-    if has_bedrock {
-        set_names.push("bedrock");
-    }
-    if has_foundry {
-        set_names.push("azure-foundry");
-    }
-    if has_openai {
-        set_names.push("openai");
-    }
-    if has_azure {
-        set_names.push("azure-openai");
-    }
-    if has_google {
-        set_names.push("google");
-    }
-    if has_chutes {
-        set_names.push("chutes");
-    }
-    if has_zai {
-        set_names.push("zai");
-    }
-
-    // Report which providers are now configured — never print the values.
-    if set_names.is_empty() {
+    // Report what is now configured — never print a key's value.
+    if lines.is_empty() {
         println!(
             "No keys stored (pass --anthropic, --openai, --google, --chutes, --zai, \
-             --bedrock-api-key, or --azure-openai-api-key to set one)."
+             --bedrock-api-key, --azure-foundry-api-key, or --azure-openai-api-key to set one)."
         );
     } else {
         println!("Provider keys updated.");
-        for name in &set_names {
-            println!("  {name}: set");
+        for line in &lines {
+            println!("{line}");
         }
         println!("\nNext: gmcli deploy --image-repo ghcr.io/<owner>/gm-miner");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summary_lines;
+    use gm_miner_cli::config::ProviderKeys;
+
+    fn foundry_keys() -> ProviderKeys {
+        ProviderKeys {
+            anthropic_upstream: Some("foundry".to_owned()),
+            azure_foundry_endpoint: Some("https://acct.services.ai.azure.com".to_owned()),
+            azure_foundry_api_key: Some("foundry-key".to_owned()),
+            azure_foundry_tenant_id: Some("tenant".to_owned()),
+            azure_foundry_subscription_id: Some("sub".to_owned()),
+            azure_foundry_resource_group: Some("rg".to_owned()),
+            azure_foundry_client_id: Some("client".to_owned()),
+            azure_foundry_client_secret: Some("secret".to_owned()),
+            ..ProviderKeys::default()
+        }
+    }
+
+    #[test]
+    fn foundry_group_is_reported_alongside_previously_stored_keys() {
+        let keys = ProviderKeys {
+            chutes: Some("cpk-1".to_owned()),
+            zai: Some("zai-1".to_owned()),
+            ..foundry_keys()
+        };
+
+        assert_eq!(
+            summary_lines(&keys),
+            [
+                "  azure-foundry: set",
+                "  chutes: set",
+                "  zai: set",
+                "  anthropic-upstream: foundry",
+            ]
+        );
+    }
+
+    #[test]
+    fn foundry_group_is_reported_when_only_one_field_is_set() {
+        let mut keys = foundry_keys();
+        keys.anthropic_upstream = None;
+        keys.azure_foundry_endpoint = None;
+        keys.azure_foundry_api_key = None;
+        keys.azure_foundry_tenant_id = None;
+        keys.azure_foundry_subscription_id = None;
+        keys.azure_foundry_resource_group = None;
+        keys.azure_foundry_client_id = None;
+
+        assert_eq!(summary_lines(&keys), ["  azure-foundry: set"]);
+    }
+
+    #[test]
+    fn bedrock_region_alone_is_reported() {
+        // The region is persisted, so the summary must acknowledge it rather
+        // than claim nothing was stored.
+        let keys = ProviderKeys {
+            bedrock_region: Some("us-west-2".to_owned()),
+            ..ProviderKeys::default()
+        };
+
+        assert_eq!(summary_lines(&keys), ["  bedrock: set"]);
+    }
+
+    #[test]
+    fn azure_openai_group_is_reported_from_any_field() {
+        let keys = ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            azure_tenant_id: Some("tenant".to_owned()),
+            ..ProviderKeys::default()
+        };
+
+        assert_eq!(
+            summary_lines(&keys),
+            ["  azure-openai: set", "  openai-upstream: azure"]
+        );
+    }
+
+    #[test]
+    fn nothing_set_reports_no_lines() {
+        assert!(summary_lines(&ProviderKeys::default()).is_empty());
+    }
 }
