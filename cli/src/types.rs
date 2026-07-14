@@ -246,6 +246,12 @@ pub struct WorkerEntry {
     pub endpoint: String,
     pub status: String,
     pub last_attestation_at: Option<String>,
+    /// When the registry created this worker row, RFC 3339. The oldest live
+    /// worker is the miner's worker #1 — the row `POST /miners/register`
+    /// refreshes — so this is what orders the live list (see
+    /// [`first_live_worker_id`](crate::workers::first_live_worker_id)).
+    #[serde(default)]
+    pub created_at: Option<String>,
     #[serde(default)]
     pub last_seen_at: Option<String>,
     #[serde(default)]

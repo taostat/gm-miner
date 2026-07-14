@@ -67,6 +67,10 @@ impl PhalaClient for StubPhala {
             app_id: "app_x".to_owned(),
         })
     }
+
+    fn existing_cvm_app_id(&self) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// A stub that simulates a deploy that always times out (hashes never appear).
@@ -88,6 +92,10 @@ impl PhalaClient for TimedOutPhala {
              increase --boot-timeout-secs or check the Phala Cloud dashboard"
         )
     }
+
+    fn existing_cvm_app_id(&self) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// A stub that always returns an error (simulates a deploy failure).
@@ -103,6 +111,10 @@ impl PhalaClient for FailingPhala {
         _boot_timeout_secs: u64,
     ) -> anyhow::Result<DeployOutcome> {
         anyhow::bail!("phala deploy exited with status 1");
+    }
+
+    fn existing_cvm_app_id(&self) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 }
 

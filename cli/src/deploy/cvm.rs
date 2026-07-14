@@ -41,6 +41,19 @@ pub trait PhalaClient {
         registry_creds: Option<&RegistryCredentials>,
         boot_timeout_secs: u64,
     ) -> Result<DeployOutcome>;
+
+    /// The Phala Cloud `app_id` of a CVM already deployed under this client's
+    /// `--name`, or `None` when the workspace has no such CVM.
+    ///
+    /// `phala deploy` refuses to reuse a CVM name ("A CVM with name '<name>'
+    /// already exists in this workspace"), so `deploy` / `worker add` probe
+    /// this *before* the image build and stop with the exact teardown command
+    /// rather than failing minutes later inside `phala deploy`.
+    ///
+    /// # Errors
+    /// Returns an error if `phala` cannot be spawned, or it exits successfully
+    /// but emits output that is not valid `cvms get --json` JSON.
+    fn existing_cvm_app_id(&self) -> Result<Option<String>>;
 }
 
 /// Shells out to `phala deploy` and parses the resulting
@@ -493,6 +506,18 @@ impl PhalaClient for RealPhalaClient {
         );
 
         poll_phala_cvm_outcome(&self.app_name, self.api_key.as_deref(), boot_timeout_secs)
+    }
+
+    fn existing_cvm_app_id(&self) -> Result<Option<String>> {
+        // `phala cvms get` accepts a CVM *name*: a zero exit with an `app_id`
+        // means the workspace already holds a CVM under this `--name`. A
+        // non-zero exit (no such CVM) is the clean, expected "free name" case.
+        let out = phala_command(self.api_key.as_deref())
+            .args(["cvms", "get", &self.app_name, "--json"])
+            .output()
+            .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
+
+        parse_phala_cvm_app_id(out.status.success(), &out.stdout)
     }
 }
 
