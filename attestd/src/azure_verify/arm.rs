@@ -10,7 +10,7 @@ use super::endpoint::AzureEndpoint;
 const MANAGEMENT_SCOPE: &str = "https://management.azure.com/.default";
 /// Newest stable `Microsoft.CognitiveServices` version. Needed at >= 2025-06-01
 /// for `accounts/projects`, which the Foundry capture-surface sweep enumerates.
-const ARM_API_VERSION: &str = "2026-05-01";
+pub(crate) const ARM_API_VERSION: &str = "2026-05-01";
 /// `Microsoft.Insights/diagnosticSettings` has only ever shipped as this
 /// preview version; there is no stable one.
 const DIAGNOSTIC_SETTINGS_API_VERSION: &str = "2021-05-01-preview";

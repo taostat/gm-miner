@@ -7,7 +7,7 @@ use serde_json::Value;
 pub(crate) use self::streaming::{
     assess_streaming_configuration, log_streaming_assessment, split_azure_governed_deployments,
 };
-use super::arm::{ArmAccount, ArmChildResource, DiagnosticSettingsList};
+use super::arm::{ArmAccount, ArmChildResource, DiagnosticSettingsList, ARM_API_VERSION};
 use super::config::AzureProvider;
 use super::endpoint::AzureEndpoint;
 
@@ -194,9 +194,16 @@ pub(crate) fn assert_no_diagnostic_capture(
 /// hosts redirect Agent-Service storage to operator-owned stores. An
 /// inference-only account needs neither, so the safe rule is "none", which also
 /// fails closed on connection categories that do not exist yet.
+///
+/// Azure attaches an Application Insights connection to any AI Foundry resource
+/// created through the portal, so an operator who followed the default path hits
+/// this check on their first boot, after paying for a CVM. The failure therefore
+/// names each offending child and prints the exact ARM call that deletes it — an
+/// unactionable message here is a crashloop with no way out.
 pub(crate) fn assert_no_capture_children(
     provider: AzureProvider,
     scope: &str,
+    resource_id: &str,
     collection: &str,
     children: &[ArmChildResource],
 ) -> Result<()> {
@@ -210,12 +217,30 @@ pub(crate) fn assert_no_capture_children(
             None => child.name.clone(),
         })
         .collect();
+    // `az` ships no delete verb for these collections, so removal is a raw ARM
+    // call. A child's id is the scope's id plus the collection and the name, and
+    // the scope is the project's id when the child hangs off a project — a
+    // delete aimed at the account would 404 and leave the miner just as stuck.
+    let deletions: Vec<String> = children
+        .iter()
+        .map(|child| {
+            format!(
+                "  az rest --method delete --url \"https://management.azure.com{resource_id}/{collection}/{}?api-version={ARM_API_VERSION}\"",
+                child.name,
+            )
+        })
+        .collect();
     bail!(
         "{} {scope} has {} {collection} ({}). A gm miner's Azure account must have none — they \
-         are the sinks prompt content would be captured to. Remove them, then redeploy.",
+         are the sinks prompt content would be captured to, and Azure attaches an Application \
+         Insights connection to every AI Foundry resource created through the portal. Remove \
+         them, then redeploy:\n{}\n  az rest --method get --url \
+         \"https://management.azure.com{resource_id}/{collection}?api-version={ARM_API_VERSION}\" \
+          # expect: value == []",
         provider.label(),
         children.len(),
         named.join(", "),
+        deletions.join("\n"),
     )
 }
 
@@ -512,12 +537,20 @@ mod tests {
         serde_json::from_str(json).expect("fixture must parse")
     }
 
+    const ACCOUNT_ID: &str =
+        "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct";
+    const PROJECT_ID: &str = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/acct/projects/p1";
+
     #[test]
     fn foundry_rejects_any_connection_including_app_insights() {
-        assert!(
-            assert_no_capture_children(AzureProvider::Foundry, "account", "connections", &[])
-                .is_ok()
-        );
+        assert!(assert_no_capture_children(
+            AzureProvider::Foundry,
+            "account",
+            ACCOUNT_ID,
+            "connections",
+            &[]
+        )
+        .is_ok());
 
         let app_insights = children_from_json(
             r#"[{"name": "telemetry", "properties": {"category": "AppInsights"}}]"#,
@@ -525,6 +558,7 @@ mod tests {
         let err = assert_no_capture_children(
             AzureProvider::Foundry,
             "project 'p1'",
+            PROJECT_ID,
             "connections",
             &app_insights,
         )
@@ -540,6 +574,7 @@ mod tests {
         assert!(assert_no_capture_children(
             AzureProvider::Foundry,
             "account",
+            ACCOUNT_ID,
             "connections",
             &blob
         )
@@ -549,10 +584,67 @@ mod tests {
         assert!(assert_no_capture_children(
             AzureProvider::Foundry,
             "account",
+            ACCOUNT_ID,
             "connections",
             &unknown
         )
         .is_err());
+    }
+
+    /// Azure attaches an App Insights connection to every portal-created Foundry
+    /// resource, so this is the failure nearly every operator meets — and it
+    /// fires at CVM boot. Without the deletion command in the message there is no
+    /// way out of the crashloop, so assert the exact command, per offending child.
+    #[test]
+    fn a_rejected_connection_carries_the_command_that_deletes_it() {
+        let children = children_from_json(
+            r#"[
+                {"name": "hello0323resourceappiafzvcx", "properties": {"category": "AppInsights"}},
+                {"name": "store", "properties": {"category": "AzureBlob"}}
+            ]"#,
+        );
+        let err = assert_no_capture_children(
+            AzureProvider::Foundry,
+            "account",
+            ACCOUNT_ID,
+            "connections",
+            &children,
+        )
+        .expect_err("connections must fail")
+        .to_string();
+
+        for name in ["hello0323resourceappiafzvcx", "store"] {
+            let expected = format!(
+                "az rest --method delete --url \"https://management.azure.com{ACCOUNT_ID}/connections/{name}?api-version={ARM_API_VERSION}\"",
+            );
+            assert!(err.contains(&expected), "{err}");
+        }
+        // The WHY survives alongside the how-to-fix.
+        assert!(
+            err.contains("sinks prompt content would be captured to"),
+            "{err}"
+        );
+    }
+
+    /// A capability host hangs off the project, not the account, so its deletion
+    /// command must be built from the PROJECT's resource id — a delete aimed at
+    /// the account would 404 and leave the miner exactly as stuck.
+    #[test]
+    fn a_rejected_project_child_deletes_at_the_project_scope() {
+        let hosts = children_from_json(r#"[{"name": "agents", "properties": {}}]"#);
+        let err = assert_no_capture_children(
+            AzureProvider::Foundry,
+            "project 'p1'",
+            PROJECT_ID,
+            "capabilityHosts",
+            &hosts,
+        )
+        .expect_err("a capability host must fail")
+        .to_string();
+        let expected = format!(
+            "az rest --method delete --url \"https://management.azure.com{PROJECT_ID}/capabilityHosts/agents?api-version={ARM_API_VERSION}\"",
+        );
+        assert!(err.contains(&expected), "{err}");
     }
 
     /// The capture rule is a property of the account, not of the upstream: an
@@ -587,6 +679,7 @@ mod tests {
         let err = assert_no_capture_children(
             AzureProvider::Foundry,
             "project 'p1'",
+            PROJECT_ID,
             "capabilityHosts",
             &hosts,
         )
