@@ -33,7 +33,7 @@ declaration, and price management.
 cd cli   # or from repo root
 
 # build
-cargo build --release -p gm-miner-cli
+cargo build --release -p gmcli
 
 # lint
 cargo clippy --all-targets --all-features -- -D warnings
@@ -42,7 +42,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 
 # tests (wiremock for registry HTTP; no real Phala Cloud / docker required)
-cargo test -p gm-miner-cli
+cargo test -p gmcli
 ```
 
 ## Subcommands
