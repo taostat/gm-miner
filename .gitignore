@@ -14,3 +14,6 @@ __pycache__/
 
 # local scratch artifacts
 /test_b64
+
+# agent worktrees
+.claude/worktrees/
