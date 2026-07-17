@@ -65,7 +65,7 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// (`DSTACK_DOCKER_*`) are
 /// excluded: the gm image is public and those vars do not appear in
 /// `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 24] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 25] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -89,6 +89,7 @@ const CANONICAL_ALLOWED_ENVS: [&str; 24] = [
     "GOOGLE_API_KEY",
     "CHUTES_API_KEY",
     "ZAI_API_KEY",
+    "MOONSHOT_API_KEY",
     "GM_NODE_SECRET",
 ];
 

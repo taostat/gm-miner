@@ -219,6 +219,9 @@ fn configured_providers(keys: Option<&ProviderKeys>) -> Result<Vec<Provider>> {
     if non_empty(keys.zai.as_deref()) {
         providers.push(Provider::Zai);
     }
+    if non_empty(keys.moonshot.as_deref()) {
+        providers.push(Provider::Moonshot);
+    }
     Ok(providers)
 }
 
@@ -338,6 +341,7 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::Gemini => "gemini-2.5-pro",
         Provider::Chutes => "deepseek-ai/DeepSeek-V3-0324",
         Provider::Zai => "glm-5.2",
+        Provider::Moonshot => "kimi-k3",
         Provider::Benchmark => "benchmark",
     }
 }
@@ -358,7 +362,7 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
         Provider::Gemini => {
             openai_compatible_probe(provider, model, "/v1beta/openai/chat/completions")
         }
-        Provider::OpenAI | Provider::Chutes | Provider::Zai => {
+        Provider::OpenAI | Provider::Chutes | Provider::Zai | Provider::Moonshot => {
             openai_compatible_probe(provider, model, "/v1/chat/completions")
         }
         Provider::Benchmark => openai_compatible_probe(provider, model, "/v1/chat/completions"),

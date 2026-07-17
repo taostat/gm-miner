@@ -107,6 +107,7 @@ pub fn render_env_file(
         ("GOOGLE_API_KEY", env_vars.google.as_deref()),
         ("CHUTES_API_KEY", env_vars.chutes.as_deref()),
         ("ZAI_API_KEY", env_vars.zai.as_deref()),
+        ("MOONSHOT_API_KEY", env_vars.moonshot.as_deref()),
     ] {
         lines.push_str(name);
         lines.push('=');
@@ -410,6 +411,7 @@ mod tests {
                 "GOOGLE_API_KEY",
                 "CHUTES_API_KEY",
                 "ZAI_API_KEY",
+                "MOONSHOT_API_KEY",
                 "GM_NODE_SECRET",
             ],
             "the env file must declare every canonical name in CANONICAL_ALLOWED_ENVS order"

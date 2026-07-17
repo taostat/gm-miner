@@ -160,7 +160,7 @@ fn provider_keys_check(cfg: &Config) -> Check {
     let Some(keys) = cfg.provider_keys.as_ref() else {
         return Check::fail(
             "Provider keys usable",
-            "no usable provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google / --chutes / --zai, or configure Bedrock/Azure upstreams)",
+            "no usable provider keys — run `gmcli set-api-keys --anthropic <key>` (and/or --openai / --google / --chutes / --zai / --moonshot, or configure Bedrock/Azure upstreams)",
         );
     };
     if !keys.any_set() {
