@@ -167,6 +167,7 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
     group("google", &[keys.google.as_ref()]);
     group("chutes", &[keys.chutes.as_ref()]);
     group("zai", &[keys.zai.as_ref()]);
+    group("moonshot", &[keys.moonshot.as_ref()]);
 
     for (name, selector) in [
         ("anthropic-upstream", keys.anthropic_upstream.as_ref()),
@@ -202,6 +203,7 @@ pub(crate) fn cmd_set_api_keys(
     google: Option<String>,
     chutes: Option<String>,
     zai: Option<String>,
+    moonshot: Option<String>,
 ) -> Result<()> {
     // Reject empty values up front so they don't pass the deploy preflight.
     if let Some(ref k) = anthropic {
@@ -252,6 +254,9 @@ pub(crate) fn cmd_set_api_keys(
     }
     if let Some(ref k) = zai {
         validate_key("zai", k)?;
+    }
+    if let Some(ref k) = moonshot {
+        validate_key("moonshot", k)?;
     }
 
     // Load → mutate → save under the lock so a concurrent `deploy` save can't
@@ -318,6 +323,9 @@ pub(crate) fn cmd_set_api_keys(
         if let Some(k) = zai {
             keys.zai = Some(k);
         }
+        if let Some(k) = moonshot {
+            keys.moonshot = Some(k);
+        }
         let lines = summary_lines(keys);
 
         config::save(&cfg).context("save config")?;
@@ -327,7 +335,7 @@ pub(crate) fn cmd_set_api_keys(
     // Report what is now configured — never print a key's value.
     if lines.is_empty() {
         println!(
-            "No keys stored (pass --anthropic, --openai, --google, --chutes, --zai, \
+            "No keys stored (pass --anthropic, --openai, --google, --chutes, --zai, --moonshot, \
              --bedrock-api-key, --azure-foundry-api-key, or --azure-openai-api-key to set one)."
         );
     } else {

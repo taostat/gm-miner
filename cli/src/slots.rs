@@ -125,7 +125,7 @@ pub fn provider_slots_for_keys(
         // v1: a worker with any cloud backend is single-slot for EVERY provider
         // — the registry rejects slot claims from backend workers and its
         // control loop never probes them. Advertising slots for the direct
-        // providers (gemini, chutes, zai, the non-backend of anthropic/openai)
+        // providers (gemini, chutes, zai, moonshot, the non-backend of anthropic/openai)
         // would 422 the registration after the CVM has already launched, and
         // multi-key values there would sit silently unused, so both are refused
         // up front. A mixed worker (Claude on Foundry + GPT on Azure) is two
@@ -149,6 +149,12 @@ pub fn provider_slots_for_keys(
     add_provider_slots(&mut slots, "gemini", keys.google.as_deref(), node_secret)?;
     add_provider_slots(&mut slots, "chutes", keys.chutes.as_deref(), node_secret)?;
     add_provider_slots(&mut slots, "zai", keys.zai.as_deref(), node_secret)?;
+    add_provider_slots(
+        &mut slots,
+        "moonshot",
+        keys.moonshot.as_deref(),
+        node_secret,
+    )?;
     Ok(slots)
 }
 
@@ -235,7 +241,7 @@ pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
 /// The direct-provider key env vars the deployed image would actually
 /// read: keys sidelined by a cloud upstream selector are excluded, so a
 /// stale semicolon value there never blocks a deploy.
-fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 5] {
+fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 6] {
     let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
     let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
     [
@@ -250,6 +256,7 @@ fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 5] 
         ("GOOGLE_API_KEY", keys.google.as_deref()),
         ("CHUTES_API_KEY", keys.chutes.as_deref()),
         ("ZAI_API_KEY", keys.zai.as_deref()),
+        ("MOONSHOT_API_KEY", keys.moonshot.as_deref()),
     ]
 }
 
