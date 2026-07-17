@@ -211,18 +211,18 @@ mod tests {
 
     /// The testnet image ref whose `app_compose` hashes to the registry's
     /// approved baseline below — the gm-published public miner image for the
-    /// current supported release (v0.3.9-dev). Must track the newest supported
+    /// current supported release (v0.3.9). Must track the newest supported
     /// image version: when a new `ImageVersion` is published, bump both this
     /// ref and `REGISTRY_TESTNET_COMPOSE_HASH` to the live registry row.
     const TESTNET_IMAGE_REF: &str =
-        "ghcr.io/taostat/gm-miner@sha256:732f50e49fa97fb9410eb54030585c196ea629cf52e94321b1630855519a3faf";
+        "ghcr.io/taostat/gm-miner@sha256:e9dd652713cb09c29e0c04700ac8bf5a4384591c4b61a265a8385606d15a5181";
 
     /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
     /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
     /// keys, cloud upstream settings, and node secret).
     ///
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "46e9e07aa65e4466b02605e065a69958e85947e65077d7dcad1c11e27b78a6cb";
+        "751f09099594c8fb6875fe032d8a9f3f4976d5ec32bfd7ce874591e508ce0cf3";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
