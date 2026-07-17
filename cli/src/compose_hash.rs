@@ -211,26 +211,18 @@ mod tests {
 
     /// The testnet image ref whose `app_compose` hashes to the registry's
     /// approved baseline below — the gm-published public miner image for the
-    /// current supported release (v0.3.2-dev). Must track the newest supported
+    /// current supported release (v0.3.8-dev). Must track the newest supported
     /// image version: when a new `ImageVersion` is published, bump both this
     /// ref and `REGISTRY_TESTNET_COMPOSE_HASH` to the live registry row.
     const TESTNET_IMAGE_REF: &str =
-        "ghcr.io/taostat/gm-miner@sha256:a673cae5dc892fea3649d6542cd57946557a11cef7ab88a8742c96f316d3a82b";
+        "ghcr.io/taostat/gm-miner@sha256:4153cc00c555add9349c355d50eca24c48fe58d9781027c4e7106a9fb7b64a70";
 
     /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
     /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
     /// keys, cloud upstream settings, and node secret).
     ///
-    /// Pre-publication anchor: `MOONSHOT_API_KEY` joined `allowed_envs`, so
-    /// this hash is not yet a live registry row.
-    ///
-    /// Rollout: rebuild the image (the template changes move the digest),
-    /// publish the new `ImageVersion` (`gmcli publish-image-version`), bump
-    /// `TESTNET_IMAGE_REF` and this anchor to the live registry row, redeploy
-    /// the live testnet miners, confirm attestation matches, then retire the
-    /// old `add557ae` row.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "04fb2e55d934da2e44a8c127962a7b9d21e0da130fcebf37b35721be2cd775d3";
+        "10292f91a4c09ad306379bbe04ad7af2628aa8ba8094e8efcc00b83297ae008d";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
