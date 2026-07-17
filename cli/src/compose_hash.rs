@@ -221,8 +221,16 @@ mod tests {
     /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
     /// keys, cloud upstream settings, and node secret).
     ///
+    /// Pre-publication anchor: `MOONSHOT_API_KEY` joined `allowed_envs`, so
+    /// this hash is not yet a live registry row.
+    ///
+    /// Rollout: rebuild the image (the template changes move the digest),
+    /// publish the new `ImageVersion` (`gmcli publish-image-version`), bump
+    /// `TESTNET_IMAGE_REF` and this anchor to the live registry row, redeploy
+    /// the live testnet miners, confirm attestation matches, then retire the
+    /// old `add557ae` row.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "add557aee8790e1af9f195ca8e737878608f2fd3f2d84f9f46d55144acd5db82";
+        "04fb2e55d934da2e44a8c127962a7b9d21e0da130fcebf37b35721be2cd775d3";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
