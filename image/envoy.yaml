@@ -184,6 +184,26 @@ static_resources:
                 ##  offer h2.
                 codec_type: AUTO
                 use_remote_address: true
+                ## ── Per-request idle timeout ─────────────────────────
+                ##  Raised from Envoy's implicit 300s default to 1800s, to
+                ##  match the per-route total `timeout` below. Envoy resets
+                ##  this timer only on bytes crossing the stream, so a
+                ##  request that is silent on the miner→upstream hop for the
+                ##  whole generation trips it — and two common cases are
+                ##  legitimately silent for many minutes: a `stream: false`
+                ##  request (the upstream buffers the whole completion and
+                ##  sends it at the end) and a buffering upstream like Azure
+                ##  gpt-5.5 (silent, then one burst). At 300s either would
+                ##  be cut mid-generation on a long reasoning item. Setting
+                ##  both this idle timeout and the route total to 1800s
+                ##  bounds every request at 30 minutes whether it streams
+                ##  continuously or sits silent then bursts. The tradeoff is
+                ##  explicit: a genuinely hung connection is now held for up
+                ##  to 1800s rather than 300s — Envoy cannot distinguish a
+                ##  silently-reasoning upstream from a hung one on this hop,
+                ##  so supporting long silent reasoning costs the longer
+                ##  hung-connection bound.
+                stream_idle_timeout: 1800s
                 ## ── HTTP/1.1 stream-level error isolation ───────────
                 ##  Without this, a malformed HTTP/1.1 request closes
                 ##  the whole connection. The HTTP/2 codec's equivalent
@@ -326,12 +346,18 @@ static_resources:
                                 regex: "^/v1/messages$"
                               substitution: "/anthropic/v1/messages"
                             ## gm:anthropic-path-rewrite-end
-                            ##  Upstream response timeout. Sized above the gateway's
-                            ##  request deadline so a slow/buffered upstream — e.g. Azure
-                            ##  gpt-5.5 at high reasoning effort, which returns the whole
-                            ##  completion in one burst — is not cut off mid-generation.
-                            ##  Applied uniformly across the provider routes below.
-                            timeout: 620s
+                            ##  Total request/response duration cap. Raised to 1800s so a
+                            ##  long single-item reasoning stream — o3, kimi-k3 or a
+                            ##  Qwen-thinking model on a hard item flows reasoning tokens
+                            ##  continuously for 10–20 minutes — completes instead of being
+                            ##  guillotined mid-generation at the old 620s total. Paired with
+                            ##  the data-plane HCM's stream_idle_timeout above, also 1800s:
+                            ##  the total bounds a continuously-streaming request, the idle
+                            ##  timeout the silent ones (a `stream: false` request or a
+                            ##  buffering upstream like Azure gpt-5.5, silent then one burst),
+                            ##  which an idle-only cap would cut mid-generation. Applied
+                            ##  uniformly across the provider routes below.
+                            timeout: 1800s
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -369,7 +395,7 @@ static_resources:
                                 regex: "^/v1/chat/completions$"
                               substitution: "/openai/v1/chat/completions"
                             ## gm:openai-path-rewrite-end
-                            timeout: 620s
+                            timeout: 1800s
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -396,7 +422,7 @@ static_resources:
                           route:
                             cluster: chutes
                             host_rewrite_literal: llm.chutes.ai
-                            timeout: 620s
+                            timeout: 1800s
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -421,7 +447,7 @@ static_resources:
                                 google_re2: {}
                                 regex: "^/v1/(.*)$"
                               substitution: "/api/paas/v4/\\1"
-                            timeout: 620s
+                            timeout: 1800s
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -443,7 +469,7 @@ static_resources:
                           route:
                             cluster: moonshot
                             host_rewrite_literal: api.moonshot.ai
-                            timeout: 620s
+                            timeout: 1800s
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -463,7 +489,7 @@ static_resources:
                           route:
                             cluster: gemini
                             host_rewrite_literal: generativelanguage.googleapis.com
-                            timeout: 620s
+                            timeout: 1800s
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -487,7 +513,7 @@ static_resources:
                           route:
                             cluster: benchmark
                             host_rewrite_literal: __GM_BENCHMARK_HOST__
-                            timeout: 620s
+                            timeout: 1800s
                           request_headers_to_remove:
                             - authorization
                             - x-gm-request-id
