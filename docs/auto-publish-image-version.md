@@ -51,7 +51,7 @@ provider keys, the Anthropic/OpenAI cloud upstream selectors and cloud
 settings, plus the node secret (`ANTHROPIC_API_KEY`, `ANTHROPIC_UPSTREAM`,
 `BEDROCK_REGION`, `BEDROCK_API_KEY`, `OPENAI_API_KEY`, `OPENAI_UPSTREAM`,
 `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
-`GOOGLE_API_KEY`, `CHUTES_API_KEY`, `ZAI_API_KEY`, `MOONSHOT_API_KEY`, `GM_NODE_SECRET`), with no private-registry
+`GOOGLE_API_KEY`, `CHUTES_API_KEY`, `ZAI_API_KEY`, `MOONSHOT_API_KEY`, `DEEPINFRA_API_KEY`, `GM_NODE_SECRET`), with no private-registry
 pull credentials. Multi-key slots use semicolon-separated values inside those
 same direct key names, so changing key count or key order does not change the
 allowed-env set. The registry's approved baseline is keyed on it.

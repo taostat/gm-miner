@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "733a2497170dc97bd13417ce1b3e8754050b817172317c01e6f541551a97cb94";
+    "825327bd3c410c5944cdfae8bbdef1647edf78c563e6c9865a7ba854580e59fb";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -43,7 +43,7 @@ from there. Older commits are not separately patched.
 
 The miner container (`image/`) runs inside an Intel TDX Trusted Execution
 Environment (TEE) on Phala Cloud. Provider API keys (Anthropic, OpenAI,
-Google, Chutes, Z.ai, Moonshot) are baked into the container's encrypted environment at deploy time
+Google, Chutes, Z.ai, Moonshot, DeepInfra) are baked into the container's encrypted environment at deploy time
 via `gmcli set-api-keys` and are never transmitted to gm operators or the
 registry. Reports that concern the confidentiality or integrity guarantees
 of the TEE boundary — attestation verification, key handling, or enclave

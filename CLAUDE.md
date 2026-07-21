@@ -51,7 +51,7 @@ cargo test -p gmcli
 | Command | Purpose |
 |---|---|
 | `init` | Guided onboarding wizard: register hotkey → login → set keys → deploy → declare products, skipping steps already done |
-| `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot) and cloud-upstream selectors (Bedrock, Microsoft Foundry, Azure OpenAI) to `~/.gmcli/config.json` |
+| `set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra) and cloud-upstream selectors (Bedrock, Microsoft Foundry, Azure OpenAI) to `~/.gmcli/config.json` |
 | `deploy` | Full trust-correct deploy: build/push image + Phala Cloud deploy + hash verification + image registration |
 | `login` | Device-code OAuth flow; stores access token in config |
 | `register-hotkey` | Record the serving hotkey: `--hotkey-ss58` records one registered elsewhere; otherwise (`--wallet`/`--hotkey`) resolves the local btcli hotkey, checks the metagraph, and prints the `btcli subnet register` command for the operator to run — gmcli never signs |

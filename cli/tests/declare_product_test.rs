@@ -140,6 +140,13 @@ fn provider_from_str_accepts_zai() {
 }
 
 #[test]
+fn provider_from_str_accepts_deepinfra() {
+    let provider = Provider::from_str("deepinfra").unwrap();
+    assert_eq!(provider, Provider::DeepInfra);
+    assert_eq!(provider.as_str(), "deepinfra");
+}
+
+#[test]
 fn product_catalog_response_parses_wrapper_shape() {
     // GET /products returns ProductCatalogResponse, NOT a bare array —
     // matches the new OpenAPI schema (registry/openapi.json post-PR-C).

@@ -327,7 +327,7 @@ pub(crate) async fn cmd_login(
     println!("Login successful ({} network).", cfg.resolved_network());
     println!("Credentials saved to {}", config::config_path().display());
     println!(
-        "\nNext: gmcli set-api-keys --anthropic <key>  (and/or --openai / --google / --chutes / --zai / --moonshot)"
+        "\nNext: gmcli set-api-keys --anthropic <key>  (and/or --openai / --google / --chutes / --zai / --moonshot / --deepinfra)"
     );
     Ok(())
 }

@@ -550,7 +550,7 @@ pub(crate) async fn cmd_deploy(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no provider keys; run `gmcli set-api-keys \
-                 --anthropic <key>` (and/or --openai / --google / --chutes / --zai / --moonshot, \
+                 --anthropic <key>` (and/or --openai / --google / --chutes / --zai / --moonshot / --deepinfra, \
                  or configure --anthropic-upstream bedrock / --openai-upstream azure) first"
             )
         })?;

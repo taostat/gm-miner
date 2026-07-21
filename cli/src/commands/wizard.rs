@@ -311,6 +311,7 @@ fn wizard_provider_keys(
         && keys.chutes.is_none()
         && keys.zai.is_none()
         && keys.moonshot.is_none()
+        && keys.deepinfra.is_none()
     {
         println!("  No keys entered — skipping. Set them later with `gmcli set-api-keys`.");
         return Ok(WizardFlow::Continue);
@@ -351,6 +352,7 @@ fn wizard_provider_keys(
             keys.chutes,
             keys.zai,
             keys.moonshot,
+            keys.deepinfra,
         )
     )
 }
@@ -382,6 +384,7 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         chutes: prompt_line("Chutes API key (blank to skip):", assume_yes)?,
         zai: prompt_line("Z.ai API key (blank to skip):", assume_yes)?,
         moonshot: prompt_line("Moonshot API key (blank to skip):", assume_yes)?,
+        deepinfra: prompt_line("DeepInfra API key (blank to skip):", assume_yes)?,
     })
 }
 
@@ -418,6 +421,9 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     }
     if keys.moonshot.is_some() {
         cmd.push_str(" --moonshot <key>");
+    }
+    if keys.deepinfra.is_some() {
+        cmd.push_str(" --deepinfra <key>");
     }
     cmd
 }
