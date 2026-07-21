@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "825327bd3c410c5944cdfae8bbdef1647edf78c563e6c9865a7ba854580e59fb";
+    "989a7b540b86fc2776b0119bc092715f01bd8893ebbd19dfb315e1a69ac485be";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,6 +62,27 @@ fn direct_unset_render_matches_pinned_output() {
     assert!(rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
     assert!(!rendered.contains("sk-ant-direct"));
     assert!(!rendered.contains("value: \"%ENVIRONMENT(ANTHROPIC_API_KEY)%\""));
+}
+
+#[test]
+fn deepinfra_cluster_forces_http1_not_h2() {
+    // api.deepinfra.com negotiates only http/1.1 (ALPN), so the deepinfra
+    // upstream must use http_protocol_options; a copy of zai's h2 config
+    // (http2_protocol_options) resets the connection and 503s every route.
+    let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant-direct")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let block = rendered
+        .split_once("- name: deepinfra")
+        .and_then(|(_, rest)| rest.split_once("\n    - name:"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        block.contains("http_protocol_options: {}"),
+        "deepinfra cluster must force http/1.1"
+    );
+    assert!(
+        !block.contains("http2_protocol_options"),
+        "deepinfra upstream is http/1.1-only; h2 resets the connection"
+    );
 }
 
 #[test]
