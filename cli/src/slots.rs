@@ -155,6 +155,12 @@ pub fn provider_slots_for_keys(
         keys.moonshot.as_deref(),
         node_secret,
     )?;
+    add_provider_slots(
+        &mut slots,
+        "deepinfra",
+        keys.deepinfra.as_deref(),
+        node_secret,
+    )?;
     Ok(slots)
 }
 
@@ -241,7 +247,7 @@ pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
 /// The direct-provider key env vars the deployed image would actually
 /// read: keys sidelined by a cloud upstream selector are excluded, so a
 /// stale semicolon value there never blocks a deploy.
-fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 6] {
+fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 7] {
     let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
     let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
     [
@@ -257,6 +263,7 @@ fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 6] 
         ("CHUTES_API_KEY", keys.chutes.as_deref()),
         ("ZAI_API_KEY", keys.zai.as_deref()),
         ("MOONSHOT_API_KEY", keys.moonshot.as_deref()),
+        ("DEEPINFRA_API_KEY", keys.deepinfra.as_deref()),
     ]
 }
 
@@ -420,17 +427,29 @@ mod tests {
             anthropic: Some("sk-ant-a;sk-ant-b".to_owned()),
             google: Some("AIza".to_owned()),
             zai: Some("zai-key".to_owned()),
+            deepinfra: Some("di-a;di-b".to_owned()),
             ..ProviderKeys::default()
         };
         let slots = provider_slots_for_keys(&keys, SECRET).expect("slots");
         assert_eq!(
             slots.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["anthropic", "gemini", "zai"]
+            vec!["anthropic", "deepinfra", "gemini", "zai"]
         );
         assert_eq!(slots["anthropic"].len(), 2);
         assert_eq!(slots["gemini"].len(), 1);
         assert_eq!(slots["zai"].len(), 1);
+        assert_eq!(slots["deepinfra"].len(), 2);
         assert!(!slots.contains_key("openai"));
+    }
+
+    #[test]
+    fn deepinfra_direct_multikey_is_advertised() {
+        let keys = ProviderKeys {
+            deepinfra: Some("di-key-a;di-key-b".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("slots");
+        assert_eq!(slots["deepinfra"].len(), 2);
     }
 
     #[test]

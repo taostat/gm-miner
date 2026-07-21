@@ -6,13 +6,13 @@ identical behavior; miners supply upstream API capacity and earn the spread. The
 inside an Intel TDX TEE so neither operators nor host machines see buyer content or miners'
 upstream keys.
 
-You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, or Bedrock/Azure behind
+You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, or Bedrock/Azure behind
 the existing Anthropic/OpenAI routes) and your own funded [Phala Cloud](https://cloud.phala.network)
 account. The `gmcli` tool handles the full operator lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Miner container image with six provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic or AWS Bedrock; OpenAI can target direct OpenAI or Azure OpenAI. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs two co-located processes: the attestation server (serves `GET /attestation/info` with a fresh TDX quote) and the envoy data plane (proxies provider traffic and exposes `/stats/prometheus`). |
+| `image/` | Miner container image with seven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic or AWS Bedrock; OpenAI can target direct OpenAI or Azure OpenAI. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs two co-located processes: the attestation server (serves `GET /attestation/info` with a fresh TDX quote) and the envoy data plane (proxies provider traffic and exposes `/stats/prometheus`). |
 | `cli/` | `gmcli` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. Runs operator-side from a laptop, not inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -94,7 +94,7 @@ Credentials are stored in `~/.gmcli/config.json`.
 
 ### 3. Set your provider API keys
 
-Your provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot) are baked into the miner container at
+Your provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra) are baked into the miner container at
 deploy time and stay inside the TEE — gm never sees them. Set the keys for whichever providers you
 intend to serve:
 
@@ -104,6 +104,7 @@ gmcli set-api-keys --openai sk-... --google AIza...
 gmcli set-api-keys --chutes cpk-...
 gmcli set-api-keys --zai zai-...
 gmcli set-api-keys --moonshot sk-...
+gmcli set-api-keys --deepinfra ...
 ```
 
 Each flag replaces the stored value; omitted flags leave existing values intact.
@@ -277,7 +278,7 @@ gmcli worker remove <worker_id>
 | `gmcli login` | Device-code OAuth login; stores credentials in `~/.gmcli/config.json` |
 | `gmcli register-hotkey` | Record the serving hotkey (`--hotkey-ss58` or assisted via btcli) |
 | `gmcli deploy` | Full deploy: fetch approved image, launch Phala CVM, verify hashes, register worker |
-| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot) |
+| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra) |
 | `gmcli declare-product` | Declare a single model offer with a discount |
 | `gmcli declare-products` | Fan one discount across the catalog or one provider's slice |
 | `gmcli status` | Registration state + per-product eligibility and rates |

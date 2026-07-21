@@ -478,6 +478,34 @@ static_resources:
                             - x-gm-provider
                             - x-gm-upstream-slot
 
+                        ## ── DeepInfra ───────────────────────────────────────
+                        ##  Enabled only when DEEPINFRA_API_KEY is set.
+                        ##  DeepInfra's OpenAI-compatible surface lives under
+                        ##  /v1/openai (not /v1), so the inbound /v1/... path is
+                        ##  rewritten to /v1/openai/... before it leaves.
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "deepinfra"
+                          route:
+                            cluster: deepinfra
+                            host_rewrite_literal: api.deepinfra.com
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/(.*)$"
+                              substitution: "/v1/openai/\\1"
+                            timeout: 1800s
+                          request_headers_to_remove:
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                            - x-gm-upstream-slot
+
                         ## ── Gemini ──────────────────────────────────────────
                         ##  Enabled only when GOOGLE_API_KEY is set.
                         - match:
@@ -603,6 +631,12 @@ static_resources:
                               default_env = __GM_MOONSHOT_DEFAULT_SLOT_ENV__,
                               slots = __GM_MOONSHOT_SLOT_MAP__,
                             },
+                            deepinfra = {
+                              cloud = false,
+                              direct_env = "DEEPINFRA_API_KEY",
+                              default_env = __GM_DEEPINFRA_DEFAULT_SLOT_ENV__,
+                              slots = __GM_DEEPINFRA_SLOT_MAP__,
+                            },
                           }
 
                           local function json_escape(value)
@@ -657,6 +691,8 @@ static_resources:
                             elseif provider == "zai" then
                               headers:add("authorization", "Bearer " .. key)
                             elseif provider == "moonshot" then
+                              headers:add("authorization", "Bearer " .. key)
+                            elseif provider == "deepinfra" then
                               headers:add("authorization", "Bearer " .. key)
                             end
                           end
@@ -1114,6 +1150,39 @@ static_resources:
                 - san_type: DNS
                   matcher:
                     exact: api.moonshot.ai
+
+    ## ── DeepInfra ─────────────────────────────────────────────────────
+    - name: deepinfra
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: deepinfra
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: api.deepinfra.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: api.deepinfra.com
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: api.deepinfra.com
 
     ## ── Gemini ────────────────────────────────────────────────────────
     - name: gemini

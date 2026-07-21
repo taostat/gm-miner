@@ -98,6 +98,7 @@ services:
       - CHUTES_API_KEY
       - ZAI_API_KEY
       - MOONSHOT_API_KEY
+      - DEEPINFRA_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
       ## Active network — `testnet` or `mainnet`. Rendered as a literal

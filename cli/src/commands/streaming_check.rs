@@ -222,6 +222,9 @@ fn configured_providers(keys: Option<&ProviderKeys>) -> Result<Vec<Provider>> {
     if non_empty(keys.moonshot.as_deref()) {
         providers.push(Provider::Moonshot);
     }
+    if non_empty(keys.deepinfra.as_deref()) {
+        providers.push(Provider::DeepInfra);
+    }
     Ok(providers)
 }
 
@@ -342,6 +345,7 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::Chutes => "deepseek-ai/DeepSeek-V3-0324",
         Provider::Zai => "glm-5.2",
         Provider::Moonshot => "kimi-k3",
+        Provider::DeepInfra => "zai-org/GLM-5.2",
         Provider::Benchmark => "benchmark",
     }
 }
@@ -362,10 +366,12 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
         Provider::Gemini => {
             openai_compatible_probe(provider, model, "/v1beta/openai/chat/completions")
         }
-        Provider::OpenAI | Provider::Chutes | Provider::Zai | Provider::Moonshot => {
-            openai_compatible_probe(provider, model, "/v1/chat/completions")
-        }
-        Provider::Benchmark => openai_compatible_probe(provider, model, "/v1/chat/completions"),
+        Provider::OpenAI
+        | Provider::Chutes
+        | Provider::Zai
+        | Provider::Moonshot
+        | Provider::DeepInfra
+        | Provider::Benchmark => openai_compatible_probe(provider, model, "/v1/chat/completions"),
     }
 }
 
@@ -708,6 +714,21 @@ mod tests {
         assert_eq!(probe.path, "/v1/chat/completions");
         assert_eq!(probe.body["model"], Value::String("glm-5.2".to_owned()));
         assert_eq!(probe.model, "glm-5.2");
+    }
+
+    #[test]
+    fn deepinfra_probe_uses_openai_compatible_route_and_model() {
+        let model = ProbeModel {
+            canonical: fallback_model(&Provider::DeepInfra).to_owned(),
+            upstream: None,
+        };
+        let probe = build_probe(Provider::DeepInfra, &model);
+        assert_eq!(probe.path, "/v1/chat/completions");
+        assert_eq!(
+            probe.body["model"],
+            Value::String("zai-org/GLM-5.2".to_owned())
+        );
+        assert_eq!(probe.model, "zai-org/GLM-5.2");
     }
 
     #[test]

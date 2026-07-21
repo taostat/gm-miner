@@ -338,6 +338,8 @@ pub struct ProviderKeys {
     pub zai: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moonshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deepinfra: Option<String>,
 }
 
 /// True when `v` holds a non-empty, non-whitespace value. `Some("")` and
@@ -471,6 +473,7 @@ impl ProviderKeys {
             || non_empty(self.chutes.as_deref())
             || non_empty(self.zai.as_deref())
             || non_empty(self.moonshot.as_deref())
+            || non_empty(self.deepinfra.as_deref())
     }
 
     /// Reject a selected cloud upstream that is missing fields `start.sh`
