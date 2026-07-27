@@ -62,10 +62,8 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// not values, so every miner produces the same `compose_hash`. The order
 /// matches `render_env_file`: Anthropic direct/Bedrock, `OpenAI` direct/Azure,
 /// Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, node secret.
-/// Private-registry
-/// pull credentials (`DSTACK_DOCKER_*`) are
-/// excluded: the gm image is public and those vars do not appear in
-/// `allowed_envs`.
+/// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
+/// gm image is public and those vars do not appear in `allowed_envs`.
 const CANONICAL_ALLOWED_ENVS: [&str; 27] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
