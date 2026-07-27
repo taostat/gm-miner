@@ -54,15 +54,7 @@ pub(crate) async fn cmd_declare_product(
     } else {
         let source = resolve_source(client, provider, model).await?;
         post_declare_product(client, provider, model, discount_bp, upstream_model).await?;
-        declaration_lines(
-            &format!(
-                "{provider}/{model}  (sources → {}/{})",
-                source.buyer_provider, source.buyer_model
-            ),
-            "Retail (buyer)",
-            &source.retail_price.dimensions,
-            discount_bp,
-        )
+        source_declaration_lines(provider, model, &source, discount_bp)
     };
 
     for line in lines {
@@ -70,6 +62,38 @@ pub(crate) async fn cmd_declare_product(
     }
     println!("\nNext: gmcli status   (confirm the offer)");
     Ok(())
+}
+
+/// The declaration summary for a sourcing route: the buyer-retail economics,
+/// plus a warning when no worker serves the route yet.
+///
+/// A route with no capable worker is declarable but earns nothing — the
+/// registry routes only to workers advertising the upstream — and the plain
+/// summary is indistinguishable from a working offer's.
+fn source_declaration_lines(
+    provider: &Provider,
+    model: &str,
+    source: &SourceProduct,
+    discount_bp: u32,
+) -> Vec<String> {
+    let mut lines = declaration_lines(
+        &format!(
+            "{provider}/{model}  (sources → {}/{})",
+            source.buyer_provider, source.buyer_model
+        ),
+        "Retail (buyer)",
+        &source.retail_price.dimensions,
+        discount_bp,
+    );
+    if source.capable_worker_count == 0 {
+        lines.push(
+            "  ! No worker of yours is currently serving this route, so the offer will".to_owned(),
+        );
+        lines.push(
+            "    sit ineligible until one does — `gmcli status` names the reason.".to_owned(),
+        );
+    }
+    lines
 }
 
 /// Find the product among the miner's sourcing routes, or reject it.
@@ -81,8 +105,9 @@ async fn resolve_source(
     provider: &Provider,
     model: &str,
 ) -> Result<SourceProduct> {
-    let sources = fetch_sources(client).await?;
-    sources
+    fetch_sources(client)
+        .await?
+        .into_routes()
         .into_iter()
         .find(|s| s.provider == provider.as_str() && s.model == model)
         .ok_or_else(|| {
@@ -428,12 +453,21 @@ mod tests {
         }
     }
 
+    /// The registry's real `PriceBlock`: every response carries `modifiers`
+    /// and `surcharges` beside `dimensions`, so the fixture must too or a
+    /// future shape change would pass here and fail on the wire.
     fn retail(input_ndollars: u64, output_ndollars: u64) -> serde_json::Value {
         serde_json::json!({
             "dimensions": {
                 "input_per_mtok_ndollars": input_ndollars,
                 "output_per_mtok_ndollars": output_ndollars,
-            }
+                "cache_read_per_mtok_ndollars": null,
+                "cache_write_5m_per_mtok_ndollars": null,
+            },
+            "modifiers": {"batch_multiplier_bps": 5000},
+            "surcharges": {
+                "anthropic_web_search": {"kind": "per_event", "unit_ndollars": 10_000_000_u64},
+            },
         })
     }
 
@@ -593,6 +627,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_registry_without_the_sources_endpoint_keeps_the_typo_error() {
+        // The registry deploy and the CLI release are separate events, so
+        // every miner on the new CLI meets a 404 here for a window. A typo
+        // must still read as a typo, not as "sources failed (404 Not Found)".
+        let server = MockServer::start().await;
+        mount_catalog(&server, serde_json::json!([])).await;
+        Mock::given(method("GET"))
+            .and(path("/miners/products/sources"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "detail": "Not Found",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/miners/products"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_declare_product(&mut client, &Provider::OpenAI, "gpt-typo", 500, None)
+            .await
+            .expect_err("a typo'd model must not be declared");
+
+        assert!(
+            err.to_string().contains("unknown product openai/gpt-typo"),
+            "got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("404"),
+            "the rollout gap must not leak a raw status; got: {err}"
+        );
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
+    }
+
     #[test]
     fn a_catalog_declaration_keeps_its_layout() {
         let dims = RetailDimensions {
@@ -611,21 +681,25 @@ mod tests {
         );
     }
 
+    fn glm_route(capable_worker_count: u32) -> SourceProduct {
+        serde_json::from_value(serde_json::json!({
+            "provider": "deepinfra",
+            "model": "zai-org/GLM-5.2",
+            "buyer_provider": "zai",
+            "buyer_model": "glm-5.2",
+            "retail_price": retail(1_400_000_000, 4_400_000_000),
+            "capable_worker_count": capable_worker_count,
+            "already_offered": false,
+        }))
+        .expect("decode sourcing route")
+    }
+
     #[test]
     fn a_source_declaration_is_priced_off_the_buyer_retail() {
         // Settlement basis is the buyer product (zai/glm-5.2) at $1.40/$4.40,
         // never what deepinfra charges the miner for the same tokens.
-        let buyer_retail = RetailDimensions {
-            input_per_mtok_ndollars: 1_400_000_000,
-            output_per_mtok_ndollars: 4_400_000_000,
-        };
         assert_eq!(
-            declaration_lines(
-                "deepinfra/zai-org/GLM-5.2  (sources → zai/glm-5.2)",
-                "Retail (buyer)",
-                &buyer_retail,
-                500,
-            ),
+            source_declaration_lines(&Provider::DeepInfra, "zai-org/GLM-5.2", &glm_route(1), 500),
             vec![
                 "deepinfra/zai-org/GLM-5.2  (sources → zai/glm-5.2)",
                 "  Retail (buyer)  : $1.400 input / $4.400 output per Mtok",
@@ -634,6 +708,17 @@ mod tests {
                 "  → ok",
             ]
         );
+    }
+
+    #[test]
+    fn a_route_no_worker_serves_declares_with_a_warning_not_a_bare_ok() {
+        let rendered =
+            source_declaration_lines(&Provider::DeepInfra, "zai-org/GLM-5.2", &glm_route(0), 500)
+                .join("\n");
+
+        assert!(rendered.contains("No worker of yours is currently serving this route"));
+        assert!(rendered.contains("sit ineligible until one does"));
+        assert!(rendered.contains("gmcli status"));
     }
 
     #[test]
