@@ -161,6 +161,7 @@ pub fn provider_slots_for_keys(
         keys.deepinfra.as_deref(),
         node_secret,
     )?;
+    add_provider_slots(&mut slots, "kubetee", keys.kubetee.as_deref(), node_secret)?;
     Ok(slots)
 }
 
@@ -247,7 +248,7 @@ pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
 /// The direct-provider key env vars the deployed image would actually
 /// read: keys sidelined by a cloud upstream selector are excluded, so a
 /// stale semicolon value there never blocks a deploy.
-fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 7] {
+fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 8] {
     let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
     let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
     [
@@ -264,6 +265,7 @@ fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 7] 
         ("ZAI_API_KEY", keys.zai.as_deref()),
         ("MOONSHOT_API_KEY", keys.moonshot.as_deref()),
         ("DEEPINFRA_API_KEY", keys.deepinfra.as_deref()),
+        ("KUBETEE_API_KEY", keys.kubetee.as_deref()),
     ]
 }
 
@@ -440,6 +442,16 @@ mod tests {
         assert_eq!(slots["zai"].len(), 1);
         assert_eq!(slots["deepinfra"].len(), 2);
         assert!(!slots.contains_key("openai"));
+    }
+
+    #[test]
+    fn kubetee_direct_multikey_is_advertised() {
+        let keys = ProviderKeys {
+            kubetee: Some("kt-key-a;kt-key-b".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("slots");
+        assert_eq!(slots["kubetee"].len(), 2);
     }
 
     #[test]

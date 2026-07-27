@@ -169,6 +169,7 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
     group("zai", &[keys.zai.as_ref()]);
     group("moonshot", &[keys.moonshot.as_ref()]);
     group("deepinfra", &[keys.deepinfra.as_ref()]);
+    group("kubetee", &[keys.kubetee.as_ref()]);
 
     for (name, selector) in [
         ("anthropic-upstream", keys.anthropic_upstream.as_ref()),
@@ -206,6 +207,7 @@ pub(crate) fn cmd_set_api_keys(
     zai: Option<String>,
     moonshot: Option<String>,
     deepinfra: Option<String>,
+    kubetee: Option<String>,
 ) -> Result<()> {
     // Reject empty values up front so they don't pass the deploy preflight.
     if let Some(ref k) = anthropic {
@@ -262,6 +264,9 @@ pub(crate) fn cmd_set_api_keys(
     }
     if let Some(ref k) = deepinfra {
         validate_key("deepinfra", k)?;
+    }
+    if let Some(ref k) = kubetee {
+        validate_key("kubetee", k)?;
     }
 
     // Load → mutate → save under the lock so a concurrent `deploy` save can't
@@ -334,6 +339,9 @@ pub(crate) fn cmd_set_api_keys(
         if let Some(k) = deepinfra {
             keys.deepinfra = Some(k);
         }
+        if let Some(k) = kubetee {
+            keys.kubetee = Some(k);
+        }
         let lines = summary_lines(keys);
 
         config::save(&cfg).context("save config")?;
@@ -344,7 +352,7 @@ pub(crate) fn cmd_set_api_keys(
     if lines.is_empty() {
         println!(
             "No keys stored (pass --anthropic, --openai, --google, --chutes, --zai, --moonshot, \
-             --deepinfra, --bedrock-api-key, --azure-foundry-api-key, or --azure-openai-api-key to set one)."
+             --deepinfra, --kubetee, --bedrock-api-key, --azure-foundry-api-key, or --azure-openai-api-key to set one)."
         );
     } else {
         println!("Provider keys updated.");

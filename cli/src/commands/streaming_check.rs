@@ -225,6 +225,9 @@ fn configured_providers(keys: Option<&ProviderKeys>) -> Result<Vec<Provider>> {
     if non_empty(keys.deepinfra.as_deref()) {
         providers.push(Provider::DeepInfra);
     }
+    if non_empty(keys.kubetee.as_deref()) {
+        providers.push(Provider::Kubetee);
+    }
     Ok(providers)
 }
 
@@ -346,6 +349,7 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::Zai => "glm-5.2",
         Provider::Moonshot => "kimi-k3",
         Provider::DeepInfra => "zai-org/GLM-5.2",
+        Provider::Kubetee => "moonshotai/kimi-k3",
         Provider::Benchmark => "benchmark",
     }
 }
@@ -371,6 +375,7 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
         | Provider::Zai
         | Provider::Moonshot
         | Provider::DeepInfra
+        | Provider::Kubetee
         | Provider::Benchmark => openai_compatible_probe(provider, model, "/v1/chat/completions"),
     }
 }
@@ -714,6 +719,21 @@ mod tests {
         assert_eq!(probe.path, "/v1/chat/completions");
         assert_eq!(probe.body["model"], Value::String("glm-5.2".to_owned()));
         assert_eq!(probe.model, "glm-5.2");
+    }
+
+    #[test]
+    fn kubetee_probe_uses_openai_compatible_route_and_model() {
+        let model = ProbeModel {
+            canonical: fallback_model(&Provider::Kubetee).to_owned(),
+            upstream: None,
+        };
+        let probe = build_probe(Provider::Kubetee, &model);
+        assert_eq!(probe.path, "/v1/chat/completions");
+        assert_eq!(
+            probe.body["model"],
+            Value::String("moonshotai/kimi-k3".to_owned())
+        );
+        assert_eq!(probe.model, "moonshotai/kimi-k3");
     }
 
     #[test]
