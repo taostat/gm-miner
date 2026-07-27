@@ -13,6 +13,7 @@ pub mod keys;
 pub mod persist;
 pub mod pricing;
 pub mod products;
+pub mod sources;
 pub mod streaming_check;
 pub mod wizard;
 

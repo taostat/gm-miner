@@ -14,6 +14,7 @@
 //!   status           — registration state + per-product eligibility and rates
 //!                      (the hidden `list-products` alias runs the same code)
 //!   pricing          — rank your offers against the eligible field
+//!   sources          — list the sourcing routes you can serve
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
 //!   worker list      — list the hotkey's live workers
 //!   worker remove    — deregister a worker (CVM teardown is separate)
@@ -60,6 +61,7 @@ use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::pricing::cmd_pricing;
 use crate::commands::products::{cmd_declare_product, cmd_declare_products, cmd_status};
+use crate::commands::sources::cmd_sources;
 use crate::commands::streaming_check::cmd_check_streaming;
 use crate::commands::wizard::cmd_init;
 
@@ -371,18 +373,23 @@ enum Command {
 
     /// Declare a single miner-product offer.
     ///
-    /// One POST to `/miners/products`. For batch declarations against the
-    /// whole catalog (or one provider's slice), use `declare-products`.
+    /// One POST to `/miners/products`. The offer can be a buyer product from
+    /// the catalog, or a sourcing route from `gmcli sources` — a route settles
+    /// on the buyer product's retail, which the output names. For batch
+    /// declarations against the whole catalog (or one provider's slice), use
+    /// `declare-products`.
     #[command(after_help = "Examples:\n  \
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 --upstream-model us.anthropic.claude-sonnet-4-6-v1\n  \
-        gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5")]
+        gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5\n  \
+        gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5   # a sourcing route; see `gmcli sources`")]
     DeclareProduct {
         /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, or deepinfra.
         #[arg(long)]
         provider: Provider,
 
-        /// Model identifier, e.g. `claude-sonnet-4-6`.
+        /// Model identifier, e.g. `claude-sonnet-4-6`. For a sourcing route
+        /// this is the upstream's model id, e.g. `zai-org/GLM-5.2`.
         #[arg(long)]
         model: String,
 
@@ -443,6 +450,18 @@ enum Command {
         gmcli pricing\n  \
         gmcli --network testnet pricing")]
     Pricing,
+
+    /// List the sourcing routes you can serve.
+    ///
+    /// A sourcing route serves a buyer product from a cheaper upstream you
+    /// hold a key for: you are paid the buyer product's retail less your
+    /// discount, and keep the difference from what the upstream charges you.
+    /// Shows each route's buyer product and retail, whether one of your
+    /// workers holds the key, and whether you already offer it.
+    #[command(after_help = "Examples:\n  \
+        gmcli sources\n  \
+        gmcli --network testnet sources")]
+    Sources,
 
     /// Show your miner's current chain emission on the subnet.
     ///
@@ -777,6 +796,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_pricing(&mut client).await
+        }
+        Command::Sources => {
+            let cfg = load_config(explicit_network, api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            let mut client = RegistryClient::new(cfg);
+            cmd_sources(&mut client).await
         }
         Command::Earnings { yes } => {
             let cfg = load_config(explicit_network, api_url)?;

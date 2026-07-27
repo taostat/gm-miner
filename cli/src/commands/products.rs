@@ -11,11 +11,11 @@ use gm_miner_cli::{
     },
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest,
-        ProductOfferStatus, Provider,
+        ProductOfferStatus, Provider, RetailDimensions, SourceProduct,
     },
 };
 
-use crate::commands::{get_me_json, status_error};
+use crate::commands::{get_me_json, sources::fetch_sources, status_error};
 
 /// `gmcli declare-product` — POST one (provider, model, `discount_bp`)
 /// offer to `/miners/products`. The registry treats POST as upsert, so this
@@ -26,6 +26,10 @@ use crate::commands::{get_me_json, status_error};
 /// extra HTTP call also catches "unknown product" before the POST goes
 /// out, which lets the CLI fail with a clearer error than the registry's
 /// generic 404.
+///
+/// A product the catalog does not carry may still be a sourcing route — the
+/// registry keeps those out of the buyer-facing `GET /products` — so the
+/// miner's routes are consulted before the declaration is rejected.
 pub(crate) async fn cmd_declare_product(
     client: &mut RegistryClient,
     provider: &Provider,
@@ -34,38 +38,103 @@ pub(crate) async fn cmd_declare_product(
     upstream_model: Option<&str>,
 ) -> Result<()> {
     let catalog = fetch_catalog(client).await?;
-    let product = catalog
+    let catalog_hit = catalog
         .products
         .iter()
-        .find(|p| &p.provider == provider && p.model == model)
-        .ok_or_else(|| anyhow::anyhow!("{provider}/{model} is not in the registry catalog"))?;
+        .find(|p| &p.provider == provider && p.model == model);
 
-    post_declare_product(client, provider, model, discount_bp, upstream_model).await?;
+    let lines = if let Some(product) = catalog_hit {
+        post_declare_product(client, provider, model, discount_bp, upstream_model).await?;
+        declaration_lines(
+            &format!("{provider}/{model}"),
+            "Retail",
+            &product.retail_price.dimensions,
+            discount_bp,
+        )
+    } else {
+        let source = resolve_source(client, provider, model).await?;
+        post_declare_product(client, provider, model, discount_bp, upstream_model).await?;
+        declaration_lines(
+            &format!(
+                "{provider}/{model}  (sources → {}/{})",
+                source.buyer_provider, source.buyer_model
+            ),
+            "Retail (buyer)",
+            &source.retail_price.dimensions,
+            discount_bp,
+        )
+    };
 
-    let dims = &product.retail_price.dimensions;
-    let retail_in = format_per_mtok_usd(dims.input_per_mtok_ndollars);
-    let retail_out = format_per_mtok_usd(dims.output_per_mtok_ndollars);
+    for line in lines {
+        println!("{line}");
+    }
+    println!("\nNext: gmcli status   (confirm the offer)");
+    Ok(())
+}
+
+/// Find the product among the miner's sourcing routes, or reject it.
+///
+/// Reached only after the catalog missed, so failing here means the product
+/// exists nowhere and no POST is issued.
+async fn resolve_source(
+    client: &mut RegistryClient,
+    provider: &Provider,
+    model: &str,
+) -> Result<SourceProduct> {
+    let sources = fetch_sources(client).await?;
+    sources
+        .into_iter()
+        .find(|s| s.provider == provider.as_str() && s.model == model)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown product {provider}/{model} — it is in neither the buyer catalog \
+                 nor your sourcing routes (`gmcli sources`)"
+            )
+        })
+}
+
+/// The declaration summary: retail, the declared discount, and the per-Mtok
+/// rate the miner receives.
+///
+/// `retail_label` names *which* retail the numbers are. A sourcing route
+/// settles on the buyer product's retail, not the upstream's, and the miner
+/// has to be able to tell the two apart on sight.
+fn declaration_lines(
+    header: &str,
+    retail_label: &str,
+    retail: &RetailDimensions,
+    discount_bp: u32,
+) -> Vec<String> {
+    let width = retail_label.len().max("You receive".len()) + 2;
+    let retail_in = format_per_mtok_usd(retail.input_per_mtok_ndollars);
+    let retail_out = format_per_mtok_usd(retail.output_per_mtok_ndollars);
     let eff_in = format_per_mtok_usd(effective_per_mtok_ndollars(
-        dims.input_per_mtok_ndollars,
+        retail.input_per_mtok_ndollars,
         discount_bp,
     ));
     let eff_out = format_per_mtok_usd(effective_per_mtok_ndollars(
-        dims.output_per_mtok_ndollars,
+        retail.output_per_mtok_ndollars,
         discount_bp,
     ));
     // What the miner keeps per token, as a percentage of retail. With
     // discount_bp = 0 this reads "100%"; at the 99.90% cap this is
     // "0.1% of retail" — the minimum positive payout.
-    let kept_bp = 10_000_u32.saturating_sub(discount_bp);
-    let kept_pct = format_discount_pct(kept_bp);
+    let kept_pct = format_discount_pct(10_000_u32.saturating_sub(discount_bp));
 
-    println!("{provider}/{model}");
-    println!("  Retail       : {retail_in} input / {retail_out} output per Mtok");
-    println!("  Declared     : {}% off", format_discount_pct(discount_bp));
-    println!("  You receive  : {eff_in} input / {eff_out} output per Mtok ({kept_pct}% of retail)");
-    println!("  → ok");
-    println!("\nNext: gmcli status   (confirm the offer)");
-    Ok(())
+    vec![
+        header.to_owned(),
+        format!("  {retail_label:<width$}: {retail_in} input / {retail_out} output per Mtok"),
+        format!(
+            "  {:<width$}: {}% off",
+            "Declared",
+            format_discount_pct(discount_bp)
+        ),
+        format!(
+            "  {:<width$}: {eff_in} input / {eff_out} output per Mtok ({kept_pct}% of retail)",
+            "You receive"
+        ),
+        "  → ok".to_owned(),
+    ]
 }
 
 /// `gmcli declare-products` — fan a single discount out over the catalog.
@@ -80,6 +149,11 @@ pub(crate) async fn cmd_declare_product(
 /// Per-product failures do not abort the loop. The function returns `Ok(())`
 /// when every POST succeeded and an aggregated error otherwise so the CLI
 /// exits non-zero on partial failure.
+///
+/// Deliberately catalog-only: sourcing routes are not swept in here. A source
+/// offer commits the miner to buying from a specific upstream with a key it
+/// holds, so it stays a single, explicit `declare-product` — see
+/// `gmcli sources`.
 pub(crate) async fn cmd_declare_products(
     client: &mut RegistryClient,
     provider_filter: Option<&Provider>,
@@ -321,10 +395,245 @@ fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
+    use gm_miner_cli::config::{Config, NetworkEntry, TokenEntry};
+    use wiremock::{
+        matchers::{body_json, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
     use super::*;
 
     fn offers(value: serde_json::Value) -> Vec<ProductOfferStatus> {
         serde_json::from_value(value).expect("decode offers")
+    }
+
+    fn config_for(server: &MockServer) -> Config {
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                api_url: Some(server.uri()),
+                tokens: Some(TokenEntry {
+                    access_token: Some("test-token".to_owned()),
+                    refresh_token: None,
+                    token_expires_at: None,
+                }),
+                ..Default::default()
+            },
+        );
+        Config {
+            active_network: Some("testnet".to_owned()),
+            networks,
+            ..Default::default()
+        }
+    }
+
+    fn retail(input_ndollars: u64, output_ndollars: u64) -> serde_json::Value {
+        serde_json::json!({
+            "dimensions": {
+                "input_per_mtok_ndollars": input_ndollars,
+                "output_per_mtok_ndollars": output_ndollars,
+            }
+        })
+    }
+
+    async fn mount_catalog(server: &MockServer, products: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/products"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "products": products,
+                "generated_at": "2026-07-27T10:00:00Z",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_sources(server: &MockServer, sources: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/miners/products/sources"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sources": sources,
+                "generated_at": "2026-07-27T10:00:00Z",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_declare(server: &MockServer, expected_body: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path("/miners/products"))
+            .and(body_json(expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "is_offered": true,
+                "is_eligible": false,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Every request the mock server saw against `path`.
+    async fn hits(server: &MockServer, verb: &str, at: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .filter(|r| r.method.as_str() == verb && r.url.path() == at)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_catalog_product_declares_without_consulting_sources() {
+        let server = MockServer::start().await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active",
+                "retail_price": retail(3_000_000_000, 15_000_000_000),
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_declare_product(
+            &mut client,
+            &Provider::Anthropic,
+            "claude-sonnet-4-6",
+            500,
+            None,
+        )
+        .await
+        .expect("a catalog product declares");
+
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+        assert_eq!(
+            hits(&server, "GET", "/miners/products/sources").await,
+            0,
+            "a catalog hit must not spend a round-trip on the sources endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_product_absent_from_the_catalog_still_declares() {
+        let server = MockServer::start().await;
+        mount_catalog(&server, serde_json::json!([])).await;
+        mount_sources(
+            &server,
+            serde_json::json!([{
+                "provider": "deepinfra",
+                "model": "zai-org/GLM-5.2",
+                "buyer_provider": "zai",
+                "buyer_model": "glm-5.2",
+                "retail_price": retail(1_400_000_000, 4_400_000_000),
+                "capable_worker_count": 1,
+                "already_offered": false,
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "deepinfra",
+                "model": "zai-org/GLM-5.2",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_declare_product(
+            &mut client,
+            &Provider::DeepInfra,
+            "zai-org/GLM-5.2",
+            500,
+            None,
+        )
+        .await
+        .expect("a sourcing route declares even though GET /products omits it");
+
+        // The declare mock only answers the exact body above, so one hit here
+        // proves the wire shape as well as the call.
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_product_in_neither_place_fails_before_any_post() {
+        let server = MockServer::start().await;
+        mount_catalog(&server, serde_json::json!([])).await;
+        mount_sources(&server, serde_json::json!([])).await;
+        Mock::given(method("POST"))
+            .and(path("/miners/products"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_declare_product(&mut client, &Provider::OpenAI, "gpt-typo", 500, None)
+            .await
+            .expect_err("a typo'd model must not be declared");
+
+        assert!(
+            err.to_string().contains("unknown product openai/gpt-typo"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("gmcli sources"), "got: {err}");
+        assert_eq!(
+            hits(&server, "POST", "/miners/products").await,
+            0,
+            "the typo path must never reach the registry"
+        );
+    }
+
+    #[test]
+    fn a_catalog_declaration_keeps_its_layout() {
+        let dims = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+        };
+        assert_eq!(
+            declaration_lines("anthropic/claude-sonnet-4-6", "Retail", &dims, 1050),
+            vec![
+                "anthropic/claude-sonnet-4-6",
+                "  Retail       : $3.000 input / $15.000 output per Mtok",
+                "  Declared     : 10.5% off",
+                "  You receive  : $2.685 input / $13.425 output per Mtok (89.5% of retail)",
+                "  → ok",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_source_declaration_is_priced_off_the_buyer_retail() {
+        // Settlement basis is the buyer product (zai/glm-5.2) at $1.40/$4.40,
+        // never what deepinfra charges the miner for the same tokens.
+        let buyer_retail = RetailDimensions {
+            input_per_mtok_ndollars: 1_400_000_000,
+            output_per_mtok_ndollars: 4_400_000_000,
+        };
+        assert_eq!(
+            declaration_lines(
+                "deepinfra/zai-org/GLM-5.2  (sources → zai/glm-5.2)",
+                "Retail (buyer)",
+                &buyer_retail,
+                500,
+            ),
+            vec![
+                "deepinfra/zai-org/GLM-5.2  (sources → zai/glm-5.2)",
+                "  Retail (buyer)  : $1.400 input / $4.400 output per Mtok",
+                "  Declared        : 5% off",
+                "  You receive     : $1.330 input / $4.180 output per Mtok (95% of retail)",
+                "  → ok",
+            ]
+        );
     }
 
     #[test]

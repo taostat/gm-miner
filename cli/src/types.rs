@@ -122,6 +122,36 @@ pub struct ProductCatalogResponse {
     pub products: Vec<Product>,
 }
 
+/// One sourcing route in `GET /miners/products/sources`.
+///
+/// A route lets the miner serve the buyer product (`buyer_provider`,
+/// `buyer_model`) from a cheaper upstream (`provider`, `model`).
+/// `retail_price` is the *buyer* product's retail: settlement is on what the
+/// buyer pays, so that block — not the upstream's list price — is the basis
+/// for what the miner receives.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceProduct {
+    /// Upstream the miner buys from, e.g. `deepinfra`. Decoded as a string
+    /// rather than [`Provider`] so a route for an upstream this CLI build
+    /// predates does not fail the decode of every other route alongside it.
+    pub provider: String,
+    pub model: String,
+    pub buyer_provider: String,
+    pub buyer_model: String,
+    pub retail_price: RetailPrice,
+    /// How many of the miner's active workers hold a key that answers for
+    /// (`provider`, `model`). Zero means the route is unservable until a key
+    /// is set and rolled out to a worker.
+    pub capable_worker_count: u32,
+    pub already_offered: bool,
+}
+
+/// Response from `GET /miners/products/sources` (`SourceProductsResponse`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceProductsResponse {
+    pub sources: Vec<SourceProduct>,
+}
+
 /// Response from `GET /miners/me` (`MinerStatusResponse`).
 #[derive(Debug, Deserialize)]
 pub struct MinerStatus {
