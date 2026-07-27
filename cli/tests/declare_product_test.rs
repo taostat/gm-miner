@@ -147,6 +147,13 @@ fn provider_from_str_accepts_deepinfra() {
 }
 
 #[test]
+fn provider_from_str_accepts_kubetee() {
+    let provider = Provider::from_str("kubetee").unwrap();
+    assert_eq!(provider, Provider::Kubetee);
+    assert_eq!(provider.as_str(), "kubetee");
+}
+
+#[test]
 fn product_catalog_response_parses_wrapper_shape() {
     // GET /products returns ProductCatalogResponse, NOT a bare array —
     // matches the new OpenAPI schema (registry/openapi.json post-PR-C).

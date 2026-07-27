@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "989a7b540b86fc2776b0119bc092715f01bd8893ebbd19dfb315e1a69ac485be";
+    "35298b5194b1babe58da70315f280cc60a2116e451f7d8bc73b152756870f0fa";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,6 +62,35 @@ fn direct_unset_render_matches_pinned_output() {
     assert!(rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
     assert!(!rendered.contains("sk-ant-direct"));
     assert!(!rendered.contains("value: \"%ENVIRONMENT(ANTHROPIC_API_KEY)%\""));
+}
+
+#[test]
+fn kubetee_route_keeps_v1_path_and_negotiates_h2() {
+    // llm.kubetee.ai serves the OpenAI-compatible surface under /v1 itself
+    // and negotiates h2 over ALPN, so the route must NOT carry deepinfra's
+    // /v1/openai rewrite and the cluster must NOT force http/1.1.
+    let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant-direct")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let cluster = rendered
+        .split_once("- name: kubetee")
+        .and_then(|(_, rest)| rest.split_once("\n    - name:"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        cluster.contains("http2_protocol_options: {}"),
+        "kubetee upstream negotiates h2"
+    );
+    assert!(
+        cluster.contains("exact: llm.kubetee.ai"),
+        "kubetee cluster must pin the SAN to llm.kubetee.ai"
+    );
+    let route = rendered
+        .split_once("exact: \"kubetee\"")
+        .and_then(|(_, rest)| rest.split_once("request_headers_to_remove"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        !route.contains("regex_rewrite"),
+        "kubetee already serves /v1; a path rewrite would 404 every request"
+    );
 }
 
 #[test]
