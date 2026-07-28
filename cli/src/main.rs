@@ -1652,6 +1652,61 @@ mod tests {
     }
 
     #[test]
+    fn clap_accepts_a_single_undeclare() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "undeclare-product",
+            "--provider",
+            "deepinfra",
+            "--model",
+            "zai-org/GLM-5.2",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::UndeclareProduct {
+                provider: Provider::DeepInfra,
+                ref model,
+            } if model == "zai-org/GLM-5.2"
+        ));
+    }
+
+    #[test]
+    fn clap_requires_a_scope_for_the_fan_out_undeclare() {
+        // Withdrawing every offer is a revenue decision, so it has to be
+        // spelled out — a bare `undeclare-products` must not mean `--all`.
+        let result = <Cli as clap::Parser>::try_parse_from(["gmcli", "undeclare-products"]);
+        assert!(result.is_err(), "expected a required scope");
+    }
+
+    #[test]
+    fn clap_rejects_a_fan_out_undeclare_scoped_two_ways() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "undeclare-products",
+            "--all",
+            "--provider",
+            "openai",
+        ]);
+        assert!(result.is_err(), "expected --all and --provider to conflict");
+    }
+
+    #[test]
+    fn clap_accepts_all_for_the_fan_out_undeclare() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["gmcli", "undeclare-products", "--all"])
+            .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::UndeclareProducts {
+                provider: None,
+                all: true,
+            }
+        ));
+    }
+
+    #[test]
     fn filter_catalog_keeps_active_real_providers() {
         let products = [
             p(Provider::Anthropic, "claude-sonnet-4-6", "active"),

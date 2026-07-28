@@ -493,6 +493,20 @@ mod tests {
             .await;
     }
 
+    async fn mount_me(server: &MockServer, products: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/miners/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hotkey": "5Grw...",
+                "status": "active",
+                "last_attestation_at": null,
+                "image_compose_hash": null,
+                "products": products,
+            })))
+            .mount(server)
+            .await;
+    }
+
     async fn mount_declare(server: &MockServer, expected_body: serde_json::Value) {
         Mock::given(method("POST"))
             .and(path("/miners/products"))
@@ -788,5 +802,230 @@ mod tests {
         let rendered = ineligible_detail_lines(&products).join("\n");
         assert!(rendered.contains("reason : not yet checked"));
         assert!(!rendered.contains("fix    :"));
+    }
+
+    // ── undeclare ────────────────────────────────────────────────────────
+
+    /// Every path a DELETE was issued against, in order.
+    async fn deleted_paths(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .map(|r| r.url.path().to_owned())
+            .collect()
+    }
+
+    async fn mount_withdraw(server: &MockServer, at: &str, status: u16) {
+        Mock::given(method("DELETE"))
+            .and(path(at.to_owned()))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn a_slashed_source_model_keeps_its_slashes_in_the_path() {
+        // `zai-org/GLM-5.2` is one model id, and the registry route is
+        // `{model_id:path}` — collapsing or escaping the slash would 404.
+        assert_eq!(
+            offer_path(&Provider::DeepInfra, "zai-org/GLM-5.2"),
+            "/miners/products/deepinfra/zai-org/GLM-5.2"
+        );
+    }
+
+    #[tokio::test]
+    async fn undeclaring_withdraws_exactly_that_offer() {
+        let server = MockServer::start().await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-sonnet-4-6", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_undeclare_product(&mut client, &Provider::Anthropic, "claude-sonnet-4-6")
+            .await
+            .expect("a declared offer withdraws");
+
+        assert_eq!(
+            deleted_paths(&server).await,
+            vec!["/miners/products/anthropic/claude-sonnet-4-6"]
+        );
+    }
+
+    #[tokio::test]
+    async fn undeclaring_a_source_route_hits_the_slashed_path() {
+        let server = MockServer::start().await;
+        mount_withdraw(&server, "/miners/products/deepinfra/zai-org/GLM-5.2", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_undeclare_product(&mut client, &Provider::DeepInfra, "zai-org/GLM-5.2")
+            .await
+            .expect("a sourcing route withdraws");
+
+        assert_eq!(
+            deleted_paths(&server).await,
+            vec!["/miners/products/deepinfra/zai-org/GLM-5.2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn undeclaring_what_was_never_declared_says_so() {
+        // The registry 404s an offer it has no row for. That is the common
+        // typo case, and it must not read as "the endpoint is missing".
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/miners/products/anthropic/claude-sonnet-4-6"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"detail": "offer not found"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_product(&mut client, &Provider::Anthropic, "claude-sonnet-4-6")
+            .await
+            .expect_err("a missing offer is an error, not a silent success");
+
+        assert!(
+            err.to_string()
+                .contains("no offer for anthropic/claude-sonnet-4-6"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("gmcli status"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_registry_failure_surfaces_its_detail() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/miners/products/openai/gpt-5.6"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({"detail": "database is down"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_product(&mut client, &Provider::OpenAI, "gpt-5.6")
+            .await
+            .expect_err("a 500 is not a withdrawal");
+
+        assert!(err.to_string().contains("database is down"), "got: {err}");
+        assert!(
+            !err.to_string().contains("no offer for"),
+            "only a 404 means the offer is absent; got: {err}"
+        );
+    }
+
+    fn offer_row(provider: &str, model: &str, is_offered: bool) -> serde_json::Value {
+        serde_json::json!({
+            "provider": provider, "model": model,
+            "is_offered": is_offered, "is_eligible": is_offered, "discount_bp": 500,
+        })
+    }
+
+    #[test]
+    fn the_fan_out_targets_only_offers_still_standing() {
+        // An offer already withdrawn keeps its row with `is_offered: false`.
+        // Re-deleting it would spend a round-trip to change nothing.
+        let all = offers(serde_json::json!([
+            offer_row("anthropic", "claude-sonnet-4-6", true),
+            offer_row("anthropic", "claude-opus-4-6", false),
+        ]));
+
+        let targets = withdrawable_offers(&all, None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn the_fan_out_honours_the_provider_filter() {
+        let all = offers(serde_json::json!([
+            offer_row("anthropic", "claude-sonnet-4-6", true),
+            offer_row("openai", "gpt-5.6", true),
+        ]));
+
+        let targets = withdrawable_offers(&all, Some(&Provider::OpenAI));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn the_fan_out_withdraws_one_provider_and_leaves_the_rest() {
+        let server = MockServer::start().await;
+        mount_me(
+            &server,
+            serde_json::json!([
+                offer_row("anthropic", "claude-sonnet-4-6", true),
+                offer_row("anthropic", "claude-haiku-4-6", true),
+                offer_row("openai", "gpt-5.6", true),
+            ]),
+        )
+        .await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-sonnet-4-6", 204).await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-haiku-4-6", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_undeclare_products(&mut client, Some(&Provider::Anthropic))
+            .await
+            .expect("withdrawing one provider's offers succeeds");
+
+        let mut paths = deleted_paths(&server).await;
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "/miners/products/anthropic/claude-haiku-4-6",
+                "/miners/products/anthropic/claude-sonnet-4-6",
+            ],
+            "the openai offer must survive a provider-scoped withdrawal"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fan_out_with_nothing_to_withdraw_stops_before_any_delete() {
+        let server = MockServer::start().await;
+        mount_me(
+            &server,
+            serde_json::json!([offer_row("openai", "gpt-5.6", true)]),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_products(&mut client, Some(&Provider::Anthropic))
+            .await
+            .expect_err("an empty target set is a failed command, not a silent no-op");
+
+        assert!(err.to_string().contains("anthropic"), "got: {err}");
+        assert!(deleted_paths(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_failed_withdrawal_does_not_abandon_the_others() {
+        let server = MockServer::start().await;
+        mount_me(
+            &server,
+            serde_json::json!([
+                offer_row("anthropic", "claude-sonnet-4-6", true),
+                offer_row("anthropic", "claude-haiku-4-6", true),
+            ]),
+        )
+        .await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-sonnet-4-6", 500).await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-haiku-4-6", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_products(&mut client, Some(&Provider::Anthropic))
+            .await
+            .expect_err("a partial failure must exit non-zero");
+
+        assert!(err.to_string().contains("1 of 2"), "got: {err}");
+        assert_eq!(
+            deleted_paths(&server).await.len(),
+            2,
+            "the second withdrawal must still be attempted"
+        );
     }
 }
