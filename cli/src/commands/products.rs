@@ -263,19 +263,50 @@ async fn post_declare_product(
     Ok(())
 }
 
-/// The registry route for one offer. The model id goes in verbatim: the
-/// route is `{model_id:path}`, so a slashed source id like `zai-org/GLM-5.2`
-/// is one model id, not extra path segments — collapsing or percent-escaping
-/// the slash would 404.
-pub(crate) fn offer_path(provider: &Provider, model: &str) -> String {
+/// What may appear in an offer path unescaped: RFC 3986's unreserved set plus
+/// `/`. The slash is deliberate — the route is `{model_id:path}`, so a source
+/// id like `zai-org/GLM-5.2` is one model id and escaping its slash would 404.
+///
+/// Everything else is escaped because the path is interpolated into a URL:
+/// an unescaped `#` in a model id ends the path at a fragment and `?` starts
+/// a query, either of which would send the DELETE at a *different* offer than
+/// the one named on the command line.
+const OFFER_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'/');
+
+/// The registry route for one offer, with the model id escaped as path data.
+///
+/// `provider` is a `&str` rather than a [`Provider`]: the fan-out withdraws
+/// what `/miners/me` reports, and the registry's spelling is authoritative
+/// there — a provider added after this CLI was built must still be
+/// withdrawable.
+pub(crate) fn offer_path(provider: &str, model: &str) -> String {
+    let provider = percent_encoding::utf8_percent_encode(provider, OFFER_PATH);
+    let model = percent_encoding::utf8_percent_encode(model, OFFER_PATH);
     format!("/miners/products/{provider}/{model}")
+}
+
+/// Reject a model id whose path segments would be resolved away rather than
+/// sent, so a `.`/`..` segment cannot silently retarget the DELETE at another
+/// offer — or another endpoint. `.` stays legal *within* a segment, which is
+/// where real model ids use it (`gpt-5.5`).
+fn reject_dot_segments(model: &str) -> Result<()> {
+    if model.split('/').any(|seg| seg == "." || seg == "..") {
+        bail!("invalid model id {model:?}: `.` and `..` are not model path segments");
+    }
+    Ok(())
 }
 
 /// Issue one `DELETE /miners/products/{provider}/{model}` — shared by
 /// `undeclare-product` and the fan-out so both read the registry's statuses
 /// the same way. A 404 means the registry has no offer row for the pair —
 /// the common typo case — and must not read as "the endpoint is missing".
-async fn delete_offer(client: &mut RegistryClient, provider: &Provider, model: &str) -> Result<()> {
+async fn delete_offer(client: &mut RegistryClient, provider: &str, model: &str) -> Result<()> {
+    reject_dot_segments(model)?;
     let path = offer_path(provider, model);
     let resp = client
         .delete(&path)
@@ -306,7 +337,7 @@ pub(crate) async fn cmd_undeclare_product(
     provider: &Provider,
     model: &str,
 ) -> Result<()> {
-    delete_offer(client, provider, model).await?;
+    delete_offer(client, provider.as_str(), model).await?;
     println!("{provider}/{model} withdrawn — buyers are no longer routed to it.");
     println!("Changed your mind? `gmcli declare-product` re-offers it.");
     Ok(())
@@ -356,14 +387,12 @@ pub(crate) async fn cmd_undeclare_products(
     let mut ok_count = 0_usize;
     let mut err_count = 0_usize;
     for offer in &targets {
-        // `/miners/me` sends the provider as a string; a row this CLI build
-        // cannot parse (a provider added after release) is a per-offer
-        // failure, not a reason to abandon the sweep.
-        let outcome = match offer.provider.parse::<Provider>() {
-            Ok(provider) => delete_offer(client, &provider, &offer.model).await,
-            Err(err) => Err(err),
-        };
-        match outcome {
+        // The provider goes back to the registry exactly as it came from
+        // `/miners/me`. Round-tripping it through the `Provider` enum would
+        // make `--all` skip any offer whose provider postdates this CLI
+        // build — silently leaving it standing after a sweep that said it
+        // withdrew everything.
+        match delete_offer(client, &offer.provider, &offer.model).await {
             Ok(()) => {
                 println!("  {}/{}: withdrawn", offer.provider, offer.model);
                 ok_count += 1;
@@ -952,9 +981,59 @@ mod tests {
         // `zai-org/GLM-5.2` is one model id, and the registry route is
         // `{model_id:path}` — collapsing or escaping the slash would 404.
         assert_eq!(
-            offer_path(&Provider::DeepInfra, "zai-org/GLM-5.2"),
+            offer_path(Provider::DeepInfra.as_str(), "zai-org/GLM-5.2"),
             "/miners/products/deepinfra/zai-org/GLM-5.2"
         );
+    }
+
+    #[test]
+    fn a_reserved_character_cannot_truncate_the_path() {
+        // Unescaped, the `#` would end the URL's path and the DELETE would
+        // land on `openai/gpt-5` — withdrawing an offer nobody named.
+        assert_eq!(
+            offer_path("openai", "gpt-5#5"),
+            "/miners/products/openai/gpt-5%235"
+        );
+        assert_eq!(
+            offer_path("openai", "gpt-5?x=1"),
+            "/miners/products/openai/gpt-5%3Fx%3D1"
+        );
+    }
+
+    #[test]
+    fn a_normal_model_id_is_still_written_plainly() {
+        // Escaping must not reach the characters real model ids are made of,
+        // or every path in an error message becomes unreadable.
+        assert_eq!(
+            offer_path("anthropic", "claude-sonnet-4-6"),
+            "/miners/products/anthropic/claude-sonnet-4-6"
+        );
+        assert_eq!(
+            offer_path("openai", "gpt-5.5"),
+            "/miners/products/openai/gpt-5.5"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dot_segment_model_id_is_refused_before_the_wire() {
+        // `..` would be resolved away by URL normalisation, aiming the DELETE
+        // at a path the operator never typed.
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_product(&mut client, &Provider::OpenAI, "../../admin/products")
+            .await
+            .expect_err("a dot segment is not a model id");
+
+        assert!(
+            err.to_string().contains("not model path segments"),
+            "got: {err}"
+        );
+        assert!(deleted_paths(&server).await.is_empty());
     }
 
     #[tokio::test]
@@ -1102,6 +1181,30 @@ mod tests {
                 "/miners/products/anthropic/claude-sonnet-4-6",
             ],
             "the openai offer must survive a provider-scoped withdrawal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_withdraws_providers_this_build_has_never_heard_of() {
+        // The registry can gain a provider between CLI releases, and a miner
+        // can hold an offer on it. `--all` that quietly skipped such a row
+        // would report a clean sweep while leaving the offer serving.
+        let server = MockServer::start().await;
+        mount_me(
+            &server,
+            serde_json::json!([offer_row("brandnew", "wonder-model-1", true)]),
+        )
+        .await;
+        mount_withdraw(&server, "/miners/products/brandnew/wonder-model-1", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_undeclare_products(&mut client, None)
+            .await
+            .expect("an unknown provider is the registry's business, not the CLI's");
+
+        assert_eq!(
+            deleted_paths(&server).await,
+            vec!["/miners/products/brandnew/wonder-model-1"]
         );
     }
 
