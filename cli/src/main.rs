@@ -11,6 +11,8 @@
 //!   register-image   — re-register the deployed miner's image hashes (hidden)
 //!   declare-product  — declare a single offer (--provider X --model Y --discount-pct N)
 //!   declare-products — fan out one discount over the whole catalog, or one provider
+//!   undeclare-product  — withdraw a single offer (--provider X --model Y)
+//!   undeclare-products — withdraw every standing offer (--all) or one provider's
 //!   status           — registration state + per-product eligibility and rates
 //!                      (the hidden `list-products` alias runs the same code)
 //!   pricing          — rank your offers against the eligible field
@@ -60,7 +62,10 @@ use crate::commands::hotkey::cmd_register_hotkey;
 use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::pricing::cmd_pricing;
-use crate::commands::products::{cmd_declare_product, cmd_declare_products, cmd_status};
+use crate::commands::products::{
+    cmd_declare_product, cmd_declare_products, cmd_status, cmd_undeclare_product,
+    cmd_undeclare_products,
+};
 use crate::commands::sources::cmd_sources;
 use crate::commands::streaming_check::cmd_check_streaming;
 use crate::commands::wizard::cmd_init;
@@ -432,6 +437,52 @@ enum Command {
         /// the fan-out touches.
         #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
         discount_bp: u32,
+    },
+
+    /// Withdraw a single miner-product offer.
+    ///
+    /// One DELETE to `/miners/products/{provider}/{model}`. The registry
+    /// keeps the offer row for audit (`is_offered` goes false, reason
+    /// `withdrawn_by_miner`) rather than deleting it, and withdrawal is
+    /// fully reversible — re-running `declare-product` re-offers the pair —
+    /// which is why there is no confirmation prompt.
+    #[command(after_help = "Examples:\n  \
+        gmcli undeclare-product --provider anthropic --model claude-sonnet-4-6\n  \
+        gmcli undeclare-product --provider deepinfra --model zai-org/GLM-5.2   # a sourcing route")]
+    UndeclareProduct {
+        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, or kubetee.
+        #[arg(long)]
+        provider: Provider,
+
+        /// Model identifier, e.g. `claude-sonnet-4-6`. For a sourcing route
+        /// this is the upstream's model id, e.g. `zai-org/GLM-5.2`.
+        #[arg(long)]
+        model: String,
+    },
+
+    /// Withdraw every standing offer, or one provider's slice.
+    ///
+    /// Reads your offers from the registry and DELETEs each one still
+    /// offered; rows already withdrawn are skipped. Withdrawing everything
+    /// is a revenue decision, so the scope must be spelled out — `--all` or
+    /// `--provider`. Reversible: `declare-product` / `declare-products`
+    /// re-offer what this withdraws.
+    #[command(
+        group = clap::ArgGroup::new("undeclare_scope")
+            .required(true)
+            .multiple(false),
+        after_help = "Examples:\n  \
+        gmcli undeclare-products --provider openai   # one provider's offers\n  \
+        gmcli undeclare-products --all               # every standing offer"
+    )]
+    UndeclareProducts {
+        /// Withdraw only this provider's standing offers.
+        #[arg(long, group = "undeclare_scope")]
+        provider: Option<Provider>,
+
+        /// Withdraw every standing offer across all providers.
+        #[arg(long, group = "undeclare_scope")]
+        all: bool,
     },
 
     /// Show the miner's current registration status and per-product eligibility.
@@ -840,6 +891,20 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
             cmd_declare_products(&mut client, provider.as_ref(), discount_bp).await
+        }
+        Command::UndeclareProduct { provider, model } => {
+            let cfg = load_config(explicit_network, api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            let mut client = RegistryClient::new(cfg);
+            cmd_undeclare_product(&mut client, &provider, &model).await
+        }
+        // `all` carries no information beyond `provider.is_none()` once clap
+        // has enforced the exactly-one-scope group, so it is not bound here.
+        Command::UndeclareProducts { provider, all: _ } => {
+            let cfg = load_config(explicit_network, api_url)?;
+            let cfg = ensure_fresh_token(cfg).await?;
+            let mut client = RegistryClient::new(cfg);
+            cmd_undeclare_products(&mut client, provider.as_ref()).await
         }
     }
 }

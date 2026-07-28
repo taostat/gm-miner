@@ -1,5 +1,6 @@
 //! Product declaration + status commands: `declare-product`,
-//! `declare-products`, and `status` (which folds in the product table).
+//! `declare-products`, their `undeclare-` counterparts, and `status` (which
+//! folds in the product table).
 
 use anyhow::{bail, Context as _, Result};
 
@@ -259,6 +260,126 @@ async fn post_declare_product(
         let body = resp.text().await.unwrap_or_default();
         return Err(status_error("declare-product", status, &body));
     }
+    Ok(())
+}
+
+/// The registry route for one offer. The model id goes in verbatim: the
+/// route is `{model_id:path}`, so a slashed source id like `zai-org/GLM-5.2`
+/// is one model id, not extra path segments — collapsing or percent-escaping
+/// the slash would 404.
+pub(crate) fn offer_path(provider: &Provider, model: &str) -> String {
+    format!("/miners/products/{provider}/{model}")
+}
+
+/// Issue one `DELETE /miners/products/{provider}/{model}` — shared by
+/// `undeclare-product` and the fan-out so both read the registry's statuses
+/// the same way. A 404 means the registry has no offer row for the pair —
+/// the common typo case — and must not read as "the endpoint is missing".
+async fn delete_offer(client: &mut RegistryClient, provider: &Provider, model: &str) -> Result<()> {
+    let path = offer_path(provider, model);
+    let resp = client
+        .delete(&path)
+        .await
+        .with_context(|| format!("DELETE {path}"))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        bail!(
+            "no offer for {provider}/{model} — nothing to withdraw; \
+             `gmcli status` lists what you have declared"
+        );
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error("undeclare-product", status, &body));
+    }
+    Ok(())
+}
+
+/// `gmcli undeclare-product` — withdraw one offer.
+///
+/// The registry keeps the row for audit (`is_offered` goes false, reason
+/// `withdrawn_by_miner`), so withdrawal is fully reversible: re-running
+/// `declare-product` re-offers the pair.
+pub(crate) async fn cmd_undeclare_product(
+    client: &mut RegistryClient,
+    provider: &Provider,
+    model: &str,
+) -> Result<()> {
+    delete_offer(client, provider, model).await?;
+    println!("{provider}/{model} withdrawn — buyers are no longer routed to it.");
+    println!("Changed your mind? `gmcli declare-product` re-offers it.");
+    Ok(())
+}
+
+/// The offers a fan-out withdrawal should touch: still standing
+/// (`is_offered`), optionally one provider's slice.
+///
+/// An offer already withdrawn keeps its registry row with `is_offered:
+/// false`, so re-deleting it would spend a round-trip to change nothing —
+/// and its 404-adjacent failure would pollute the summary.
+pub(crate) fn withdrawable_offers<'a>(
+    offers: &'a [ProductOfferStatus],
+    provider_filter: Option<&Provider>,
+) -> Vec<&'a ProductOfferStatus> {
+    offers
+        .iter()
+        .filter(|o| o.is_offered)
+        .filter(|o| provider_filter.is_none_or(|target| o.provider == target.as_str()))
+        .collect()
+}
+
+/// `gmcli undeclare-products` — withdraw every standing offer, or one
+/// provider's slice.
+///
+/// Targets come from the miner's own `GET /miners/me` rather than the public
+/// catalog: the catalog omits sourcing routes, and only `/miners/me` knows
+/// which offers are still standing. Mirrors `cmd_declare_products`: each
+/// result is printed individually, per-offer failures do not abort the loop,
+/// and a partial failure returns an aggregated error so the CLI exits
+/// non-zero.
+pub(crate) async fn cmd_undeclare_products(
+    client: &mut RegistryClient,
+    provider_filter: Option<&Provider>,
+) -> Result<()> {
+    let miner: MinerStatus = get_me_json(client, gm_miner_cli::client::ME_PATH).await?;
+    let targets = withdrawable_offers(&miner.products, provider_filter);
+
+    if targets.is_empty() {
+        let scope =
+            provider_filter.map_or_else(|| "any provider".to_owned(), |p| format!("provider {p}"));
+        bail!("no standing offers from {scope} to withdraw — `gmcli status` shows what you offer");
+    }
+
+    println!("Withdrawing {} offer(s)...", targets.len());
+
+    let mut ok_count = 0_usize;
+    let mut err_count = 0_usize;
+    for offer in &targets {
+        // `/miners/me` sends the provider as a string; a row this CLI build
+        // cannot parse (a provider added after release) is a per-offer
+        // failure, not a reason to abandon the sweep.
+        let outcome = match offer.provider.parse::<Provider>() {
+            Ok(provider) => delete_offer(client, &provider, &offer.model).await,
+            Err(err) => Err(err),
+        };
+        match outcome {
+            Ok(()) => {
+                println!("  {}/{}: withdrawn", offer.provider, offer.model);
+                ok_count += 1;
+            }
+            Err(err) => {
+                println!("  {}/{}: ERROR {err}", offer.provider, offer.model);
+                err_count += 1;
+            }
+        }
+    }
+
+    println!("\nSummary: {ok_count} ok, {err_count} failed.");
+    if err_count > 0 {
+        bail!("{err_count} of {} withdrawals failed", targets.len());
+    }
+    println!("Re-offer any time: `gmcli declare-product` / `gmcli declare-products`.");
     Ok(())
 }
 
