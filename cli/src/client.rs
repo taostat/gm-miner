@@ -140,6 +140,24 @@ impl RegistryClient {
         Ok(resp)
     }
 
+    /// Issue a GET request to a public registry route, with no credential.
+    ///
+    /// Distinct from [`Self::get`] rather than a flag on it: the callers of the
+    /// authenticated form must keep failing loudly when the token is missing,
+    /// and a route that silently dropped the bearer would turn a self-scoped
+    /// answer into a public one without saying so.
+    ///
+    /// # Errors
+    /// Returns an error if the request fails at the network level.
+    pub async fn get_public(&self, path: &str) -> Result<Response> {
+        let url = format!("{}{path}", self.api_url());
+        self.client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))
+    }
+
     /// Issue an authenticated POST request with a JSON body.
     ///
     /// # Errors

@@ -16,6 +16,7 @@ use gm_miner_cli::{
 use crate::commands::status_error;
 
 const SOURCES_PATH: &str = "/miners/products/sources";
+const PUBLIC_SOURCES_PATH: &str = "/products/sources";
 const SOURCING_DOC_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/blob/main/docs/sourcing.md");
 
 pub(crate) async fn cmd_sources(client: &mut RegistryClient) -> Result<()> {
@@ -48,10 +49,18 @@ impl SourceLookup {
     }
 }
 
-/// Pull the miner's sourcing routes. Source products are filtered out of the
-/// buyer-facing `GET /products`, so this endpoint is the only place they
+/// Pull the sourcing routes. Source products are filtered out of the
+/// buyer-facing `GET /products`, so these routes are the only place they
 /// surface — both for `gmcli sources` and for `declare-product`'s lookup.
+///
+/// Without a stored token this reads the PUBLIC listing instead of failing:
+/// deciding whether the upstreams are worth mining is a question you ask before
+/// registering, and requiring a login to answer it defeats the point. The
+/// public rows carry no `capable_worker_count` or `already_offered`.
 pub(crate) async fn fetch_sources(client: &mut RegistryClient) -> Result<SourceLookup> {
+    if !client.config.has_access_token() {
+        return fetch_public_sources(client).await;
+    }
     let resp = client
         .get(SOURCES_PATH)
         .await
@@ -62,6 +71,28 @@ pub(crate) async fn fetch_sources(client: &mut RegistryClient) -> Result<SourceL
     // it answers 401 unauthenticated and 200 with an empty list when the miner
     // has no routes. Surfacing it as an error would turn every mistyped model
     // into FastAPI's bare "sources failed (404 Not Found): Not Found".
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(SourceLookup::Unsupported);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error("sources", status, &body));
+    }
+    let body = resp
+        .json::<SourceProductsResponse>()
+        .await
+        .context("parse sourcing routes")?;
+    Ok(SourceLookup::Routes(body.sources))
+}
+
+/// The unauthenticated listing, for a caller with no stored token.
+async fn fetch_public_sources(client: &RegistryClient) -> Result<SourceLookup> {
+    let resp = client
+        .get_public(PUBLIC_SOURCES_PATH)
+        .await
+        .context("GET /products/sources")?;
+
+    let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(SourceLookup::Unsupported);
     }
@@ -148,9 +179,25 @@ fn render_sources(network: Network, lookup: &SourceLookup) -> Vec<String> {
         source_rule(),
     ];
     lines.extend(sources.iter().map(route_line));
+    lines.extend(anonymous_lines(sources));
     lines.extend(unserved_lines(sources));
     lines.extend(declare_lines(sources));
     lines
+}
+
+/// Explain the blank per-miner columns of the public listing.
+///
+/// Without this the table reads as though the miner serves nothing and offers
+/// nothing, rather than as though nobody asked who they are.
+fn anonymous_lines(sources: &[SourceProduct]) -> Vec<String> {
+    if !sources.iter().any(|s| s.capable_worker_count.is_none()) {
+        return Vec::new();
+    }
+    vec![
+        String::new(),
+        "YOU SERVE and OFFERED are blank because you are not logged in — the routes".to_owned(),
+        "above are the same for every miner. `gmcli login` fills in your own status.".to_owned(),
+    ]
 }
 
 fn route_line(source: &SourceProduct) -> String {
@@ -164,15 +211,24 @@ fn route_line(source: &SourceProduct) -> String {
             format_per_mtok_usd(retail.output_per_mtok_ndollars),
         ),
         serving_cell(source.capable_worker_count),
-        if source.already_offered { "yes" } else { "no" }.to_owned(),
+        match source.already_offered {
+            Some(true) => "yes".to_owned(),
+            Some(false) => "no".to_owned(),
+            None => UNKNOWN_CELL.to_owned(),
+        },
     ])
 }
 
-fn serving_cell(capable_worker_count: u32) -> String {
+/// `-` where the public listing simply does not know, kept distinct from the
+/// `no` that means "you have no capable worker".
+const UNKNOWN_CELL: &str = "-";
+
+fn serving_cell(capable_worker_count: Option<u32>) -> String {
     match capable_worker_count {
-        0 => "no".to_owned(),
-        1 => "yes (1 worker)".to_owned(),
-        n => format!("yes ({n} workers)"),
+        None => UNKNOWN_CELL.to_owned(),
+        Some(0) => "no".to_owned(),
+        Some(1) => "yes (1 worker)".to_owned(),
+        Some(n) => format!("yes ({n} workers)"),
     }
 }
 
@@ -186,7 +242,7 @@ fn serving_cell(capable_worker_count: u32) -> String {
 fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
     let unserved: Vec<_> = sources
         .iter()
-        .filter(|s| s.capable_worker_count == 0)
+        .filter(|s| s.capable_worker_count == Some(0))
         .collect();
     if unserved.is_empty() {
         return Vec::new();
@@ -214,10 +270,10 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
 fn declare_lines(sources: &[SourceProduct]) -> Vec<String> {
     let ready: Vec<_> = sources
         .iter()
-        .filter(|s| !s.already_offered && s.capable_worker_count > 0)
+        .filter(|s| s.already_offered == Some(false) && s.capable_worker_count > Some(0))
         .collect();
     if ready.is_empty() {
-        if sources.iter().all(|s| s.already_offered) {
+        if sources.iter().all(|s| s.already_offered == Some(true)) {
             return vec![
                 String::new(),
                 "Every route above is already declared — `gmcli status` shows how each is doing."
@@ -302,6 +358,88 @@ mod tests {
             networks,
             ..Default::default()
         }
+    }
+
+    /// Same config with no stored token — a miner who has never logged in.
+    fn logged_out_config_for(server: &MockServer) -> Config {
+        let mut config = config_for(server);
+        if let Some(entry) = config.networks.get_mut("testnet") {
+            entry.tokens = None;
+        }
+        config
+    }
+
+    /// A public row: the shared fields, and neither per-miner field.
+    fn public_deepinfra_glm() -> serde_json::Value {
+        let mut row = deepinfra_glm(0, false);
+        let map = row.as_object_mut().expect("row is an object");
+        map.remove("capable_worker_count");
+        map.remove("already_offered");
+        row
+    }
+
+    #[tokio::test]
+    async fn without_a_token_it_reads_the_public_listing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/products/sources"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sources": [public_deepinfra_glm()],
+                "generated_at": "2026-07-30T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(logged_out_config_for(&server));
+        let lookup = fetch_sources(&mut client)
+            .await
+            .expect("the public listing needs no credential");
+
+        let routes = lookup.into_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].capable_worker_count, None);
+        assert_eq!(routes[0].already_offered, None);
+        // The miner-scoped route must not have been touched: wiremock would
+        // have 404'd it, and a 404 is read as "registry too old".
+    }
+
+    #[tokio::test]
+    async fn a_stored_token_still_uses_the_miner_scoped_listing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/miners/products/sources"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sources": [deepinfra_glm(2, true)],
+                "generated_at": "2026-07-30T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let routes = fetch_sources(&mut client)
+            .await
+            .expect("authenticated fetch")
+            .into_routes();
+
+        assert_eq!(routes[0].capable_worker_count, Some(2));
+        assert_eq!(routes[0].already_offered, Some(true));
+    }
+
+    #[test]
+    fn the_public_listing_says_why_the_per_miner_columns_are_blank() {
+        let rendered = render_sources(
+            Network::Mainnet,
+            &sources(serde_json::json!([public_deepinfra_glm()])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("deepinfra/zai-org/GLM-5.2"));
+        assert!(rendered.contains("you are not logged in"));
+        assert!(rendered.contains("gmcli login"));
+        // Must not read as "no worker of yours serves this" — nobody asked who
+        // the caller is, which is a different statement from a zero count.
+        assert!(!rendered.contains("No worker of yours is currently serving"));
+        assert!(!rendered.contains("--discount-pct <pct>"));
     }
 
     #[test]

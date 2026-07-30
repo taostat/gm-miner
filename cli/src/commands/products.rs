@@ -86,7 +86,9 @@ fn source_declaration_lines(
         &source.retail_price.dimensions,
         discount_bp,
     );
-    if source.capable_worker_count == 0 {
+    // `Some(0)`, not `None`: the public listing does not know the caller, and a
+    // warning that no worker serves the route would be asserting that.
+    if source.capable_worker_count == Some(0) {
         lines.push(
             "  ! No worker of yours is currently serving this route, so the offer will".to_owned(),
         );
