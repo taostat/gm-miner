@@ -6,7 +6,8 @@ use anyhow::{bail, Context as _, Result};
 use gm_miner_cli::{
     client::{build_data_plane_probe_client, build_http_client, RegistryClient, ME_PATH},
     config::{Config, ProviderKeys, WorkerRecord},
-    types::{MinerStatus, ProductCatalogResponse, Provider, WorkerListResponse},
+    types::{MinerStatus, ProductCatalogResponse, Provider, WorkerEntry, WorkerListResponse},
+    workers::first_live_worker_id,
 };
 use reqwest::Url;
 use serde_json::Value;
@@ -42,6 +43,7 @@ enum StreamingVerdict {
     Inconclusive,
 }
 
+#[derive(Debug)]
 struct StreamingTarget {
     endpoint: String,
     node_secret: String,
@@ -134,14 +136,14 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
 async fn resolve_primary_worker(cfg: &Config) -> Result<StreamingTarget> {
     let local = cfg
         .active_network_entry()
-        .and_then(|entry| entry.workers.first())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no deployed worker is tracked for {}; run `gmcli deploy` first",
-                cfg.resolved_network()
-            )
-        })?;
-    validate_local_worker(local)?;
+        .map(|entry| entry.workers.as_slice())
+        .unwrap_or_default();
+    if local.is_empty() {
+        bail!(
+            "no deployed worker is tracked for {}; run `gmcli deploy` first",
+            cfg.resolved_network()
+        );
+    }
 
     let mut client = RegistryClient::new(cfg.clone());
     let hotkey = fetch_hotkey(&mut client).await?;
@@ -156,22 +158,50 @@ async fn resolve_primary_worker(cfg: &Config) -> Result<StreamingTarget> {
         bail!("could not fetch worker endpoint from registry ({status}): {body}");
     }
     let workers: WorkerListResponse = resp.json().await.context("parse worker list response")?;
-    let endpoint = workers
-        .workers
+
+    pick_target_worker(local, &workers.workers)
+}
+
+/// Pick which worker `check-streaming` probes: the oldest worker the
+/// registry still lists as live ([`first_live_worker_id`]), matched to the
+/// local record that carries its `node_secret`.
+///
+/// Local `WorkerRecord`s are never pruned when the registry deregisters a
+/// worker (see `workers::is_secondary_live`'s doc comment), so picking
+/// whatever sits at local position 0 can target a long-dead CVM while a live
+/// one sits further down the list. Resolving the target `worker_id` from the
+/// live registry list first — the same pattern `deploy`/`register-image` use
+/// via `first_live_worker_id` — avoids that; the local list is consulted only
+/// afterward, to find the matching record's `node_secret`.
+///
+/// # Errors
+/// Returns an error when the registry lists no live worker, when the live
+/// worker has no matching local record (the node secret is only ever known
+/// locally, so there is nothing to probe with), or when that record is
+/// otherwise invalid ([`validate_local_worker`]).
+fn pick_target_worker(local: &[WorkerRecord], live: &[WorkerEntry]) -> Result<StreamingTarget> {
+    let worker_id = first_live_worker_id(live).ok_or_else(|| {
+        anyhow::anyhow!("registry lists no live worker; run `gmcli deploy` first")
+    })?;
+    let endpoint = live
         .iter()
-        .find(|worker| worker.worker_id == local.worker_id)
+        .find(|worker| worker.worker_id == worker_id)
         .map(|worker| worker.endpoint.clone())
+        .ok_or_else(|| anyhow::anyhow!("internal error: live worker {worker_id} vanished"))?;
+    let record = local
+        .iter()
+        .find(|worker| worker.worker_id == worker_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "registry has no worker endpoint for local worker {}; run \
-                 `gmcli worker list` and redeploy if the local record is stale",
-                local.worker_id
+                "registry's live worker {worker_id} has no matching local record; run \
+                 `gmcli worker list` and redeploy if the local record is stale"
             )
         })?;
+    validate_local_worker(record)?;
 
     Ok(StreamingTarget {
         endpoint,
-        node_secret: local.node_secret.clone(),
+        node_secret: record.node_secret.clone(),
     })
 }
 
@@ -665,6 +695,10 @@ fn fmt_duration(duration: Duration) -> String {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions intentionally panic on unexpected values"
+)]
 mod tests {
     use super::*;
 
@@ -762,5 +796,73 @@ mod tests {
             classify_streaming(&[ms(1_500)]),
             StreamingVerdict::Inconclusive
         );
+    }
+
+    fn live_worker(worker_id: &str, created_at: &str) -> WorkerEntry {
+        serde_json::from_value(serde_json::json!({
+            "worker_id": worker_id,
+            "endpoint": format!("https://{worker_id}.example.org"),
+            "status": "active",
+            "last_attestation_at": null,
+            "created_at": created_at,
+        }))
+        .expect("decode live worker entry")
+    }
+
+    fn local_record(worker_id: &str) -> WorkerRecord {
+        WorkerRecord {
+            worker_id: worker_id.to_owned(),
+            app_id: format!("app_{worker_id}"),
+            app_name: format!("gm-miner-{worker_id}"),
+            node_secret: format!("secret-{worker_id}"),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: local position 0 was a worker deregistered from the
+    /// registry weeks ago, while the actual live worker sat at local
+    /// position 2. `check-streaming` must probe the live one, not whatever
+    /// sits first in the never-pruned local list.
+    #[test]
+    fn pick_target_worker_skips_a_dead_local_position_zero() {
+        let local = vec![
+            local_record("01J0A"), // deregistered, stale local position 0
+            local_record("01J0B"), // deregistered
+            local_record("01J0Z"), // the live worker, local position 2
+        ];
+        let live = vec![live_worker("01J0Z", "2026-07-03T00:00:00Z")];
+
+        let target = pick_target_worker(&local, &live).expect("resolves the live worker");
+        assert_eq!(target.endpoint, "https://01J0Z.example.org");
+        assert_eq!(target.node_secret, "secret-01J0Z");
+    }
+
+    /// Ties broken the same way `first_live_worker_id` breaks them: the
+    /// oldest `created_at`, regardless of local record order.
+    #[test]
+    fn pick_target_worker_picks_the_oldest_live_worker() {
+        let local = vec![local_record("01J0B"), local_record("01J0A")];
+        let live = vec![
+            live_worker("01J0B", "2026-07-02T00:00:00Z"),
+            live_worker("01J0A", "2026-07-01T00:00:00Z"),
+        ];
+
+        let target = pick_target_worker(&local, &live).expect("resolves the oldest live worker");
+        assert_eq!(target.node_secret, "secret-01J0A");
+    }
+
+    #[test]
+    fn pick_target_worker_errors_when_registry_has_no_live_worker() {
+        let local = vec![local_record("01J0A")];
+        let err = pick_target_worker(&local, &[]).expect_err("no live worker to pick");
+        assert!(err.to_string().contains("no live worker"));
+    }
+
+    #[test]
+    fn pick_target_worker_errors_when_live_worker_has_no_local_record() {
+        let local = vec![local_record("01J0A")];
+        let live = vec![live_worker("01J0Z", "2026-07-03T00:00:00Z")];
+        let err = pick_target_worker(&local, &live).expect_err("no matching local record");
+        assert!(err.to_string().contains("no matching local record"));
     }
 }
