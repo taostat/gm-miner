@@ -692,6 +692,18 @@ impl Config {
             .and_then(|n| n.tokens.as_ref())
     }
 
+    /// Whether the active network has a stored access token.
+    ///
+    /// Says nothing about whether it is still valid — only whether a login has
+    /// ever happened, which is what decides between the authenticated and
+    /// public form of a request that has both.
+    #[must_use]
+    pub fn has_access_token(&self) -> bool {
+        self.active_tokens()
+            .and_then(|t| t.access_token.as_deref())
+            .is_some_and(|t| !t.is_empty())
+    }
+
     /// The active network's entry, if one has been created.
     #[must_use]
     pub fn active_network_entry(&self) -> Option<&NetworkEntry> {

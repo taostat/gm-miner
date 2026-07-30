@@ -145,8 +145,14 @@ pub struct SourceProduct {
     /// How many of the miner's active workers hold a key that answers for
     /// (`provider`, `model`). Zero means the route is unservable until a key
     /// is set and rolled out to a worker.
-    pub capable_worker_count: u32,
-    pub already_offered: bool,
+    ///
+    /// `None` from the public `GET /products/sources`, which knows no caller —
+    /// distinct from `Some(0)`, "you have no capable worker".
+    #[serde(default)]
+    pub capable_worker_count: Option<u32>,
+    /// `None` from the public route, for the same reason as above.
+    #[serde(default)]
+    pub already_offered: Option<bool>,
 }
 
 /// Response from `GET /miners/products/sources` (`SourceProductsResponse`).
