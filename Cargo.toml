@@ -23,6 +23,9 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+# Held at 0.12 because dstack-sdk pins `^0.12`: bumping to 0.13 to dedupe with
+# axoupdater's copy only moves the duplication into attestd, the TEE binary.
+# Revisit when dstack-sdk ships 0.13.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 axum = "0.8"
 async-trait = "0.1"
@@ -32,6 +35,9 @@ sha2 = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 dstack-sdk = "0.1"
+# Reads the install receipt dist's shell installer writes, so it tracks the
+# cargo-dist family that builds the releases it updates from.
+axoupdater = "0.10"
 gm-azure-verify = { path = "azure-verify" }
 
 [workspace.lints.clippy]

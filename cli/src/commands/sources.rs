@@ -16,6 +16,7 @@ use gm_miner_cli::{
 use crate::commands::status_error;
 
 const SOURCES_PATH: &str = "/miners/products/sources";
+const SOURCING_DOC_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/blob/main/docs/sourcing.md");
 
 pub(crate) async fn cmd_sources(client: &mut RegistryClient) -> Result<()> {
     let network = client.config.resolved_network();
@@ -99,28 +100,42 @@ fn source_rule() -> String {
     "-".repeat(cells + SOURCE_COLUMNS.len() - 1)
 }
 
+/// A no-table result: the two lines of `why`, then the shared tail. Both empty
+/// states end at the same two pointers, so a third cannot forget the doc link.
+fn empty_state(network: Network, why: [&str; 2]) -> Vec<String> {
+    vec![
+        format!("Sourcing routes ({network})"),
+        String::new(),
+        why[0].to_owned(),
+        why[1].to_owned(),
+        "`gmcli pricing` lists the buyer products you can serve directly.".to_owned(),
+        String::new(),
+        format!("What a sourcing route is: {SOURCING_DOC_URL}"),
+    ]
+}
+
 fn render_sources(network: Network, lookup: &SourceLookup) -> Vec<String> {
     let sources = match lookup {
         SourceLookup::Routes(routes) => routes.as_slice(),
         SourceLookup::Unsupported => {
-            return vec![
-                format!("Sourcing routes ({network})"),
-                String::new(),
-                "This registry does not publish sourcing routes yet — nothing on your".to_owned(),
-                "side to fix; routes appear here once it is updated.".to_owned(),
-                "`gmcli pricing` lists the buyer products you can serve directly.".to_owned(),
-            ];
+            return empty_state(
+                network,
+                [
+                    "This registry does not publish sourcing routes yet — nothing on your",
+                    "side to fix; routes appear here once it is updated.",
+                ],
+            );
         }
     };
 
     if sources.is_empty() {
-        return vec![
-            format!("Sourcing routes ({network})"),
-            String::new(),
-            "None available to you. A sourcing route serves a buyer product from a".to_owned(),
-            "cheaper upstream; one appears here when the registry publishes it.".to_owned(),
-            "`gmcli pricing` lists the buyer products you can serve directly.".to_owned(),
-        ];
+        return empty_state(
+            network,
+            [
+                "None available to you. A sourcing route serves a buyer product from a",
+                "cheaper upstream; one appears here when the registry publishes it.",
+            ],
+        );
     }
 
     let mut lines = vec![
@@ -354,6 +369,8 @@ mod tests {
         assert!(rendered.contains("None available to you."));
         assert!(!rendered.contains("ROUTE"));
         assert!(!rendered.contains("----"));
+        // The miner with no routes has nowhere else to learn what one is.
+        assert!(rendered.contains(super::SOURCING_DOC_URL));
     }
 
     #[test]
@@ -367,6 +384,7 @@ mod tests {
             "an un-deployed endpoint must not read as 'you have no routes'"
         );
         assert!(!rendered.contains("ROUTE"));
+        assert!(rendered.contains(super::SOURCING_DOC_URL));
     }
 
     #[tokio::test]

@@ -14,6 +14,8 @@ ci = "github"
 # deferred to go-public (tap repo doesn't exist yet); re-add "homebrew" + its
 # publish-job when the repo flips public and the tap is created.
 installers = ["shell"]
+# No `install-updater`: gmcli embeds axoupdater as `gmcli update`, so a
+# standalone `gmcli-update` binary would duplicate it.
 # Target platforms to build apps for (Rust target-triple syntax). Unix only —
 # see the Windows note above.
 targets = [

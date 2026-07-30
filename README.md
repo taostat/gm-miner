@@ -42,6 +42,17 @@ Three steps to a running miner.
    directory is on your `PATH`. To install a specific version, replace `latest/download` with
    `download/<tag>`, e.g. `https://github.com/taostat/gm-miner/releases/download/v0.1.0/gmcli-installer.sh`.
 
+   To upgrade later:
+
+   ```sh
+   gmcli update
+   ```
+
+   That replaces the binary in place with the latest release and needs no login. Nothing warns
+   you when your CLI is behind, so a documented command that reports `unrecognized subcommand`
+   usually means an upgrade is due rather than a missing feature; `gmcli --version` confirms
+   what you are on.
+
 3. **Run the guided onboarding:**
 
    ```sh
@@ -117,6 +128,12 @@ gmcli set-api-keys --anthropic "sk-ant-a;sk-ant-b;sk-ant-c"
 ```
 
 See [multi-key slots](docs/multi-key-slots.md) for the slot behavior and limits.
+
+DeepInfra and KubeTEE are *sourcing* upstreams: they do not appear in the buyer catalog under
+their own names, they serve an existing buyer product more cheaply — DeepInfra serves
+`zai/glm-5.2`, KubeTEE serves `moonshot/kimi-k3`. Setting one of those keys is what makes the
+matching route available to you. Run `gmcli sources` to see them, and read
+[sourcing routes](docs/sourcing.md) for how they settle.
 
 To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
 API, select Bedrock and provide the Bedrock region and API key:
@@ -230,6 +247,16 @@ gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-
 Use `--upstream-model` only when the upstream expects a different id, typically Bedrock. Azure
 deployments named exactly like the gm model id do not need it.
 
+To see the buyer products you can serve from a cheaper upstream — and the pre-filled
+`declare-product` line for each:
+
+```sh
+gmcli sources
+```
+
+These settle on the *buyer* product's retail less your discount, so the gap between that and what
+the upstream charges you is your spread. See [sourcing routes](docs/sourcing.md).
+
 ### 6. Check your status
 
 ```sh
@@ -282,9 +309,15 @@ gmcli worker remove <worker_id>
 | `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE) |
 | `gmcli declare-product` | Declare a single model offer with a discount |
 | `gmcli declare-products` | Fan one discount across the catalog or one provider's slice |
+| `gmcli undeclare-product` | Withdraw a single offer; re-declaring re-offers it |
+| `gmcli undeclare-products` | Withdraw every standing offer (`--all`) or one provider's slice |
 | `gmcli status` | Registration state + per-product eligibility and rates |
+| `gmcli pricing` | Rank each offer against the eligible field on the scalar the gateway routes on |
+| `gmcli sources` | List the [sourcing routes](docs/sourcing.md) you can serve — a buyer product served from a cheaper upstream |
 | `gmcli earnings` | On-chain hotkey emission from the subnet metagraph (requires btcli) |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
+| `gmcli check-streaming` | Send one tiny streaming request per configured provider through your own data plane; reports whether tokens stream or buffer |
+| `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
 | `gmcli worker list` | List workers with per-worker status and last attestation |
 | `gmcli worker remove` | Deregister a worker from the registry |
