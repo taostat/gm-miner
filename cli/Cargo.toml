@@ -77,3 +77,6 @@ wiremock     = "0.6"
 tokio        = { workspace = true }
 tempfile     = "3"
 chrono       = { version = "0.4", features = ["serde"] }
+rcgen        = "0.14.8"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls       = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }

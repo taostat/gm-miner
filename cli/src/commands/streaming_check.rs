@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use gm_miner_cli::{
-    client::{build_http_client, RegistryClient, ME_PATH},
+    client::{build_data_plane_probe_client, build_http_client, RegistryClient, ME_PATH},
     config::{Config, ProviderKeys, WorkerRecord},
     types::{MinerStatus, ProductCatalogResponse, Provider, WorkerListResponse},
 };
@@ -407,7 +407,7 @@ async fn run_provider_probe(
     probe: &ProviderProbe,
 ) -> Result<Vec<Duration>> {
     let url = endpoint_url(&target.endpoint, probe.path)?;
-    let client = build_http_client()?;
+    let client = build_data_plane_probe_client()?;
     let started = Instant::now();
     let mut response = client
         .post(url.clone())

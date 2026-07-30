@@ -48,6 +48,50 @@ pub fn build_http_client() -> Result<Client> {
         .context("build http client")
 }
 
+/// Build an HTTP client for probing a miner CVM's own data-plane endpoint —
+/// the `-8080s` RA-TLS passthrough route `gmcli check-streaming` (and
+/// deploy's post-deploy streaming self-test) sends provider probes to.
+///
+/// That endpoint terminates TLS with a certificate dstack mints inside the
+/// enclave via its `GetTlsKey` RPC (see `attestd::ratls`'s module doc):
+/// self-signed and bound to a TDX quote, not CA-issued. A normal
+/// certificate-verifying client always fails against it with "self signed
+/// certificate in certificate chain", so this client disables certificate
+/// verification. That is safe *only* in this narrow context, for three
+/// reasons:
+///
+/// 1. By the time this client is used, `gmcli deploy` has already verified
+///    this exact CVM's `compose_hash` and `os_image_hash` against the
+///    registry's approved `ImageVersion` list via the trusted Phala Cloud API
+///    (see `deploy::hashes::verify_hashes`) — trust in the CVM comes from
+///    that prior check, not from this HTTPS connection.
+/// 2. Every request sent with this client carries the operator's own
+///    `x-gm-node-key` (the per-worker `GM_NODE_SECRET` gmcli generated),
+///    known only to the operator and that CVM's envoy — a MITM would also
+///    need to have stolen that secret.
+/// 3. Real buyer traffic never goes through this client or trusts it: the
+///    production gateway performs the full RA-TLS verification described in
+///    `attestd::ratls` (quote validation via `dcap-qvl`, event-log replay)
+///    before trusting this same endpoint for buyer traffic.
+///
+/// Same timeout, user-agent, and no-redirect policy as [`build_http_client`]
+/// (see its doc comment for why redirects are disabled — it applies equally
+/// here). **Never use this client for the registry API or any other
+/// request** — only for hitting a miner CVM's own data-plane endpoint that
+/// gmcli has already hash-verified.
+///
+/// # Errors
+/// Returns an error if the TLS stack cannot be initialised.
+pub fn build_data_plane_probe_client() -> Result<Client> {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("build data-plane probe http client")
+}
+
 /// Fetch OAuth configuration from the registry.
 ///
 /// Unauthenticated `GET {api_url}/auth/config`. Called by `gmcli login`
@@ -240,9 +284,19 @@ impl RegistryClient {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::build_http_client;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    use rustls::ServerConfig;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{build_data_plane_probe_client, build_http_client};
 
     /// The gmcli HTTP client must never follow a redirect. The streaming
     /// probe sends the worker's `x-gm-node-key` to a miner-controlled
@@ -278,5 +332,97 @@ mod tests {
         // `server` drops here; the `.expect(1)` verifies the origin was hit
         // exactly once — a followed redirect would dial the unroutable
         // target instead and error before this assertion.
+    }
+
+    /// Starts a bare HTTPS listener on `127.0.0.1` presenting a freshly
+    /// minted, self-signed certificate — standing in for the miner CVM's
+    /// dstack-minted RA-TLS cert (self-signed, not CA-issued; see
+    /// `attestd::ratls`'s module doc). Serves exactly one request with a
+    /// minimal 200 response, then the accept task exits.
+    async fn spawn_self_signed_https_server() -> SocketAddr {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(["127.0.0.1".to_owned()])
+                .expect("generate self-signed cert");
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der = PrivatePkcs8KeyDer::from(signing_key.serialize_der());
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("select tls protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der.into())
+            .expect("build tls server config");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("read bound local addr");
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut tls) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut buf = [0_u8; 1024];
+            let _ = tls.read(&mut buf).await;
+            let body = b"ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = tls.write_all(response.as_bytes()).await;
+            let _ = tls.write_all(body).await;
+            let _ = tls.shutdown().await;
+        });
+
+        addr
+    }
+
+    /// The regression this whole fix is for: `run_provider_probe` posts to
+    /// the miner CVM's `-8080s` RA-TLS passthrough endpoint, whose
+    /// certificate is self-signed and dstack-minted, not CA-issued. Proves
+    /// two things against the same self-signed server: the dedicated probe
+    /// client connects successfully...
+    #[tokio::test]
+    async fn data_plane_probe_client_accepts_the_cvms_self_signed_cert() {
+        let addr = spawn_self_signed_https_server().await;
+        let url = format!("https://127.0.0.1:{}/", addr.port());
+
+        let response = build_data_plane_probe_client()
+            .expect("build probe client")
+            .get(&url)
+            .send()
+            .await;
+
+        assert!(
+            response.is_ok(),
+            "the data-plane probe client must accept a self-signed cert: {response:?}"
+        );
+    }
+
+    /// ...while the plain client — what `check-streaming` used before this
+    /// fix — fails with a certificate-verification error against the exact
+    /// same server. This is the assertion that proves the bug was real and
+    /// that the dedicated probe client is the fix, not an unrelated change.
+    #[tokio::test]
+    async fn plain_http_client_rejects_the_same_self_signed_cert() {
+        let addr = spawn_self_signed_https_server().await;
+        let url = format!("https://127.0.0.1:{}/", addr.port());
+
+        let err = build_http_client()
+            .expect("build plain client")
+            .get(&url)
+            .send()
+            .await
+            .expect_err("the plain client must reject an unverifiable self-signed cert");
+
+        assert!(
+            err.is_connect(),
+            "expected a connect/TLS-verification error, got: {err}"
+        );
     }
 }
