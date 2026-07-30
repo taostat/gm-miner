@@ -66,7 +66,10 @@ fi
 read -r -p "Tag and push $TAG? This publishes a GitHub Release. [y/N] " reply
 [[ "$reply" == "y" || "$reply" == "Y" ]] || die "aborted"
 
-git tag "$TAG"
+# Annotated, and always with a message: a bare `git tag` produces a SIGNED tag
+# under `tag.gpgsign = true` (common in this org, with `gpg.format = ssh`) and
+# then aborts with "fatal: no tag message?" when it has none.
+git tag -a -m "Release $TAG" "$TAG"
 git push origin "$TAG"
 
 echo "Pushed $TAG. Watch the release run:"
