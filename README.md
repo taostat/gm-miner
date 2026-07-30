@@ -362,14 +362,24 @@ A release is triggered by pushing a **version tag** matching `v<major>.<minor>.<
 the workflow cross-builds `gmcli` for all configured targets, generates the shell installer, and
 publishes a GitHub Release with the artifacts and checksums.
 
-To cut a release (the current version is `0.1.4`):
+To cut a release:
 
 ```sh
-# 1. Ensure Cargo.toml `version` matches the tag (e.g. 0.1.4) and main is green.
-# 2. Tag and push.
-git tag v0.1.4
-git push origin v0.1.4
+# 1. Bump `version` under [workspace.package] in Cargo.toml, in a PR. Merge it.
+# 2. From an up-to-date main:
+./scripts/release.sh              # or --dry-run to see what it would tag
 ```
+
+`release.sh` reads the version out of `Cargo.toml` and tags that — you never type it. It
+refuses to run off `main`, on a dirty tree, when `main` is behind `origin`, or when the tag
+already exists, and asks before pushing.
+
+Do not hand-tag. `dist` rejects a tag that does not match the workspace version, and every
+failed release in this repo has been exactly that: `v0.3.11-dev`, `v0.3.12-dev`, `v0.3.13-dev`,
+`v0.3.14` and `v0.3.14-dev` were all pushed against a stale `Cargo.toml`, published nothing, and
+went unnoticed because a failed release looks the same as no release. A burned tag cannot be
+reused either, since deleting a published tag rewrites a public ref — bump to the next version
+instead.
 
 The `release` workflow also runs in dry-run mode on pull requests, so changes to the pipeline
 are validated before merge without publishing.
