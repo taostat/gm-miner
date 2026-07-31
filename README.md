@@ -117,6 +117,7 @@ gmcli set-api-keys --zai zai-...
 gmcli set-api-keys --moonshot sk-...
 gmcli set-api-keys --deepinfra ...
 gmcli set-api-keys --kubetee sk-...
+gmcli set-api-keys --engy sk-...
 ```
 
 Each flag replaces the stored value; omitted flags leave existing values intact.
@@ -129,10 +130,12 @@ gmcli set-api-keys --anthropic "sk-ant-a;sk-ant-b;sk-ant-c"
 
 See [multi-key slots](docs/multi-key-slots.md) for the slot behavior and limits.
 
-DeepInfra and KubeTEE are *sourcing* upstreams: they do not appear in the buyer catalog under
-their own names, they serve an existing buyer product more cheaply — DeepInfra serves
-`zai/glm-5.2`, KubeTEE serves `moonshot/kimi-k3`. Setting one of those keys is what makes the
-matching route available to you. Run `gmcli sources` to see them, and read
+DeepInfra, Engy and KubeTEE are *sourcing* upstreams: they do not appear in the buyer catalog
+under their own names, they serve an existing buyer product — DeepInfra and Engy both serve
+`zai/glm-5.2`, KubeTEE serves `moonshot/kimi-k3`. One buyer product can have several such
+routes and none of them is canonical. Setting one of those keys is what makes the matching
+route available to you. A single worker can serve only one route per buyer product, so run two
+workers to run two upstreams for the same model. Run `gmcli sources` to see them, and read
 [sourcing routes](docs/sourcing.md) for how they settle.
 
 To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic

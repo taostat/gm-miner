@@ -64,7 +64,7 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, node secret.
 /// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
 /// gm image is public and those vars do not appear in `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 27] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 28] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -91,6 +91,7 @@ const CANONICAL_ALLOWED_ENVS: [&str; 27] = [
     "MOONSHOT_API_KEY",
     "DEEPINFRA_API_KEY",
     "KUBETEE_API_KEY",
+    "ENGY_API_KEY",
     "GM_NODE_SECRET",
 ];
 
@@ -223,7 +224,7 @@ mod tests {
     /// keys, cloud upstream settings, and node secret).
     ///
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "d15c9da67b8b91948a3b755c75312545b48df6c6cea05d9de0c1dd9d8efa268a";
+        "8211ae97d50b4468a0a708d923133be9b7f705837947464cf90cb0a2fc7e6d73";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
