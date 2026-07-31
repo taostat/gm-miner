@@ -342,6 +342,8 @@ pub struct ProviderKeys {
     pub deepinfra: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kubetee: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engy: Option<String>,
 }
 
 /// True when `v` holds a non-empty, non-whitespace value. `Some("")` and
@@ -477,6 +479,7 @@ impl ProviderKeys {
             || non_empty(self.moonshot.as_deref())
             || non_empty(self.deepinfra.as_deref())
             || non_empty(self.kubetee.as_deref())
+            || non_empty(self.engy.as_deref())
     }
 
     /// Reject a selected cloud upstream that is missing fields `start.sh`

@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "35298b5194b1babe58da70315f280cc60a2116e451f7d8bc73b152756870f0fa";
+    "036179fdc95cff4c14b1b8f20486526a39acc96a7da0678ce1214a5763fe993b";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,6 +62,41 @@ fn direct_unset_render_matches_pinned_output() {
     assert!(rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
     assert!(!rendered.contains("sk-ant-direct"));
     assert!(!rendered.contains("value: \"%ENVIRONMENT(ANTHROPIC_API_KEY)%\""));
+}
+
+#[test]
+fn engy_route_keeps_v1_path_and_pins_the_wildcard_san() {
+    // api.engy.ai serves the OpenAI-compatible surface under /v1 itself and
+    // negotiates h2 over ALPN, so it mirrors kubetee rather than deepinfra.
+    // Its certificate carries only the wildcard `*.engy.ai`; Envoy's exact DNS
+    // SAN matcher resolves that per RFC 6125, as it already does for
+    // llm.kubetee.ai, api.z.ai and api.moonshot.ai.
+    let (status, _, stderr, rendered) = render_envoy([("ENGY_API_KEY", "sk-engy")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let cluster = rendered
+        .split_once("- name: engy")
+        .and_then(|(_, rest)| rest.split_once("\n    - name:"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        cluster.contains("http2_protocol_options: {}"),
+        "engy upstream negotiates h2"
+    );
+    assert!(
+        cluster.contains("exact: api.engy.ai"),
+        "engy cluster must pin the SAN to api.engy.ai"
+    );
+    let route = rendered
+        .split_once("exact: \"engy\"")
+        .and_then(|(_, rest)| rest.split_once("request_headers_to_remove"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        !route.contains("regex_rewrite"),
+        "engy already serves /v1; a path rewrite would 404 every request"
+    );
+    assert!(
+        !rendered.contains("sk-engy"),
+        "the key must never be rendered"
+    );
 }
 
 #[test]
