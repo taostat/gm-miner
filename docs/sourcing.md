@@ -25,8 +25,9 @@ explains the table and how to set each upstream up.
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
 
 Both buyer products can also be served **direct** — with a Z.ai key (`--zai`) or a
-Moonshot key (`--moonshot`). Direct is just another route; it is not a default and
-carries no advantage beyond whatever the upstream itself offers.
+Moonshot key (`--moonshot`). Direct is not the canonical route, but it does carry one
+concrete advantage: where a worker could serve a product both directly and through a
+route, the router keeps the direct one (see below).
 
 Routes are absent from the public catalog (`gmcli pricing`, and the registry's
 buyer-facing `GET /products`): they are dispatch targets, not products a buyer can
@@ -135,8 +136,11 @@ glm-5.2`. The registry keeps the row for audit and re-declaring re-offers it.
 
 ## Why a route shows `YOU SERVE: no`
 
-The count is how many of your workers the router would admit for that upstream
-today. Zero means declaring it buys you nothing yet. In rough order of frequency:
+The count is how many of your workers hold a usable key for that upstream and are
+on an approved image today. Zero means declaring it buys you nothing yet. It is a
+capability count, not final admission: if one worker can serve two routes for the
+same buyer product, it is counted under both, and only one of them will be routed.
+In rough order of frequency:
 
 - The key is not set, or was set after your last deploy — run `gmcli set-api-keys`
   then `gmcli deploy`.
