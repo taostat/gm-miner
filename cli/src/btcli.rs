@@ -125,13 +125,64 @@ struct MetagraphOutput {
     tempo: Option<MetagraphTempo>,
 }
 
+/// Escapes bare C0 control bytes (`0x00`-`0x1F`) found inside JSON string
+/// literals, leaving everything outside a string byte-for-byte unchanged.
+///
+/// bittensor-cli's `--json-output` echoes on-chain identity fields verbatim,
+/// and at least one live neuron (netuid 28, see gm-miner#154) carries a raw
+/// control character in its `identity` string. `serde_json` refuses to parse
+/// that, reporting "control character found while parsing a string" —
+/// and since `serde_json` must scan every string to find the matching closing
+/// quote (even for fields gmcli's structs don't model), one bad byte breaks
+/// the whole document, not just that field. btcli itself isn't ours to patch,
+/// so gmcli sanitizes the bytes before handing them to `serde_json`.
+///
+/// This only rewrites bytes the scanner has determined are inside an open,
+/// unescaped string literal, replacing each with a `\u00XX` escape. Control
+/// bytes used as structural JSON whitespace (tab, newline, carriage return
+/// *between* tokens) sit outside any string and are left alone. Backslash
+/// escaping is tracked byte-by-byte so an escaped backslash immediately
+/// before a closing quote (`"...\\"`) isn't mistaken for an escaped quote,
+/// which would otherwise run the "inside a string" state past the real end
+/// of the literal.
+fn sanitize_control_chars(json: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(json.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in json {
+        if in_string {
+            if escaped {
+                out.push(byte);
+                escaped = false;
+            } else if byte == b'\\' {
+                out.push(byte);
+                escaped = true;
+            } else if byte == b'"' {
+                out.push(byte);
+                in_string = false;
+            } else if byte < 0x20 {
+                out.extend_from_slice(format!("\\u{byte:04x}").as_bytes());
+            } else {
+                out.push(byte);
+            }
+        } else {
+            if byte == b'"' {
+                in_string = true;
+            }
+            out.push(byte);
+        }
+    }
+    out
+}
+
 /// Find a hotkey's uid in `btcli subnet metagraph --json-output --no-prompt`.
 ///
 /// Isolated so the brittle shape-matching against btcli's JSON lives in one
 /// place: bittensor-cli 9.20.x nests the neuron rows under `uids`, each row
 /// keying its address `hotkey` and its index `uid`.
 fn parse_registration(json: &[u8], ss58: &str) -> Result<Registration> {
-    let parsed: MetagraphOutput = serde_json::from_slice(json)
+    let sanitized = sanitize_control_chars(json);
+    let parsed: MetagraphOutput = serde_json::from_slice(&sanitized)
         .context("parse `btcli subnet metagraph --json-output --no-prompt`")?;
     match parsed.uids.iter().find(|n| n.hotkey == ss58) {
         Some(neuron) => Ok(Registration::Registered { uid: neuron.uid }),
@@ -143,7 +194,8 @@ fn parse_registration(json: &[u8], ss58: &str) -> Result<Registration> {
 /// --no-prompt`, or `None` when the row is absent. Same `uids`/`tempo` shape as
 /// [`parse_registration`]; isolated here so the JSON contract lives in one place.
 fn parse_neuron_stats(json: &[u8], ss58: &str) -> Result<Option<NeuronStats>> {
-    let parsed: MetagraphOutput = serde_json::from_slice(json)
+    let sanitized = sanitize_control_chars(json);
+    let parsed: MetagraphOutput = serde_json::from_slice(&sanitized)
         .context("parse `btcli subnet metagraph --json-output --no-prompt`")?;
     let tempo_blocks = parsed.tempo.map(|t| t.tempo);
     Ok(parsed
@@ -279,7 +331,7 @@ impl BtcliBridge for RealBtcli {
 mod tests {
     use super::{
         btcli_network, metagraph_args, parse_hotkey_ss58, parse_neuron_stats, parse_registration,
-        wallet_list_args, Registration,
+        sanitize_control_chars, wallet_list_args, Registration,
     };
     use crate::network::Network;
 
@@ -451,5 +503,85 @@ mod tests {
                 "placeholder {placeholder:?} must not resolve"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_control_chars_escapes_control_byte_inside_string() {
+        let mut input = b"{\"identity\":\"TAO".to_vec();
+        input.push(0x07); // BEL, a raw control byte inside the string value
+        input.extend_from_slice(b"com\"}");
+
+        let out = sanitize_control_chars(&input);
+        assert_eq!(out, b"{\"identity\":\"TAO\\u0007com\"}");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&out).expect("sanitized JSON must parse");
+        assert_eq!(value["identity"], "TAO\u{7}com");
+    }
+
+    #[test]
+    fn sanitize_control_chars_preserves_structural_whitespace() {
+        // Tab, newline, and carriage return *between* tokens are valid JSON
+        // whitespace and must survive untouched.
+        let input = b"{\n\t\"a\":\r\n1\n}";
+        assert_eq!(sanitize_control_chars(input), input);
+    }
+
+    #[test]
+    fn sanitize_control_chars_tracks_escaped_backslash_before_quote() {
+        // `"x\\"` is the two-byte-escape for the one-character string `x\`:
+        // the backslash right before the closing quote is itself escaped, so
+        // it must NOT be read as escaping that quote. A scanner that mis-
+        // tracks this would believe the string named "a" is still open past
+        // its real end, corrupting everything that follows — including the
+        // control byte inside the next string, "b".
+        let mut input = br#"{"a":"x\\","b":""#.to_vec();
+        input.push(0x01);
+        input.extend_from_slice(b"\"}");
+
+        let out = sanitize_control_chars(&input);
+        let expected: &[u8] = br#"{"a":"x\\","b":"\u0001"}"#;
+        assert_eq!(out, expected);
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&out).expect("sanitized JSON must parse");
+        assert_eq!(value["a"], "x\\");
+        assert_eq!(value["b"], "\u{1}");
+    }
+
+    #[test]
+    fn sanitize_control_chars_passes_through_valid_json_unchanged() {
+        assert_eq!(sanitize_control_chars(METAGRAPH_JSON), METAGRAPH_JSON);
+    }
+
+    #[test]
+    fn sanitize_control_chars_of_empty_input_is_empty() {
+        assert_eq!(sanitize_control_chars(b""), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn parse_registration_tolerates_control_character_in_identity_field() {
+        // Regression test for gm-miner#154: a live neuron on netuid 28 carries
+        // a raw control character inside its (unmodeled) `identity` field.
+        // Before sanitizing, serde_json rejected the whole document with
+        // "control character (...) found while parsing a string", breaking
+        // both `register-hotkey` and `earnings` — both parse through here.
+        let mut json = br#"{"netuid":28,"uids":[{"uid":6,"hotkey":"5AAA",
+            "coldkey":"5CWzmvA17MAMQ9mnAecLxFXS2N8846rz6T7m4QNHyVtJVq4j",
+            "identity":"TAO"#
+            .to_vec();
+        json.push(0x00); // raw control byte inside the identity string
+        json.extend_from_slice(
+            br#"com","claim_type":"Swap","stake":10.0,"incentive":0.1,
+            "dividends":0.0,"emissions":1.0}]}"#,
+        );
+
+        let reg = parse_registration(&json, "5AAA").expect("parse must succeed after sanitizing");
+        assert_eq!(reg, Registration::Registered { uid: 6 });
+
+        let stats = parse_neuron_stats(&json, "5AAA")
+            .expect("parse must succeed after sanitizing")
+            .expect("hotkey present");
+        assert_eq!(stats.uid, 6);
     }
 }
