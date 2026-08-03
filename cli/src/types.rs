@@ -290,6 +290,14 @@ pub struct WorkerEntry {
     pub endpoint: String,
     pub status: String,
     pub last_attestation_at: Option<String>,
+    /// Why the registry's last probe rejected this worker, verbatim from the
+    /// registry. `status` alone says `failed_attestation` and stops there, so
+    /// TCB drift, an unapproved image, a stale quote and a `report_data`
+    /// mismatch are indistinguishable — and they have four different fixes.
+    /// `None` on a healthy worker, and on a registry deployed before the field
+    /// existed.
+    #[serde(default)]
+    pub attestation_error: Option<String>,
     /// When the registry created this worker row, RFC 3339. The oldest live
     /// worker is the miner's worker #1 — the row `POST /miners/register`
     /// refreshes — so this is what orders the live list (see

@@ -64,7 +64,16 @@ pub fn worker_health_lines(
     // `suspended_at` is only ever set, never cleared, so a restored worker still
     // carries a stale one — `status` is the only truthful source.
     let suspended = worker.status == "suspended";
-    if !suspended && dead.is_empty() {
+    // The registry clears this on a healthy probe, so a present value always
+    // describes the worker's current failure. It is also what makes a
+    // `failed_attestation` or `unreachable` worker render anything at all:
+    // before it existed those statuses printed a bare row and no explanation.
+    let cause = worker
+        .attestation_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|cause| !cause.is_empty());
+    if !suspended && dead.is_empty() && cause.is_none() {
         return Vec::new();
     }
 
@@ -72,6 +81,12 @@ pub fn worker_health_lines(
         String::new(),
         format!("{} ({})", worker.worker_id, worker.status),
     ];
+    // Verbatim, not translated. The registry owns this vocabulary; a second
+    // copy here would drift from it exactly as `ineligible_reasons`' docstring
+    // warns, and an unrecognised cause must still reach the operator.
+    if let Some(cause) = cause {
+        lines.push(format!("  cause           : {cause}"));
+    }
     if suspended {
         if let Some(since) = worker.suspended_at.as_deref() {
             lines.push(format!("  suspended since : {since}"));
@@ -302,6 +317,46 @@ mod tests {
         assert!(rendered.contains("next re-probe   : 2026-07-11T09:02:00+00:00 (in 2m)"));
         assert!(rendered.contains("1 of 2 consecutive good probes"));
         assert!(rendered.contains("re-probe attempt 3"));
+    }
+
+    /// Before the registry recorded a cause, a `failed_attestation` worker
+    /// rendered a bare table row and nothing else — the operator was told to
+    /// fix "attestation" without being told which of four unrelated faults it
+    /// was. The cause is what makes this status explain itself.
+    #[test]
+    fn a_failed_attestation_worker_reports_its_cause() {
+        let mut worker = worker_entry("failed_attestation");
+        worker.attestation_error = Some("tcb status OutOfDate".to_owned());
+
+        let rendered = worker_health_lines(&worker, 2, now()).join("\n");
+        assert!(rendered.contains("01J0A (failed_attestation)"));
+        assert!(rendered.contains("cause           : tcb status OutOfDate"));
+    }
+
+    /// A suspended worker's cause explains why it went down, so it renders
+    /// alongside the recovery view rather than replacing it.
+    #[test]
+    fn a_suspended_worker_reports_its_cause_and_its_recovery_view() {
+        let mut worker = worker_entry("suspended");
+        worker.attestation_error = Some("worker_unreachable".to_owned());
+        worker.suspended_at = Some("2026-07-11T08:30:00+00:00".to_owned());
+        worker.consecutive_ok = 1;
+
+        let rendered = worker_health_lines(&worker, 2, now()).join("\n");
+        assert!(rendered.contains("cause           : worker_unreachable"));
+        assert!(rendered.contains("1 of 2 consecutive good probes"));
+    }
+
+    /// A registry deployed before the field existed omits it entirely, and an
+    /// empty string is not a cause. Neither may turn a healthy worker into one
+    /// that renders an empty explanation block.
+    #[test]
+    fn an_absent_or_blank_cause_renders_nothing_for_a_healthy_worker() {
+        assert!(worker_health_lines(&worker_entry("active"), 2, now()).is_empty());
+
+        let mut blank = worker_entry("active");
+        blank.attestation_error = Some("   ".to_owned());
+        assert!(worker_health_lines(&blank, 2, now()).is_empty());
     }
 
     #[test]
