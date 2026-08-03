@@ -15,6 +15,7 @@ pub mod pricing;
 pub mod products;
 pub mod sources;
 pub mod streaming_check;
+pub mod update;
 pub mod wizard;
 
 use anyhow::{Context as _, Result};

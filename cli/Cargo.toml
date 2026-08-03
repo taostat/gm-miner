@@ -63,6 +63,7 @@ thiserror    = { workspace = true }
 anyhow       = { workspace = true }
 reqwest      = { workspace = true }
 gm-azure-verify = { workspace = true }
+axoupdater   = { workspace = true }
 chrono       = { version = "0.4", features = ["serde"] }
 dirs         = "6"
 open         = "5"

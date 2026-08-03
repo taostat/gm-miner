@@ -17,6 +17,7 @@
 //!                      (the hidden `list-products` alias runs the same code)
 //!   pricing          — rank your offers against the eligible field
 //!   sources          — list the sourcing routes you can serve
+//!   update           — upgrade gmcli in place to the latest release
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
 //!   worker list      — list the hotkey's live workers
 //!   worker remove    — deregister a worker (CVM teardown is separate)
@@ -68,6 +69,7 @@ use crate::commands::products::{
 };
 use crate::commands::sources::cmd_sources;
 use crate::commands::streaming_check::cmd_check_streaming;
+use crate::commands::update::cmd_update;
 use crate::commands::wizard::cmd_init;
 
 // Re-exports so the in-file `mod tests` block can keep reaching items it moved
@@ -519,6 +521,16 @@ enum Command {
         gmcli --network testnet sources")]
     Sources,
 
+    /// Upgrade gmcli in place to the latest release.
+    ///
+    /// Replaces this binary with the newest published release, wherever the
+    /// installer put it. Needs no login and does not touch your config, keys,
+    /// or workers. Nothing tells you when a new gmcli is out, so run this if a
+    /// documented command reports `unrecognized subcommand`.
+    #[command(after_help = "Examples:\n  \
+        gmcli update")]
+    Update,
+
     /// Show your miner's current chain emission on the subnet.
     ///
     /// Reads your hotkey's neuron row straight from the subnet metagraph (via
@@ -861,6 +873,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let mut client = RegistryClient::new(cfg);
             cmd_sources(&mut client).await
         }
+        // No config and no login: an upgrade must work for a miner whose stored
+        // token has expired, which is exactly the miner most likely to be stale.
+        Command::Update => cmd_update().await,
         Command::Earnings { yes } => {
             let cfg = load_config(explicit_network, api_url)?;
             cmd_earnings(&cfg, yes)
