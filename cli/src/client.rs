@@ -57,22 +57,30 @@ pub fn build_http_client() -> Result<Client> {
 /// self-signed and bound to a TDX quote, not CA-issued. A normal
 /// certificate-verifying client always fails against it with "self signed
 /// certificate in certificate chain", so this client disables certificate
-/// verification. That is safe *only* in this narrow context, for three
-/// reasons:
+/// verification. That is an accepted trade-off *only* in this narrow context,
+/// for two reasons:
 ///
 /// 1. By the time this client is used, `gmcli deploy` has already verified
 ///    this exact CVM's `compose_hash` and `os_image_hash` against the
 ///    registry's approved `ImageVersion` list via the trusted Phala Cloud API
 ///    (see `deploy::hashes::verify_hashes`) — trust in the CVM comes from
 ///    that prior check, not from this HTTPS connection.
-/// 2. Every request sent with this client carries the operator's own
-///    `x-gm-node-key` (the per-worker `GM_NODE_SECRET` gmcli generated),
-///    known only to the operator and that CVM's envoy — a MITM would also
-///    need to have stolen that secret.
-/// 3. Real buyer traffic never goes through this client or trusts it: the
+/// 2. Real buyer traffic never goes through this client or trusts it: the
 ///    production gateway performs the full RA-TLS verification described in
 ///    `attestd::ratls` (quote validation via `dcap-qvl`, event-log replay)
-///    before trusting this same endpoint for buyer traffic.
+///    before trusting this same endpoint for buyer traffic. Disabling
+///    verification here weakens one operator-run diagnostic, not the path
+///    buyers are served on.
+///
+/// The residual risk is real and deliberately accepted: every request sent
+/// with this client carries the per-worker `GM_NODE_SECRET` as
+/// `x-gm-node-key`, so an attacker able to intercept the operator's
+/// connection to the CVM can present any certificate, have it accepted, and
+/// harvest that secret — which is what the CVM's envoy checks before serving
+/// traffic on the operator's upstream provider keys. The node secret does
+/// *not* protect this connection; it is exposed over it. Closing the gap
+/// means verifying the presented certificate against the CVM's TDX quote
+/// (what the gateway does), not adding another header.
 ///
 /// Same timeout, user-agent, and no-redirect policy as [`build_http_client`]
 /// (see its doc comment for why redirects are disabled — it applies equally
