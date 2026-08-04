@@ -153,6 +153,7 @@ enum Command {
         gmcli set-api-keys --moonshot sk-...\n  \
         gmcli set-api-keys --deepinfra ...\n  \
         gmcli set-api-keys --kubetee sk-...\n  \
+        gmcli set-api-keys --engy sk-...\n  \
         gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
           --bedrock-api-key brk-...\n  \
         gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
@@ -242,6 +243,10 @@ enum Command {
         /// `KubeTEE` API key.
         #[arg(long)]
         kubetee: Option<String>,
+
+        /// Engy API key.
+        #[arg(long)]
+        engy: Option<String>,
     },
 
     /// Deploy the miner to Phala Cloud with trust-correct hash verification.
@@ -313,7 +318,7 @@ enum Command {
     /// Render upstream key slot exports for the container entrypoint.
     #[command(hide = true)]
     SlotEnv {
-        /// Provider id: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, or kubetee.
+        /// Provider id: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, or engy.
         #[arg(long)]
         provider: Provider,
 
@@ -396,7 +401,7 @@ enum Command {
         gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5\n  \
         gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5   # a sourcing route; see `gmcli sources`")]
     DeclareProduct {
-        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, or kubetee.
+        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, or engy.
         #[arg(long)]
         provider: Provider,
 
@@ -452,7 +457,7 @@ enum Command {
         gmcli undeclare-product --provider anthropic --model claude-sonnet-4-6\n  \
         gmcli undeclare-product --provider deepinfra --model zai-org/GLM-5.2   # a sourcing route")]
     UndeclareProduct {
-        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, or kubetee.
+        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, or engy.
         #[arg(long)]
         provider: Provider,
 
@@ -781,6 +786,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             moonshot,
             deepinfra,
             kubetee,
+            engy,
         } => cmd_set_api_keys(
             explicit_network,
             anthropic,
@@ -803,6 +809,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             moonshot,
             deepinfra,
             kubetee,
+            engy,
         ),
         Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
         Command::Gm => {

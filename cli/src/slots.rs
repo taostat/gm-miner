@@ -162,6 +162,7 @@ pub fn provider_slots_for_keys(
         node_secret,
     )?;
     add_provider_slots(&mut slots, "kubetee", keys.kubetee.as_deref(), node_secret)?;
+    add_provider_slots(&mut slots, "engy", keys.engy.as_deref(), node_secret)?;
     Ok(slots)
 }
 
@@ -248,7 +249,7 @@ pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
 /// The direct-provider key env vars the deployed image would actually
 /// read: keys sidelined by a cloud upstream selector are excluded, so a
 /// stale semicolon value there never blocks a deploy.
-fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 8] {
+fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 9] {
     let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
     let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
     [
@@ -266,6 +267,7 @@ fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 8] 
         ("MOONSHOT_API_KEY", keys.moonshot.as_deref()),
         ("DEEPINFRA_API_KEY", keys.deepinfra.as_deref()),
         ("KUBETEE_API_KEY", keys.kubetee.as_deref()),
+        ("ENGY_API_KEY", keys.engy.as_deref()),
     ]
 }
 
