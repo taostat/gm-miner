@@ -138,7 +138,7 @@ zero, because a second offer there changes nothing about why no worker qualifies
 
 **For a provider you have no offer under, declare before waiting for
 `YOU SERVE: yes`.** The registry builds its probe set from the providers you
-have offers for, so a provider with no offer at all is never probed and every one
+have offers for, so while a provider has no offer it is not probed and every one
 of its routes reads `YOU SERVE: no` however your workers are configured.
 Declaring one of them puts the provider into the probe set, which is what lets
 the count move for **all** of that provider's routes — the probe is per provider,
@@ -150,7 +150,9 @@ telling you about that route rather than about the probe set: no worker of yours
 currently qualifies for it. That is worth diagnosing (the causes are listed
 below, and several are transient) rather than answering with another declare.
 `gmcli sources` uses the same distinction to decide when to print the declare
-line, from the routes it can see.
+line, from the offers it can see — it knows whether a provider is offered now,
+not whether a probe has finished, so give a fresh declaration a cycle before
+reading anything into its count.
 
 Note that `declare-products` (the fan-out) is catalog-only on purpose and will not
 declare a route. A route offer commits you to an upstream you hold a key for, so
