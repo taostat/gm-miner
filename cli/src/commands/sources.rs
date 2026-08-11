@@ -172,14 +172,31 @@ fn serving_cell(capable_worker_count: u32) -> String {
     }
 }
 
-/// Whether any route for this provider is already declared.
+/// Whether any route for this provider is already declared, as a proxy for
+/// "the registry has this provider in its probe set".
 ///
-/// The registry's probe set is keyed by *provider*, not by route
-/// (`control_loop/driver.py` groups a miner's offers into `offers_by_provider`
-/// and probes each key once). So one offer anywhere under a provider is enough
-/// to get every model that provider serves into the worker's supported set —
-/// which is what separates a zero that means "never probed" from a zero that
-/// means "probed, and this model is not reachable".
+/// The probe set is keyed by *provider*, not by route: `control_loop/driver.py`
+/// groups a miner's offers into `offers_by_provider` and probes each key once,
+/// so one offer anywhere under a provider pulls every model it serves into the
+/// worker's supported set. That is what separates a zero meaning "never probed"
+/// from a zero meaning "probed, and this model is not reachable".
+///
+/// Two things make this a proxy rather than the real predicate, both of which
+/// would make it answer `true` too eagerly and so *withhold* a declare line the
+/// miner needs — the same cycle this module exists to break:
+///
+/// - It sees only sourcing routes. A **direct** offer under the same provider
+///   also puts it in the probe set, and direct offers are not on this endpoint.
+/// - A **cloud-backed** provider is not grouped at all: `driver.py` probes those
+///   offers one at a time through `cloud_capability` and removes them before the
+///   grouping, so one offer there does not probe the provider's other routes.
+///
+/// Both are inert for the providers this command lists: a sourcing route's
+/// upstream (deepinfra, kubetee, engy) is never sold as a buyer product, so it
+/// carries no direct offers, and cloud backends attach only to anthropic and
+/// openai (`LEGACY_BACKEND_PROVIDER`). If either ever stops holding, the failure
+/// is silent and one-directional — the second route under such a provider goes
+/// back to being undeclarable from this output.
 fn provider_is_probed(sources: &[SourceProduct], provider: &str) -> bool {
     sources
         .iter()

@@ -196,8 +196,15 @@ pub struct SourceProduct {
     pub buyer_model: String,
     pub retail_price: RetailPrice,
     /// How many of the miner's active workers hold a key that answers for
-    /// (`provider`, `model`). Zero means the route is unservable until a key
-    /// is set and rolled out to a worker.
+    /// (`provider`, `model`).
+    ///
+    /// Zero has two unrelated causes and the difference decides what to do
+    /// about it. A worker holding a perfectly good key still reads zero while
+    /// its provider sits outside the registry's probe set — the control loop
+    /// probes only providers the miner already has an offer for — so zero on a
+    /// never-declared provider says nothing about the key. Once the provider is
+    /// probed, zero does mean the route is unservable until a key is set and
+    /// rolled out.
     pub capable_worker_count: u32,
     pub already_offered: bool,
 }

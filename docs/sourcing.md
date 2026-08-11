@@ -130,8 +130,12 @@ gmcli deploy
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 ```
 
-`gmcli sources` prints this line for you, pre-filled, for every route you have
-not declared yet.
+`gmcli sources` prints this line for you, pre-filled, for every undeclared route
+where declaring it would actually get you somewhere — one a worker already
+serves, or any route under a provider you have not declared at all. It stays
+quiet for a route whose provider is already declared and whose count is still
+zero, because there the zero is a real answer and a second offer would only sit
+ineligible.
 
 **For a provider you have never declared, declare before waiting for
 `YOU SERVE: yes`.** The registry builds its probe set from the providers you
