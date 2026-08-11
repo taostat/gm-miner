@@ -172,13 +172,26 @@ fn serving_cell(capable_worker_count: u32) -> String {
     }
 }
 
-/// Routes no worker serves yet.
+/// Whether any route for this provider is already declared.
 ///
-/// Declaring is the *fix* for a zero count, not something to hold back until it
-/// clears: the registry builds its probe set from the providers a miner has
-/// offers for, so a provider with no offer is never probed and its routes stay
-/// at zero however the worker is configured. Earlier copy here told miners to
-/// set the key and redeploy, which cannot break that cycle.
+/// The registry's probe set is keyed by *provider*, not by route
+/// (`control_loop/driver.py` groups a miner's offers into `offers_by_provider`
+/// and probes each key once). So one offer anywhere under a provider is enough
+/// to get every model that provider serves into the worker's supported set —
+/// which is what separates a zero that means "never probed" from a zero that
+/// means "probed, and this model is not reachable".
+fn provider_is_probed(sources: &[SourceProduct], provider: &str) -> bool {
+    sources
+        .iter()
+        .any(|s| s.provider == provider && s.already_offered)
+}
+
+/// Routes no worker serves yet, split by whether the zero is informative.
+///
+/// An *unprobed* provider (no offer under it at all) reads zero however the
+/// worker is configured, so the only way forward is to declare. A provider that
+/// already has an offer has been probed, so its zero is real evidence about that
+/// model and declaring buys another ineligible offer instead of an answer.
 ///
 /// A zero is still not proof the key is missing — the control loop also clears a
 /// worker's supported models when it is un-probed or just restored from
@@ -204,22 +217,48 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
             .iter()
             .map(|s| format!("  {}/{}", s.provider, s.model)),
     );
-    lines.push(
-        "  The registry probes a provider only for routes you have declared, so a".to_owned(),
-    );
-    lines.push("  route you have never offered reads zero whatever the worker holds —".to_owned());
-    lines
-        .push("  declare it and the next control-loop cycle fills the count in. If the".to_owned());
-    lines.push("  key is genuinely absent, `gmcli set-api-keys` then `gmcli deploy`.".to_owned());
+
+    let any_unprobed = unserved
+        .iter()
+        .any(|s| !provider_is_probed(sources, &s.provider));
+    if any_unprobed {
+        lines.push(
+            "  A provider you have never declared is never probed, so its routes read".to_owned(),
+        );
+        lines.push(
+            "  zero whatever the worker holds — declare one and the next control-loop".to_owned(),
+        );
+        lines.push("  cycle fills in the rest.".to_owned());
+    }
+    if unserved
+        .iter()
+        .any(|s| provider_is_probed(sources, &s.provider))
+    {
+        lines.push(
+            "  For a provider you already offer, a zero is a real answer: the worker".to_owned(),
+        );
+        lines.push(
+            "  cannot reach that model today. Check the key, the worker's image and".to_owned(),
+        );
+        lines.push("  its last attestation with `gmcli worker list`.".to_owned());
+    }
     lines
 }
 
 fn declare_lines(sources: &[SourceProduct]) -> Vec<String> {
-    // Not gated on `capable_worker_count`: that count stays 0 until the
-    // provider is probed, and the provider is probed only once it has an offer,
-    // so withholding the command until a worker serves the route is a cycle a
-    // miner cannot break from here.
-    let ready: Vec<_> = sources.iter().filter(|s| !s.already_offered).collect();
+    // Suggest a route when a worker already serves it, and additionally when its
+    // provider has no offer at all: that provider is outside the registry's
+    // probe set, so its count cannot leave zero until something is declared —
+    // withholding the command there is a cycle a miner cannot break from here.
+    // Once the provider IS probed, a zero is informative and a second offer
+    // under it would only sit ineligible, so the gate still applies per model.
+    let ready: Vec<_> = sources
+        .iter()
+        .filter(|s| {
+            !s.already_offered
+                && (s.capable_worker_count > 0 || !provider_is_probed(sources, &s.provider))
+        })
+        .collect();
     if ready.is_empty() {
         if sources.iter().all(|s| s.already_offered) {
             return vec![
@@ -270,6 +309,33 @@ mod tests {
             "model": "zai-org/GLM-5.2",
             "buyer_provider": "zai",
             "buyer_model": "glm-5.2",
+            "retail_price": {
+                "dimensions": {
+                    "input_per_mtok_ndollars": 1_400_000_000_u64,
+                    "output_per_mtok_ndollars": 4_400_000_000_u64,
+                    "cache_read_per_mtok_ndollars": null,
+                },
+                "modifiers": {"batch_multiplier_bps": 5000},
+                "surcharges": {},
+            },
+            "capable_worker_count": capable_worker_count,
+            "already_offered": already_offered,
+        })
+    }
+
+    /// A second route under one provider, so a test can put both an offered and
+    /// an unoffered route under the same key — the case that separates "never
+    /// probed" from "probed and unreachable".
+    fn engy_route(
+        model: &str,
+        capable_worker_count: u32,
+        already_offered: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "provider": "engy",
+            "model": model,
+            "buyer_provider": if model == "glm-5.2" { "zai" } else { "moonshot" },
+            "buyer_model": model,
             "retail_price": {
                 "dimensions": {
                     "input_per_mtok_ndollars": 1_400_000_000_u64,
@@ -387,13 +453,64 @@ mod tests {
         // An un-probed or just-restored worker reports zero with the key
         // already set, so the copy must not claim the key is absent.
         assert!(!rendered.contains("holds a key for these upstreams"));
-        assert!(rendered.contains("probes a provider only for routes you have declared"));
-        assert!(rendered.contains("`gmcli set-api-keys`"));
-        assert!(rendered.contains("`gmcli deploy`"));
+        assert!(rendered.contains("never declared is never probed"));
         // Declaring is what puts the provider in the registry's probe set, so
         // the command must be offered precisely when the count is still zero —
-        // withholding it is the cycle this test used to lock in.
-        assert!(rendered.contains("--discount-pct <pct>"));
+        // withholding it is the cycle this test used to lock in. Named in full:
+        // a bare `--discount-pct <pct>` would pass on any suggested route.
+        assert!(rendered.contains(
+            "gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct <pct>"
+        ));
+    }
+
+    /// The circularity is per *provider*: the registry groups a miner's offers
+    /// into `offers_by_provider` and probes each key once, so one engy offer
+    /// gets every engy model into the worker's supported set. A zero on the
+    /// second engy route is then a real answer, and suggesting a declare for it
+    /// would only mint another ineligible offer.
+    #[test]
+    fn a_zero_under_an_already_offered_provider_is_not_treated_as_unprobed() {
+        let rendered = render_sources(
+            Network::Mainnet,
+            &sources(serde_json::json!([
+                engy_route("kimi-k3", 1, true),
+                engy_route("glm-5.2", 0, false),
+            ])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("No worker of yours is currently serving these routes (1):"));
+        assert!(rendered.contains("engy/glm-5.2"));
+        // engy is already probed via the kimi-k3 offer, so the copy must give
+        // the real diagnosis rather than telling the miner to declare.
+        assert!(rendered.contains("a zero is a real answer"));
+        assert!(!rendered.contains("never declared is never probed"));
+        assert!(
+            !rendered.contains("--discount-pct <pct>"),
+            "declaring a probed-but-unreachable route only adds an ineligible offer:\n{rendered}"
+        );
+    }
+
+    /// The mirror of the above: no engy route is offered, so engy is outside the
+    /// probe set entirely and declaring is the only way out.
+    #[test]
+    fn a_zero_under_a_provider_with_no_offers_still_suggests_declaring() {
+        let rendered = render_sources(
+            Network::Mainnet,
+            &sources(serde_json::json!([
+                engy_route("kimi-k3", 0, false),
+                engy_route("glm-5.2", 0, false),
+            ])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("never declared is never probed"));
+        assert!(rendered.contains(
+            "gmcli declare-product --provider engy --model glm-5.2 --discount-pct <pct>"
+        ));
+        assert!(rendered.contains(
+            "gmcli declare-product --provider engy --model kimi-k3 --discount-pct <pct>"
+        ));
     }
 
     #[test]
