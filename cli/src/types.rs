@@ -206,9 +206,9 @@ pub struct SourceProduct {
     ///
     /// Zero therefore says only "none qualify right now" and is not evidence
     /// about the key. It is not even evidence about the worker while the route's
-    /// provider sits outside the registry's probe set — the control loop probes
-    /// only providers the miner already has an offer for, so nothing has ever
-    /// written a capability entry to be counted.
+    /// provider has no live offer — the control loop probes only providers the
+    /// miner currently offers, so no probe is running to refresh the capability
+    /// entry this counts, whatever an earlier offer may once have written.
     pub capable_worker_count: u32,
     pub already_offered: bool,
 }

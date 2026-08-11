@@ -172,14 +172,20 @@ fn serving_cell(capable_worker_count: u32) -> String {
     }
 }
 
-/// Whether any route for this provider is already declared, as a proxy for
-/// "the registry has this provider in its probe set".
+/// Whether this provider has a live sourcing-route offer, which is the closest
+/// this endpoint gets to "the registry has it in the probe set".
 ///
 /// The probe set is keyed by *provider*, not by route: `control_loop/driver.py`
 /// groups a miner's offers into `offers_by_provider` and probes each key once,
 /// so one offer anywhere under a provider pulls every model it serves into the
-/// worker's supported set. That is what separates a zero meaning "never probed"
-/// from a zero meaning "probed, and this model is not reachable".
+/// worker's supported set. Without an offer nothing can put a capability entry
+/// there, which is what separates a zero that cannot move from a zero that is
+/// about the route.
+///
+/// Named for what it observes, deliberately. An offer is a *precondition* for
+/// probing, not evidence a probe has run — one declared seconds ago is still
+/// queued — and its absence today says nothing about whether an earlier offer
+/// was probed before being withdrawn. Copy driven off this must claim neither.
 ///
 /// Two things make this a proxy rather than the real predicate, and they fail in
 /// opposite directions, which is why only one of them is worth worrying about:
@@ -203,7 +209,7 @@ fn serving_cell(capable_worker_count: u32) -> String {
 /// source upstream, or an anthropic/openai product given a source route, is a
 /// catalog edit away. The first case then costs a redundant declare; the second
 /// silently withholds a needed one.
-fn provider_is_probed(sources: &[SourceProduct], provider: &str) -> bool {
+fn provider_has_live_offer(sources: &[SourceProduct], provider: &str) -> bool {
     sources
         .iter()
         .any(|s| s.provider == provider && s.already_offered)
@@ -243,10 +249,10 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
 
     let any_unprobed = unserved
         .iter()
-        .any(|s| !provider_is_probed(sources, &s.provider));
+        .any(|s| !provider_has_live_offer(sources, &s.provider));
     if any_unprobed {
         lines.push(
-            "  A provider you have never declared is never probed, so its routes read".to_owned(),
+            "  A provider you have no offer under is not probed, so its routes read".to_owned(),
         );
         lines.push(
             "  zero whatever the worker holds. Declaring one puts the provider in the".to_owned(),
@@ -258,14 +264,16 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
     }
     if unserved
         .iter()
-        .any(|s| provider_is_probed(sources, &s.provider))
+        .any(|s| provider_has_live_offer(sources, &s.provider))
     {
         lines.push(
             "  For a provider you already offer, no worker of yours currently qualifies".to_owned(),
         );
         lines.push(
-            "  for that route — declaring it again will not change that. A worker counts"
-                .to_owned(),
+            "  for that route — a second offer will not change that. If you declared it".to_owned(),
+        );
+        lines.push(
+            "  only just now, give the control loop a cycle first. A worker counts".to_owned(),
         );
         lines.push(
             "  only while it is active, on an approved image, and holds the route in its"
@@ -287,7 +295,7 @@ fn declare_lines(sources: &[SourceProduct]) -> Vec<String> {
         .iter()
         .filter(|s| {
             !s.already_offered
-                && (s.capable_worker_count > 0 || !provider_is_probed(sources, &s.provider))
+                && (s.capable_worker_count > 0 || !provider_has_live_offer(sources, &s.provider))
         })
         .collect();
     if ready.is_empty() {
@@ -484,7 +492,7 @@ mod tests {
         // An un-probed or just-restored worker reports zero with the key
         // already set, so the copy must not claim the key is absent.
         assert!(!rendered.contains("holds a key for these upstreams"));
-        assert!(rendered.contains("never declared is never probed"));
+        assert!(rendered.contains("no offer under is not probed"));
         // Declaring is what puts the provider in the registry's probe set, so
         // the command must be offered precisely when the count is still zero —
         // withholding it is the cycle this test used to lock in. Named in full:
@@ -515,7 +523,7 @@ mod tests {
         // engy is already probed via the kimi-k3 offer, so the copy must give
         // the real diagnosis rather than telling the miner to declare.
         assert!(rendered.contains("no worker of yours currently qualifies"));
-        assert!(!rendered.contains("never declared is never probed"));
+        assert!(!rendered.contains("no offer under is not probed"));
         assert!(
             !rendered.contains("--discount-pct <pct>"),
             "declaring a probed-but-unreachable route only adds an ineligible offer:\n{rendered}"
@@ -535,7 +543,7 @@ mod tests {
         )
         .join("\n");
 
-        assert!(rendered.contains("never declared is never probed"));
+        assert!(rendered.contains("no offer under is not probed"));
         assert!(rendered.contains(
             "gmcli declare-product --provider engy --model glm-5.2 --discount-pct <pct>"
         ));

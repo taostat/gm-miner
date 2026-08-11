@@ -132,11 +132,11 @@ gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 
 `gmcli sources` prints this line for you, pre-filled, for every undeclared route
 where declaring it would actually get you somewhere — one a worker already
-serves, or any route under a provider you have not declared at all. It stays
+serves, or any route under a provider you have no live offer under. It stays
 quiet for a route whose provider is already declared and whose count is still
 zero, because a second offer there changes nothing about why no worker qualifies.
 
-**For a provider you have never declared, declare before waiting for
+**For a provider you have no offer under, declare before waiting for
 `YOU SERVE: yes`.** The registry builds its probe set from the providers you
 have offers for, so a provider with no offer at all is never probed and every one
 of its routes reads `YOU SERVE: no` however your workers are configured.
@@ -168,7 +168,7 @@ immediately. It is a capability count, not final admission: if one
 worker can serve two routes for the same buyer product, it is counted under both,
 and only one of them will be routed. In rough order of frequency:
 
-- **You have declared nothing under that provider.** Not a fault: the registry
+- **You have no live offer under that provider.** Not a fault: the registry
   only probes providers you have offers for, so a provider with no offer reads
   zero across all its routes no matter how the worker is configured. Declare any
   one of them to put the provider in the probe set; the causes below then decide
