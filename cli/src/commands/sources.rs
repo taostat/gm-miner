@@ -195,11 +195,14 @@ fn serving_cell(capable_worker_count: u32) -> String {
 ///   miner needs — putting that route back in the cycle this module exists to
 ///   break.
 ///
-/// Both are inert for the providers this command lists: a sourcing route's
-/// upstream (deepinfra, kubetee, engy) is never sold as a buyer product, so it
-/// carries no direct offers, and cloud backends attach only to anthropic and
-/// openai (`LEGACY_BACKEND_PROVIDER`). Should a source upstream ever become
-/// cloud-backed, the second case turns live and fails silently.
+/// Neither fires against today's catalog — a sourcing route's upstream
+/// (deepinfra, kubetee, engy) is not also sold as a buyer product, and cloud
+/// backends are configured only for anthropic and openai
+/// (`LEGACY_BACKEND_PROVIDER`). Nothing enforces either: this endpoint serves
+/// whatever aliased `UpstreamRoute` rows exist, so a direct product under a
+/// source upstream, or an anthropic/openai product given a source route, is a
+/// catalog edit away. The first case then costs a redundant declare; the second
+/// silently withholds a needed one.
 fn provider_is_probed(sources: &[SourceProduct], provider: &str) -> bool {
     sources
         .iter()
@@ -246,25 +249,29 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
             "  A provider you have never declared is never probed, so its routes read".to_owned(),
         );
         lines.push(
-            "  zero whatever the worker holds — declare one and the next control-loop".to_owned(),
+            "  zero whatever the worker holds. Declaring one puts the provider in the".to_owned(),
         );
-        lines.push("  cycle fills in the rest.".to_owned());
+        lines.push(
+            "  probe set, which is what lets the count move at all — it still has to".to_owned(),
+        );
+        lines.push("  reach the upstream before it does.".to_owned());
     }
     if unserved
         .iter()
         .any(|s| provider_is_probed(sources, &s.provider))
     {
         lines.push(
-            "  For a provider you already offer, no worker answered for that route on".to_owned(),
+            "  For a provider you already offer, no worker of yours currently qualifies".to_owned(),
         );
         lines.push(
-            "  the last cycle — declaring it again will not change that. Check the key,".to_owned(),
-        );
-        lines.push(
-            "  the image and the last attestation with `gmcli worker list`; a worker just"
+            "  for that route — declaring it again will not change that. A worker counts"
                 .to_owned(),
         );
-        lines.push("  restored from suspension also reads zero until it is reprobed.".to_owned());
+        lines.push(
+            "  only while it is active, on an approved image, and holds the route in its"
+                .to_owned(),
+        );
+        lines.push("  probed capability; `gmcli worker list` shows the first two.".to_owned());
     }
     lines
 }
@@ -507,7 +514,7 @@ mod tests {
         assert!(rendered.contains("engy/glm-5.2"));
         // engy is already probed via the kimi-k3 offer, so the copy must give
         // the real diagnosis rather than telling the miner to declare.
-        assert!(rendered.contains("no worker answered for that route"));
+        assert!(rendered.contains("no worker of yours currently qualifies"));
         assert!(!rendered.contains("never declared is never probed"));
         assert!(
             !rendered.contains("--discount-pct <pct>"),

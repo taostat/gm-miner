@@ -198,14 +198,17 @@ pub struct SourceProduct {
     /// How many of the miner's active workers hold a key that answers for
     /// (`provider`, `model`).
     ///
-    /// Zero is not one condition. A worker holding a perfectly good key reads
-    /// zero for as long as its provider sits outside the registry's probe set —
-    /// the control loop probes only providers the miner already has an offer
-    /// for — so zero on a never-declared provider says nothing at all about the
-    /// worker. Once the provider is probed, zero means no worker answered for
-    /// this route on the last cycle, which a missing key explains but so do an
-    /// unapproved image, a worker just restored from suspension with its
-    /// supported-model list cleared, and a reprobe that has not run yet.
+    /// Evaluated live, not a record of the last probe: it counts the miner's
+    /// workers that are active, run a currently-approved image, and carry this
+    /// route in their stored capability set. Any of those three failing drops a
+    /// worker out, so a worker that served happily an hour ago counts zero the
+    /// moment its image is revoked.
+    ///
+    /// Zero therefore says only "none qualify right now" and is not evidence
+    /// about the key. It is not even evidence about the worker while the route's
+    /// provider sits outside the registry's probe set — the control loop probes
+    /// only providers the miner already has an offer for, so nothing has ever
+    /// written a capability entry to be counted.
     pub capable_worker_count: u32,
     pub already_offered: bool,
 }
