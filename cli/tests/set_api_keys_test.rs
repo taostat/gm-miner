@@ -338,6 +338,19 @@ fn any_set_true_when_kubetee_set() {
 }
 
 #[test]
+fn any_set_true_when_engy_set() {
+    let keys = ProviderKeys {
+        anthropic: None,
+        openai: None,
+        google: None,
+        chutes: None,
+        engy: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(keys.any_set());
+}
+
+#[test]
 fn any_set_true_when_bedrock_selected_and_key_set() {
     let keys = ProviderKeys {
         anthropic_upstream: Some("bedrock".to_owned()),

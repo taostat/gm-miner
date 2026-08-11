@@ -248,27 +248,14 @@ pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
 
 /// The direct-provider key env vars the deployed image would actually
 /// read: keys sidelined by a cloud upstream selector are excluded, so a
-/// stale semicolon value there never blocks a deploy.
-fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 9] {
-    let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
-    let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
-    [
-        (
-            "ANTHROPIC_API_KEY",
-            keys.anthropic.as_deref().filter(|_| anthropic_direct),
-        ),
-        (
-            "OPENAI_API_KEY",
-            keys.openai.as_deref().filter(|_| openai_direct),
-        ),
-        ("GOOGLE_API_KEY", keys.google.as_deref()),
-        ("CHUTES_API_KEY", keys.chutes.as_deref()),
-        ("ZAI_API_KEY", keys.zai.as_deref()),
-        ("MOONSHOT_API_KEY", keys.moonshot.as_deref()),
-        ("DEEPINFRA_API_KEY", keys.deepinfra.as_deref()),
-        ("KUBETEE_API_KEY", keys.kubetee.as_deref()),
-        ("ENGY_API_KEY", keys.engy.as_deref()),
-    ]
+/// stale semicolon value there never blocks a deploy. Delegates to
+/// [`ProviderKeys::direct_keys`], which walks every `Provider` variant
+/// through a compile-time-exhaustive match rather than a literal here that
+/// a new provider could silently miss.
+fn active_direct_keys(
+    keys: &ProviderKeys,
+) -> impl Iterator<Item = (&'static str, Option<&str>)> + '_ {
+    keys.direct_keys()
 }
 
 #[must_use]

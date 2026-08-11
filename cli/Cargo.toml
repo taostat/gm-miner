@@ -72,6 +72,7 @@ fd-lock      = "4"
 data-encoding = "=2.11.0"
 percent-encoding = "=2.3.2"
 hmac         = "=0.13.0"
+strum        = { version = "0.28", features = ["derive"] }
 
 [dev-dependencies]
 wiremock     = "0.6"

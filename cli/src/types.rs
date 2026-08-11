@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use strum::EnumIter;
 
 /// Provider identifier — must match the canonical enum in product.json.
 ///
@@ -21,7 +22,12 @@ use serde::{Deserialize, Serialize};
 /// discovery as a defence in depth — today the registry omits the entry
 /// from `GET /products` entirely, but the CLI must not regress if that
 /// changes).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `EnumIter` backs [`ProviderKeys::direct_keys`](crate::config::ProviderKeys::direct_keys):
+/// `Provider::iter()` is generated from this definition, so a new variant
+/// appears there automatically and only needs handling in the exhaustive
+/// match `direct_key` uses to look up its key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, EnumIter)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Anthropic,

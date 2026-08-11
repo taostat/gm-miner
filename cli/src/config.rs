@@ -462,24 +462,65 @@ fn validate_azure_foundry_endpoint(endpoint: &str) -> Result<()> {
 }
 
 impl ProviderKeys {
+    /// The direct-upstream env var name and current value for `provider`, or
+    /// `None` when `provider` carries no direct key at all (`Benchmark`) or
+    /// is currently routed to a cloud backend instead (a non-direct
+    /// `anthropic_upstream`/`openai_upstream`).
+    ///
+    /// Matched with no wildcard arm on purpose: adding a `Provider` variant
+    /// without a case here is a compile error. That replaces two
+    /// hand-maintained lists — `any_set`'s OR-chain and
+    /// `slots::active_direct_keys`'s array literal — where a forgotten
+    /// provider used to compile cleanly and only surface once `deploy`
+    /// reported "no usable provider keys" after `set-api-keys` had already
+    /// accepted the value.
+    #[must_use]
+    pub fn direct_key(
+        &self,
+        provider: &crate::types::Provider,
+    ) -> Option<(&'static str, Option<&str>)> {
+        use crate::types::Provider;
+        match provider {
+            Provider::Anthropic => {
+                let direct = self.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
+                Some((
+                    "ANTHROPIC_API_KEY",
+                    self.anthropic.as_deref().filter(|_| direct),
+                ))
+            }
+            Provider::OpenAI => {
+                let direct = self.openai_upstream.as_deref().unwrap_or("direct") == "direct";
+                Some(("OPENAI_API_KEY", self.openai.as_deref().filter(|_| direct)))
+            }
+            Provider::Gemini => Some(("GOOGLE_API_KEY", self.google.as_deref())),
+            Provider::Chutes => Some(("CHUTES_API_KEY", self.chutes.as_deref())),
+            Provider::Zai => Some(("ZAI_API_KEY", self.zai.as_deref())),
+            Provider::Moonshot => Some(("MOONSHOT_API_KEY", self.moonshot.as_deref())),
+            Provider::DeepInfra => Some(("DEEPINFRA_API_KEY", self.deepinfra.as_deref())),
+            Provider::Kubetee => Some(("KUBETEE_API_KEY", self.kubetee.as_deref())),
+            Provider::Engy => Some(("ENGY_API_KEY", self.engy.as_deref())),
+            Provider::Benchmark => None,
+        }
+    }
+
+    /// Every direct-provider key, derived by walking every `Provider`
+    /// variant through [`Self::direct_key`] — see that method's doc for why
+    /// this stays complete as providers are added, unlike a hand-maintained
+    /// list.
+    pub(crate) fn direct_keys(&self) -> impl Iterator<Item = (&'static str, Option<&str>)> + '_ {
+        use strum::IntoEnumIterator as _;
+        crate::types::Provider::iter().filter_map(move |p| self.direct_key(&p))
+    }
+
     /// Returns true if at least one key is set to a non-empty, non-whitespace value.
     #[must_use]
     pub fn any_set(&self) -> bool {
         let anthropic_upstream = self.anthropic_upstream.as_deref().unwrap_or("direct");
         let openai_upstream = self.openai_upstream.as_deref().unwrap_or("direct");
-        ((anthropic_upstream == "direct" && non_empty(self.anthropic.as_deref()))
-            || (anthropic_upstream == "bedrock" && non_empty(self.bedrock_api_key.as_deref()))
-            || (anthropic_upstream == "foundry"
-                && non_empty(self.azure_foundry_api_key.as_deref())))
-            || ((openai_upstream == "direct" && non_empty(self.openai.as_deref()))
-                || (openai_upstream == "azure" && non_empty(self.azure_openai_api_key.as_deref())))
-            || non_empty(self.google.as_deref())
-            || non_empty(self.chutes.as_deref())
-            || non_empty(self.zai.as_deref())
-            || non_empty(self.moonshot.as_deref())
-            || non_empty(self.deepinfra.as_deref())
-            || non_empty(self.kubetee.as_deref())
-            || non_empty(self.engy.as_deref())
+        (anthropic_upstream == "bedrock" && non_empty(self.bedrock_api_key.as_deref()))
+            || (anthropic_upstream == "foundry" && non_empty(self.azure_foundry_api_key.as_deref()))
+            || (openai_upstream == "azure" && non_empty(self.azure_openai_api_key.as_deref()))
+            || self.direct_keys().any(|(_, value)| non_empty(value))
     }
 
     /// Reject a selected cloud upstream that is missing fields `start.sh`
@@ -975,6 +1016,69 @@ mod tests {
         );
 
         assert!(ProviderKeys::default().worker_backends().is_empty());
+    }
+
+    #[test]
+    fn direct_key_covers_every_declarable_provider() {
+        use crate::types::Provider;
+
+        let keys = ProviderKeys {
+            anthropic: Some("ant".to_owned()),
+            openai: Some("oai".to_owned()),
+            google: Some("gem".to_owned()),
+            chutes: Some("chu".to_owned()),
+            zai: Some("zai".to_owned()),
+            moonshot: Some("moo".to_owned()),
+            deepinfra: Some("dif".to_owned()),
+            kubetee: Some("kube".to_owned()),
+            engy: Some("eng".to_owned()),
+            ..ProviderKeys::default()
+        };
+
+        assert_eq!(
+            keys.direct_key(&Provider::Engy),
+            Some(("ENGY_API_KEY", Some("eng")))
+        );
+        assert_eq!(keys.direct_key(&Provider::Benchmark), None);
+
+        // Every non-Benchmark variant is set above, so the derived iterator
+        // must surface one entry per variant in enum declaration order.
+        let names: Vec<&str> = keys.direct_keys().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GOOGLE_API_KEY",
+                "CHUTES_API_KEY",
+                "ZAI_API_KEY",
+                "MOONSHOT_API_KEY",
+                "DEEPINFRA_API_KEY",
+                "KUBETEE_API_KEY",
+                "ENGY_API_KEY",
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_key_sidelines_anthropic_and_openai_behind_a_cloud_selector() {
+        use crate::types::Provider;
+
+        let keys = ProviderKeys {
+            anthropic: Some("ant".to_owned()),
+            anthropic_upstream: Some("bedrock".to_owned()),
+            openai: Some("oai".to_owned()),
+            openai_upstream: Some("azure".to_owned()),
+            ..ProviderKeys::default()
+        };
+        assert_eq!(
+            keys.direct_key(&Provider::Anthropic),
+            Some(("ANTHROPIC_API_KEY", None))
+        );
+        assert_eq!(
+            keys.direct_key(&Provider::OpenAI),
+            Some(("OPENAI_API_KEY", None))
+        );
     }
 
     #[test]
