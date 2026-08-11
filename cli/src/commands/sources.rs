@@ -172,11 +172,15 @@ fn serving_cell(capable_worker_count: u32) -> String {
     }
 }
 
-/// Routes no worker serves yet. Declaring one now buys nothing: the registry
-/// routes to workers that advertise the upstream, so the offer lands
-/// ineligible.
+/// Routes no worker serves yet.
 ///
-/// A zero count is not proof the key is missing — the control loop clears a
+/// Declaring is the *fix* for a zero count, not something to hold back until it
+/// clears: the registry builds its probe set from the providers a miner has
+/// offers for, so a provider with no offer is never probed and its routes stay
+/// at zero however the worker is configured. Earlier copy here told miners to
+/// set the key and redeploy, which cannot break that cycle.
+///
+/// A zero is still not proof the key is missing — the control loop also clears a
 /// worker's supported models when it is un-probed or just restored from
 /// suspension — so the copy states only what the count actually says.
 fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
@@ -200,18 +204,22 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
             .iter()
             .map(|s| format!("  {}/{}", s.provider, s.model)),
     );
-    lines.push("  A worker serves a route once it holds the upstream key and has been".to_owned());
     lines.push(
-        "  probed. If the key is not set, `gmcli set-api-keys` then `gmcli deploy`.".to_owned(),
+        "  The registry probes a provider only for routes you have declared, so a".to_owned(),
     );
+    lines.push("  route you have never offered reads zero whatever the worker holds —".to_owned());
+    lines
+        .push("  declare it and the next control-loop cycle fills the count in. If the".to_owned());
+    lines.push("  key is genuinely absent, `gmcli set-api-keys` then `gmcli deploy`.".to_owned());
     lines
 }
 
 fn declare_lines(sources: &[SourceProduct]) -> Vec<String> {
-    let ready: Vec<_> = sources
-        .iter()
-        .filter(|s| !s.already_offered && s.capable_worker_count > 0)
-        .collect();
+    // Not gated on `capable_worker_count`: that count stays 0 until the
+    // provider is probed, and the provider is probed only once it has an offer,
+    // so withholding the command until a worker serves the route is a cycle a
+    // miner cannot break from here.
+    let ready: Vec<_> = sources.iter().filter(|s| !s.already_offered).collect();
     if ready.is_empty() {
         if sources.iter().all(|s| s.already_offered) {
             return vec![
@@ -379,11 +387,13 @@ mod tests {
         // An un-probed or just-restored worker reports zero with the key
         // already set, so the copy must not claim the key is absent.
         assert!(!rendered.contains("holds a key for these upstreams"));
-        assert!(rendered.contains("If the key is not set, `gmcli set-api-keys`"));
+        assert!(rendered.contains("probes a provider only for routes you have declared"));
+        assert!(rendered.contains("`gmcli set-api-keys`"));
         assert!(rendered.contains("`gmcli deploy`"));
-        // Declaring a route nothing serves only produces an ineligible
-        // offer, so the command must not be suggested yet.
-        assert!(!rendered.contains("--discount-pct <pct>"));
+        // Declaring is what puts the provider in the registry's probe set, so
+        // the command must be offered precisely when the count is still zero —
+        // withholding it is the cycle this test used to lock in.
+        assert!(rendered.contains("--discount-pct <pct>"));
     }
 
     #[test]

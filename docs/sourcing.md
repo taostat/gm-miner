@@ -124,18 +124,21 @@ the miner advertises opaque slot ids for them — see
 gmcli deploy
 ```
 
-The registry probes each worker for the models it can actually reach. Until that
-probe succeeds, the route shows `YOU SERVE: no` and declaring it would only
-produce an ineligible offer.
-
 **3. Declare the route.** Use the **route** pair, not the buyer pair:
 
 ```sh
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 ```
 
-`gmcli sources` prints this line for you, pre-filled, for every route you can
-serve and have not declared yet.
+`gmcli sources` prints this line for you, pre-filled, for every route you have
+not declared yet.
+
+**Declare before waiting for `YOU SERVE: yes`.** The registry builds its probe
+set from the providers you have offers for, so a provider you have never declared
+is never probed and its routes read `YOU SERVE: no` forever. Declaring is what
+puts the provider into the probe set; the offer sits ineligible for at most one
+control-loop cycle and then goes eligible on its own once the probe confirms the
+worker reaches the upstream.
 
 Note that `declare-products` (the fan-out) is catalog-only on purpose and will not
 declare a route. A route offer commits you to an upstream you hold a key for, so
@@ -147,11 +150,14 @@ glm-5.2`. The registry keeps the row for audit and re-declaring re-offers it.
 ## Why a route shows `YOU SERVE: no`
 
 The count is how many of your workers hold a usable key for that upstream and are
-on an approved image today. Zero means declaring it buys you nothing yet. It is a
-capability count, not final admission: if one worker can serve two routes for the
-same buyer product, it is counted under both, and only one of them will be routed.
-In rough order of frequency:
+on an approved image today. It is a capability count, not final admission: if one
+worker can serve two routes for the same buyer product, it is counted under both,
+and only one of them will be routed. In rough order of frequency:
 
+- **You have not declared the route.** This is the usual answer for a route you
+  have never offered, and it is not a fault: the registry only probes providers
+  you have offers for, so an undeclared provider reads zero no matter how the
+  worker is configured. Declare it and the next cycle fills the count in.
 - The key is not set, or was set after your last deploy — run `gmcli set-api-keys`
   then `gmcli deploy`.
 - The worker has not been probed since it came up. Wait a cycle and re-check.
