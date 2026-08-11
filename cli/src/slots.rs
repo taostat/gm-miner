@@ -12,7 +12,10 @@ use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
 
+use strum::IntoEnumIterator as _;
+
 use crate::config::ProviderKeys;
+use crate::types::Provider;
 
 const MAX_PROVIDER_SLOTS: usize = 8;
 const SLOT_ID_LEN: usize = 12;
@@ -134,35 +137,16 @@ pub fn provider_slots_for_keys(
         return Ok(BTreeMap::new());
     }
 
+    // Walks `direct_key` rather than listing providers here: it already nulls a
+    // provider routed to a cloud backend, and `add_provider_slots` no-ops on a
+    // null value, so the two together reproduce the per-provider gating without
+    // a second copy of it that a new variant could be missed from.
     let mut slots = BTreeMap::new();
-    if keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct" {
-        add_provider_slots(
-            &mut slots,
-            "anthropic",
-            keys.anthropic.as_deref(),
-            node_secret,
-        )?;
+    for provider in Provider::iter() {
+        if let Some((_, value)) = keys.direct_key(&provider) {
+            add_provider_slots(&mut slots, provider.as_str(), value, node_secret)?;
+        }
     }
-    if keys.openai_upstream.as_deref().unwrap_or("direct") == "direct" {
-        add_provider_slots(&mut slots, "openai", keys.openai.as_deref(), node_secret)?;
-    }
-    add_provider_slots(&mut slots, "gemini", keys.google.as_deref(), node_secret)?;
-    add_provider_slots(&mut slots, "chutes", keys.chutes.as_deref(), node_secret)?;
-    add_provider_slots(&mut slots, "zai", keys.zai.as_deref(), node_secret)?;
-    add_provider_slots(
-        &mut slots,
-        "moonshot",
-        keys.moonshot.as_deref(),
-        node_secret,
-    )?;
-    add_provider_slots(
-        &mut slots,
-        "deepinfra",
-        keys.deepinfra.as_deref(),
-        node_secret,
-    )?;
-    add_provider_slots(&mut slots, "kubetee", keys.kubetee.as_deref(), node_secret)?;
-    add_provider_slots(&mut slots, "engy", keys.engy.as_deref(), node_secret)?;
     Ok(slots)
 }
 

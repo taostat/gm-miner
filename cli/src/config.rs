@@ -468,12 +468,14 @@ impl ProviderKeys {
     /// `anthropic_upstream`/`openai_upstream`).
     ///
     /// Matched with no wildcard arm on purpose: adding a `Provider` variant
-    /// without a case here is a compile error. That replaces two
-    /// hand-maintained lists — `any_set`'s OR-chain and
-    /// `slots::active_direct_keys`'s array literal — where a forgotten
-    /// provider used to compile cleanly and only surface once `deploy`
-    /// reported "no usable provider keys" after `set-api-keys` had already
-    /// accepted the value.
+    /// without a case here is a compile error. That replaces three
+    /// hand-maintained lists — `any_set`'s OR-chain,
+    /// `slots::active_direct_keys`'s array literal, and
+    /// `slots::provider_slots_for_keys`'s per-provider calls — where a
+    /// forgotten provider used to compile cleanly and only surface once
+    /// `deploy` reported "no usable provider keys" after `set-api-keys` had
+    /// already accepted the value, or silently advertised zero key slots to
+    /// the registry.
     #[must_use]
     pub fn direct_key(
         &self,
