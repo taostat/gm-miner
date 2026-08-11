@@ -6,13 +6,13 @@ identical behavior; miners supply upstream API capacity and earn the spread. The
 inside an Intel TDX TEE so neither operators nor host machines see buyer content or miners'
 upstream keys.
 
-You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE, or Bedrock/Azure behind
+You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE, Engy, or Bedrock/Azure behind
 the existing Anthropic/OpenAI routes) and your own funded [Phala Cloud](https://cloud.phala.network)
 account. The `gmcli` tool handles the full operator lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Miner container image with eight provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic or AWS Bedrock; OpenAI can target direct OpenAI or Azure OpenAI. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs two co-located processes: the attestation server (serves `GET /attestation/info` with a fresh TDX quote) and the envoy data plane (proxies provider traffic and exposes `/stats/prometheus`). |
+| `image/` | Miner container image with nine provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic or AWS Bedrock; OpenAI can target direct OpenAI or Azure OpenAI. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs two co-located processes: the attestation server (serves `GET /attestation/info` with a fresh TDX quote) and the envoy data plane (proxies provider traffic and exposes `/stats/prometheus`). |
 | `cli/` | `gmcli` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. Runs operator-side from a laptop, not inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -105,7 +105,7 @@ Credentials are stored in `~/.gmcli/config.json`.
 
 ### 3. Set your provider API keys
 
-Your provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE) are baked into the miner container at
+Your provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE, Engy) are baked into the miner container at
 deploy time and stay inside the TEE — gm never sees them. Set the keys for whichever providers you
 intend to serve:
 
@@ -132,11 +132,11 @@ See [multi-key slots](docs/multi-key-slots.md) for the slot behavior and limits.
 
 DeepInfra, Engy and KubeTEE are *sourcing* upstreams: they do not appear in the buyer catalog
 under their own names, they serve an existing buyer product — DeepInfra and Engy both serve
-`zai/glm-5.2`, KubeTEE serves `moonshot/kimi-k3`. One buyer product can have several such
-routes and none of them is canonical. Setting one of those keys is what makes the matching
-route available to you. A single worker can serve only one route per buyer product, so run two
-workers to run two upstreams for the same model. Run `gmcli sources` to see them, and read
-[sourcing routes](docs/sourcing.md) for how they settle.
+`zai/glm-5.2`, and Engy and KubeTEE both serve `moonshot/kimi-k3`. One buyer product can have
+several such routes and none of them is canonical. Setting one of those keys is what makes the
+matching route available to you. A single worker can serve only one route per buyer product, so
+run two workers to run two upstreams for the same model. Run `gmcli sources` to see them, and
+read [sourcing routes](docs/sourcing.md) for how they settle.
 
 To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
 API, select Bedrock and provide the Bedrock region and API key:
@@ -320,7 +320,7 @@ gmcli worker remove <worker_id>
 | `gmcli login` | Device-code OAuth login; stores credentials in `~/.gmcli/config.json` |
 | `gmcli register-hotkey` | Record the serving hotkey (`--hotkey-ss58` or assisted via btcli) |
 | `gmcli deploy` | Full deploy: fetch approved image, launch Phala CVM, verify hashes, register worker |
-| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE) |
+| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE, Engy) |
 | `gmcli declare-product` | Declare a single model offer with a discount |
 | `gmcli declare-products` | Fan one discount across the catalog or one provider's slice |
 | `gmcli undeclare-product` | Withdraw a single offer; re-declaring re-offers it |

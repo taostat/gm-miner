@@ -23,6 +23,7 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
+| `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
 
 Both buyer products can also be served **direct** — with a Z.ai key (`--zai`) or a
 Moonshot key (`--moonshot`). Direct is not the canonical route, but it does carry one
