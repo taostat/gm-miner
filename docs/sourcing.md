@@ -145,10 +145,12 @@ Declaring one of them puts the provider into the probe set, and the next
 control-loop cycle fills in the count for **all** of that provider's routes —
 the probe is per provider, not per route.
 
-Once the provider is probed, a `YOU SERVE: no` on one of its other routes is a
-real answer: that model is not reachable from your workers today, and declaring
-it adds an ineligible offer rather than an answer. `gmcli sources` makes the
-distinction for you and only prints the declare line where it helps.
+Once the provider is probed, a `YOU SERVE: no` on one of its other routes is
+telling you something about that route rather than about the probe set — no
+worker answered for it on the last cycle. That is worth diagnosing (the causes
+are listed below, and several are transient) rather than answering with another
+declare. `gmcli sources` uses the same distinction to decide when to print the
+declare line, from the routes it can see.
 
 Note that `declare-products` (the fan-out) is catalog-only on purpose and will not
 declare a route. A route offer commits you to an upstream you hold a key for, so

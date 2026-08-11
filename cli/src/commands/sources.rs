@@ -181,22 +181,25 @@ fn serving_cell(capable_worker_count: u32) -> String {
 /// worker's supported set. That is what separates a zero meaning "never probed"
 /// from a zero meaning "probed, and this model is not reachable".
 ///
-/// Two things make this a proxy rather than the real predicate, both of which
-/// would make it answer `true` too eagerly and so *withhold* a declare line the
-/// miner needs — the same cycle this module exists to break:
+/// Two things make this a proxy rather than the real predicate, and they fail in
+/// opposite directions, which is why only one of them is worth worrying about:
 ///
-/// - It sees only sourcing routes. A **direct** offer under the same provider
-///   also puts it in the probe set, and direct offers are not on this endpoint.
+/// - It sees only sourcing routes, and a **direct** offer under the same
+///   provider also puts it in the probe set. The provider is then probed while
+///   no visible route is offered, so this answers `false` — it suggests a
+///   declare that was not needed, costing one ineligible offer.
 /// - A **cloud-backed** provider is not grouped at all: `driver.py` probes those
 ///   offers one at a time through `cloud_capability` and removes them before the
-///   grouping, so one offer there does not probe the provider's other routes.
+///   grouping. One offer there does not probe the provider's other routes, so
+///   this answers `true` when it should not and *withholds* a declare line the
+///   miner needs — putting that route back in the cycle this module exists to
+///   break.
 ///
 /// Both are inert for the providers this command lists: a sourcing route's
 /// upstream (deepinfra, kubetee, engy) is never sold as a buyer product, so it
 /// carries no direct offers, and cloud backends attach only to anthropic and
-/// openai (`LEGACY_BACKEND_PROVIDER`). If either ever stops holding, the failure
-/// is silent and one-directional — the second route under such a provider goes
-/// back to being undeclarable from this output.
+/// openai (`LEGACY_BACKEND_PROVIDER`). Should a source upstream ever become
+/// cloud-backed, the second case turns live and fails silently.
 fn provider_is_probed(sources: &[SourceProduct], provider: &str) -> bool {
     sources
         .iter()
@@ -252,12 +255,16 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
         .any(|s| provider_is_probed(sources, &s.provider))
     {
         lines.push(
-            "  For a provider you already offer, a zero is a real answer: the worker".to_owned(),
+            "  For a provider you already offer, no worker answered for that route on".to_owned(),
         );
         lines.push(
-            "  cannot reach that model today. Check the key, the worker's image and".to_owned(),
+            "  the last cycle — declaring it again will not change that. Check the key,".to_owned(),
         );
-        lines.push("  its last attestation with `gmcli worker list`.".to_owned());
+        lines.push(
+            "  the image and the last attestation with `gmcli worker list`; a worker just"
+                .to_owned(),
+        );
+        lines.push("  restored from suspension also reads zero until it is reprobed.".to_owned());
     }
     lines
 }
@@ -500,7 +507,7 @@ mod tests {
         assert!(rendered.contains("engy/glm-5.2"));
         // engy is already probed via the kimi-k3 offer, so the copy must give
         // the real diagnosis rather than telling the miner to declare.
-        assert!(rendered.contains("a zero is a real answer"));
+        assert!(rendered.contains("no worker answered for that route"));
         assert!(!rendered.contains("never declared is never probed"));
         assert!(
             !rendered.contains("--discount-pct <pct>"),
