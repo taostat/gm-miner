@@ -103,7 +103,7 @@ struct ProbeTiming {
 ///
 /// Discovers the worker endpoint from the registry and the matching node secret
 /// from local gmcli config, then sends one streaming probe per configured
-/// provider and per offered `KubeTEE` sourcing route. Per-route failures are
+/// provider and per offered `KubeTEE`/NEAR sourcing route. Per-route failures are
 /// reported inline and do not panic.
 pub(crate) async fn cmd_check_streaming(cfg: Config) -> Result<()> {
     let target = resolve_primary_worker(&cfg).await?;
@@ -148,10 +148,14 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
         return;
     }
 
-    if declared.is_none() && providers.contains(&Provider::Kubetee) {
-        println!(
-            "  [--] kubetee: could not read declared offers; probing fallback only (offered-route coverage unknown)"
-        );
+    if declared.is_none() {
+        for provider in [Provider::Kubetee, Provider::Near] {
+            if providers.contains(&provider) {
+                println!(
+                    "  [--] {provider}: could not read declared offers; probing fallback only (offered-route coverage unknown)"
+                );
+            }
+        }
     }
 
     let empty_declared = std::collections::HashMap::new();
@@ -302,6 +306,9 @@ fn configured_providers(keys: Option<&ProviderKeys>) -> Result<Vec<Provider>> {
     if non_empty(keys.moonmath.as_deref()) {
         providers.push(Provider::Moonmath);
     }
+    if non_empty(keys.near.as_deref()) {
+        providers.push(Provider::Near);
+    }
     Ok(providers)
 }
 
@@ -310,7 +317,7 @@ fn non_empty(value: Option<&str>) -> bool {
 }
 
 struct ProbeModels {
-    /// One or more models to probe per provider. Sourcing providers (`KubeTEE`)
+    /// One or more models to probe per provider. Sourcing providers (`KubeTEE`, NEAR)
     /// may declare several routes (e.g. `z-ai/glm-5.2` and
     /// `deepseek/deepseek-v4-flash-0731`); each gets its own check.
     models: std::collections::HashMap<Provider, Vec<ProbeModel>>,
@@ -333,7 +340,7 @@ impl ProbeModels {
 /// public catalog, joined with the miner's own declared `upstream_model` (from
 /// `/miners/me`) so cloud-backed offers probe their real upstream deployment.
 ///
-/// `KubeTEE` is a sourcing provider, so its supply health is the set of every
+/// `KubeTEE` and NEAR are sourcing providers, so their supply health is every
 /// **offered** model from `/miners/me` (e.g. GLM-5.2 and
 /// deepseek-v4-flash-0731), independent of buyer-catalog availability. If
 /// nothing is declared, [`fallback_model`] is used at print time. The check
@@ -355,10 +362,10 @@ fn resolve_probe_models(
 ) -> ProbeModels {
     let mut models = std::collections::HashMap::new();
     for provider in providers {
-        // KubeTEE's offered sourcing routes are the supply being checked. Use
+        // Offered sourcing routes are the supply being checked. Use
         // `/miners/me` as their authority even when `/products` is unavailable
         // or later gains an unrelated KubeTEE buyer-catalog row.
-        if *provider == Provider::Kubetee {
+        if matches!(provider, Provider::Kubetee | Provider::Near) {
             let declared_models = declared_models_for_provider(declared, provider);
             if !declared_models.is_empty() {
                 models.insert(provider.clone(), declared_models);
@@ -497,6 +504,7 @@ fn fallback_model(provider: &Provider) -> &'static str {
         // Last resort only when `/miners/me` has no kubetee offer. Prefer GLM
         // over kimi; flash is probed once declared (see #185 / sources).
         Provider::Kubetee => "z-ai/glm-5.2",
+        Provider::Near => "Qwen/Qwen3.6-27B-FP8",
         Provider::Benchmark => "benchmark",
     }
 }
@@ -526,6 +534,7 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
         | Provider::Kubetee
         | Provider::Engy
         | Provider::Moonmath
+        | Provider::Near
         | Provider::Benchmark => openai_compatible_probe(provider, model, "/v1/chat/completions"),
     }
 }
@@ -560,12 +569,19 @@ async fn run_provider_probe(
     let url = endpoint_url(&target.endpoint, probe.path)?;
     let client = build_data_plane_probe_client()?;
     let started = Instant::now();
-    let mut response = client
+    let mut request = client
         .post(url.clone())
         .header("accept", "text/event-stream")
         .header("content-type", "application/json")
         .header("x-gm-node-key", &target.node_secret)
-        .header("x-gm-provider", probe.provider.as_str())
+        .header("x-gm-provider", probe.provider.as_str());
+    if probe.provider == Provider::Near {
+        let selector = probe.body["model"]
+            .as_str()
+            .context("NEAR probe has no upstream source model")?;
+        request = request.header("x-gm-upstream-model", selector);
+    }
+    let mut response = request
         .json(&probe.body)
         .send()
         .await
@@ -970,6 +986,37 @@ mod tests {
             .map(|model| model.canonical.as_str())
             .collect();
         assert_eq!(ids, vec!["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]);
+    }
+
+    #[test]
+    fn every_offered_near_route_uses_its_hidden_source_model() {
+        let declared = std::collections::HashMap::from([
+            (
+                (Provider::Near, "glm-5.1".to_owned()),
+                DeclaredOffer {
+                    upstream_model: Some("zai-org/GLM-5.1-FP8".to_owned()),
+                    is_offered: true,
+                },
+            ),
+            (
+                (Provider::Near, "qwen3.6-27b".to_owned()),
+                DeclaredOffer {
+                    upstream_model: Some("Qwen/Qwen3.6-27B-FP8".to_owned()),
+                    is_offered: true,
+                },
+            ),
+        ]);
+        let catalog = resolve_probe_models(
+            &[Provider::Near],
+            &std::collections::HashMap::new(),
+            &declared,
+        );
+        let models = catalog.models_for(&Provider::Near);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].canonical, "glm-5.1");
+        assert_eq!(models[0].wire_model(), "zai-org/GLM-5.1-FP8");
+        assert_eq!(models[1].canonical, "qwen3.6-27b");
+        assert_eq!(models[1].wire_model(), "Qwen/Qwen3.6-27B-FP8");
     }
 
     #[test]

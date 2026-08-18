@@ -37,6 +37,10 @@ path = "src/main.rs"
 name = "gm-miner-ratls"
 path = "src/bin/ratls.rs"
 
+[[bin]]
+name = "gm-near-verify-proxy"
+path = "src/bin/near_verify_proxy.rs"
+
 [lib]
 name = "gm_miner_attestd"
 path = "src/lib.rs"
@@ -59,6 +63,14 @@ hex = { workspace = true }
 chrono = { workspace = true }
 dstack-sdk = { workspace = true }
 gm-azure-verify = { workspace = true }
+dcap-qvl = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rand = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

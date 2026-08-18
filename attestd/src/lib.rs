@@ -12,6 +12,7 @@
 pub mod identity;
 pub mod info;
 pub mod keypair;
+pub mod near_verify;
 pub mod provider;
 pub mod ratls;
 pub mod report_data;

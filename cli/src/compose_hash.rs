@@ -65,7 +65,7 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// Moonmath, node secret.
 /// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
 /// gm image is public and those vars do not appear in `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 29] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -94,6 +94,7 @@ const CANONICAL_ALLOWED_ENVS: [&str; 29] = [
     "KUBETEE_API_KEY",
     "ENGY_API_KEY",
     "MOONMATH_API_KEY",
+    "NEAR_API_KEY",
     "GM_NODE_SECRET",
 ];
 

@@ -346,6 +346,8 @@ pub struct ProviderKeys {
     pub engy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moonmath: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub near: Option<String>,
 }
 
 /// True when `v` holds a non-empty, non-whitespace value. `Some("")` and
@@ -504,6 +506,7 @@ impl ProviderKeys {
             Provider::Kubetee => Some(("KUBETEE_API_KEY", self.kubetee.as_deref())),
             Provider::Engy => Some(("ENGY_API_KEY", self.engy.as_deref())),
             Provider::Moonmath => Some(("MOONMATH_API_KEY", self.moonmath.as_deref())),
+            Provider::Near => Some(("NEAR_API_KEY", self.near.as_deref())),
             Provider::Benchmark => None,
         }
     }
@@ -1038,6 +1041,7 @@ mod tests {
             kubetee: Some("kube".to_owned()),
             engy: Some("eng".to_owned()),
             moonmath: Some("moon".to_owned()),
+            near: Some("near".to_owned()),
             ..ProviderKeys::default()
         };
 
@@ -1050,6 +1054,10 @@ mod tests {
             Some(("MOONMATH_API_KEY", Some("moon")))
         );
         assert_eq!(keys.direct_key(&Provider::Benchmark), None);
+        assert_eq!(
+            keys.direct_key(&Provider::Near),
+            Some(("NEAR_API_KEY", Some("near")))
+        );
 
         // Every non-Benchmark variant is set above, so the derived iterator
         // must surface one entry per variant in enum declaration order.
@@ -1067,6 +1075,7 @@ mod tests {
                 "KUBETEE_API_KEY",
                 "ENGY_API_KEY",
                 "MOONMATH_API_KEY",
+                "NEAR_API_KEY",
             ]
         );
     }

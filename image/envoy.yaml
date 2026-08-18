@@ -600,6 +600,46 @@ static_resources:
                             - x-gm-provider
                             - x-gm-upstream-slot
 
+                        ## ── NEAR direct confidential inference ─────────────
+                        ##  This route terminates only at the co-located
+                        ##  measured near-verify-proxy. The proxy owns the
+                        ##  closed selector-to-host allowlist and attests the
+                        ##  exact upstream TLS connection before forwarding.
+                        ##  If the proxy is absent or rejects evidence, Envoy
+                        ##  returns 503 and never falls back to cloud-api.
+                        - match:
+                            path: "/v1/models"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "near"
+                          route:
+                            cluster: near_verify_proxy
+                            timeout: 1800s
+                          request_headers_to_remove:
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                            - x-gm-upstream-slot
+                        - match:
+                            path: "/v1/chat/completions"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "near"
+                          route:
+                            cluster: near_verify_proxy
+                            timeout: 1800s
+                          request_headers_to_remove:
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                            - x-gm-upstream-slot
+
                         ## ── Benchmark ───────────────────────────────────────
                         ##  A plain proxy to the synthetic benchmark upstream —
                         ##  no API key, no upstream auth header. start.sh
@@ -729,6 +769,12 @@ static_resources:
                               default_env = __GM_MOONMATH_DEFAULT_SLOT_ENV__,
                               slots = __GM_MOONMATH_SLOT_MAP__,
                             },
+                            near = {
+                              cloud = false,
+                              direct_env = "NEAR_API_KEY",
+                              default_env = __GM_NEAR_DEFAULT_SLOT_ENV__,
+                              slots = __GM_NEAR_SLOT_MAP__,
+                            },
                           }
 
                           local function json_escape(value)
@@ -791,6 +837,8 @@ static_resources:
                             elseif provider == "engy" then
                               headers:add("authorization", "Bearer " .. key)
                             elseif provider == "moonmath" then
+                              headers:add("authorization", "Bearer " .. key)
+                            elseif provider == "near" then
                               headers:add("authorization", "Bearer " .. key)
                             end
                           end
@@ -869,6 +917,20 @@ static_resources:
                             end
                             strip_inbound_auth(headers)
                             local provider = headers:get("x-gm-provider")
+                            if provider ~= "near" or bare == "/v1/models" then
+                              headers:remove("x-gm-upstream-model")
+                            end
+                            if provider == "near" and bare ~= "/v1/models" then
+                              local model = headers:get("x-gm-upstream-model")
+                              if model ~= "zai-org/GLM-5.1-FP8"
+                                and model ~= "Qwen/Qwen3.6-27B-FP8" then
+                                handle:respond(
+                                  {[":status"] = "400",
+                                   ["content-type"] = "application/json"},
+                                  "{\"error\":\"missing or unsupported NEAR source model\"}")
+                                return
+                              end
+                            end
                             if not select_upstream_slot(handle, headers, provider) then
                               return
                             end
@@ -1070,6 +1132,22 @@ static_resources:
                     socket_address:
                       address: 127.0.0.1
                       port_value: 9901
+
+    ## ── NEAR attestation proxy ────────────────────────────────────────
+    ##  Loopback is deliberate: direct NEAR origins are never configured in
+    ##  Envoy, so there is no bypass around attestation policy.
+    - name: near_verify_proxy
+      type: STATIC
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: near_verify_proxy
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8082
 
     ## ── Anthropic ─────────────────────────────────────────────────────
     - name: anthropic

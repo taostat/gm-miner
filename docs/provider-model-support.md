@@ -29,7 +29,7 @@ published.
 | `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`) |
 | `Gemini 3.1 Pro Preview` | Google: `gemini/gemini-3.1-pro-preview` (`--google`) |
 | `Gemini 3.5 Flash` | Google: `gemini/gemini-3.5-flash` (`--google`) |
-| `GLM-5.1 TEE` | Chutes: `chutes/zai-org/GLM-5.1-TEE` (`--chutes`) |
+| `GLM-5.1 TEE` | Chutes: `chutes/zai-org/GLM-5.1-TEE` (`--chutes`); NEAR confidential inference: `near/zai-org/GLM-5.1-FP8` (`--near`) |
 | `GLM-5.2` | Z.ai direct: `zai/glm-5.2` (`--zai`); DeepInfra: `deepinfra/zai-org/GLM-5.2` (`--deepinfra`); Engy: `engy/glm-5.2` (`--engy`); KubeTEE: `kubetee/z-ai/glm-5.2` (`--kubetee`); Moonmath ZRO: `moonmath/glm-5.2` (`--moonmath`) |
 | `GLM-5.2 TEE` | Chutes: `chutes/zai-org/GLM-5.2-TEE` (`--chutes`) |
 | `GPT-5.4` | OpenAI direct: `openai/gpt-5.4` (`--openai`); Azure OpenAI (`--openai-upstream azure`) |
@@ -51,7 +51,7 @@ published.
 | `Qwen3 235B A22B Thinking 2507 TEE` | Chutes: `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` (`--chutes`) |
 | `Qwen3 32B TEE` | Chutes: `chutes/Qwen/Qwen3-32B-TEE` (`--chutes`) |
 | `Qwen3.5 397B A17B TEE` | Chutes: `chutes/Qwen/Qwen3.5-397B-A17B-TEE` (`--chutes`) |
-| `Qwen3.6 27B TEE` | Chutes: `chutes/Qwen/Qwen3.6-27B-TEE` (`--chutes`) |
+| `Qwen3.6 27B TEE` | Chutes: `chutes/Qwen/Qwen3.6-27B-TEE` (`--chutes`); NEAR confidential inference: `near/Qwen/Qwen3.6-27B-FP8` (`--near`) |
 
 KubeTEE also advertises `deepseek/deepseek-v4-flash-0731`,
 `qwen/qwen3.5-397b-a17b`, and `xiaomi/mimo-v2.5`. They are not listed as

@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "c59a3077e5e1a8584f9a235ec3d728401aad580f0425e71ad4c7f9a1b63ec8f2";
+    "e40cc87be914e09a08349fb091e170b99cf927b03b98f6acf2cd04a63699dcc7";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -159,6 +159,35 @@ fn moonmath_route_keeps_v1_path_uses_bearer_slots_and_pins_tls() {
         rendered.contains("elseif provider == \"moonmath\" then\n                              headers:add(\"authorization\", \"Bearer \" .. key)"),
         "Moonmath authentication must use the published Bearer scheme"
     );
+}
+
+#[test]
+fn near_route_has_no_direct_origin_bypass_and_never_renders_the_key() {
+    let (status, _, stderr, rendered) = render_envoy([("NEAR_API_KEY", "near-secret")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let near_route = rendered
+        .split_once("## ── NEAR direct confidential inference")
+        .and_then(|(_, rest)| rest.split_once("## ── Benchmark"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(near_route.contains("exact: \"near\""));
+    assert!(near_route.contains("path: \"/v1/models\""));
+    assert!(near_route.contains("path: \"/v1/chat/completions\""));
+    assert!(!near_route.contains("prefix: \"/\""));
+    assert!(near_route.contains("cluster: near_verify_proxy"));
+    let anthropic_route = rendered
+        .split_once("## ── Anthropic")
+        .and_then(|(_, rest)| rest.split_once("## ── OpenAI"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(anthropic_route.contains("prefix: \"/\""));
+    assert!(rendered.contains("address: 127.0.0.1"));
+    assert!(rendered.contains("port_value: 8082"));
+    assert!(rendered.contains("zai-org/GLM-5.1-FP8"));
+    assert!(rendered.contains("Qwen/Qwen3.6-27B-FP8"));
+    assert!(!rendered.contains("glm-5-1.completions.near.ai"));
+    assert!(!rendered.contains("qwen3-6-27b.completions.near.ai"));
+    assert!(!rendered.contains("near-secret"));
+    assert!(rendered.contains("if provider ~= \"near\" or bare == \"/v1/models\" then"));
+    assert!(rendered.contains("headers:remove(\"x-gm-upstream-model\")"));
 }
 
 #[test]

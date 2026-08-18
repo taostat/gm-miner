@@ -38,12 +38,14 @@ COPY azure-verify/Cargo.toml ./azure-verify/
 COPY dstack/ ./dstack/
 
 ## Pre-build a dummy workspace to cache dependencies. The attestd crate
-## ships a lib and two bins (gm-miner-attestd, gm-miner-ratls), so the
+## ships a lib and three bins (gm-miner-attestd, gm-miner-ratls, and the
+## fail-closed NEAR verification proxy), so the
 ## dummy tree needs an entry file for each declared target.
 RUN mkdir -p cli/src attestd/src/bin azure-verify/src \
   && echo "fn main() {}" > cli/src/main.rs \
   && echo "fn main() {}" > attestd/src/main.rs \
   && echo "fn main() {}" > attestd/src/bin/ratls.rs \
+  && echo "fn main() {}" > attestd/src/bin/near_verify_proxy.rs \
   && echo "" > attestd/src/lib.rs \
   && echo "" > azure-verify/src/lib.rs \
   && cargo build --release --workspace 2>/dev/null || true \
@@ -57,10 +59,11 @@ COPY azure-verify/ ./azure-verify/
 ## Build the workspace. Touch the entry points to invalidate the dummy
 ## build cache so the real sources compile.
 RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
-    attestd/src/bin/ratls.rs azure-verify/src/lib.rs \
+    attestd/src/bin/ratls.rs attestd/src/bin/near_verify_proxy.rs \
+    azure-verify/src/lib.rs \
   && cargo build --release --workspace \
   && strip target/release/gmcli target/release/gm-miner-attestd \
-    target/release/gm-miner-ratls
+    target/release/gm-miner-ratls target/release/gm-near-verify-proxy
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
 ## Envoy 1.32.x pinned by digest.
@@ -89,6 +92,10 @@ COPY --from=builder /build/target/release/gm-miner-attestd /usr/local/bin/gm-min
 ## Copy the RA-TLS provisioner. start.sh runs it once before envoy to
 ## mint the data-plane TLS cert via the dstack guest agent.
 COPY --from=builder /build/target/release/gm-miner-ratls /usr/local/bin/gm-miner-ratls
+
+## Copy the NEAR verifier. It attests and forwards each NEAR inference over
+## one exact TLS connection; Envoy never has a direct NEAR origin route.
+COPY --from=builder /build/target/release/gm-near-verify-proxy /usr/local/bin/gm-near-verify-proxy
 
 ## Copy Envoy config.
 COPY image/envoy.yaml /etc/envoy/envoy.yaml

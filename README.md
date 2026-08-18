@@ -7,13 +7,13 @@ inside an Intel TDX TEE so neither operators nor host machines see buyer content
 upstream keys.
 
 You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot,
-DeepInfra, KubeTEE, Engy, Moonmath, or Bedrock/Foundry/Azure behind the existing
+DeepInfra, KubeTEE, Engy, Moonmath, NEAR AI Cloud, or Bedrock/Foundry/Azure behind the existing
 Anthropic/OpenAI routes) and your own funded [Phala Cloud](https://cloud.phala.network)
 account. The `gmcli` tool handles the full operator lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Miner container image with ten provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs two co-located processes: the attestation server (serves `GET /attestation/info` with a fresh TDX quote) and the envoy data plane (proxies provider traffic and exposes `/stats/prometheus`). |
+| `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, optional NEAR verifier, and Envoy data plane. |
 | `cli/` | `gmcli` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. Runs operator-side from a laptop, not inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -107,7 +107,7 @@ Credentials are stored in `~/.gmcli/config.json`.
 ### 3. Set your provider API keys
 
 Your provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE,
-Engy, Moonmath) are baked into the miner container at
+Engy, Moonmath, NEAR) are baked into the miner container at
 deploy time and stay inside the TEE — gm never sees them. Set the keys for whichever providers you
 intend to serve:
 
@@ -121,6 +121,7 @@ gmcli set-api-keys --deepinfra ...
 gmcli set-api-keys --kubetee sk-...
 gmcli set-api-keys --engy sk-...
 gmcli set-api-keys --moonmath sk-...
+gmcli set-api-keys --near near-...
 ```
 
 Each flag replaces the stored value; omitted flags leave existing values intact.
@@ -135,7 +136,7 @@ gmcli set-api-keys --anthropic "sk-ant-a;sk-ant-b;sk-ant-c"
 
 See [multi-key slots](docs/multi-key-slots.md) for the slot behavior and limits.
 
-DeepInfra, Engy, KubeTEE and Moonmath are *sourcing* upstreams: they do not appear in the buyer
+DeepInfra, Engy, KubeTEE, Moonmath and NEAR are *sourcing* upstreams: they do not appear in the buyer
 catalog under their own names. Each can serve the existing `zai/glm-5.2` and
 `moonshot/kimi-k3` products; the precise upstream model ids are listed in the
 [miner model sourcing matrix](docs/provider-model-support.md). One model can have several such
@@ -326,7 +327,7 @@ gmcli worker remove <worker_id>
 | `gmcli login` | Device-code OAuth login; stores credentials in `~/.gmcli/config.json` |
 | `gmcli register-hotkey` | Record the serving hotkey (`--hotkey-ss58` or assisted via btcli) |
 | `gmcli deploy` | Full deploy: fetch approved image, launch Phala CVM, verify hashes, register worker |
-| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE, Engy, Moonmath) |
+| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE, Engy, Moonmath, NEAR) |
 | `gmcli declare-product` | Declare a single model offer with a discount |
 | `gmcli declare-products` | Fan one discount across the catalog or one provider's slice |
 | `gmcli undeclare-product` | Withdraw a single offer; re-declaring re-offers it |
@@ -336,7 +337,7 @@ gmcli worker remove <worker_id>
 | `gmcli sources` | List the [sourcing routes](docs/sourcing.md) you can serve — a buyer product served from a cheaper upstream |
 | `gmcli earnings` | On-chain hotkey emission from the subnet metagraph (requires btcli) |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
-| `gmcli check-streaming` | Probe streaming through your own data plane: once per configured provider, and once per offered KubeTEE sourcing route |
+| `gmcli check-streaming` | Probe streaming through your own data plane: once per configured provider, and once per offered KubeTEE or NEAR sourcing route |
 | `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
 | `gmcli worker list` | List workers with per-worker status and last attestation |

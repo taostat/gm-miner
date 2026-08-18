@@ -252,6 +252,10 @@ enum Command {
         /// Moonmath ZRO API key (sk-...).
         #[arg(long)]
         moonmath: Option<String>,
+
+        /// NEAR AI Cloud API key.
+        #[arg(long)]
+        near: Option<String>,
     },
 
     /// Deploy the miner to Phala Cloud with trust-correct hash verification.
@@ -824,6 +828,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             kubetee,
             engy,
             moonmath,
+            near,
         } => cmd_set_api_keys(
             explicit_network,
             anthropic,
@@ -848,6 +853,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             kubetee,
             engy,
             moonmath,
+            near,
         ),
         Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
         Command::Gm => {

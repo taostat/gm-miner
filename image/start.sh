@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # gm miner container entrypoint.
 #
-# Startup runs the required one-shot gates, then launches two co-located
+# Startup runs the required one-shot gates, then launches the required
+# co-located
 # long-running processes:
 #
 #   0. gm-miner-attestd --verify-azure-once (one-shot, Azure only) —
@@ -15,7 +16,10 @@
 #   2. gm-miner-attestd — serves GET /attestation/info with a fresh
 #      Intel TDX quote from the dstack guest agent. Bound to loopback;
 #      envoy routes the single /attestation/info path to it.
-#   3. envoy — the data plane on :8080. Terminates RA-TLS with the
+#   3. gm-near-verify-proxy (when NEAR_API_KEY is configured) — verifies
+#      nonce-bound TDX, GPU, model and live TLS-key evidence on the exact
+#      upstream connection used for each NEAR inference request.
+#   4. envoy — the data plane on :8080. Terminates RA-TLS with the
 #      minted certificate, proxies provider inference traffic and the
 #      registry's x-gm-provider capability probes, and forwards
 #      /attestation/info to the attestation server.
@@ -35,8 +39,8 @@
 # attestation enforcement. The rendering step substitutes the resolved
 # URL's host/port into envoy.yaml.
 #
-# Process supervision: attestd and envoy both run in the background;
-# this script stays PID 1 and `wait -n`s on both. When either exits the
+# Process supervision: required servers run in the background; this script
+# stays PID 1 and watches all of them. When any exits the
 # whole container exits non-zero so the runtime's `restart:
 # unless-stopped` policy recreates the stack — a miner missing either
 # process cannot serve the registry, so crashing fast and recovering is
@@ -392,10 +396,14 @@ if [[ -n "${MOONMATH_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "MOONMATH_API_KEY set"
 fi
+if [[ -n "${NEAR_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "NEAR_API_KEY set (NEAR requests require the local attestation proxy)"
+fi
 
 if [[ "${HAS_KEY}" -eq 0 ]]; then
   if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && "${OPENAI_UPSTREAM}" == "direct" ]]; then
-    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY must be set"
+    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY / NEAR_API_KEY must be set"
   else
     log "error: at least one usable provider key must be set"
   fi
@@ -433,6 +441,9 @@ fi
 if [[ -n "${MOONMATH_API_KEY:-}" ]]; then
   fan_out_slots moonmath MOONMATH_API_KEY
 fi
+if [[ -n "${NEAR_API_KEY:-}" ]]; then
+  fan_out_slots near NEAR_API_KEY
+fi
 
 GM_ANTHROPIC_SLOT_MAP="$(lua_slot_map "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
 GM_ANTHROPIC_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
@@ -454,6 +465,8 @@ GM_ENGY_SLOT_MAP="$(lua_slot_map "${GM_ENGY_SLOT_IDS:-}" "GM_ENGY")"
 GM_ENGY_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_ENGY_SLOT_IDS:-}" "GM_ENGY")"
 GM_MOONMATH_SLOT_MAP="$(lua_slot_map "${GM_MOONMATH_SLOT_IDS:-}" "GM_MOONMATH")"
 GM_MOONMATH_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_MOONMATH_SLOT_IDS:-}" "GM_MOONMATH")"
+GM_NEAR_SLOT_MAP="$(lua_slot_map "${GM_NEAR_SLOT_IDS:-}" "GM_NEAR")"
+GM_NEAR_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_NEAR_SLOT_IDS:-}" "GM_NEAR")"
 
 # ── Resolve the benchmark upstream ────────────────────────────────────
 # The benchmark URL is hardcoded per network in this script, NOT taken
@@ -576,6 +589,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_ENGY_DEFAULT_SLOT_ENV="${GM_ENGY_DEFAULT_SLOT_ENV}" \
   GM_MOONMATH_SLOT_MAP="${GM_MOONMATH_SLOT_MAP}" \
   GM_MOONMATH_DEFAULT_SLOT_ENV="${GM_MOONMATH_DEFAULT_SLOT_ENV}" \
+  GM_NEAR_SLOT_MAP="${GM_NEAR_SLOT_MAP}" \
+  GM_NEAR_DEFAULT_SLOT_ENV="${GM_NEAR_DEFAULT_SLOT_ENV}" \
   GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
   GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
   GM_OPENAI_AZURE_TLS="${OPENAI_AZURE_TLS}" \
@@ -631,6 +646,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     engy_default_slot_env = ENVIRON["GM_ENGY_DEFAULT_SLOT_ENV"]
     moonmath_slot_map = ENVIRON["GM_MOONMATH_SLOT_MAP"]
     moonmath_default_slot_env = ENVIRON["GM_MOONMATH_DEFAULT_SLOT_ENV"]
+    near_slot_map = ENVIRON["GM_NEAR_SLOT_MAP"]
+    near_default_slot_env = ENVIRON["GM_NEAR_DEFAULT_SLOT_ENV"]
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
     openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
@@ -693,6 +710,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_ENGY_DEFAULT_SLOT_ENV__", engy_default_slot_env)
     line = subst(line, "__GM_MOONMATH_SLOT_MAP__", moonmath_slot_map)
     line = subst(line, "__GM_MOONMATH_DEFAULT_SLOT_ENV__", moonmath_default_slot_env)
+    line = subst(line, "__GM_NEAR_SLOT_MAP__", near_slot_map)
+    line = subst(line, "__GM_NEAR_DEFAULT_SLOT_ENV__", near_default_slot_env)
     line = subst(line, "__GM_OPENAI_SAN_MATCH__", openai_san_match)
     line = subst(line, "__GM_OPENAI_SAN_VALUE__", openai_san_value)
     print line
@@ -745,6 +764,21 @@ log "minting data-plane RA-TLS certificate via dstack get_tls_key"
 gm-miner-ratls
 log "RA-TLS certificate ready"
 
+# ── Verify and launch the NEAR attestation proxy ──────────────────────
+# NEAR routes exist only when a key is configured. Before Envoy can expose
+# such a route, verify every closed-list origin once. Each inference is then
+# re-attested by the long-running proxy over the exact TLS connection it
+# forwards on; the startup check is readiness, not a reusable attestation.
+NEAR_PROXY_PID=""
+if [[ -n "${NEAR_API_KEY:-}" ]]; then
+  log "verifying NEAR confidential endpoints before starting data plane"
+  gm-near-verify-proxy --verify-once
+  log "NEAR endpoint attestation verification passed"
+  log "starting NEAR verification proxy on 127.0.0.1:8082"
+  gm-near-verify-proxy &
+  NEAR_PROXY_PID=$!
+fi
+
 # ── Launch the attestation server ─────────────────────────────────────
 # gm-miner-attestd binds 127.0.0.1:8081 (envoy's `attestd` cluster
 # target) and fetches TDX quotes over /var/run/dstack.sock. The socket
@@ -769,16 +803,19 @@ ENVOY_PID=$!
 # shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
 shutdown() {
   log "received signal — shutting down"
-  kill -TERM "${ENVOY_PID}" "${ATTESTD_PID}" 2>/dev/null || true
+  local -a pids=("${ENVOY_PID}" "${ATTESTD_PID}")
+  if [[ -n "${NEAR_PROXY_PID}" ]]; then
+    pids+=("${NEAR_PROXY_PID}")
+  fi
+  kill -TERM "${pids[@]}" 2>/dev/null || true
 }
 trap shutdown TERM INT
 
-# ── Supervise both processes ──────────────────────────────────────────
-# `wait -n` blocks until *either* child exits, then returns that child's
-# status. It must run in this (the main) shell: `wait` can only reap a
-# shell's own children, so a backgrounded `( wait "$PID" )` subshell
-# sees neither attestd nor envoy as its child and returns 127
-# immediately — falsely reporting the process dead. Whichever process
+# ── Supervise all serving processes ───────────────────────────────────
+# `jobs -pr` lists only children still running. Poll it from this main shell
+# so the first stopped child can be reaped here with `wait`, preserving its
+# real status. This is portable to the older Bash shipped on macOS too, which
+# keeps the startup/supervision integration tests honest. Whichever process
 # exits first, the container must come down so the runtime's
 # `restart: unless-stopped` policy recreates the whole stack: a miner
 # missing either envoy or attestd cannot serve the registry.
@@ -788,21 +825,38 @@ trap shutdown TERM INT
 # non-zero — without it the diagnostic block below never runs and the
 # exit cause is never logged.
 FIRST_EXIT_STATUS=0
-wait -n "${ATTESTD_PID}" "${ENVOY_PID}" || FIRST_EXIT_STATUS=$?
+FIRST_EXIT_PID=""
+SUPERVISED_PIDS=("${ATTESTD_PID}" "${ENVOY_PID}")
+if [[ -n "${NEAR_PROXY_PID}" ]]; then
+  SUPERVISED_PIDS+=("${NEAR_PROXY_PID}")
+fi
+while [[ -z "${FIRST_EXIT_PID}" ]]; do
+  RUNNING_PIDS=" $(jobs -pr | tr '\n' ' ') "
+  for pid in "${SUPERVISED_PIDS[@]}"; do
+    if [[ "${RUNNING_PIDS}" != *" ${pid} "* ]]; then
+      FIRST_EXIT_PID="${pid}"
+      wait "${pid}" || FIRST_EXIT_STATUS=$?
+      break
+    fi
+  done
+  if [[ -z "${FIRST_EXIT_PID}" ]]; then
+    sleep 0.1
+  fi
+done
 
-# Name the process that exited so the log states the real cause. `kill
-# -0` succeeds only while a pid is still alive; the dead one is the one
-# that triggered the `wait -n` return.
-if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
+# Name the process that exited so the log states the real cause.
+if [[ "${FIRST_EXIT_PID}" == "${ATTESTD_PID}" ]]; then
   log "error: attestation server exited (status ${FIRST_EXIT_STATUS}) — stopping container"
-elif ! kill -0 "${ENVOY_PID}" 2>/dev/null; then
+elif [[ -n "${NEAR_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${NEAR_PROXY_PID}" ]]; then
+  log "error: NEAR verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
+elif [[ "${FIRST_EXIT_PID}" == "${ENVOY_PID}" ]]; then
   log "error: envoy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 else
   log "error: a supervised process exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 fi
 
 # Stop the survivor and reap it before exiting.
-kill -TERM "${ATTESTD_PID}" "${ENVOY_PID}" 2>/dev/null || true
+kill -TERM "${SUPERVISED_PIDS[@]}" 2>/dev/null || true
 wait 2>/dev/null || true
 
 # Always exit non-zero so the container runtime's `restart:

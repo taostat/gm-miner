@@ -399,17 +399,7 @@ fn wizard_provider_keys(
         return Ok(StepOutcome::Done);
     }
     let keys = prompt_provider_keys(assume_yes)?;
-    if keys.anthropic.is_none()
-        && keys.openai.is_none()
-        && keys.google.is_none()
-        && keys.chutes.is_none()
-        && keys.zai.is_none()
-        && keys.moonshot.is_none()
-        && keys.deepinfra.is_none()
-        && keys.kubetee.is_none()
-        && keys.engy.is_none()
-        && keys.moonmath.is_none()
-    {
+    if !wizard_has_provider_key(&keys) {
         println!("  No keys entered — skipping. Set them later with `gmcli set-api-keys`.");
         return Ok(StepOutcome::Outstanding("gmcli set-api-keys".to_owned()));
     }
@@ -453,8 +443,23 @@ fn wizard_provider_keys(
             keys.kubetee,
             keys.engy,
             keys.moonmath,
+            keys.near,
         )
     )
+}
+
+fn wizard_has_provider_key(keys: &ProviderKeys) -> bool {
+    keys.anthropic.is_some()
+        || keys.openai.is_some()
+        || keys.google.is_some()
+        || keys.chutes.is_some()
+        || keys.zai.is_some()
+        || keys.moonshot.is_some()
+        || keys.deepinfra.is_some()
+        || keys.kubetee.is_some()
+        || keys.engy.is_some()
+        || keys.moonmath.is_some()
+        || keys.near.is_some()
 }
 
 /// Prompt for each provider key in turn (blank to skip a provider).
@@ -488,6 +493,7 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         kubetee: prompt_line("KubeTEE API key (blank to skip):", assume_yes)?,
         engy: prompt_line("Engy API key (blank to skip):", assume_yes)?,
         moonmath: prompt_line("Moonmath ZRO API key (blank to skip):", assume_yes)?,
+        near: prompt_line("NEAR AI Cloud API key (blank to skip):", assume_yes)?,
     })
 }
 
@@ -536,6 +542,9 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     }
     if keys.moonmath.is_some() {
         cmd.push_str(" --moonmath <key>");
+    }
+    if keys.near.is_some() {
+        cmd.push_str(" --near <key>");
     }
     cmd
 }
@@ -602,8 +611,9 @@ fn prompt_discount(assume_yes: bool) -> Result<Option<u32>> {
 )]
 mod tests {
     use super::{
-        closing_lines, record, run_steps, wizard_declare_products, wizard_deploy, wizard_login,
-        wizard_provider_keys, wizard_register_hotkey, Config, StepOutcome, WizardFlow,
+        closing_lines, record, run_steps, wizard_declare_products, wizard_deploy,
+        wizard_has_provider_key, wizard_login, wizard_provider_keys, wizard_register_hotkey,
+        Config, ProviderKeys, StepOutcome, WizardFlow,
     };
 
     /// The banner that must appear if and only if onboarding actually finished.
@@ -782,6 +792,15 @@ mod tests {
     fn a_keys_step_with_no_keys_entered_is_outstanding() {
         let outcome = wizard_provider_keys(None, &fresh_config(), true).expect("step runs");
         assert_eq!(command_of(&outcome), "gmcli set-api-keys");
+    }
+
+    #[test]
+    fn a_near_only_key_is_not_treated_as_empty() {
+        let keys = ProviderKeys {
+            near: Some("near-key".to_owned()),
+            ..ProviderKeys::default()
+        };
+        assert!(wizard_has_provider_key(&keys));
     }
 
     #[tokio::test]

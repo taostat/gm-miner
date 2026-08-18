@@ -5,7 +5,7 @@ A **route** is how your worker fulfils it: which host it calls, with which key.
 
 One buyer product can have several routes, and none of them is the canonical one.
 `zai/glm-5.2` is the open GLM weights; Z.ai runs an API for them, and so do
-DeepInfra, Engy, KubeTEE and Moonmath. The product id names the model, not the
+DeepInfra, Engy, KubeTEE, Moonmath and NEAR. The product id names the model, not the
 company you buy it from. Buyers see the product they asked for either way.
 
 Routes differ on more than price — latency, availability, region, context window,
@@ -28,6 +28,8 @@ explains the table and how to set each upstream up.
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
 | `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
+| `chutes/zai-org/GLM-5.1-TEE` | `near/zai-org/GLM-5.1-FP8` | `glm-5-1.completions.near.ai` | `--near` |
+| `chutes/Qwen/Qwen3.6-27B-TEE` | `near/Qwen/Qwen3.6-27B-FP8` | `qwen3-6-27b.completions.near.ai` | `--near` |
 
 Both buyer products can also be served **direct** — with a Z.ai key (`--zai`) or a
 Moonshot key (`--moonshot`). Direct is not the canonical route, but it does carry one
@@ -117,6 +119,7 @@ gmcli set-api-keys --deepinfra <key>
 gmcli set-api-keys --engy <key>
 gmcli set-api-keys --kubetee <key>
 gmcli set-api-keys --moonmath <key>
+gmcli set-api-keys --near <key>
 ```
 
 Like the other upstream flags, each accepts up to 8 semicolon-separated keys and
@@ -140,7 +143,30 @@ gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
 gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
+gmcli declare-product --provider near --model zai-org/GLM-5.1-FP8 --discount-pct 5
+gmcli declare-product --provider near --model Qwen/Qwen3.6-27B-FP8 --discount-pct 5
 ```
+
+### NEAR attestation enforcement
+
+NEAR is not a normal TLS proxy route. When a NEAR key is present, the image
+first verifies every closed-list NEAR endpoint before starting Envoy. For each
+inference request, the co-located verifier then opens a fresh TLS connection,
+requests nonce-bound evidence on that connection, validates the Intel TDX quote,
+the exact model id, the live TLS public-key fingerprint, the compose measurement
+binding, and NVIDIA's GPU verdict, and only then forwards inference on that same
+connection. A missing, stale, substituted, malformed, or failed verdict returns
+an error; there is no direct-origin or unattested fallback route.
+
+The registry's `GET /v1/models` capability check is answered locally from that
+same compiled allowlist. It does not contact an unattested catalog endpoint;
+the registry's follow-up one-token balance check still takes the fully attested
+inference path for the exact offered source model.
+
+The verifier's endpoint and model allowlist is compiled into the measured miner
+image. Adding a NEAR model therefore requires a new image build and the normal
+registry image-approval process; changing a CLI catalog row alone cannot make an
+arbitrary NEAR host reachable.
 
 `gmcli sources` prints this line for you, pre-filled, for every undeclared route
 where declaring it would actually get you somewhere — one a worker already

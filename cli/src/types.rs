@@ -40,6 +40,7 @@ pub enum Provider {
     Kubetee,
     Engy,
     Moonmath,
+    Near,
     Benchmark,
 }
 
@@ -57,6 +58,7 @@ impl Provider {
             Self::Kubetee => "kubetee",
             Self::Engy => "engy",
             Self::Moonmath => "moonmath",
+            Self::Near => "near",
             Self::Benchmark => "benchmark",
         }
     }
@@ -90,12 +92,13 @@ impl std::str::FromStr for Provider {
             "kubetee" => Ok(Self::Kubetee),
             "engy" => Ok(Self::Engy),
             "moonmath" => Ok(Self::Moonmath),
+            "near" => Ok(Self::Near),
             "benchmark" => anyhow::bail!(
                 "provider \"benchmark\" is not declarable — every gm miner serves \
                  the benchmark pool automatically; see docs/plans/admission-benchmark.md"
             ),
             other => anyhow::bail!(
-                "unknown provider {other:?} — must be one of: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, engy, moonmath"
+                "unknown provider {other:?} — must be one of: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, engy, moonmath, near"
             ),
         }
     }
