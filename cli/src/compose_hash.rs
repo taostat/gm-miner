@@ -216,18 +216,18 @@ mod tests {
 
     /// The testnet image ref whose `app_compose` hashes to the registry's
     /// approved baseline below — the gm-published public miner image for the
-    /// current testnet-supported Moonmath candidate. Must track a supported
+    /// current testnet-supported NEAR candidate. Must track a supported
     /// image version: when a new `ImageVersion` is published, bump both this
     /// ref and `REGISTRY_TESTNET_COMPOSE_HASH` to the live registry row.
     const TESTNET_IMAGE_REF: &str =
-        "ghcr.io/taostat/gm-miner@sha256:0930385fbe2bd733cb10425b08618756c0f09bd20b6a52a2dca95811853da10a";
+        "ghcr.io/taostat/gm-miner@sha256:11f99ebde0d1acb944669be8fd0215086e8857de4324ae3fbeab2fcb42c72299";
 
     /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
     /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
     /// keys, cloud upstream settings, and node secret).
     ///
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "803706d985bf0add871b3d42782d8f737a17e6c9b7ae02188144dcac065a167a";
+        "81e5f2b7544840f5394dd76940a6cf75558a4e822e7992670972af9cca695377";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
