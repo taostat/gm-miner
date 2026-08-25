@@ -15,6 +15,10 @@ selection rules. Run `gmcli sources` against your chosen network before
 deploying: it is the live authority for which source routes that registry has
 published.
 
+Prefixes such as `chutes`, `kubetee`, `engy`, and `near` identify the supplier
+account and key used by that route; they are not the model maker or
+buyer-product namespace.
+
 | Model you want to provide | Supported sources |
 |---|---|
 | `claude-fable-5` | Anthropic direct: `anthropic/claude-fable-5` (`--anthropic`); AWS Bedrock (`--anthropic-upstream bedrock`); Microsoft Foundry (`--anthropic-upstream foundry`, with `--upstream-model`) |
@@ -25,7 +29,7 @@ published.
 | `claude-sonnet-4-6` | Anthropic direct: `anthropic/claude-sonnet-4-6` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
 | `claude-sonnet-5` | Anthropic direct: `anthropic/claude-sonnet-5` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
 | `DeepSeek V3.2 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V3.2-TEE` (`--chutes`) |
-| `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`) |
+| `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`); Engy: `engy/deepseek-v4-flash-0731` (`--engy`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`); NEAR confidential inference: `near/deepseek-ai/DeepSeek-V4-Flash` (`--near`) |
 | `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`); NEAR confidential inference: `near/google/gemma-4-31B-it` (`--near`) |
 | `Gemini 3.1 Pro Preview` | Google: `gemini/gemini-3.1-pro-preview` (`--google`) |

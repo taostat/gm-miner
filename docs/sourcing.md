@@ -1,12 +1,15 @@
 # Sourcing routes: the upstreams that can serve a buyer product
 
-A **buyer product** is what a buyer asks for — `zai/glm-5.2`, `anthropic/claude-sonnet-4-6`.
-A **route** is how your worker fulfils it: which host it calls, with which key.
+A **buyer product** is the stable identity a buyer requests: the model maker
+plus its serving class. `qwen/qwen3.8-27b` is open inference and
+`qwen/qwen3.8-27b-tee` is confidential inference; they are different buyer
+products even though they use the same model family.
 
-One buyer product can have several routes, and none of them is the canonical one.
-`zai/glm-5.2` is the open GLM weights; Z.ai runs an API for them, and so do
-DeepInfra, Engy, KubeTEE, Moonmath and NEAR. The product id names the model, not the
-company you buy it from. Buyers see the product they asked for either way.
+A **route** is the supplier account and exact upstream checkpoint your worker
+uses to fulfil that product. The maker prefix never says which supplier handled
+the request, and no supplier route is canonical. For example, open
+`zai/glm-5.2` can route through Z.ai direct, DeepInfra, Engy, KubeTEE, or
+Moonmath; confidential `zai/glm-5.2-tee` can route through Chutes or NEAR.
 
 Routes differ on more than price — latency, availability, region, context window,
 and data handling all vary between hosts serving identical weights. Price is
@@ -22,23 +25,41 @@ explains the table and how to set each upstream up.
 |---|---|---|---|
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
 | `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
-| `engy/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
-| `engy/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
+| `qwen/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
+| `qwen/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
-| `kubetee/deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
+| `deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
+| `qwen/qwen3.6-35b-a3b` | `engy/qwen3.6-35b-a3b` | `api.engy.ai` | `--engy` |
+| `qwen/qwen3.8-27b` | `engy/qwen3.8-27b` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
+| `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | `llm.kubetee.ai` | `--kubetee` |
+| `ornith/ornith-1.5-397b` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
 | `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
-| `chutes/zai-org/GLM-5.1-TEE` | `near/zai-org/GLM-5.1-FP8` | `glm-5-1.completions.near.ai` | `--near` |
-| `chutes/Qwen/Qwen3.6-27B-TEE` | `near/Qwen/Qwen3.6-27B-FP8` | `qwen3-6-27b.completions.near.ai` | `--near` |
-| `chutes/zai-org/GLM-5.2-TEE` | `near/z-ai/glm-5.2` | `glm-5-2-long.completions.near.ai` | `--near` |
-| `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` | `near/deepseek-ai/DeepSeek-V4-Flash` | `dsv4-flash.completions.near.ai` | `--near` |
-| `chutes/google/gemma-4-31B-turbo-TEE` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
+| `qwen/qwen3-32b-tee` | `chutes/Qwen/Qwen3-32B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `google/gemma-4-31b-turbo-tee` | `chutes/google/gemma-4-31B-turbo-TEE` | `llm.chutes.ai` | `--chutes` |
+| `zai/glm-5.1-tee` | `chutes/zai-org/GLM-5.1-TEE` | `llm.chutes.ai` | `--chutes` |
+| `deepseek/deepseek-v3.2-tee` | `chutes/deepseek-ai/DeepSeek-V3.2-TEE` | `llm.chutes.ai` | `--chutes` |
+| `moonshot/kimi-k2.6-tee` | `chutes/moonshotai/Kimi-K2.6-TEE` | `llm.chutes.ai` | `--chutes` |
+| `qwen/qwen3.5-397b-a17b-tee` | `chutes/Qwen/Qwen3.5-397B-A17B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `qwen/qwen3.6-27b-tee` | `chutes/Qwen/Qwen3.6-27B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `qwen/qwen3-235b-a22b-thinking-2507-tee` | `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` | `llm.chutes.ai` | `--chutes` |
+| `mistral/mistral-nemo-instruct-2407-tee` | `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` | `llm.chutes.ai` | `--chutes` |
+| `zai/glm-5.2-tee` | `chutes/zai-org/GLM-5.2-TEE` | `llm.chutes.ai` | `--chutes` |
+| `deepseek/deepseek-v4-flash-0731-tee` | `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` | `llm.chutes.ai` | `--chutes` |
+| `moonshot/kimi-k3-tee` | `chutes/moonshotai/Kimi-K3-TEE` | `llm.chutes.ai` | `--chutes` |
+| `nvidia/nemotron-3-nano-omni-30b-tee` | `chutes/Nemotron-3-Nano-Omni-30B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `zai/glm-5.1-tee` | `near/zai-org/GLM-5.1-FP8` | `glm-5-1.completions.near.ai` | `--near` |
+| `qwen/qwen3.6-27b-tee` | `near/Qwen/Qwen3.6-27B-FP8` | `qwen3-6-27b.completions.near.ai` | `--near` |
+| `zai/glm-5.2-tee` | `near/z-ai/glm-5.2` | `glm-5-2-long.completions.near.ai` | `--near` |
+| `deepseek/deepseek-v4-flash-0731-tee` | `near/deepseek-ai/DeepSeek-V4-Flash` | `dsv4-flash.completions.near.ai` | `--near` |
+| `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
+| `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
 
-The Z.ai, Moonshot, and Engy Qwen buyer products can also be served **direct** — with a Z.ai key
-(`--zai`), Moonshot key (`--moonshot`), or Engy key (`--engy`). Direct is not the canonical route, but it does carry one
+The Z.ai and Moonshot buyer products can also be served **direct** — with a Z.ai key
+(`--zai`) or Moonshot key (`--moonshot`). Direct is not the canonical route, but it does carry one
 concrete advantage: where a worker could serve a product both directly and through a
 route, the router keeps the direct one (see below).
 
@@ -139,7 +160,7 @@ gmcli deploy
 ```
 
 **3. Declare the product.** For a sourcing route, use the **route** pair rather
-than the buyer pair; direct Engy Qwen products use their buyer pair:
+than the buyer pair:
 
 ```sh
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5

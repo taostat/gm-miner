@@ -136,17 +136,16 @@ gmcli set-api-keys --anthropic "sk-ant-a;sk-ant-b;sk-ant-c"
 
 See [multi-key slots](docs/multi-key-slots.md) for the slot behavior and limits.
 
-DeepInfra, Engy's GLM/Kimi routes, Moonmath, NEAR, and KubeTEE's GLM/Kimi routes are *sourcing*
-upstreams: they serve buyer products under existing names rather than appearing
-in the catalog under their own names. Engy's Qwen3.6 35B-A3B and Qwen3.8 27B,
-plus KubeTEE's
-`deepseek/deepseek-v4-flash-0731` and `ornith/ornith-1.5-397b` are instead
-buyer-visible products. The precise model ids are listed in the
-[miner model sourcing matrix](docs/provider-model-support.md). One model can have several such
-routes and none of them is canonical. Setting one of those keys is what makes the matching route
-available to you. A single worker can serve only one route per model, so run two workers to use
-two upstreams for the same model. Run `gmcli sources` to see the routes your registry currently
-publishes, and read [sourcing routes](docs/sourcing.md) for setup and settlement details.
+DeepInfra, Engy, KubeTEE, Moonmath, NEAR, and Chutes are *sourcing* upstreams:
+they serve buyer products named for the model maker rather than appearing in
+the buyer catalog under the supplier's name. The precise source model ids are
+listed in the [miner model sourcing matrix](docs/provider-model-support.md).
+One buyer product can have several such routes and none of them is canonical. Setting
+one of those keys is what makes the matching route available to you. A single
+worker can serve only one route per buyer product, so run two workers to use two
+upstreams for the same buyer product. Run `gmcli sources` to see the routes your
+registry currently publishes, and read [sourcing routes](docs/sourcing.md) for
+setup and settlement details.
 
 To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
 API, select Bedrock and provide the Bedrock region and API key:
