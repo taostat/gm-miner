@@ -33,6 +33,8 @@ published.
 | `GLM-5.1 TEE` | Chutes: `chutes/zai-org/GLM-5.1-TEE` (`--chutes`); NEAR confidential inference: `near/zai-org/GLM-5.1-FP8` (`--near`) |
 | `GLM-5.2` | Z.ai API: `zai/glm-5.2` (`--zai`); DeepInfra: `deepinfra/zai-org/GLM-5.2` (`--deepinfra`); Engy: `engy/glm-5.2` (`--engy`); KubeTEE: `kubetee/z-ai/glm-5.2` (`--kubetee`); Moonmath ZRO: `moonmath/glm-5.2` (`--moonmath`) |
 | `GLM-5.2 TEE` | Chutes: `chutes/zai-org/GLM-5.2-TEE` (`--chutes`); NEAR confidential inference: `near/z-ai/glm-5.2` (`--near`) |
+| `GLM-5.3` | Z.ai API: `zai/glm-5.3` (`--zai`) |
+| `GLM-5.3-Flash` | Z.ai API: `zai/glm-5.3-flash` (`--zai`); KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`) |
 | `GPT-5.4` | OpenAI API: `openai/gpt-5.4` (`--openai`); Azure OpenAI (`--openai-upstream azure`) |
 | `GPT-5.4 mini` | OpenAI API: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI |
 | `GPT-5.4 nano` | OpenAI API: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI |
@@ -57,3 +59,4 @@ published.
 | `Qwen3.6 27B TEE` | Chutes: `chutes/Qwen/Qwen3.6-27B-TEE` (`--chutes`); NEAR confidential inference: `near/Qwen/Qwen3.6-27B-FP8` (`--near`) |
 | `Qwen3.8 27B` | Engy: `engy/qwen3.8-27b` (`--engy`); DeepInfra: `deepinfra/Qwen/Qwen3.8-27B` (`--deepinfra`) |
 | `Qwen3.8 27B TEE` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
+| `Qwen3.8-Flash-Next` | KubeTEE: `kubetee/qwen/qwen3.8-flash-next` (`--kubetee`) |
