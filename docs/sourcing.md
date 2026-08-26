@@ -20,27 +20,40 @@ explains the table and how to set each upstream up.
 
 | Buyer product | Route | Upstream host | Key flag |
 |---|---|---|---|
+| `nvidia/nemotron-3-nano-omni-30b-tee` | `chutes/Nemotron-3-Nano-Omni-30B-TEE` | `api.chutes.ai` | `--chutes` |
+| `qwen/qwen3-235b-a22b-thinking-2507-tee` | `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` | `api.chutes.ai` | `--chutes` |
+| `qwen/qwen3-32b-tee` | `chutes/Qwen/Qwen3-32B-TEE` | `api.chutes.ai` | `--chutes` |
+| `qwen/qwen3.5-397b-a17b-tee` | `chutes/Qwen/Qwen3.5-397B-A17B-TEE` | `api.chutes.ai` | `--chutes` |
+| `qwen/qwen3.6-27b-tee` | `chutes/Qwen/Qwen3.6-27B-TEE` | `api.chutes.ai` | `--chutes` |
+| `deepseek/deepseek-v3.2-tee` | `chutes/deepseek-ai/DeepSeek-V3.2-TEE` | `api.chutes.ai` | `--chutes` |
+| `deepseek/deepseek-v4-flash-0731-tee` | `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` | `api.chutes.ai` | `--chutes` |
+| `google/gemma-4-31b-turbo-tee` | `chutes/google/gemma-4-31B-turbo-TEE` | `api.chutes.ai` | `--chutes` |
+| `moonshot/kimi-k2.6-tee` | `chutes/moonshotai/Kimi-K2.6-TEE` | `api.chutes.ai` | `--chutes` |
+| `moonshot/kimi-k3-tee` | `chutes/moonshotai/Kimi-K3-TEE` | `api.chutes.ai` | `--chutes` |
+| `mistral/mistral-nemo-instruct-2407-tee` | `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` | `api.chutes.ai` | `--chutes` |
+| `zai/glm-5.1-tee` | `chutes/zai-org/GLM-5.1-TEE` | `api.chutes.ai` | `--chutes` |
+| `zai/glm-5.2-tee` | `chutes/zai-org/GLM-5.2-TEE` | `api.chutes.ai` | `--chutes` |
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
 | `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
-| `engy/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
-| `engy/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
+| `qwen/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
+| `qwen/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
-| `kubetee/deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
+| `deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
+| `qwen/qwen3.6-35b-a3b` | `engy/qwen3.6-35b-a3b` | `api.engy.ai` | `--engy` |
+| `qwen/qwen3.8-27b` | `engy/qwen3.8-27b` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
+| `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | `llm.kubetee.ai` | `--kubetee` |
+| `ornith/ornith-1.5-397b` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
 | `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
-| `chutes/zai-org/GLM-5.1-TEE` | `near/zai-org/GLM-5.1-FP8` | `glm-5-1.completions.near.ai` | `--near` |
-| `chutes/Qwen/Qwen3.6-27B-TEE` | `near/Qwen/Qwen3.6-27B-FP8` | `qwen3-6-27b.completions.near.ai` | `--near` |
-| `chutes/zai-org/GLM-5.2-TEE` | `near/z-ai/glm-5.2` | `glm-5-2-long.completions.near.ai` | `--near` |
-| `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` | `near/deepseek-ai/DeepSeek-V4-Flash` | `dsv4-flash.completions.near.ai` | `--near` |
-| `chutes/google/gemma-4-31B-turbo-TEE` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
-
-The Z.ai, Moonshot, and Engy Qwen buyer products can also be served **direct** — with a Z.ai key
-(`--zai`), Moonshot key (`--moonshot`), or Engy key (`--engy`). Direct is not the canonical route, but it does carry one
-concrete advantage: where a worker could serve a product both directly and through a
-route, the router keeps the direct one (see below).
+| `zai/glm-5.1-tee` | `near/zai-org/GLM-5.1-FP8` | `glm-5-1.completions.near.ai` | `--near` |
+| `qwen/qwen3.6-27b-tee` | `near/Qwen/Qwen3.6-27B-FP8` | `qwen3-6-27b.completions.near.ai` | `--near` |
+| `zai/glm-5.2-tee` | `near/z-ai/glm-5.2` | `glm-5-2-long.completions.near.ai` | `--near` |
+| `deepseek/deepseek-v4-flash-0731-tee` | `near/deepseek-ai/DeepSeek-V4-Flash` | `dsv4-flash.completions.near.ai` | `--near` |
+| `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
+| `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
 
 Routes are absent from the public catalog (`gmcli pricing`, and the registry's
 buyer-facing `GET /products`): they are dispatch targets, not products a buyer can
@@ -66,8 +79,7 @@ A worker may hold keys for several upstreams, but it can only serve **one route
 per buyer product**. If a single worker declares both `deepinfra/zai-org/GLM-5.2`
 and `engy/glm-5.2`, the router keeps one of them and ignores the other: it draws
 from a pool keyed by worker, so two routes from one worker would be the same
-worker twice. A direct offer always wins over a route; between two routes the
-outcome is not one you should rely on.
+worker twice. Which route is retained is not something you should rely on.
 
 To run two upstreams for the same buyer product, put them on **separate workers**,
 each holding only that upstream's key.
