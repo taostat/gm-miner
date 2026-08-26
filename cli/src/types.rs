@@ -225,6 +225,14 @@ pub struct SourceProductsResponse {
     pub sources: Vec<SourceProduct>,
 }
 
+/// Response from the route-first `GET /miners/products/routes` endpoint.
+/// `SourceProduct` deliberately ignores the additive `route_id`: declarations
+/// are still addressed by the source pair, while the gateway owns route IDs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupplierRoutesResponse {
+    pub routes: Vec<SourceProduct>,
+}
+
 /// Response from `GET /miners/me` (`MinerStatusResponse`).
 #[derive(Debug, Deserialize)]
 pub struct MinerStatus {

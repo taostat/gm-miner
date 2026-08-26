@@ -20,19 +20,19 @@ explains the table and how to set each upstream up.
 
 | Buyer product | Route | Upstream host | Key flag |
 |---|---|---|---|
-| `nvidia/nemotron-3-nano-omni-30b-tee` | `chutes/Nemotron-3-Nano-Omni-30B-TEE` | `api.chutes.ai` | `--chutes` |
-| `qwen/qwen3-235b-a22b-thinking-2507-tee` | `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` | `api.chutes.ai` | `--chutes` |
-| `qwen/qwen3-32b-tee` | `chutes/Qwen/Qwen3-32B-TEE` | `api.chutes.ai` | `--chutes` |
-| `qwen/qwen3.5-397b-a17b-tee` | `chutes/Qwen/Qwen3.5-397B-A17B-TEE` | `api.chutes.ai` | `--chutes` |
-| `qwen/qwen3.6-27b-tee` | `chutes/Qwen/Qwen3.6-27B-TEE` | `api.chutes.ai` | `--chutes` |
-| `deepseek/deepseek-v3.2-tee` | `chutes/deepseek-ai/DeepSeek-V3.2-TEE` | `api.chutes.ai` | `--chutes` |
-| `deepseek/deepseek-v4-flash-0731-tee` | `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` | `api.chutes.ai` | `--chutes` |
-| `google/gemma-4-31b-turbo-tee` | `chutes/google/gemma-4-31B-turbo-TEE` | `api.chutes.ai` | `--chutes` |
-| `moonshot/kimi-k2.6-tee` | `chutes/moonshotai/Kimi-K2.6-TEE` | `api.chutes.ai` | `--chutes` |
-| `moonshot/kimi-k3-tee` | `chutes/moonshotai/Kimi-K3-TEE` | `api.chutes.ai` | `--chutes` |
-| `mistral/mistral-nemo-instruct-2407-tee` | `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` | `api.chutes.ai` | `--chutes` |
-| `zai/glm-5.1-tee` | `chutes/zai-org/GLM-5.1-TEE` | `api.chutes.ai` | `--chutes` |
-| `zai/glm-5.2-tee` | `chutes/zai-org/GLM-5.2-TEE` | `api.chutes.ai` | `--chutes` |
+| `nvidia/nemotron-3-nano-omni-30b-tee` | `chutes/Nemotron-3-Nano-Omni-30B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `qwen/qwen3-235b-a22b-thinking-2507-tee` | `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` | `llm.chutes.ai` | `--chutes` |
+| `qwen/qwen3-32b-tee` | `chutes/Qwen/Qwen3-32B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `qwen/qwen3.5-397b-a17b-tee` | `chutes/Qwen/Qwen3.5-397B-A17B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `qwen/qwen3.6-27b-tee` | `chutes/Qwen/Qwen3.6-27B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `deepseek/deepseek-v3.2-tee` | `chutes/deepseek-ai/DeepSeek-V3.2-TEE` | `llm.chutes.ai` | `--chutes` |
+| `deepseek/deepseek-v4-flash-0731-tee` | `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` | `llm.chutes.ai` | `--chutes` |
+| `google/gemma-4-31b-turbo-tee` | `chutes/google/gemma-4-31B-turbo-TEE` | `llm.chutes.ai` | `--chutes` |
+| `moonshot/kimi-k2.6-tee` | `chutes/moonshotai/Kimi-K2.6-TEE` | `llm.chutes.ai` | `--chutes` |
+| `moonshot/kimi-k3-tee` | `chutes/moonshotai/Kimi-K3-TEE` | `llm.chutes.ai` | `--chutes` |
+| `mistral/mistral-nemo-instruct-2407-tee` | `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` | `llm.chutes.ai` | `--chutes` |
+| `zai/glm-5.1-tee` | `chutes/zai-org/GLM-5.1-TEE` | `llm.chutes.ai` | `--chutes` |
+| `zai/glm-5.2-tee` | `chutes/zai-org/GLM-5.2-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
 | `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
 | `qwen/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
@@ -55,13 +55,15 @@ explains the table and how to set each upstream up.
 | `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
 | `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
 
-Routes are absent from the public catalog (`gmcli pricing`, and the registry's
-buyer-facing `GET /products`): they are dispatch targets, not products a buyer can
-ask for by name. `gmcli sources` is where they appear.
+Source pairs that differ from their buyer are absent from the public catalog:
+they are dispatch targets, not products a buyer can request by name. The
+`gmcli sources` uses `GET /miners/products/routes` and lists every explicit
+route, including self routes. It falls back to the older cross-product-only
+endpoint while reporting a registry that predates the complete route catalog.
 
-### Cloud upstreams for a direct product
+### Cloud transport variants
 
-Three routes are selected per worker rather than declared as a separate product,
+Three backend transports are selected per worker rather than declared as separate products,
 because the product id is unchanged:
 
 | Buyer product | Route | Selector |
@@ -73,16 +75,13 @@ because the product id is unchanged:
 Same idea, different mechanism — these are set once per worker and apply to every
 model from that provider.
 
-## One route per buyer product per worker
+## One lottery entry per worker
 
-A worker may hold keys for several upstreams, but it can only serve **one route
-per buyer product**. If a single worker declares both `deepinfra/zai-org/GLM-5.2`
-and `engy/glm-5.2`, the router keeps one of them and ignores the other: it draws
-from a pool keyed by worker, so two routes from one worker would be the same
-worker twice. Which route is retained is not something you should rely on.
-
-To run two upstreams for the same buyer product, put them on **separate workers**,
-each holding only that upstream's key.
+A worker may offer several routes into one buyer product. For each request, the
+gateway first removes routes that cannot serve its capability envelope or fail
+another admission gate, then keeps that worker's cheapest surviving route.
+Source pair and route id only break equal-cost ties. The worker receives one
+lottery entry regardless of how many routes it offers.
 
 ## How you are paid
 
@@ -150,12 +149,13 @@ the miner advertises opaque slot ids for them — see
 gmcli deploy
 ```
 
-**3. Declare the product.** For a sourcing route, use the **route** pair rather
-than the buyer pair; direct Engy Qwen products use their buyer pair:
+**3. Declare the route.** Use the route's **source pair**, including when the
+source pair happens to equal the buyer pair:
 
 ```sh
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider engy --model kimi-k3 --discount-pct 5
+gmcli declare-product --provider engy --model deepseek-v4-flash-0731 --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.6-35b-a3b --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.8-27b --discount-pct 5
 gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5

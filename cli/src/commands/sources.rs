@@ -9,12 +9,13 @@ use gm_miner_cli::{
     network::Network,
     pricing::{extra_dimension_count, format_usd},
     table,
-    types::{RetailDimensions, SourceProduct, SourceProductsResponse},
+    types::{RetailDimensions, SourceProduct, SourceProductsResponse, SupplierRoutesResponse},
 };
 
 use crate::commands::status_error;
 
 const SOURCES_PATH: &str = "/miners/products/sources";
+const ROUTES_PATH: &str = "/miners/products/routes";
 const SOURCING_DOC_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/blob/main/docs/sourcing.md");
 
 pub(crate) async fn cmd_sources(client: &mut RegistryClient) -> Result<()> {
@@ -32,18 +33,23 @@ pub(crate) async fn cmd_sources(client: &mut RegistryClient) -> Result<()> {
 /// `declare-product` can still reject an unknown product on its own terms.
 #[derive(Debug)]
 pub(crate) enum SourceLookup {
+    /// Complete explicit route set, including self routes.
     Routes(Vec<SourceProduct>),
+    /// Compatibility response from a registry predating the route endpoint.
+    LegacyRoutes(Vec<SourceProduct>),
     Unsupported,
 }
 
 impl SourceLookup {
-    /// The routes, with an unsupported registry read as "none" — a caller
-    /// doing a membership test cannot act on the difference.
-    pub(crate) fn into_routes(self) -> Vec<SourceProduct> {
+    pub(crate) fn routes(&self) -> &[SourceProduct] {
         match self {
-            Self::Routes(routes) => routes,
-            Self::Unsupported => Vec::new(),
+            Self::Routes(routes) | Self::LegacyRoutes(routes) => routes,
+            Self::Unsupported => &[],
         }
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self, Self::Routes(_))
     }
 }
 
@@ -51,6 +57,23 @@ impl SourceLookup {
 /// buyer-facing `GET /products`, so this endpoint is the only place they
 /// surface — both for `gmcli sources` and for `declare-product`'s lookup.
 pub(crate) async fn fetch_sources(client: &mut RegistryClient) -> Result<SourceLookup> {
+    let routes_resp = client
+        .get(ROUTES_PATH)
+        .await
+        .context("GET /miners/products/routes")?;
+    let routes_status = routes_resp.status();
+    if routes_status.is_success() {
+        let body = routes_resp
+            .json::<SupplierRoutesResponse>()
+            .await
+            .context("parse supplier routes")?;
+        return Ok(SourceLookup::Routes(body.routes));
+    }
+    if routes_status != reqwest::StatusCode::NOT_FOUND {
+        let body = routes_resp.text().await.unwrap_or_default();
+        return Err(status_error("routes", routes_status, &body));
+    }
+
     let resp = client
         .get(SOURCES_PATH)
         .await
@@ -72,7 +95,7 @@ pub(crate) async fn fetch_sources(client: &mut RegistryClient) -> Result<SourceL
         .json::<SourceProductsResponse>()
         .await
         .context("parse sourcing routes")?;
-    Ok(SourceLookup::Routes(body.sources))
+    Ok(SourceLookup::LegacyRoutes(body.sources))
 }
 
 const SOURCE_HEADERS: [&str; 5] = [
@@ -91,7 +114,7 @@ fn empty_state(network: Network, why: [&str; 2]) -> Vec<String> {
         String::new(),
         why[0].to_owned(),
         why[1].to_owned(),
-        "`gmcli pricing` lists the buyer products you can serve directly.".to_owned(),
+        "`gmcli pricing` lists the buyer products your routes can serve.".to_owned(),
         String::new(),
         format!("What a sourcing route is: {SOURCING_DOC_URL}"),
     ]
@@ -99,7 +122,7 @@ fn empty_state(network: Network, why: [&str; 2]) -> Vec<String> {
 
 fn render_sources(network: Network, lookup: &SourceLookup) -> Vec<String> {
     let sources = match lookup {
-        SourceLookup::Routes(routes) => routes.as_slice(),
+        SourceLookup::Routes(routes) | SourceLookup::LegacyRoutes(routes) => routes.as_slice(),
         SourceLookup::Unsupported => {
             return empty_state(
                 network,
@@ -196,7 +219,7 @@ const CLOUD_BACKABLE: [&str; 2] = ["anthropic", "openai"];
 /// Two things make this a proxy rather than the real predicate, and they fail in
 /// opposite directions:
 ///
-/// - It sees only sourcing routes, and a **direct** offer under the same
+/// - It sees only cross-product source routes, and a **self-route** offer under the same
 ///   provider also puts it in the probe set. The provider is then probed while
 ///   no visible route is offered, so this answers `false` — it suggests a
 ///   declare that was not needed, costing one ineligible offer. Harmless enough
@@ -208,12 +231,8 @@ const CLOUD_BACKABLE: [&str; 2] = ["anthropic", "openai"];
 ///   the miner needs. That is the cycle this module exists to break, so it is
 ///   guarded rather than tolerated: [`CLOUD_BACKABLE`] never counts as offered.
 ///
-/// Neither fires against today's catalog anyway — a sourcing route's upstream
-/// (deepinfra, kubetee, engy) is not also sold as a buyer product. But nothing
-/// enforces that: this endpoint serves whatever aliased `UpstreamRoute` rows
-/// exist, so a source route under one of those providers is a catalog edit away,
-/// and the guard means such an edit costs a redundant declare instead of an
-/// undeclarable route.
+/// The guard means a future provider carrying both route shapes costs a
+/// redundant declaration suggestion rather than hiding a declarable route.
 fn provider_has_live_offer(sources: &[SourceProduct], provider: &str) -> bool {
     if CLOUD_BACKABLE.contains(&provider) {
         return false;

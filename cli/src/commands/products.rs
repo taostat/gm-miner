@@ -55,8 +55,26 @@ pub(crate) async fn cmd_declare_product(
         .products
         .iter()
         .find(|p| p.provider == provider.as_str() && p.model == model);
+    let routes = fetch_sources(client).await?;
+    let route = routes
+        .routes()
+        .iter()
+        .find(|route| route.provider == provider.as_str() && route.model == model);
 
-    let lines = if let Some(product) = catalog_hit {
+    let lines = if let (Some(product), Some(_)) = (catalog_hit, route) {
+        declaration_lines(
+            &format!("{provider}/{model}"),
+            "Retail",
+            &product.retail_price.dimensions,
+            discount_bp,
+        )
+    } else if let Some(source) = route {
+        source_declaration_lines(provider, model, source, discount_bp)
+    } else if let Some(product) = catalog_hit.filter(|_| !routes.is_complete()) {
+        // Before the explicit-route endpoint, catalog products were implicit
+        // self routes. Keep single declarations compatible with that API.
+        // On a migrated database, 0057's offer-route trigger is the backstop
+        // against an old registry pod accepting a buyer-only product.
         declaration_lines(
             &format!("{provider}/{model}"),
             "Retail",
@@ -64,8 +82,13 @@ pub(crate) async fn cmd_declare_product(
             discount_bp,
         )
     } else {
-        let source = resolve_source(client, provider, model).await?;
-        source_declaration_lines(provider, model, &source, discount_bp)
+        if catalog_hit.is_some() {
+            bail!("product {provider}/{model} has no active supplier route and cannot be declared")
+        }
+        bail!(
+            "unknown product {provider}/{model} — it is in neither the buyer catalog \
+             nor your sourcing routes (`gmcli sources`)"
+        )
     };
 
     for line in lines {
@@ -181,24 +204,6 @@ fn source_declaration_lines(
 ///
 /// Reached only after the catalog missed, so failing here means the product
 /// exists nowhere and no POST is issued.
-async fn resolve_source(
-    client: &mut RegistryClient,
-    provider: &Provider,
-    model: &str,
-) -> Result<SourceProduct> {
-    fetch_sources(client)
-        .await?
-        .into_routes()
-        .into_iter()
-        .find(|s| s.provider == provider.as_str() && s.model == model)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown product {provider}/{model} — it is in neither the buyer catalog \
-                 nor your sourcing routes (`gmcli sources`)"
-            )
-        })
-}
-
 /// The declaration preview: retail, the declared discount, and the absolute
 /// per-Mtok rate the miner receives on every dimension the product prices.
 ///
@@ -282,7 +287,22 @@ pub(crate) async fn cmd_declare_products(
     assume_yes: bool,
 ) -> Result<DeclareOutcome> {
     let catalog = fetch_catalog(client).await?;
-    let targets = filter_catalog(&catalog.products, provider_filter);
+    let routes = fetch_sources(client).await?;
+    if !routes.is_complete() {
+        bail!(
+            "this registry does not publish the complete supplier-route catalog yet; \
+             refusing a bulk declaration because buyer-only products cannot be distinguished"
+        );
+    }
+    let mut targets = filter_catalog(&catalog.products, provider_filter);
+    targets.retain(|product| {
+        routes.routes().iter().any(|route| {
+            route.provider == product.provider.as_str()
+                && route.model == product.model
+                && route.buyer_provider == product.provider.as_str()
+                && route.buyer_model == product.model
+        })
+    });
 
     if targets.is_empty() {
         let scope =
@@ -864,6 +884,17 @@ mod tests {
             .await;
     }
 
+    async fn mount_routes(server: &MockServer, routes: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/miners/products/routes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "routes": routes,
+                "generated_at": "2026-08-26T10:00:00Z",
+            })))
+            .mount(server)
+            .await;
+    }
+
     async fn mount_me(server: &MockServer, products: serde_json::Value) {
         Mock::given(method("GET"))
             .and(path("/miners/me"))
@@ -902,7 +933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_catalog_product_declares_without_consulting_sources() {
+    async fn a_catalog_product_declares_against_a_legacy_registry() {
         let server = MockServer::start().await;
         mount_catalog(
             &server,
@@ -921,7 +952,6 @@ mod tests {
             }),
         )
         .await;
-
         let mut client = RegistryClient::new(config_for(&server));
         cmd_declare_product(
             &mut client,
@@ -931,14 +961,10 @@ mod tests {
             DeclareArgs::default(),
         )
         .await
-        .expect("a catalog product declares");
+        .expect("a legacy registry's catalog product remains declarable");
 
         assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
-        assert_eq!(
-            hits(&server, "GET", "/miners/products/sources").await,
-            0,
-            "a catalog hit must not spend a round-trip on the sources endpoint"
-        );
+        assert_eq!(hits(&server, "GET", "/miners/products/sources").await, 1);
     }
 
     #[tokio::test]
@@ -1072,6 +1098,20 @@ mod tests {
             serde_json::json!([{
                 "provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active",
                 "retail_price": retail(3_000_000_000, 15_000_000_000),
+            }]),
+        )
+        .await;
+        mount_routes(
+            &server,
+            serde_json::json!([{
+                "route_id": 1,
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "buyer_provider": "anthropic",
+                "buyer_model": "claude-sonnet-4-6",
+                "retail_price": retail(3_000_000_000, 15_000_000_000),
+                "capable_worker_count": 1,
+                "already_offered": false,
             }]),
         )
         .await;
