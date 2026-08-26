@@ -4,26 +4,34 @@ Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
 Snapshot date: **2026-08-26**. This is a miner setup matrix, not a buyer product
-catalog. A supplier route is listed only when the GM miner image
-supports its API and GM has reviewed the exact upstream model id. Its
-backticked `provider/model` is the exact pair to pass to
-`gmcli declare-product`; configure its key, redeploy the worker, then declare
-that pair. Bedrock, Foundry and Azure entries mean the miner supports that
-cloud transport; you must also make the model available in your own cloud
-account. See [sourcing.md](sourcing.md) for complete commands and route
-selection rules. Run `gmcli sources` against your chosen network before
-deploying: it is the live authority for which explicit routes that registry has
-published.
+catalog. It distinguishes transport capability from registry admission:
+
+* A direct/API-key source is declarable when the registry publishes the route
+  and the worker passes its normal capability checks.
+* A cloud adapter being able to answer HTTP is not enough to make its model
+  supply routable. The only reviewed cloud binding today is Bedrock
+  `anthropic/claude-sonnet-4-6` with the exact Mantle id
+  `anthropic.claude-sonnet-4-6-v1`.
+* Azure OpenAI, Microsoft Foundry, and every other Bedrock model/id
+  combination remain transport-capable but non-admissible until an
+  authoritative binding is reviewed. Do not declare those as cloud supply.
+
+The backticked `provider/model` is the pair to pass to
+`gmcli declare-product` for a direct route. For the one reviewed Bedrock route,
+also pass `--upstream-model anthropic.claude-sonnet-4-6-v1`. See
+[sourcing.md](sourcing.md) for complete commands and route selection rules. Run
+`gmcli sources` against your chosen network before deploying: it is the live
+authority for which explicit routes that registry has published.
 
 | Model you want to provide | Supported sources |
 |---|---|
-| `claude-fable-5` | Anthropic API: `anthropic/claude-fable-5` (`--anthropic`); AWS Bedrock (`--anthropic-upstream bedrock`); Microsoft Foundry (`--anthropic-upstream foundry`, with `--upstream-model`) |
-| `claude-haiku-4-5` | Anthropic API: `anthropic/claude-haiku-4-5` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
-| `claude-opus-4-7` | Anthropic API: `anthropic/claude-opus-4-7` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
-| `claude-opus-4-8` | Anthropic API: `anthropic/claude-opus-4-8` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
-| `claude-opus-5` | Anthropic API: `anthropic/claude-opus-5` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
-| `claude-sonnet-4-6` | Anthropic API: `anthropic/claude-sonnet-4-6` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
-| `claude-sonnet-5` | Anthropic API: `anthropic/claude-sonnet-5` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
+| `claude-fable-5` | Anthropic API: `anthropic/claude-fable-5` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
+| `claude-haiku-4-5` | Anthropic API: `anthropic/claude-haiku-4-5` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
+| `claude-opus-4-7` | Anthropic API: `anthropic/claude-opus-4-7` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
+| `claude-opus-4-8` | Anthropic API: `anthropic/claude-opus-4-8` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
+| `claude-opus-5` | Anthropic API: `anthropic/claude-opus-5` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
+| `claude-sonnet-4-6` | Anthropic API: `anthropic/claude-sonnet-4-6` (`--anthropic`); **Bedrock only with `--upstream-model anthropic.claude-sonnet-4-6-v1`**; Microsoft Foundry: transport only, no reviewed registry binding |
+| `claude-sonnet-5` | Anthropic API: `anthropic/claude-sonnet-5` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
 | `DeepSeek V3.2 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V3.2-TEE` (`--chutes`) |
 | `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`); Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`); NEAR confidential inference: `near/deepseek-ai/DeepSeek-V4-Flash` (`--near`) |
@@ -35,22 +43,22 @@ published.
 | `GLM-5.2 TEE` | Chutes: `chutes/zai-org/GLM-5.2-TEE` (`--chutes`); NEAR confidential inference: `near/z-ai/glm-5.2` (`--near`) |
 | `GLM-5.3` | Z.ai API: `zai/glm-5.3` (`--zai`) |
 | `GLM-5.3-Flash` | Z.ai API: `zai/glm-5.3-flash` (`--zai`); KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`) |
-| `GPT-5.4` | OpenAI API: `openai/gpt-5.4` (`--openai`); Azure OpenAI (`--openai-upstream azure`) |
-| `GPT-5.4 mini` | OpenAI API: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI |
-| `GPT-5.4 nano` | OpenAI API: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI |
-| `GPT-5.5` | OpenAI API: `openai/gpt-5.5` (`--openai`); Azure OpenAI |
-| `GPT-5.5 Pro` | OpenAI API: `openai/gpt-5.5-pro` (`--openai`); Azure OpenAI |
-| `GPT-5.6` | OpenAI API: `openai/gpt-5.6` (`--openai`); Azure OpenAI |
-| `GPT-5.6 Luna` | OpenAI API: `openai/gpt-5.6-luna` (`--openai`); Azure OpenAI |
-| `GPT-5.6 Sol` | OpenAI API: `openai/gpt-5.6-sol` (`--openai`); Azure OpenAI |
-| `GPT-5.6 Terra` | OpenAI API: `openai/gpt-5.6-terra` (`--openai`); Azure OpenAI |
+| `GPT-5.4` | OpenAI API: `openai/gpt-5.4` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `GPT-5.4 mini` | OpenAI API: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `GPT-5.4 nano` | OpenAI API: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `GPT-5.5` | OpenAI API: `openai/gpt-5.5` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `GPT-5.5 Pro` | OpenAI API: `openai/gpt-5.5-pro` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `GPT-5.6` | OpenAI API: `openai/gpt-5.6` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `GPT-5.6 Luna` | OpenAI API: `openai/gpt-5.6-luna` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `GPT-5.6 Sol` | OpenAI API: `openai/gpt-5.6-sol` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `GPT-5.6 Terra` | OpenAI API: `openai/gpt-5.6-terra` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
 | `Kimi K2.6 TEE` | Chutes: `chutes/moonshotai/Kimi-K2.6-TEE` (`--chutes`) |
 | `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); KubeTEE: `kubetee/moonshotai/kimi-k3` (`--kubetee`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`) |
 | `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
 | `Mistral Nemo Instruct 2407 TEE` | Chutes: `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` (`--chutes`) |
 | `Nemotron 3 Nano Omni 30B TEE` | Chutes: `chutes/Nemotron-3-Nano-Omni-30B-TEE` (`--chutes`) |
-| `o3` | OpenAI API: `openai/o3` (`--openai`); Azure OpenAI |
-| `o4-mini` | OpenAI API: `openai/o4-mini` (`--openai`); Azure OpenAI |
+| `o3` | OpenAI API: `openai/o3` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
+| `o4-mini` | OpenAI API: `openai/o4-mini` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
 | `Ornith 1.5 397B` | KubeTEE: `kubetee/ornith/ornith-1.5-397b` (`--kubetee`); Engy: `engy/ornith-1.5-397b` (`--engy`) |
 | `Qwen3 235B A22B Thinking 2507 TEE` | Chutes: `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` (`--chutes`) |
 | `Qwen3 32B TEE` | Chutes: `chutes/Qwen/Qwen3-32B-TEE` (`--chutes`) |

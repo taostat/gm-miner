@@ -16,7 +16,7 @@
 //!   status           — registration state + per-product eligibility and rates
 //!                      (the hidden `list-products` alias runs the same code)
 //!   pricing          — rank your offers against the eligible field
-//!   sources          — list the sourcing routes you can serve
+//!   sources          — list sourcing routes with capability vs admission status
 //!   update           — upgrade gmcli in place to the latest release
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
 //!   worker list      — list the hotkey's live workers
@@ -169,7 +169,9 @@ enum Command {
         #[arg(long)]
         anthropic: Option<String>,
 
-        /// Anthropic upstream selector: direct, bedrock, or foundry.
+        /// Anthropic transport selector: direct, bedrock, or foundry.
+        /// Cloud transport capability is not registry admission; only the
+        /// exact reviewed Bedrock binding is currently routable.
         #[arg(long)]
         anthropic_upstream: Option<String>,
 
@@ -181,7 +183,8 @@ enum Command {
         #[arg(long)]
         bedrock_api_key: Option<String>,
 
-        /// Microsoft Foundry (Claude on Azure) upstream settings.
+        /// Microsoft Foundry (Claude on Azure) transport settings.
+        /// Foundry remains pending an authoritative registry binding.
         #[command(flatten)]
         foundry: FoundryArgs,
 
@@ -189,7 +192,8 @@ enum Command {
         #[arg(long)]
         openai: Option<String>,
 
-        /// `OpenAI` upstream selector: direct or azure.
+        /// `OpenAI` transport selector: direct or azure. Azure remains
+        /// pending an authoritative registry binding.
         #[arg(long)]
         openai_upstream: Option<String>,
 
@@ -412,7 +416,7 @@ enum Command {
     /// asks you to confirm the discount.
     #[command(after_help = "Examples:\n  \
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
-        gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 --upstream-model us.anthropic.claude-sonnet-4-6-v1\n  \
+        gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 --upstream-model anthropic.claude-sonnet-4-6-v1\n  \
         gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5\n  \
         gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5   # a sourcing route; see `gmcli sources`")]
     DeclareProduct {
@@ -425,8 +429,11 @@ enum Command {
         #[arg(long)]
         model: String,
 
-        /// Upstream model id for cloud-backed offers, e.g. a Bedrock model id.
-        /// Azure deployments named exactly like the gm model id do not need this.
+        /// Reviewed upstream model id for a cloud-backed offer. Currently the
+        /// only admitted cloud binding is Bedrock
+        /// `anthropic/claude-sonnet-4-6` with
+        /// `anthropic.claude-sonnet-4-6-v1`; Azure, Foundry and other Bedrock
+        /// combinations remain pending review.
         #[arg(long = "upstream-model", value_name = "ID")]
         upstream_model: Option<String>,
 
@@ -453,15 +460,17 @@ enum Command {
     /// Fan a single discount out across multiple offers.
     ///
     /// Discovers products via the public `GET /products` endpoint, filters
-    /// by `--provider` when set, then POSTs one offer per surviving entry.
+    /// by `--provider` when set, then POSTs one offer per surviving direct
+    /// entry. Cloud-backed providers that need a reviewed model binding are
+    /// explicitly skipped/refused because bulk requests carry no upstream id.
     /// Per-product failures are reported individually and do not abort the
     /// loop — the final summary lists ok/err counts.
     ///
-    /// Lists what the discount works out to on every target before sending,
+    /// Lists what the discount works out to on every direct target before sending,
     /// and asks you to confirm the discount once for the whole batch.
     #[command(after_help = "Examples:\n  \
-        gmcli declare-products --discount-pct 5            # whole catalog\n  \
-        gmcli declare-products --provider openai --discount-pct 10")]
+        gmcli declare-products --discount-pct 5            # direct/API-key catalog entries\n  \
+        gmcli declare-products --provider openai --discount-pct 10  # direct only; Azure pending")]
     DeclareProducts {
         /// Optional provider filter. When set, only products from this
         /// provider are declared. Omit to fan out over the whole catalog.
@@ -554,13 +563,15 @@ enum Command {
         gmcli --network testnet pricing")]
     Pricing,
 
-    /// List the sourcing routes you can serve.
+    /// List sourcing routes, separating transport capability from registry
+    /// admission.
     ///
     /// A sourcing route serves a buyer product from a cheaper upstream you
     /// hold a key for: you are paid the buyer product's retail less your
     /// discount, and keep the difference from what the upstream charges you.
     /// Shows each route's buyer product and retail, whether one of your
-    /// workers holds the key, and whether you already offer it.
+    /// workers is capable, whether you already offer it, and the current
+    /// direct/cloud admission status. A transport probe is not admission.
     #[command(after_help = "Examples:\n  \
         gmcli sources\n  \
         gmcli --network testnet sources")]
@@ -1740,7 +1751,7 @@ mod tests {
             "--discount-pct",
             "5",
             "--upstream-model",
-            "us.anthropic.claude-sonnet-4-6-v1",
+            "anthropic.claude-sonnet-4-6-v1",
         ])
         .unwrap();
 
@@ -1749,7 +1760,7 @@ mod tests {
             Command::DeclareProduct {
                 upstream_model: Some(ref upstream_model),
                 ..
-            } if upstream_model == "us.anthropic.claude-sonnet-4-6-v1"
+            } if upstream_model == "anthropic.claude-sonnet-4-6-v1"
         ));
     }
 

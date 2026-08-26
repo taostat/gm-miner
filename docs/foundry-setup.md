@@ -1,10 +1,20 @@
 # Serving Claude through Microsoft Foundry
 
-This guide sets up an Azure AI Foundry resource so a gm miner can serve the
-`anthropic` route from it (`ANTHROPIC_UPSTREAM=foundry`). It covers the Azure
-side — the resource, the connections and settings that must not exist on it, the
-read-only service principal, and the deployment name — then the two `gmcli`
-commands that consume the result.
+This guide sets up an Azure AI Foundry resource and preserves the Foundry
+transport adapter for future reviewed bindings. It does **not** currently make
+Foundry a routable or registry-admissible source: an HTTP-successful Foundry
+probe is transport capability, not authoritative model admission. The current
+GM policy has no reviewed Foundry binding, so do not declare a Foundry offer or
+count it as usable supply. Azure OpenAI is in the same pending state; the only
+cloud binding currently admitted is exact Bedrock
+`anthropic/claude-sonnet-4-6` with Mantle id
+`anthropic.claude-sonnet-4-6-v1`.
+
+The rest of this guide is still useful for validating the adapter and preparing
+the Azure resource, endpoint, credentials, and deployment identity for a later
+binding review. It covers the Azure side — the resource, the connections and
+settings that must not exist on it, the read-only service principal, and the
+deployment name — then the `gmcli` command that consumes the result.
 
 Foundry serves Claude over Anthropic's own Messages API at
 `https://<resource>.services.ai.azure.com/anthropic/v1/messages`, authenticated
@@ -175,8 +185,9 @@ az cognitiveservices account deployment list -n <ACCOUNT> -g <RG> \
   --query "[].{deployment:name, model:properties.model.name, format:properties.model.format}" -o table
 ```
 
-The `deployment` column is what you pass as `--upstream-model` in step 8. If it
-happens to equal the gm model id, you can omit the flag.
+The `deployment` column is the upstream identity that a future reviewed binding
+would carry. Record it for that review; it is not currently an instruction to
+declare a Foundry offer.
 
 ## 7. Configure gmcli
 
@@ -209,16 +220,17 @@ capability host or diagnostic setting is still attached, doctor names it and
 prints the `az` command that clears it, here rather than after you have paid for
 a CVM that crashloops.
 
-## 8. Deploy and declare offers
+## 8. Deploy and validate transport (do not declare Foundry supply)
 
 ```sh
 gmcli deploy
-gmcli declare-product --provider anthropic --model claude-sonnet-4-6 \
-  --discount-pct 5 --upstream-model <deployment-name>
 ```
 
-`--upstream-model` is per offer, because the deployment name is per model. Omit
-it only when the deployment name is already identical to the gm model id.
+The deploy keeps the adapter available for a controlled transport check, but
+the registry currently rejects Foundry as an unbound cloud backend. Do not run
+`gmcli declare-product` for Foundry, with or without `--upstream-model`; that
+would claim supply the registry cannot route. If a reviewed binding is later
+published, its release notes will provide the exact declaration identity.
 
 If the account still has a connection, a capability host or a diagnostic setting
 on it, the CVM starts, the boot gate fails, the container exits non-zero, and the
