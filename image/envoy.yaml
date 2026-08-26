@@ -206,9 +206,24 @@ static_resources:
                           upstream_detected_close_type: "%UPSTREAM_DETECTED_CLOSE_TYPE%"
                           upstream_local_close_reason: "%UPSTREAM_LOCAL_CLOSE_REASON%"
                           duration_ms: "%DURATION%"
+                          first_byte_ms: "%RESPONSE_DURATION%"
+                          attempt_count: "%UPSTREAM_REQUEST_ATTEMPT_COUNT%"
                           bytes_received: "%BYTES_RECEIVED%"
                           bytes_sent: "%BYTES_SENT%"
                           stream_id: "%STREAM_ID%"
+                  ## Distinct grep-able line for upstream reset / connect
+                  ## failure. bytes_sent=0 is the pre-first-token RST class
+                  ## that seeds SN28 cooldown; bytes_sent>0 is mid-stream.
+                  ## Filter is flag-only (UR/UF); confirm bytes_sent in the line.
+                  - name: envoy.access_loggers.stdout
+                    filter:
+                      response_flag_filter:
+                        flags: ["UR", "UF"]
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "upstream_rst_0byte timestamp=%START_TIME% cluster=%UPSTREAM_CLUSTER% flags=%RESPONSE_FLAGS% bytes_sent=%BYTES_SENT% details=%RESPONSE_CODE_DETAILS% reason=%UPSTREAM_TRANSPORT_FAILURE_REASON% request_id=%DYNAMIC_METADATA(gm.access_log:request_id)% attempts=%UPSTREAM_REQUEST_ATTEMPT_COUNT% first_byte_ms=%RESPONSE_DURATION%\n"
                 ## ── HTTP/2 via ALPN ─────────────────────────────────
                 ##  Envoy's HCM default is HTTP/1.1 only. `AUTO` selects
                 ##  h1 or h2 per connection based on the ALPN protocol
@@ -304,6 +319,19 @@ static_resources:
                       body_format_override:
                         json_format:
                           error: "miner saturated — request rate limited"
+                    ## Clean SN28-facing error for Envoy-generated upstream
+                    ## failures (reset, connect-failure, idle timeout). Does
+                    ## not rewrite a JSON 5xx that already came from Engy.
+                    - filter:
+                        status_code_filter:
+                          comparison:
+                            op: GE
+                            value:
+                              default_value: 502
+                              runtime_key: local_reply.upstream_fail.min
+                      body_format_override:
+                        json_format:
+                          error: "upstream unavailable"
                 route_config:
                   name: provider_routes
                   virtual_hosts:
@@ -568,7 +596,24 @@ static_resources:
                           route:
                             cluster: engy
                             host_rewrite_literal: api.engy.ai
+                            ## Total bound still 1800s so a long streaming
+                            ## completion is not killed. Idle is 30s: first
+                            ## byte OR inter-token silence. Do NOT set
+                            ## per_try_timeout here — that timer covers the
+                            ## whole SSE body and would abort healthy K3/GLM
+                            ## streams (miner→Engy TTFT ewma ~1.8s GLM / ~10s K3;
+                            ## a 900ms per_try_timeout re-seeds SN28 cooldown).
                             timeout: 1800s
+                            idle_timeout: 30s
+                            retry_policy:
+                              retry_on: "5xx,reset,connect-failure,refused-stream"
+                              num_retries: 1
+                              retry_host_predicate:
+                                - name: envoy.retry_host_predicates.previous_hosts
+                              host_selection_retry_max_attempts: 3
+                              retry_back_off:
+                                base_interval: 25ms
+                                max_interval: 100ms
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -1466,11 +1511,15 @@ static_resources:
     ## ── Engy ──────────────────────────────────────────────────────────
     - name: engy
       type: LOGICAL_DNS
-      connect_timeout: 10s
+      ## 2s not 10s: a hung TCP/TLS handshake must fail fast so the
+      ## retry_policy can fire a second attempt inside the first-byte budget.
+      connect_timeout: 2s
       dns_lookup_family: V4_ONLY
       typed_extension_protocol_options:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          common_http_protocol_options:
+            idle_timeout: 300s
           explicit_http_config:
             http2_protocol_options: {}
       load_assignment:
