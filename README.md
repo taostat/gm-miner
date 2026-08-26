@@ -7,9 +7,13 @@ inside an Intel TDX TEE so neither operators nor host machines see buyer content
 upstream keys.
 
 You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot,
-DeepInfra, KubeTEE, Engy, Moonmath, NEAR AI Cloud, or Bedrock/Foundry/Azure behind the existing
-Anthropic/OpenAI routes) and your own funded [Phala Cloud](https://cloud.phala.network)
-account. The `gmcli` tool handles the full operator lifecycle from your laptop.
+DeepInfra, KubeTEE, Engy, Moonmath, NEAR AI Cloud, or Bedrock/Foundry/Azure transport backends
+behind the existing Anthropic/OpenAI routes) and your own funded
+[Phala Cloud](https://cloud.phala.network) account. Transport capability is not registry
+admission: today only exact Bedrock `anthropic/claude-sonnet-4-6` with Mantle id
+`anthropic.claude-sonnet-4-6-v1` is cloud-admissible. Azure OpenAI, Foundry and every other
+Bedrock model combination remain pending authoritative reviewed bindings. The `gmcli` tool
+handles the full operator lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
@@ -148,8 +152,13 @@ available to you. A single worker can serve only one route per model, so run two
 two upstreams for the same model. Run `gmcli sources` to see the routes your registry currently
 publishes, and read [sourcing routes](docs/sourcing.md) for setup and settlement details.
 
-To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
-API, select Bedrock and provide the Bedrock region and API key:
+The image contains cloud transport adapters for Bedrock, Azure OpenAI and Foundry, but transport
+capability is not registry admission. Configure these adapters for transport testing or a future
+reviewed binding; do not advertise their responses as usable supply until the registry admits the
+exact route.
+
+The one currently reviewed cloud route is `anthropic/claude-sonnet-4-6` through AWS Bedrock. Select
+Bedrock and provide the Bedrock region and API key:
 
 ```sh
 gmcli set-api-keys \
@@ -158,8 +167,9 @@ gmcli set-api-keys \
   --bedrock-api-key <bedrock-api-key>
 ```
 
-To serve the existing `openai` route through Azure OpenAI instead of the direct OpenAI API, select
-Azure and provide the resource endpoint and API key:
+Azure OpenAI remains transport-capable but has no authoritative model binding, so it is not
+currently routable/admissible. For transport setup, select Azure and provide the resource endpoint
+and API key:
 
 ```sh
 gmcli set-api-keys \
@@ -168,9 +178,10 @@ gmcli set-api-keys \
   --azure-openai-api-key <azure-api-key>
 ```
 
-To serve the existing `anthropic` route through Claude on Microsoft Foundry, select Foundry and
-provide the resource endpoint, its API key, and a read-only Azure service principal that
-`attestd` uses to verify the account from ARM:
+Microsoft Foundry remains transport-capable but has no authoritative model binding, so it is not
+currently routable/admissible. For transport setup, select Foundry and provide the resource
+endpoint, its API key, and a read-only Azure service principal that `attestd` uses to verify the
+account from ARM:
 
 ```sh
 gmcli set-api-keys \
@@ -184,15 +195,16 @@ gmcli set-api-keys \
   --azure-foundry-client-secret <password>
 ```
 
-Foundry needs Azure-side setup before this works, and one step is easy to miss: Azure attaches an
+Foundry needs Azure-side setup before transport testing works, and one step is easy to miss: Azure attaches an
 Application Insights connection to any Foundry resource created through the portal, and the miner
 refuses to boot while it exists. Follow [Serving Claude through Microsoft
 Foundry](docs/foundry-setup.md) before your first Foundry deploy. Foundry routes on the Azure
-*deployment* name, so declare each offer with `--upstream-model <deployment-name>`.
+*deployment* name, but do not declare it as cloud supply until a reviewed binding is published.
 
-Azure OpenAI must have deployments named exactly like the gm model id, for example `gpt-4o`;
-the miner does not rewrite Azure model ids. Bedrock model-id translation is handled by the
-gateway before requests reach the miner. Worker backend provenance is auto-derived from these
+Azure OpenAI must have deployments named exactly like the gm model id for transport, for example
+`gpt-4o`; the miner does not rewrite Azure model ids. Bedrock model-id translation is handled by
+the gateway before requests reach the miner. Only the exact reviewed Bedrock route above may be
+declared with its Mantle id; all other Bedrock combinations remain pending. Worker backend provenance is auto-derived from these
 selectors when you deploy: the Anthropic-side upstream wins, so `anthropic-upstream=bedrock`
 registers `bedrock` and `anthropic-upstream=foundry` registers `foundry`; otherwise
 `openai-upstream=azure` registers `azure`, and direct workers omit the backend field. Bedrock,
@@ -234,7 +246,9 @@ gmcli doctor
 Tell the registry which models you serve and at what discount off retail. The discount sets your
 payout: a 10% discount means you keep 90% of each per-Mtok dollar.
 
-Fan one discount across the whole catalog:
+Fan one discount across the whole catalog. Bulk declaration retains direct/API-key providers, but
+explicitly skips cloud-backed providers because it never sends an `upstream_model` binding. A
+transport-capable Azure, Foundry or non-reviewed Bedrock worker is not usable registry supply:
 
 ```sh
 gmcli declare-products --discount-pct 5
@@ -247,18 +261,22 @@ gmcli declare-products --provider anthropic --discount-pct 5
 gmcli declare-products --provider openai --discount-pct 10
 ```
 
+If the selected provider uses Bedrock, Foundry or Azure, bulk declaration refuses/skips those
+offers and explains the pending binding. Declare the one reviewed Bedrock route explicitly:
+
 Or declare a single offer:
 
 ```sh
 gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5
 gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 \
-  --upstream-model us.anthropic.claude-sonnet-4-6-v1
+  --upstream-model anthropic.claude-sonnet-4-6-v1
 ```
 
 `--discount-pct` accepts a value in `[0, 99.90]` with up to two decimal places (e.g. `10.5`).
 `0` means at retail; `99.90` is the cap (keeps per-request revenue strictly positive).
-Use `--upstream-model` only when the upstream expects a different id, typically Bedrock. Azure
-deployments named exactly like the gm model id do not need it.
+Use `--upstream-model` only for an authoritative binding. Currently that means the exact Bedrock
+tuple above (`anthropic/claude-sonnet-4-6` → `anthropic.claude-sonnet-4-6-v1`). Azure, Foundry and
+other Bedrock combinations are transport-capable only and must not be declared as cloud supply.
 
 Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price
 you would receive on **every dimension the product prices** — input and output, plus prompt
@@ -271,8 +289,7 @@ retail when it records the offer, so the printed numbers are "at current retail"
 change in between moves what you are paid. The output says so, and `gmcli status` shows the
 rate each standing offer is actually on.
 
-To see the buyer products you can serve from a cheaper upstream — and the pre-filled
-`declare-product` line for each:
+To see the buyer products and the explicit capability/admission status for each route:
 
 ```sh
 gmcli sources
@@ -337,7 +354,7 @@ gmcli worker remove <worker_id>
 | `gmcli undeclare-products` | Withdraw every standing offer (`--all`) or one provider's slice |
 | `gmcli status` | Registration state + per-product eligibility and rates |
 | `gmcli pricing` | Rank each offer against the eligible field on the scalar the gateway routes on |
-| `gmcli sources` | List the [sourcing routes](docs/sourcing.md) you can serve — a buyer product served from a cheaper upstream |
+| `gmcli sources` | List [sourcing routes](docs/sourcing.md), separating transport capability from current registry admission |
 | `gmcli earnings` | On-chain hotkey emission from the subnet metagraph (requires btcli) |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |

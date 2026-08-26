@@ -65,19 +65,26 @@ they are dispatch targets, not products a buyer can request by name. The
 route, including self routes. It falls back to the older cross-product-only
 endpoint while reporting a registry that predates the complete route catalog.
 
-### Cloud transport variants
+### Cloud transport variants and admission
 
-Three backend transports are selected per worker rather than declared as separate products,
-because the product id is unchanged:
+The image retains three backend transports for capability testing and future
+reviewed bindings. Selecting one per worker does **not** make every model on
+that provider a registry-admissible route, and a successful upstream probe is
+not evidence of admission:
 
 | Buyer product | Route | Selector |
 |---|---|---|
-| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` |
-| `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) |
-| `openai/*` | Azure OpenAI | `--openai-upstream azure` |
+| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — only `anthropic/claude-sonnet-4-6` with `anthropic.claude-sonnet-4-6-v1` is currently reviewed |
+| `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) — transport only, pending binding |
+| `openai/*` | Azure OpenAI | `--openai-upstream azure` — transport only, pending binding |
 
-Same idea, different mechanism — these are set once per worker and apply to every
-model from that provider.
+Same idea, different mechanism — selectors are set once per worker and apply to
+every model from that provider, but they do not grant cloud admission. Use
+direct/API-key providers for ordinary declarations. Use
+`gmcli declare-product --provider anthropic --model claude-sonnet-4-6
+--upstream-model anthropic.claude-sonnet-4-6-v1` only for the exact reviewed
+Bedrock route. Azure, Foundry and other Bedrock combinations must not be
+declared as cloud supply until an authoritative binding is published.
 
 ## One lottery entry per worker
 

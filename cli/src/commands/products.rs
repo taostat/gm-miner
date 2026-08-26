@@ -6,6 +6,9 @@ use anyhow::{bail, Context as _, Result};
 
 use gm_miner_cli::{
     client::RegistryClient,
+    cloud_policy::{
+        configured_cloud_backend, is_reviewed_bedrock_binding, REVIEWED_BEDROCK_UPSTREAM_MODEL,
+    },
     dependency::confirm,
     pricing::{
         effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
@@ -304,6 +307,8 @@ pub(crate) async fn cmd_declare_products(
         })
     });
 
+    let skipped_cloud = skip_cloud_bulk_targets(client, &mut targets)?;
+
     if targets.is_empty() {
         let scope =
             provider_filter.map_or_else(|| "the catalog".to_owned(), |p| format!("provider {p}"));
@@ -349,12 +354,63 @@ pub(crate) async fn cmd_declare_products(
         }
     }
 
-    println!("\nSummary: {ok_count} ok, {err_count} failed.");
+    if skipped_cloud == 0 {
+        println!("\nSummary: {ok_count} ok, {err_count} failed.");
+    } else {
+        println!(
+            "\nSummary: {ok_count} ok, {err_count} failed, {skipped_cloud} skipped (cloud binding pending)."
+        );
+    }
     if err_count > 0 {
         bail!("{err_count} of {} declarations failed", targets.len());
     }
     println!("Next: gmcli status   (confirm offers + eligibility)");
     Ok(DeclareOutcome::Declared)
+}
+
+/// Remove configured cloud-backed products from a bulk declaration and explain
+/// why they were not sent. Bulk requests intentionally omit `upstream_model`;
+/// direct/API-key products remain eligible, while cloud products need an
+/// explicit reviewed binding (currently only the exact Bedrock tuple).
+fn skip_cloud_bulk_targets(client: &RegistryClient, targets: &mut Vec<&Product>) -> Result<usize> {
+    let mut skipped_cloud: Vec<(String, String, String)> = Vec::new();
+    targets.retain(|product| {
+        let Some(backend) = configured_cloud_backend(&client.config, &product.provider) else {
+            return true;
+        };
+        skipped_cloud.push((
+            product.provider.clone(),
+            product.model.clone(),
+            backend.to_owned(),
+        ));
+        false
+    });
+
+    if skipped_cloud.is_empty() {
+        return Ok(0);
+    }
+    println!(
+        "Skipped {} cloud-backed product(s): bulk declaration does not send an upstream model binding.",
+        skipped_cloud.len()
+    );
+    for (provider, model, backend) in &skipped_cloud {
+        println!(
+            "  {provider}/{model} ({backend}) — transport capability is not registry admission; reviewed binding required."
+        );
+        if is_reviewed_bedrock_binding(provider, model, REVIEWED_BEDROCK_UPSTREAM_MODEL)
+            && backend == "bedrock"
+        {
+            println!(
+                "    Declare explicitly with `gmcli declare-product --provider {provider} --model {model} --upstream-model {REVIEWED_BEDROCK_UPSTREAM_MODEL}`."
+            );
+        }
+    }
+    if targets.is_empty() {
+        bail!(
+            "bulk declaration refused: all selected products use cloud-backed providers that need a reviewed binding; no upstream_model was submitted"
+        );
+    }
+    Ok(skipped_cloud.len())
 }
 
 /// Whether a declaration actually reached the registry.
@@ -811,7 +867,7 @@ fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use gm_miner_cli::config::{Config, NetworkEntry, TokenEntry};
+    use gm_miner_cli::config::{Config, NetworkEntry, ProviderKeys, TokenEntry};
     use wiremock::{
         matchers::{body_json, method, path},
         Mock, MockServer, ResponseTemplate,
@@ -1136,6 +1192,78 @@ mod tests {
         // after declaring, exactly as `Ok(())` on a real cancellation made it
         // announce "All set" after declaring nothing.
         assert_eq!(outcome, DeclareOutcome::Declared);
+    }
+
+    #[tokio::test]
+    async fn bulk_skips_cloud_products_without_sending_an_unbound_request() {
+        let server = MockServer::start().await;
+        mount_catalog(
+            &server,
+            serde_json::json!([
+                {
+                    "provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active",
+                    "retail_price": retail(3_000_000_000, 15_000_000_000),
+                },
+                {
+                    "provider": "zai", "model": "glm-5.2", "status": "active",
+                    "retail_price": retail(1_400_000_000, 4_400_000_000),
+                },
+            ]),
+        )
+        .await;
+        mount_routes(
+            &server,
+            serde_json::json!([
+                {
+                    "route_id": 1,
+                    "provider": "anthropic", "model": "claude-sonnet-4-6",
+                    "buyer_provider": "anthropic", "buyer_model": "claude-sonnet-4-6",
+                    "retail_price": retail(3_000_000_000, 15_000_000_000),
+                    "capable_worker_count": 1, "already_offered": false,
+                },
+                {
+                    "route_id": 2,
+                    "provider": "zai", "model": "glm-5.2",
+                    "buyer_provider": "zai", "buyer_model": "glm-5.2",
+                    "retail_price": retail(1_400_000_000, 4_400_000_000),
+                    "capable_worker_count": 1, "already_offered": false,
+                },
+            ]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "zai",
+                "model": "glm-5.2",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        client.config.provider_keys = Some(ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            ..Default::default()
+        });
+        let outcome = cmd_declare_products(&mut client, None, 500, false)
+            .await
+            .expect("direct products remain declarable after cloud skip");
+
+        assert_eq!(outcome, DeclareOutcome::Declared);
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+        let requests = server.received_requests().await.expect("request recording");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST"
+                        && String::from_utf8_lossy(&request.body).contains("anthropic")
+                })
+                .count(),
+            0,
+            "bulk must not POST the cloud-backed Anthropic product"
+        );
     }
 
     #[test]

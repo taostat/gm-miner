@@ -6,6 +6,10 @@ use anyhow::{Context as _, Result};
 
 use gm_miner_cli::{
     client::RegistryClient,
+    cloud_policy::{
+        configured_cloud_backend, is_reviewed_bedrock_binding, REVIEWED_BEDROCK_UPSTREAM_MODEL,
+    },
+    config::Config,
     network::Network,
     pricing::{extra_dimension_count, format_usd},
     table,
@@ -22,7 +26,10 @@ pub(crate) async fn cmd_sources(client: &mut RegistryClient) -> Result<()> {
     let network = client.config.resolved_network();
     let sources = fetch_sources(client).await?;
 
-    println!("{}", render_sources(network, &sources).join("\n"));
+    println!(
+        "{}",
+        render_sources_with_config(network, &sources, &client.config).join("\n")
+    );
     Ok(())
 }
 
@@ -98,13 +105,23 @@ pub(crate) async fn fetch_sources(client: &mut RegistryClient) -> Result<SourceL
     Ok(SourceLookup::LegacyRoutes(body.sources))
 }
 
-const SOURCE_HEADERS: [&str; 5] = [
+const SOURCE_HEADERS: [&str; 6] = [
     "ROUTE",
     "SERVES",
     "BUYER RETAIL / MTOK",
     "YOU SERVE",
     "OFFERED",
+    "ADMISSION",
 ];
+
+const CLOUD_ADMISSION_NOTICE: [&str; 3] = [
+    "Capability is not admission: a cloud transport probe only proves that the adapter can answer.",
+    "Current cloud admission: direct/API-key routes remain usable; only exact Bedrock",
+    "anthropic/claude-sonnet-4-6 → anthropic.claude-sonnet-4-6-v1 is reviewed. Azure OpenAI,",
+];
+
+const CLOUD_ADMISSION_NOTICE_TAIL: &str =
+    "Foundry, and every other Bedrock model binding remain pending authoritative review.";
 
 /// A no-table result: the two lines of `why`, then the shared tail. Both empty
 /// states end at the same two pointers, so a third cannot forget the doc link.
@@ -114,13 +131,37 @@ fn empty_state(network: Network, why: [&str; 2]) -> Vec<String> {
         String::new(),
         why[0].to_owned(),
         why[1].to_owned(),
+        String::new(),
+        CLOUD_ADMISSION_NOTICE[0].to_owned(),
+        CLOUD_ADMISSION_NOTICE[1].to_owned(),
+        format!(
+            "{} {}",
+            CLOUD_ADMISSION_NOTICE[2], CLOUD_ADMISSION_NOTICE_TAIL
+        ),
         "`gmcli pricing` lists the buyer products your routes can serve.".to_owned(),
         String::new(),
         format!("What a sourcing route is: {SOURCING_DOC_URL}"),
     ]
 }
 
+#[cfg(test)]
 fn render_sources(network: Network, lookup: &SourceLookup) -> Vec<String> {
+    render_sources_inner(network, lookup, None)
+}
+
+fn render_sources_with_config(
+    network: Network,
+    lookup: &SourceLookup,
+    config: &Config,
+) -> Vec<String> {
+    render_sources_inner(network, lookup, Some(config))
+}
+
+fn render_sources_inner(
+    network: Network,
+    lookup: &SourceLookup,
+    config: Option<&Config>,
+) -> Vec<String> {
     let sources = match lookup {
         SourceLookup::Routes(routes) | SourceLookup::LegacyRoutes(routes) => routes.as_slice(),
         SourceLookup::Unsupported => {
@@ -150,15 +191,22 @@ fn render_sources(network: Network, lookup: &SourceLookup) -> Vec<String> {
         "product's retail less your discount, so the gap between that and what the".to_owned(),
         "upstream charges you is your spread.".to_owned(),
         String::new(),
+        CLOUD_ADMISSION_NOTICE[0].to_owned(),
+        CLOUD_ADMISSION_NOTICE[1].to_owned(),
+        format!(
+            "{} {}",
+            CLOUD_ADMISSION_NOTICE[2], CLOUD_ADMISSION_NOTICE_TAIL
+        ),
+        String::new(),
     ];
-    let rows: Vec<Vec<String>> = sources.iter().map(route_row).collect();
+    let rows: Vec<Vec<String>> = sources.iter().map(|s| route_row(s, config)).collect();
     lines.extend(table::render(&SOURCE_HEADERS, &rows));
-    lines.extend(unserved_lines(sources));
-    lines.extend(declare_lines(sources));
+    lines.extend(unserved_lines(sources, config));
+    lines.extend(declare_lines(sources, config));
     lines
 }
 
-fn route_row(source: &SourceProduct) -> Vec<String> {
+fn route_row(source: &SourceProduct, config: Option<&Config>) -> Vec<String> {
     let retail = &source.retail_price.dimensions;
     vec![
         format!("{}/{}", source.provider, source.model),
@@ -166,7 +214,30 @@ fn route_row(source: &SourceProduct) -> Vec<String> {
         buyer_retail_cell(retail),
         serving_cell(source.capable_worker_count),
         if source.already_offered { "yes" } else { "no" }.to_owned(),
+        admission_cell(source, config),
     ]
+}
+
+fn admission_cell(source: &SourceProduct, config: Option<&Config>) -> String {
+    if let Some(backend) = configured_cloud_backend_for(config, &source.provider) {
+        return match backend {
+            "bedrock" if source.model == "claude-sonnet-4-6" => {
+                "Bedrock: exact ID reviewed".to_owned()
+            }
+            "bedrock" => "Bedrock: binding pending".to_owned(),
+            "foundry" => "Foundry: binding pending".to_owned(),
+            "azure" => "Azure: binding pending".to_owned(),
+            _ => "cloud: binding pending".to_owned(),
+        };
+    }
+    match source.provider.as_str() {
+        "anthropic" if source.model == "claude-sonnet-4-6" => {
+            "direct; Bedrock exact ID only".to_owned()
+        }
+        "anthropic" => "direct only; Bedrock/Foundry pending".to_owned(),
+        "openai" => "direct only; Azure pending".to_owned(),
+        _ => "direct / reviewed route".to_owned(),
+    }
 }
 
 /// The buyer product's retail anchors, plus a count of the dimensions it
@@ -195,12 +266,6 @@ fn serving_cell(capable_worker_count: u32) -> String {
     }
 }
 
-/// Providers the registry can route through a cloud backend, per its
-/// `LEGACY_BACKEND_PROVIDER` map. For these the control loop probes each offer
-/// individually instead of grouping the provider, so one offer says nothing
-/// about the provider's other routes.
-const CLOUD_BACKABLE: [&str; 2] = ["anthropic", "openai"];
-
 /// Whether this provider has a live sourcing-route offer, which is the closest
 /// this endpoint gets to "the registry has it in the probe set".
 ///
@@ -216,27 +281,18 @@ const CLOUD_BACKABLE: [&str; 2] = ["anthropic", "openai"];
 /// queued — and its absence today says nothing about whether an earlier offer
 /// was probed before being withdrawn. Copy driven off this must claim neither.
 ///
-/// Two things make this a proxy rather than the real predicate, and they fail in
-/// opposite directions:
+/// Two things make this a proxy rather than the real predicate:
 ///
 /// - It sees only cross-product source routes, and a **self-route** offer under the same
 ///   provider also puts it in the probe set. The provider is then probed while
 ///   no visible route is offered, so this answers `false` — it suggests a
 ///   declare that was not needed, costing one ineligible offer. Harmless enough
 ///   to leave.
-/// - A **cloud-backed** provider is not grouped at all: `driver.py` probes those
-///   offers one at a time through `cloud_capability` and removes them before the
-///   grouping. One offer there does not probe the provider's other routes, so
-///   this would answer `true` when it should not and *withhold* a declare line
-///   the miner needs. That is the cycle this module exists to break, so it is
-///   guarded rather than tolerated: [`CLOUD_BACKABLE`] never counts as offered.
-///
-/// The guard means a future provider carrying both route shapes costs a
-/// redundant declaration suggestion rather than hiding a declarable route.
+/// - Cloud-backed providers can also have model-specific admission bindings;
+///   this proxy says nothing about those. `gmcli sources` prints the explicit
+///   admission column and never treats a transport capability as proof of a
+///   reviewed cloud binding.
 fn provider_has_live_offer(sources: &[SourceProduct], provider: &str) -> bool {
-    if CLOUD_BACKABLE.contains(&provider) {
-        return false;
-    }
     sources
         .iter()
         .any(|s| s.provider == provider && s.already_offered)
@@ -252,7 +308,7 @@ fn provider_has_live_offer(sources: &[SourceProduct], provider: &str) -> bool {
 /// A zero is still not proof the key is missing — the control loop also clears a
 /// worker's supported models when it is un-probed or just restored from
 /// suspension — so the copy states only what the count actually says.
-fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
+fn unserved_lines(sources: &[SourceProduct], config: Option<&Config>) -> Vec<String> {
     let unserved: Vec<_> = sources
         .iter()
         .filter(|s| s.capable_worker_count == 0)
@@ -274,9 +330,24 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
             .map(|s| format!("  {}/{}", s.provider, s.model)),
     );
 
-    let any_unprobed = unserved
+    let cloud_unserved = unserved
         .iter()
-        .any(|s| !provider_has_live_offer(sources, &s.provider));
+        .filter(|s| configured_cloud_backend_for(config, &s.provider).is_some())
+        .count();
+    if cloud_unserved > 0 {
+        lines.push(format!(
+            "  {cloud_unserved} cloud-backed route(s) remain non-admissible pending a reviewed"
+        ));
+        lines.push(
+            "  model binding; transport success or an omitted upstream id does not change that."
+                .to_owned(),
+        );
+    }
+
+    let any_unprobed = unserved.iter().any(|s| {
+        configured_cloud_backend_for(config, &s.provider).is_none()
+            && !provider_has_live_offer(sources, &s.provider)
+    });
     if any_unprobed {
         lines.push(
             "  A provider you have no offer under is not probed, so its routes read".to_owned(),
@@ -289,10 +360,10 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
         );
         lines.push("  reach the upstream before it does.".to_owned());
     }
-    if unserved
-        .iter()
-        .any(|s| provider_has_live_offer(sources, &s.provider))
-    {
+    if unserved.iter().any(|s| {
+        configured_cloud_backend_for(config, &s.provider).is_none()
+            && provider_has_live_offer(sources, &s.provider)
+    }) {
         lines.push(
             "  For a provider you already offer, no worker of yours currently qualifies".to_owned(),
         );
@@ -311,21 +382,28 @@ fn unserved_lines(sources: &[SourceProduct]) -> Vec<String> {
     lines
 }
 
-fn declare_lines(sources: &[SourceProduct]) -> Vec<String> {
-    // Suggest a route when a worker already serves it, and additionally when its
-    // provider has no offer at all: that provider is outside the registry's
-    // probe set, so its count cannot leave zero until something is declared —
-    // withholding the command there is a cycle a miner cannot break from here.
-    // Once the provider IS probed, a zero is informative and a second offer
-    // under it would only sit ineligible, so the gate still applies per model.
+fn declare_lines(sources: &[SourceProduct], config: Option<&Config>) -> Vec<String> {
+    // Suggest a direct route when a worker already serves it, and additionally
+    // when its direct provider has no offer at all. Cloud-backed routes are
+    // handled separately below: an omitted upstream id cannot establish their
+    // reviewed binding, so they must not be advertised as generic supply.
     let ready: Vec<_> = sources
         .iter()
         .filter(|s| {
             !s.already_offered
+                && configured_cloud_backend_for(config, &s.provider).is_none()
                 && (s.capable_worker_count > 0 || !provider_has_live_offer(sources, &s.provider))
         })
         .collect();
-    if ready.is_empty() {
+    let cloud_ready: Vec<_> = sources
+        .iter()
+        .filter(|s| {
+            !s.already_offered
+                && configured_cloud_backend_for(config, &s.provider).is_some()
+                && s.capable_worker_count > 0
+        })
+        .collect();
+    if ready.is_empty() && cloud_ready.is_empty() {
         if sources.iter().all(|s| s.already_offered) {
             return vec![
                 String::new(),
@@ -336,14 +414,45 @@ fn declare_lines(sources: &[SourceProduct]) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut lines = vec![String::new(), "Declare a route:".to_owned()];
+    let mut lines = Vec::new();
+    if !ready.is_empty() {
+        lines.push(String::new());
+        lines.push("Declare a direct/API-key route:".to_owned());
+    }
     lines.extend(ready.iter().map(|s| {
         format!(
             "  gmcli declare-product --provider {} --model {} --discount-pct <pct>",
             s.provider, s.model
         )
     }));
+    if !cloud_ready.is_empty() {
+        lines.push(String::new());
+        lines.push("Cloud route bindings are restricted to reviewed identities:".to_owned());
+        for source in cloud_ready {
+            if source.provider == "anthropic"
+                && is_reviewed_bedrock_binding(
+                    source.provider.as_str(),
+                    source.model.as_str(),
+                    REVIEWED_BEDROCK_UPSTREAM_MODEL,
+                )
+            {
+                lines.push(format!(
+                    "  gmcli declare-product --provider {} --model {} --discount-pct <pct> --upstream-model {}  # exact Bedrock binding",
+                    source.provider, source.model, REVIEWED_BEDROCK_UPSTREAM_MODEL
+                ));
+            } else {
+                lines.push(format!(
+                    "  {}/{}: no reviewed cloud binding currently; do not declare it as cloud supply",
+                    source.provider, source.model
+                ));
+            }
+        }
+    }
     lines
+}
+
+fn configured_cloud_backend_for(config: Option<&Config>, provider: &str) -> Option<&'static str> {
+    config.and_then(|c| configured_cloud_backend(c, provider))
 }
 
 #[cfg(test)]
@@ -354,14 +463,14 @@ fn declare_lines(sources: &[SourceProduct]) -> Vec<String> {
 mod tests {
     use gm_miner_cli::{
         client::RegistryClient,
-        config::{Config, NetworkEntry, TokenEntry},
+        config::{Config, NetworkEntry, ProviderKeys, TokenEntry},
     };
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
     };
 
-    use super::{fetch_sources, render_sources, Network, SourceLookup};
+    use super::{fetch_sources, render_sources, render_sources_with_config, Network, SourceLookup};
 
     fn sources(value: serde_json::Value) -> SourceLookup {
         SourceLookup::Routes(serde_json::from_value(value).expect("decode sourcing routes"))
@@ -460,6 +569,19 @@ mod tests {
         Config {
             active_network: Some("testnet".to_owned()),
             networks,
+            ..Default::default()
+        }
+    }
+
+    fn config_with_backend(provider: &str, backend: &str) -> Config {
+        let mut keys = ProviderKeys::default();
+        match provider {
+            "anthropic" => keys.anthropic_upstream = Some(backend.to_owned()),
+            "openai" => keys.openai_upstream = Some(backend.to_owned()),
+            _ => return Config::default(),
+        }
+        Config {
+            provider_keys: Some(keys),
             ..Default::default()
         }
     }
@@ -584,28 +706,128 @@ mod tests {
         );
     }
 
-    /// A provider the registry can put behind a cloud backend is probed per
-    /// offer, not per provider, so one offer there does not cover its other
-    /// routes. Suppressing the declare line would strand the second route in the
-    /// cycle this module exists to break, so the guard must keep offering it.
+    /// A provider the registry can put behind a cloud backend is not made
+    /// declarable merely because one transport probe succeeded. The output
+    /// must identify the pending binding and avoid a generic declaration that
+    /// would send `upstream_model: None`.
     #[test]
     fn a_cloud_backable_provider_is_never_treated_as_covered_by_one_offer() {
-        let rendered = render_sources(
+        let config = config_with_backend("anthropic", "bedrock");
+        let rendered = render_sources_with_config(
             Network::Mainnet,
             &sources(serde_json::json!([
                 cloud_backable_route("anthropic", "claude-a", 1, true),
                 cloud_backable_route("anthropic", "claude-b", 0, false),
             ])),
+            &config,
         )
         .join("\n");
 
-        assert!(
-            rendered.contains(
-                "gmcli declare-product --provider anthropic --model claude-b --discount-pct <pct>"
-            ),
-            "a cloud-backable provider's second route must stay declarable:\n{rendered}"
-        );
+        assert!(rendered.contains("cloud-backed route(s) remain non-admissible"));
+        assert!(!rendered.contains(
+            "gmcli declare-product --provider anthropic --model claude-b --discount-pct <pct>"
+        ));
+        assert!(rendered.contains("Bedrock: binding pending"));
+    }
+
+    #[test]
+    fn direct_anthropic_zero_capability_keeps_bootstrap_declaration_guidance() {
+        let config = config_with_backend("anthropic", "direct");
+        let rendered = render_sources_with_config(
+            Network::Mainnet,
+            &sources(serde_json::json!([cloud_backable_route(
+                "anthropic",
+                "claude-bootstrap",
+                0,
+                false,
+            )])),
+            &config,
+        )
+        .join("\n");
+
         assert!(rendered.contains("no offer under is not probed"));
+        assert!(rendered.contains(
+            "gmcli declare-product --provider anthropic --model claude-bootstrap --discount-pct <pct>"
+        ));
+        assert!(!rendered.contains("cloud-backed route(s) remain non-admissible"));
+    }
+
+    #[test]
+    fn direct_openai_zero_capability_keeps_bootstrap_declaration_guidance() {
+        let config = config_with_backend("openai", "direct");
+        let rendered = render_sources_with_config(
+            Network::Mainnet,
+            &sources(serde_json::json!([cloud_backable_route(
+                "openai",
+                "gpt-bootstrap",
+                0,
+                false,
+            )])),
+            &config,
+        )
+        .join("\n");
+
+        assert!(rendered.contains("no offer under is not probed"));
+        assert!(rendered.contains(
+            "gmcli declare-product --provider openai --model gpt-bootstrap --discount-pct <pct>"
+        ));
+        assert!(!rendered.contains("cloud-backed route(s) remain non-admissible"));
+    }
+
+    #[test]
+    fn configured_cloud_backends_restrict_unserved_routes() {
+        for (provider, model, backend, expected_status) in [
+            (
+                "anthropic",
+                "claude-sonnet-4-6",
+                "bedrock",
+                "Bedrock: exact ID reviewed",
+            ),
+            (
+                "anthropic",
+                "claude-other",
+                "foundry",
+                "Foundry: binding pending",
+            ),
+            ("openai", "gpt-other", "azure", "Azure: binding pending"),
+        ] {
+            let config = config_with_backend(provider, backend);
+            let rendered = render_sources_with_config(
+                Network::Mainnet,
+                &sources(serde_json::json!([cloud_backable_route(
+                    provider, model, 0, false,
+                )])),
+                &config,
+            )
+            .join("\n");
+
+            assert!(rendered.contains(expected_status), "{rendered}");
+            assert!(rendered.contains("cloud-backed route(s) remain non-admissible"));
+            assert!(!rendered.contains("--discount-pct <pct>"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn exact_reviewed_bedrock_route_gets_explicit_binding_guidance() {
+        let config = config_with_backend("anthropic", "bedrock");
+        let rendered = render_sources_with_config(
+            Network::Mainnet,
+            &sources(serde_json::json!([cloud_backable_route(
+                "anthropic",
+                "claude-sonnet-4-6",
+                1,
+                false,
+            )])),
+            &config,
+        )
+        .join("\n");
+
+        assert!(rendered.contains("Bedrock: exact ID reviewed"));
+        assert!(rendered
+            .contains("--upstream-model anthropic.claude-sonnet-4-6-v1  # exact Bedrock binding"));
+        assert!(!rendered.contains(
+            "gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct <pct>\n"
+        ));
     }
 
     /// The mirror of the above: no engy route is offered, so engy is outside the

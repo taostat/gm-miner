@@ -1,13 +1,14 @@
 //! `gmcli check-streaming` — detect buffered upstream streaming.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context as _, Result};
 use gm_miner_cli::{
     client::{build_data_plane_probe_client, build_http_client, RegistryClient, ME_PATH},
+    cloud_policy::normalize_bedrock_upstream_model,
     config::{Config, ProviderKeys, WorkerRecord},
     types::{MinerStatus, ProductCatalogResponse, Provider, WorkerEntry, WorkerListResponse},
     workers::first_live_worker_id,
@@ -55,10 +56,11 @@ struct StreamingTarget {
     /// just-used configuration is authoritative. `Some(empty)` means registry
     /// ownership is unknown and must be reported as inconclusive, not guessed.
     provider_models: Option<HashMap<Provider, ProviderModelCoverage>>,
-    /// Providers this deployed worker sends through Azure/Bedrock/Foundry.
-    /// Their direct probe must have the offer's declared upstream deployment
-    /// id; silently sending the canonical gm id would be a false failure.
-    requires_upstream_model: HashSet<Provider>,
+    /// Provider -> transport backend for this selected worker. A direct
+    /// worker must probe the canonical gm model even when another worker's
+    /// miner-scoped offer carries a cloud upstream id. Cloud bindings are
+    /// resolved against this map, never against the offer alone.
+    worker_backends: HashMap<Provider, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -102,11 +104,10 @@ struct SelectedProbeModel {
 /// The two model ids a probe needs: the canonical gm id for display and the
 /// upstream deployment/model id to actually send.
 ///
-/// Azure/Bedrock offers map a canonical model to a distinct upstream
-/// deployment name; the gateway rewrites the request `model` to that upstream
-/// id before forwarding to the miner CVM. This self-test bypasses the gateway,
-/// so it performs the same rewrite — otherwise the probe 404s on exactly the
-/// cloud setups the streaming check exists to warn about.
+/// A selected worker's backend determines whether `upstream` is used. The
+/// miner's offer is scoped to the hotkey, not to the worker, so an offer's
+/// upstream id is only a candidate binding until it is matched to the selected
+/// worker backend.
 #[derive(Clone)]
 struct ProbeModel {
     canonical: String,
@@ -115,8 +116,9 @@ struct ProbeModel {
 }
 
 impl ProbeModel {
-    /// The id to place in the request body: the declared upstream deployment
-    /// when present, else the canonical gm model id.
+    /// The id to place in the request body. `models_for_target` clears or
+    /// normalizes `upstream` according to the selected worker backend before a
+    /// probe is built.
     fn wire_model(&self) -> &str {
         self.upstream.as_deref().unwrap_or(&self.canonical)
     }
@@ -152,10 +154,10 @@ pub(crate) async fn deploy_streaming_advisory(cfg: &Config, endpoint: &str, node
         endpoint: endpoint.to_owned(),
         node_secret: node_secret.to_owned(),
         provider_models: None,
-        requires_upstream_model: cfg
+        worker_backends: cfg
             .provider_keys
             .as_ref()
-            .map(|keys| providers_from_backends(&keys.worker_backends()))
+            .map(|keys| backends_from_config(&keys.worker_backends()))
             .unwrap_or_default(),
     };
     run_streaming_checks(cfg, &target).await;
@@ -226,9 +228,15 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
             continue;
         };
         if models.is_empty() {
-            println!(
-                "  [--] {provider}: no probe model overlaps the selected worker's verified coverage; supply probe is inconclusive"
-            );
+            if let Some(backend) = target.worker_backends.get(&provider) {
+                println!(
+                    "  [--] {provider}: selected worker's {backend} model binding is unavailable/unverified; no streaming probe sent"
+                );
+            } else {
+                println!(
+                    "  [--] {provider}: no probe model overlaps the selected worker's verified coverage; supply probe is inconclusive"
+                );
+            }
             continue;
         }
         for selected in models {
@@ -308,20 +316,25 @@ fn pick_target_worker(local: &[WorkerRecord], live: &[WorkerEntry]) -> Result<St
         endpoint: worker.endpoint.clone(),
         node_secret: record.node_secret.clone(),
         provider_models: Some(worker_provider_models(worker)),
-        requires_upstream_model: record
+        worker_backends: record
             .backends
             .as_ref()
-            .map(providers_from_backends)
+            .map(backends_from_config)
             .unwrap_or_default(),
     })
 }
 
-fn providers_from_backends(
+fn backends_from_config(
     backends: &std::collections::BTreeMap<String, String>,
-) -> HashSet<Provider> {
+) -> HashMap<Provider, String> {
     backends
-        .keys()
-        .filter_map(|provider| provider.parse().ok())
+        .iter()
+        .filter_map(|(provider, backend)| {
+            provider
+                .parse()
+                .ok()
+                .map(|provider| (provider, backend.clone()))
+        })
         .collect()
 }
 
@@ -370,11 +383,9 @@ fn models_for_target(
     provider: &Provider,
     mut models: Vec<ProbeModel>,
 ) -> Option<Vec<SelectedProbeModel>> {
-    if target.requires_upstream_model.contains(provider) {
-        models.retain(|model| model.upstream.is_some());
-        if models.is_empty() {
-            return None;
-        }
+    models = bind_models_to_worker(target, provider, models);
+    if models.is_empty() && target.worker_backends.contains_key(provider) {
+        return Some(Vec::new());
     }
     let Some(worker_coverage) = target
         .provider_models
@@ -430,6 +441,43 @@ fn models_for_target(
         }
     }
     Some(selected)
+}
+
+/// Bind catalog/offer models to the backend of the selected worker.
+///
+/// Offers are miner-scoped, so their `upstream_model` cannot be used blindly:
+/// a direct worker must send the canonical id even when a sibling Bedrock
+/// worker's offer carries a deployment id. Bedrock accepts only the reviewed
+/// canonical/legacy ids; Azure, Foundry, and unknown cloud backends stay
+/// unverified until an authoritative binding exists.
+fn bind_models_to_worker(
+    target: &StreamingTarget,
+    provider: &Provider,
+    models: Vec<ProbeModel>,
+) -> Vec<ProbeModel> {
+    match target.worker_backends.get(provider).map(String::as_str) {
+        None | Some("direct") => models
+            .into_iter()
+            .map(|mut model| {
+                model.upstream = None;
+                model
+            })
+            .collect(),
+        Some("bedrock") => models
+            .into_iter()
+            .filter_map(|mut model| {
+                let upstream = model.upstream.as_deref()?;
+                let normalized = normalize_bedrock_upstream_model(
+                    provider.as_str(),
+                    &model.canonical,
+                    upstream,
+                )?;
+                model.upstream = Some(normalized.to_owned());
+                Some(model)
+            })
+            .collect(),
+        Some(_) => Vec::new(),
+    }
 }
 
 fn sourcing_providers() -> [Provider; 5] {
@@ -1073,13 +1121,13 @@ mod tests {
     fn probe_sends_declared_upstream_model_when_present() {
         let model = ProbeModel {
             canonical: "claude-sonnet-4-6".to_owned(),
-            upstream: Some("us.anthropic.claude-sonnet-4-6-v1".to_owned()),
+            upstream: Some("anthropic.claude-sonnet-4-6-v1".to_owned()),
             fallback: false,
         };
         let probe = build_probe(Provider::Anthropic, &model, None);
         assert_eq!(
             probe.body["model"],
-            Value::String("us.anthropic.claude-sonnet-4-6-v1".to_owned())
+            Value::String("anthropic.claude-sonnet-4-6-v1".to_owned())
         );
         assert_eq!(probe.model, "claude-sonnet-4-6");
     }
@@ -1495,7 +1543,7 @@ mod tests {
                 Provider::Engy,
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
-            requires_upstream_model: HashSet::new(),
+            worker_backends: HashMap::new(),
         };
         let providers = providers_for_target(
             &[Provider::DeepInfra, Provider::Engy, Provider::OpenAI],
@@ -1548,7 +1596,7 @@ mod tests {
                 Provider::Engy,
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
-            requires_upstream_model: HashSet::new(),
+            worker_backends: HashMap::new(),
         };
         let models = vec![
             ProbeModel {
@@ -1593,7 +1641,7 @@ mod tests {
                     ]),
                 },
             )])),
-            requires_upstream_model: HashSet::new(),
+            worker_backends: HashMap::new(),
         };
         let models = vec![
             ProbeModel {
@@ -1649,7 +1697,7 @@ mod tests {
                     ]),
                 },
             )])),
-            requires_upstream_model: HashSet::new(),
+            worker_backends: HashMap::new(),
         };
         let models = vec![ProbeModel {
             canonical: "qwen3.8-27b".to_owned(),
@@ -1661,99 +1709,105 @@ mod tests {
     }
 
     #[test]
-    fn direct_provider_intersects_all_catalog_models_before_selecting() {
-        let canonical = HashMap::from([(
-            Provider::OpenAI,
-            vec!["gpt-5.4".to_owned(), "gpt-5.6".to_owned()],
+    fn direct_worker_ignores_a_sibling_bedrock_offer() {
+        let canonical =
+            HashMap::from([(Provider::Anthropic, vec!["claude-sonnet-4-6".to_owned()])]);
+        let declared = HashMap::from([(
+            (Provider::Anthropic, "claude-sonnet-4-6".to_owned()),
+            DeclaredOffer {
+                upstream_model: Some("anthropic.claude-sonnet-4-6-v1".to_owned()),
+                is_offered: true,
+            },
         )]);
-        let declared = HashMap::from([
-            (
-                (Provider::OpenAI, "gpt-5.4".to_owned()),
-                DeclaredOffer {
-                    upstream_model: Some("withdrawn-deployment-gpt-54".to_owned()),
-                    is_offered: false,
-                },
-            ),
-            (
-                (Provider::OpenAI, "gpt-5.6".to_owned()),
-                DeclaredOffer {
-                    upstream_model: Some("deployment-gpt-56".to_owned()),
-                    is_offered: true,
-                },
-            ),
-        ]);
-        let catalog = resolve_probe_models(&[Provider::OpenAI], &canonical, &declared);
+        let catalog = resolve_probe_models(&[Provider::Anthropic], &canonical, &declared);
         let target = StreamingTarget {
             endpoint: "https://worker.example.org".to_owned(),
             node_secret: "secret".to_owned(),
             provider_models: Some(HashMap::from([(
-                Provider::OpenAI,
-                unscoped_coverage(&["gpt-5.6"]),
+                Provider::Anthropic,
+                unscoped_coverage(&["claude-sonnet-4-6"]),
             )])),
-            requires_upstream_model: HashSet::from([Provider::OpenAI]),
+            worker_backends: HashMap::from([(Provider::Anthropic, "direct".to_owned())]),
         };
 
         let selected = models_for_target(
             &target,
-            &Provider::OpenAI,
-            catalog.models_for(&Provider::OpenAI),
+            &Provider::Anthropic,
+            catalog.models_for(&Provider::Anthropic),
         )
-        .expect("coverage");
+        .expect("direct worker coverage");
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].model.canonical, "gpt-5.6");
-        assert_eq!(selected[0].model.wire_model(), "deployment-gpt-56");
+        assert_eq!(selected[0].model.wire_model(), "claude-sonnet-4-6");
     }
 
     #[test]
-    fn post_deploy_cloud_probe_selects_a_declared_deployment_not_catalog_first() {
-        let canonical = HashMap::from([(
-            Provider::OpenAI,
-            vec!["gpt-5.4".to_owned(), "gpt-5.6".to_owned()],
-        )]);
+    fn bedrock_worker_normalizes_legacy_alias_to_mantle_id() {
+        let canonical =
+            HashMap::from([(Provider::Anthropic, vec!["claude-sonnet-4-6".to_owned()])]);
         let declared = HashMap::from([(
-            (Provider::OpenAI, "gpt-5.6".to_owned()),
+            (Provider::Anthropic, "claude-sonnet-4-6".to_owned()),
             DeclaredOffer {
-                upstream_model: Some("deployment-gpt-56".to_owned()),
+                upstream_model: Some("us.anthropic.claude-sonnet-4-6-v1".to_owned()),
                 is_offered: true,
             },
         )]);
-        let catalog = resolve_probe_models(&[Provider::OpenAI], &canonical, &declared);
+        let catalog = resolve_probe_models(&[Provider::Anthropic], &canonical, &declared);
         let target = StreamingTarget {
             endpoint: "https://worker.example.org".to_owned(),
             node_secret: "secret".to_owned(),
             provider_models: None,
-            requires_upstream_model: HashSet::from([Provider::OpenAI]),
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
         };
 
         let selected = models_for_target(
             &target,
-            &Provider::OpenAI,
-            catalog.models_for(&Provider::OpenAI),
+            &Provider::Anthropic,
+            catalog.models_for(&Provider::Anthropic),
         )
-        .expect("declared deployment");
+        .expect("reviewed Bedrock binding");
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].model.canonical, "gpt-5.6");
-        assert_eq!(selected[0].model.wire_model(), "deployment-gpt-56");
+        assert_eq!(
+            selected[0].model.wire_model(),
+            "anthropic.claude-sonnet-4-6-v1"
+        );
     }
 
     #[test]
-    fn cloud_probe_without_declared_upstream_mapping_is_inconclusive() {
-        let target = StreamingTarget {
-            endpoint: "https://worker.example.org".to_owned(),
-            node_secret: "secret".to_owned(),
-            provider_models: Some(HashMap::from([(
-                Provider::OpenAI,
-                unscoped_coverage(&["gpt-5.6"]),
-            )])),
-            requires_upstream_model: HashSet::from([Provider::OpenAI]),
-        };
-        let models = vec![ProbeModel {
-            canonical: "gpt-5.6".to_owned(),
-            upstream: None,
-            fallback: false,
-        }];
+    fn unsupported_cloud_bindings_are_unverified_without_a_probe() {
+        for (provider, backend, model, upstream) in [
+            (Provider::OpenAI, "azure", "gpt-5.6", "deployment-gpt-56"),
+            (
+                Provider::Anthropic,
+                "foundry",
+                "claude-sonnet-4-6",
+                "foundry-deployment",
+            ),
+            (
+                Provider::Anthropic,
+                "bedrock",
+                "claude-sonnet-4-6",
+                "anthropic.claude-sonnet-4-6-v2",
+            ),
+        ] {
+            let target = StreamingTarget {
+                endpoint: "https://worker.example.org".to_owned(),
+                node_secret: "secret".to_owned(),
+                provider_models: Some(HashMap::from([(
+                    provider.clone(),
+                    unscoped_coverage(&[model]),
+                )])),
+                worker_backends: HashMap::from([(provider.clone(), backend.to_owned())]),
+            };
+            let models = vec![ProbeModel {
+                canonical: model.to_owned(),
+                upstream: Some(upstream.to_owned()),
+                fallback: false,
+            }];
 
-        assert!(models_for_target(&target, &Provider::OpenAI, models).is_none());
+            let selected = models_for_target(&target, &provider, models)
+                .expect("unverified cloud binding is reported as an empty selection");
+            assert!(selected.is_empty(), "{provider}/{backend}");
+        }
     }
 
     #[test]
@@ -1765,7 +1819,7 @@ mod tests {
                 Provider::Engy,
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
-            requires_upstream_model: HashSet::new(),
+            worker_backends: HashMap::new(),
         };
         let fallback = vec![ProbeModel {
             canonical: "glm-5.2".to_owned(),
@@ -1784,7 +1838,7 @@ mod tests {
             endpoint: "https://worker.example.org".to_owned(),
             node_secret: "secret".to_owned(),
             provider_models: Some(HashMap::new()),
-            requires_upstream_model: HashSet::new(),
+            worker_backends: HashMap::new(),
         };
         assert!(providers_for_target(&[Provider::Engy], &target).is_empty());
     }
