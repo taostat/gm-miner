@@ -46,6 +46,7 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.3-flash` | `engy/glm-5.3-flash` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-flash` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
+| `zai/glm-5.3` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
 | `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | `llm.kubetee.ai` | `--kubetee` |
@@ -177,6 +178,7 @@ gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.6-35B-A3B --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.8-27B --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
+gmcli declare-product --provider kubetee --model z-ai/glm-5.3 --discount-pct 5
 gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
 gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
