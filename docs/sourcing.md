@@ -43,6 +43,7 @@ explains the table and how to set each upstream up.
 | `qwen/qwen3.6-35b-a3b` | `engy/qwen3.6-35b-a3b` | `api.engy.ai` | `--engy` |
 | `qwen/qwen3.8-27b` | `engy/qwen3.8-27b` | `api.engy.ai` | `--engy` |
 | `ornith/ornith-1.5-397b` | `engy/ornith-1.5-397b` | `api.engy.ai` | `--engy` |
+| `zai/glm-5.3` | `engy/glm-5.3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.3-flash` | `engy/glm-5.3-flash` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-flash` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
@@ -170,6 +171,7 @@ gmcli declare-product --provider engy --model kimi-k3 --discount-pct 5
 gmcli declare-product --provider engy --model deepseek-v4-flash-0731 --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.6-35b-a3b --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.8-27b --discount-pct 5
+gmcli declare-product --provider engy --model glm-5.3 --discount-pct 5
 gmcli declare-product --provider engy --model glm-5.3-flash --discount-pct 5
 gmcli declare-product --provider engy --model ornith-1.5-397b --discount-pct 5
 gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5
