@@ -37,7 +37,7 @@ dcap-qvl = { version = "0.6.1", default-features = false, features = ["std", "re
 http-body-util = "0.1"
 hyper = { version = "1.6", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-rand = "0.9"
+rand = "0.10"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 x509-parser = "0.18.1"
