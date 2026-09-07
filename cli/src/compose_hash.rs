@@ -101,14 +101,14 @@ const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
 /// The pinned dstack OS image's published reproducible `os_image_hash`.
 ///
 /// This is the measurement of [`crate::deploy::DEFAULT_OS_IMAGE`]
-/// (`dstack-0.5.9`), published by dstack's reproducible OS image build and
+/// (`dstack-0.6.0-rc1`), published by Phala's production OS image catalog and
 /// reported in every CVM's attestation TCB info (`os.os_image_hash`). It is
 /// verifiable against any live gm CVM on that image and against the
 /// registry's approved baseline; the gate test
 /// [`tests::os_image_hash_matches_registry_baseline`] anchors it. Bump this
 /// in lockstep with `DEFAULT_OS_IMAGE`.
 pub const PINNED_OS_IMAGE_HASH: &str =
-    "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033";
+    "2f0ab348b35b1c1b2d9c397e8386fec59f891149f079b1ef6203d688f9ae1fe3";
 
 /// The pinned `app_compose` security and runtime flag fields a gm release
 /// deploy produces, as `(field, value)` pairs. `gateway_enabled` and
@@ -325,7 +325,7 @@ mod tests {
     fn os_image_hash_matches_registry_baseline() {
         assert_eq!(
             PINNED_OS_IMAGE_HASH,
-            "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033"
+            "2f0ab348b35b1c1b2d9c397e8386fec59f891149f079b1ef6203d688f9ae1fe3"
         );
     }
 }
