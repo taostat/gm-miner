@@ -711,7 +711,8 @@ pub(crate) struct DeployFlags {
 
     /// Production OS image for the CVM (`phala deploy --image`). The
     /// version must match the dstack version of the Phala node the CVM
-    /// lands on — prod5/prod9 currently run dstack v0.5.9.
+    /// lands on — prod5/prod9 currently run dstack v0.6.0; Phala's production
+    /// catalog names dstack-0.6.0-rc1 as the matching guest image.
     #[arg(long, env = "PHALA_OS_IMAGE", default_value = DEFAULT_OS_IMAGE)]
     pub(crate) os_image: String,
 

@@ -11,6 +11,7 @@ use clap::Parser as _;
 
 use gm_miner_cli::{
     client::RegistryClient,
+    compose_hash::PINNED_OS_IMAGE_HASH,
     config::{self, Config, WorkerRecord},
     dependency::{ensure_dependency, PHALA},
     deploy::{
@@ -18,7 +19,7 @@ use gm_miner_cli::{
         parse_phala_cvm_endpoint, parse_phala_cvm_name, preflight_phala_cli, prepare_deploy_target,
         resolve_image_source, resolve_registry_credentials, select_version,
         to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, ImageVersion,
-        PhalaClient, PHALA_ENDPOINT_FIELD,
+        PhalaClient, DEFAULT_OS_IMAGE, PHALA_ENDPOINT_FIELD,
     },
     node_secret, slots, terms,
     types::{
@@ -581,6 +582,7 @@ pub(crate) async fn cmd_deploy(
 
     // Step 4: select the target version.
     let approved = select_version(&versions, args.version)?;
+    ensure_pinned_os_image(approved)?;
     println!(
         "Selected version {}  ({})",
         approved.notes.as_deref().unwrap_or("<no notes>"),
@@ -735,6 +737,22 @@ pub(crate) async fn cmd_deploy(
     print_deploy_summary(&worker_id, &actual.app_id, registration);
     deploy_streaming_advisory(cfg, &actual.endpoint, &node_secret).await;
     Ok(())
+}
+
+/// Refuse to combine a registry row for a different measured OS with the
+/// locally pinned Phala guest image. This keeps an incomplete Phala image
+/// rollout from creating a CVM that can never pass attestation verification.
+fn ensure_pinned_os_image(approved: &ImageVersion) -> Result<()> {
+    let expected = normalize_hash(PINNED_OS_IMAGE_HASH);
+    let actual = normalize_hash(&approved.os_image_hash);
+    if actual == expected {
+        return Ok(());
+    }
+
+    bail!(
+        "registry selected os_image_hash {actual}, but this gmcli requires {expected} for {DEFAULT_OS_IMAGE}; \
+         the Phala image rollout is incomplete; refusing to deploy",
+    );
 }
 
 /// Print the deploy result and, for a first deploy, the next-step hint.
@@ -1321,6 +1339,37 @@ mod tests {
             networks: HashMap::from([("testnet".to_owned(), NetworkEntry::default())]),
             ..Default::default()
         }
+    }
+
+    fn test_image_version(os_image_hash: &str) -> ImageVersion {
+        ImageVersion {
+            compose_hash: "compose".to_owned(),
+            os_image_hash: os_image_hash.to_owned(),
+            status: "supported".to_owned(),
+            notes: None,
+            created_at: "2025-01-01T00:00:00Z".to_owned(),
+            image_ref: None,
+            features: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_registry_row_with_the_pinned_os_image_passes_preflight() {
+        ensure_pinned_os_image(&test_image_version(PINNED_OS_IMAGE_HASH))
+            .expect("the pinned Phala OS image must pass preflight");
+    }
+
+    #[test]
+    fn a_registry_row_with_a_different_os_image_is_rejected_before_deploy() {
+        let err = ensure_pinned_os_image(&test_image_version(
+            "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+        ))
+        .expect_err("a stale Phala OS image must be rejected before deploy");
+        let message = err.to_string();
+        assert!(message.contains("registry selected os_image_hash"));
+        assert!(message.contains(PINNED_OS_IMAGE_HASH));
+        assert!(message.contains("dstack-0.6.0-rc1"));
+        assert!(message.contains("refusing to deploy"));
     }
 
     #[test]

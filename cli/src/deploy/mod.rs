@@ -68,11 +68,10 @@ pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
 /// Default OS image passed to `phala deploy --image`.
 ///
 /// The OS image version must match the dstack version of the Phala node
-/// the CVM lands on. Confirmed via `phala cvms list-nodes` (2026-07-30):
-/// prod5/prod9 dropped `dstack-0.5.7` and now offer `dstack-0.5.8` and
-/// `dstack-0.5.9`; `dstack-0.5.9` is the newest, so it's the working
-/// default.
-pub const DEFAULT_OS_IMAGE: &str = "dstack-0.5.9";
+/// the CVM lands on. prod5/prod9 now run dstack v0.6.0; Phala's production
+/// catalog names `dstack-0.6.0-rc1` as the matching guest image, so pin it
+/// rather than the retired 0.5.x image line.
+pub const DEFAULT_OS_IMAGE: &str = "dstack-0.6.0-rc1";
 
 /// Abstraction over the image-build step, injectable so the deploy
 /// orchestration can be exercised without a real `docker` toolchain.
