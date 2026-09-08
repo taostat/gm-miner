@@ -89,6 +89,45 @@ fn node_secret_carrying_lua_breakout_is_rejected_before_render() {
         !rendered.contains("envoy_on_response"),
         "no injected Lua may reach the rendered config"
     );
+    assert!(
+        rendered.is_empty(),
+        "a rejected render must emit no config at all"
+    );
+}
+
+#[test]
+fn node_secret_valid_first_line_then_quote_is_rejected() {
+    // Discriminates whole-string anchoring from a per-line bug: the first line
+    // is a full valid match, so a `^`/`$` that anchored per line would accept
+    // it. The embedded newline+quote must still be rejected.
+    let (status, _, stderr, _) = render_envoy([
+        ("ANTHROPIC_API_KEY", "sk-ant-direct"),
+        ("GM_NODE_SECRET", "validsecret0123456\n\"payload"),
+    ]);
+    assert!(
+        !status.success(),
+        "a value with any non-conforming line must be rejected"
+    );
+    assert!(
+        stderr.contains("GM_NODE_SECRET must match"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+fn token_shaped_node_secret_renders_as_inert_literal() {
+    // A secret that itself looks like a `__GM_*__` render token passes the
+    // charset check; it must land as a verbatim Lua literal, never be
+    // re-expanded by a later substitution into `local expected = ""...""`.
+    let (status, _, stderr, rendered) = render_envoy([
+        ("ANTHROPIC_API_KEY", "sk-ant-direct"),
+        ("GM_NODE_SECRET", "__GM_ANTHROPIC_DEFAULT_SLOT_ENV__"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert!(
+        rendered.contains("local expected = \"__GM_ANTHROPIC_DEFAULT_SLOT_ENV__\""),
+        "the token-shaped secret must survive verbatim, not be re-expanded"
+    );
 }
 
 #[test]
