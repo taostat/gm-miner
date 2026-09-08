@@ -27,19 +27,22 @@ fn validate_selector(name: &str, value: &str, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The `ANTHROPIC_UPSTREAM=foundry` flag group: the Claude-on-Azure data-plane
-/// endpoint and key, plus the read-only Entra service principal `attestd` uses
-/// to verify the Foundry account carries no owner-capture controls. Grouped so
+/// The `ANTHROPIC_UPSTREAM=foundry` transport flag group: the Claude-on-Azure
+/// data-plane endpoint and key, plus the read-only Entra service principal
+/// `attestd` uses to verify the Foundry account carries no owner-capture
+/// controls. Foundry remains transport-capable but has no authoritative GM
+/// model binding yet; configuring it does not make supply routable. Grouped so
 /// the seven flags travel as one argument instead of widening an already-long
 /// handler signature.
 #[derive(Debug, Default, clap::Args)]
 pub(crate) struct FoundryArgs {
-    /// Microsoft Foundry endpoint for `ANTHROPIC_UPSTREAM=foundry`
+    /// Microsoft Foundry transport endpoint for `ANTHROPIC_UPSTREAM=foundry`
+    /// (not currently registry-admissible)
     /// (`https://<resource>.services.ai.azure.com`).
     #[arg(long = "azure-foundry-endpoint")]
     pub(crate) endpoint: Option<String>,
 
-    /// Microsoft Foundry API key for `ANTHROPIC_UPSTREAM=foundry`.
+    /// Microsoft Foundry API key for transport validation.
     #[arg(long = "azure-foundry-api-key")]
     pub(crate) api_key: Option<String>,
 

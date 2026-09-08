@@ -85,19 +85,26 @@ evidence for the two settled charges. It is not a worker health probe and is
 never run by `gmcli check-streaming`; validator, finalizer, and dashboard
 evidence is a separate GM runbook concern.
 
-### Cloud transport variants
+### Cloud transport variants and admission
 
-Three backend transports are selected per worker rather than declared as separate products,
-because the product id is unchanged:
+The image retains three backend transports for capability testing and future
+reviewed bindings. Selecting one per worker does **not** make every model on
+that provider a registry-admissible route, and a successful upstream probe is
+not evidence of admission:
 
 | Buyer product | Route | Selector |
 |---|---|---|
-| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` |
-| `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) |
-| `openai/*` | Azure OpenAI | `--openai-upstream azure` |
+| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — transport only, pending verified provenance |
+| `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) — transport only, pending binding |
+| `openai/*` | Azure OpenAI | `--openai-upstream azure` — transport only, pending binding |
 
-Same idea, different mechanism — these are set once per worker and apply to every
-model from that provider.
+Same idea, different mechanism — selectors are set once per worker and apply to
+every model from that provider, but they do not grant cloud admission. Use
+direct/API-key providers for ordinary declarations. Direct Anthropic/OpenAI
+routes require verified key slots enforced inside the miner runtime. Cloud
+admission needs independent evidence of both the actual transport and model;
+a known Bedrock model id alone is not enough. Do not declare cloud adapters
+as usable supply until that evidence is supported.
 
 ## One lottery entry per worker
 

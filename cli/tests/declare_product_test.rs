@@ -61,7 +61,7 @@ fn declaration_request_includes_upstream_model_when_set() {
         provider: Provider::Anthropic.as_str(),
         model: "claude-sonnet-4-6",
         discount_bp: 500,
-        upstream_model: Some("us.anthropic.claude-sonnet-4-6-v1"),
+        upstream_model: Some("anthropic.claude-sonnet-4-6-v1"),
     })
     .unwrap();
 
@@ -71,7 +71,7 @@ fn declaration_request_includes_upstream_model_when_set() {
             "provider": "anthropic",
             "model": "claude-sonnet-4-6",
             "discount_bp": 500,
-            "upstream_model": "us.anthropic.claude-sonnet-4-6-v1",
+            "upstream_model": "anthropic.claude-sonnet-4-6-v1",
         }),
         "Bedrock offers can carry the upstream model id as metadata"
     );
