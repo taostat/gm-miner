@@ -190,7 +190,8 @@ pub fn parse_phala_cvm_app_id(succeeded: bool, stdout: &[u8]) -> Result<Option<S
 /// `Ok(None)` means the list was read and holds no CVM under that name — the
 /// name is free. A list that could not be read is an error at the call site, not
 /// an absent CVM, so an unreadable workspace never reads as an empty one.
-pub fn parse_phala_cvm_app_id_by_name(stdout: &[u8], app_name: &str) -> Result<Option<String>> {
+#[cfg(test)]
+fn parse_phala_cvm_app_id_by_name(stdout: &[u8], app_name: &str) -> Result<Option<String>> {
     let listed: PhalaCvmList =
         serde_json::from_slice(stdout).context("parse phala cvms list --json output")?;
 
@@ -200,6 +201,87 @@ pub fn parse_phala_cvm_app_id_by_name(stdout: &[u8], app_name: &str) -> Result<O
         .find(|row| row.name.as_deref() == Some(app_name))
         .and_then(|row| row.app_id)
         .filter(|id| !id.is_empty()))
+}
+
+/// The name lookup result and pagination metadata from one successful list
+/// response. The metadata is required by the collision preflight: without it,
+/// an empty first page cannot prove that no later page contains the name.
+#[derive(Debug, PartialEq, Eq)]
+struct PhalaCvmListPage {
+    page: usize,
+    total_pages: usize,
+    app_id: Option<String>,
+}
+
+/// Parse one complete, paginated `phala cvms list --json` response.
+fn parse_phala_cvm_list_page(stdout: &[u8], app_name: &str) -> Result<PhalaCvmListPage> {
+    let listed: PhalaCvmList =
+        serde_json::from_slice(stdout).context("parse phala cvms list --json output")?;
+    let page = listed
+        .page
+        .context("phala cvms list --json output is missing `page`")?;
+    let total_pages = listed
+        .total_pages
+        .context("phala cvms list --json output is missing `totalPages`")?;
+    if page == 0 || (total_pages > 0 && page > total_pages) {
+        bail!(
+            "phala cvms list --json returned invalid pagination (page {page}, totalPages {total_pages})"
+        );
+    }
+
+    let app_id = listed
+        .items
+        .into_iter()
+        .find(|row| row.name.as_deref() == Some(app_name))
+        .and_then(|row| row.app_id)
+        .filter(|id| !id.is_empty());
+
+    Ok(PhalaCvmListPage {
+        page,
+        total_pages,
+        app_id,
+    })
+}
+
+/// Walk every page of a CVM list until `app_name` is found or the server's
+/// pagination envelope proves that the last page was read. Any fetch or parse
+/// error is returned, never interpreted as an available name.
+fn find_phala_cvm_app_id_by_name(
+    mut fetch_page: impl FnMut(usize) -> Result<PhalaCvmListPage>,
+) -> Result<Option<String>> {
+    let mut requested_page = 1;
+    loop {
+        let listed = fetch_page(requested_page)?;
+        if listed.page != requested_page {
+            bail!(
+                "phala cvms list --json returned page {} when page {} was requested",
+                listed.page,
+                requested_page
+            );
+        }
+        if let Some(app_id) = listed.app_id {
+            return Ok(Some(app_id));
+        }
+        if listed.total_pages == 0 || listed.page >= listed.total_pages {
+            return Ok(None);
+        }
+        requested_page = listed
+            .page
+            .checked_add(1)
+            .context("phala cvms pagination overflow")?;
+    }
+}
+
+/// Build the arguments for one page of `phala cvms list --json`.
+#[must_use]
+fn build_phala_cvm_list_args(page: usize) -> Vec<String> {
+    vec![
+        "cvms".to_owned(),
+        "list".to_owned(),
+        "--json".to_owned(),
+        "--page".to_owned(),
+        page.to_string(),
+    ]
 }
 
 /// One row of `phala cvms list --json`. Only the two fields the collision
@@ -220,6 +302,10 @@ struct PhalaCvmListRow {
 struct PhalaCvmList {
     #[serde(default)]
     items: Vec<PhalaCvmListRow>,
+    #[serde(default)]
+    page: Option<usize>,
+    #[serde(default, rename = "totalPages", alias = "total_pages")]
+    total_pages: Option<usize>,
 }
 
 /// Parse the CVM's operator-chosen `name` (the `phala deploy --name` value)
@@ -477,6 +563,31 @@ fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<
     }))
 }
 
+/// Run one paginated `phala cvms list --json` request and parse its collision
+/// lookup result. A non-zero exit is an error because an unreadable page cannot
+/// establish that the requested CVM name is free.
+fn read_phala_cvm_list_page(
+    page: usize,
+    app_name: &str,
+    api_key: Option<&str>,
+) -> Result<PhalaCvmListPage> {
+    let args = build_phala_cvm_list_args(page);
+    let out = phala_command(api_key)
+        .args(&args)
+        .output()
+        .context("run phala cvms list — is the phala CLI installed? (npm i -g phala)")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "could not read Phala CVM list page {page}, so `{app_name}` cannot be checked for a name collision: {}",
+            stderr.trim()
+        );
+    }
+
+    parse_phala_cvm_list_page(&out.stdout, app_name)
+        .with_context(|| format!("parse Phala CVM list page {page}"))
+}
+
 impl PhalaClient for RealPhalaClient {
     fn deploy(
         &self,
@@ -547,28 +658,9 @@ impl PhalaClient for RealPhalaClient {
     }
 
     fn existing_cvm_app_id(&self) -> Result<Option<String>> {
-        // Ask for the whole list rather than `cvms get <name>`. `get` exits
-        // non-zero both when the name is free and when the CLI could not ask at
-        // all — an expired session, no network — and the two are not
-        // distinguishable from the exit code. Reading "could not ask" as "free"
-        // skips the collision preflight silently and hands the operator back the
-        // raw `phala deploy` failure this exists to prevent. A LIST that
-        // succeeds and omits the name is proof the name is free; a list that
-        // fails is an error, and says so.
-        let out = phala_command(self.api_key.as_deref())
-            .args(["cvms", "list", "--json"])
-            .output()
-            .context("run phala cvms list — is the phala CLI installed? (npm i -g phala)")?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!(
-                "could not list Phala CVMs, so `{}` cannot be checked for a name collision: {}",
-                self.app_name,
-                stderr.trim()
-            );
-        }
-
-        parse_phala_cvm_app_id_by_name(&out.stdout, &self.app_name)
+        find_phala_cvm_app_id_by_name(|page| {
+            read_phala_cvm_list_page(page, &self.app_name, self.api_key.as_deref())
+        })
     }
 }
 
@@ -884,6 +976,59 @@ mod tests {
             .expect("an empty list must parse");
 
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_name_on_a_later_phala_page_is_checked_before_it_is_declared_free() {
+        // `phala cvms list` returns a paginated envelope. The lookup must ask
+        // for page two after page one omits the requested name.
+        let page_one = br#"{
+            "success":true,"page":1,"pageSize":50,"total":51,"totalPages":2,
+            "items":[{"app_id":"app_other","name":"gm-testnet-other"}]
+        }"#;
+        let page_two = br#"{
+            "success":true,"page":2,"pageSize":50,"total":51,"totalPages":2,
+            "items":[{"app_id":"app_collision","name":"gm-testnet-colliding"}]
+        }"#;
+        let pages: [&[u8]; 2] = [page_one, page_two];
+        let mut requested_pages = Vec::new();
+        let found = find_phala_cvm_app_id_by_name(|page| {
+            requested_pages.push(page);
+            parse_phala_cvm_list_page(pages[page - 1], "gm-testnet-colliding")
+        })
+        .expect("all pages must parse");
+
+        assert_eq!(requested_pages, vec![1, 2]);
+        assert_eq!(
+            found.as_deref(),
+            Some("app_collision"),
+            "every result page must be checked before a name is declared free"
+        );
+    }
+
+    #[test]
+    fn a_failed_later_phala_page_is_not_treated_as_a_free_name() {
+        let page_one = br#"{
+            "success":true,"page":1,"pageSize":50,"total":51,"totalPages":2,
+            "items":[{"app_id":"app_other","name":"gm-testnet-other"}]
+        }"#;
+        let result = find_phala_cvm_app_id_by_name(|page| {
+            if page == 1 {
+                parse_phala_cvm_list_page(page_one, "gm-testnet-colliding")
+            } else {
+                Err(anyhow::anyhow!("page {page} unavailable"))
+            }
+        });
+
+        assert!(result.is_err(), "a failed page must fail closed");
+    }
+
+    #[test]
+    fn paginated_phala_list_requests_carry_the_page_number() {
+        assert_eq!(
+            build_phala_cvm_list_args(2),
+            vec!["cvms", "list", "--json", "--page", "2"]
+        );
     }
 
     #[test]
