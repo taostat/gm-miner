@@ -278,9 +278,11 @@ fn prompt_for_key(assume_yes: bool) -> Result<String> {
 /// Persist `key` to gmcli config (network-independent). Loads a fresh config
 /// so a concurrent edit elsewhere is not clobbered, mirroring `set-api-keys`.
 fn persist_key(key: &str) -> Result<()> {
-    let mut cfg: Config = config::load().context("load gmcli config")?;
-    cfg.phala_api_key = Some(key.to_owned());
-    config::save(&cfg).context("persist Phala Cloud API key")
+    config::with_config_lock(|| {
+        let mut cfg: Config = config::load().context("load gmcli config")?;
+        cfg.phala_api_key = Some(key.to_owned());
+        config::save(&cfg).context("persist Phala Cloud API key")
+    })
 }
 
 #[cfg(test)]
@@ -289,11 +291,26 @@ fn persist_key(key: &str) -> Result<()> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{is_positive_amount, pick_key_source, validate_key, PhalaCredits};
+    use super::{is_positive_amount, persist_key, pick_key_source, validate_key, PhalaCredits};
+    use crate::config::{self, Config, NetworkEntry, WorkerRecord};
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
     use wiremock::{
         matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
     };
+
+    fn with_temp_config_dir() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::config::TEST_CONFIG_DIR_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // SAFETY: this test holds the process-local guard for its whole scope.
+        unsafe { std::env::set_var("GMCLI_CONFIG_DIR", dir.path()) };
+        (dir, guard)
+    }
 
     #[test]
     fn positive_amount_parsing() {
@@ -354,6 +371,84 @@ mod tests {
         assert_eq!(source.key, "env-key");
         assert!(pick_key_source(Some("  "), Some(""), Some("\t")).is_none());
         assert!(pick_key_source(None, None, None).is_none());
+    }
+
+    #[test]
+    fn phala_key_persistence_preserves_a_concurrent_worker_update() {
+        let (_dir, _guard) = with_temp_config_dir();
+        let mut entry = NetworkEntry::default();
+        entry.workers.push(WorkerRecord {
+            worker_id: "worker-1".to_owned(),
+            app_id: "app-1".to_owned(),
+            app_name: "miner-1".to_owned(),
+            node_secret: "old-secret".to_owned(),
+            ..Default::default()
+        });
+        let mut cfg = Config::default();
+        cfg.networks.insert("mainnet".to_owned(), entry);
+        cfg.active_network = Some("mainnet".to_owned());
+        config::save(&cfg).expect("seed config");
+
+        let stale_loaded = Arc::new(Barrier::new(2));
+        let allow_stale_save = Arc::new(Barrier::new(2));
+        let stale_loaded_writer = Arc::clone(&stale_loaded);
+        let allow_stale_save_writer = Arc::clone(&allow_stale_save);
+        let writer = thread::spawn(move || {
+            config::with_config_lock(|| {
+                // This snapshot predates the key write and models a worker
+                // update already holding the shared config lock.
+                let mut stale = config::load().expect("load under lock");
+                stale_loaded_writer.wait();
+                allow_stale_save_writer.wait();
+                stale.active_entry_mut().workers[0].node_secret = "new-secret".to_owned();
+                config::save(&stale)
+            })
+            .expect("locked writer must save");
+        });
+
+        stale_loaded.wait();
+        // Start the key write while the stale worker writer holds `.lock`.
+        // On the baseline it returns before the stale writer is released; the
+        // fixed path waits for the lock instead.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let key_writer = thread::spawn(move || {
+            started_tx.send(()).expect("signal key writer start");
+            result_tx
+                .send(persist_key("test-key").is_ok())
+                .expect("send key writer result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("key writer must start");
+
+        // The baseline completes while the lock is held. The fixed path is
+        // still blocked, so either way release the stale writer after a short
+        // bounded wait and then require the key write to succeed.
+        let completed_before_release = result_rx.recv_timeout(Duration::from_millis(500));
+        allow_stale_save.wait();
+        writer.join().expect("writer thread must finish");
+        let key_saved = completed_before_release
+            .or_else(|_| result_rx.recv_timeout(Duration::from_secs(1)))
+            .expect("key writer must finish after the lock is released");
+        assert!(key_saved, "key persistence must succeed");
+        key_writer.join().expect("key writer thread must finish");
+
+        let final_cfg = config::load().expect("reload final config");
+        assert_eq!(
+            final_cfg.phala_api_key.as_deref(),
+            Some("test-key"),
+            "the worker writer must not overwrite the key"
+        );
+        assert_eq!(
+            final_cfg
+                .networks
+                .get("mainnet")
+                .expect("mainnet entry")
+                .workers[0]
+                .node_secret,
+            "new-secret"
+        );
     }
 
     async fn mock_auth_me(body: serde_json::Value, status: u16) -> MockServer {

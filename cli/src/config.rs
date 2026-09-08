@@ -7,6 +7,12 @@ use std::path::PathBuf;
 
 use crate::network::Network;
 
+// Unit tests in sibling modules can point the process-global config directory
+// at separate tempdirs. They must share one guard so a test never reads
+// another test's temporary config.
+#[cfg(test)]
+pub(crate) static TEST_CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The `sub` claim of a JWT, read without verifying the signature — the gm
 /// registry verifies the token; the CLI only needs the identity it asserts.
 fn jwt_sub(token: &str) -> Option<String> {
@@ -1417,15 +1423,13 @@ mod tests {
     // serialises every test that points the config dir at its own tempdir —
     // otherwise parallel tests would clobber each other's `GMCLI_CONFIG_DIR`.
 
-    use std::sync::{Mutex, MutexGuard};
-
-    static CONFIG_DIR_ENV: Mutex<()> = Mutex::new(());
+    use std::sync::MutexGuard;
 
     /// Point `GMCLI_CONFIG_DIR` at a fresh tempdir for the duration of the
     /// returned guard's scope. Holds the env mutex so concurrent on-disk tests
     /// don't fight over the variable.
     fn with_temp_config_dir() -> (tempfile::TempDir, MutexGuard<'static, ()>) {
-        let guard = CONFIG_DIR_ENV
+        let guard = super::TEST_CONFIG_DIR_ENV
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("create tempdir");
