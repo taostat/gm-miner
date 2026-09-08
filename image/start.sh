@@ -132,6 +132,22 @@ fan_out_slots() {
 ANTHROPIC_UPSTREAM="${ANTHROPIC_UPSTREAM:-direct}"
 OPENAI_UPSTREAM="${OPENAI_UPSTREAM:-direct}"
 
+# The node secret is substituted raw into the Envoy Lua filter as a bare
+# string literal (`local expected = "<secret>"`); a value carrying a quote,
+# backslash, or newline would close that literal and inject attacker Lua onto
+# the buyer data path. The registry constrains the secret it registers to
+# `^[A-Za-z0-9_-]{16,128}$`, but the CVM env is supplied independently and is
+# not covered by the attestation compose_hash — so re-check it here before it
+# reaches the render. Empty stays allowed: that selects the unauthenticated
+# legacy path the Lua already handles.
+validate_node_secret() {
+  local secret="${GM_NODE_SECRET:-}"
+  if [[ -n "${secret}" && ! "${secret}" =~ ^[A-Za-z0-9_-]{16,128}$ ]]; then
+    log "error: GM_NODE_SECRET must match ^[A-Za-z0-9_-]{16,128}\$ (16-128 URL-safe chars); refusing to render the data plane"
+    exit 1
+  fi
+}
+
 validate_hostname() {
   local name="$1"
   local host="$2"
@@ -411,6 +427,7 @@ if [[ "${HAS_KEY}" -eq 0 ]]; then
 fi
 
 # ── Fan direct provider keys out into per-slot process env ────────────
+validate_node_secret
 if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
   fan_out_slots anthropic ANTHROPIC_API_KEY
 fi
@@ -605,6 +622,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     return out rest
   }
   BEGIN {
+    # Rendered raw into a Lua string literal; injection-safe only because
+    # validate_node_secret already rejected any quote/backslash/newline.
     secret = ENVIRON["GM_NODE_SECRET"]
     bench_host = ENVIRON["GM_BENCHMARK_HOST"]
     bench_port = ENVIRON["GM_BENCHMARK_PORT"]
