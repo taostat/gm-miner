@@ -184,25 +184,6 @@ pub fn parse_phala_cvm_app_id(succeeded: bool, stdout: &[u8]) -> Result<Option<S
     Ok(detail.app_id.filter(|id| !id.is_empty()))
 }
 
-/// Find a CVM by its operator-chosen `name` in `phala cvms list --json` output
-/// and return its `app_id`.
-///
-/// `Ok(None)` means the list was read and holds no CVM under that name — the
-/// name is free. A list that could not be read is an error at the call site, not
-/// an absent CVM, so an unreadable workspace never reads as an empty one.
-#[cfg(test)]
-fn parse_phala_cvm_app_id_by_name(stdout: &[u8], app_name: &str) -> Result<Option<String>> {
-    let listed: PhalaCvmList =
-        serde_json::from_slice(stdout).context("parse phala cvms list --json output")?;
-
-    Ok(listed
-        .items
-        .into_iter()
-        .find(|row| row.name.as_deref() == Some(app_name))
-        .and_then(|row| row.app_id)
-        .filter(|id| !id.is_empty()))
-}
-
 /// The name lookup result and pagination metadata from one successful list
 /// response. The metadata is required by the collision preflight: without it,
 /// an empty first page cannot prove that no later page contains the name.
@@ -217,6 +198,9 @@ struct PhalaCvmListPage {
 fn parse_phala_cvm_list_page(stdout: &[u8], app_name: &str) -> Result<PhalaCvmListPage> {
     let listed: PhalaCvmList =
         serde_json::from_slice(stdout).context("parse phala cvms list --json output")?;
+    if listed.success == Some(false) {
+        bail!("phala cvms list --json reported failure");
+    }
     let page = listed
         .page
         .context("phala cvms list --json output is missing `page`")?;
@@ -229,12 +213,28 @@ fn parse_phala_cvm_list_page(stdout: &[u8], app_name: &str) -> Result<PhalaCvmLi
         );
     }
 
-    let app_id = listed
+    let items = listed
         .items
-        .into_iter()
-        .find(|row| row.name.as_deref() == Some(app_name))
-        .and_then(|row| row.app_id)
-        .filter(|id| !id.is_empty());
+        .context("phala cvms list --json output is missing `items`")?;
+    let mut app_id = None;
+    for row in items {
+        if row.name.as_deref() != Some(app_name) {
+            continue;
+        }
+
+        let usable_id = row
+            .app_id
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .with_context(|| {
+                format!(
+                    "phala cvms list --json has matching CVM `{app_name}` without a usable `app_id`"
+                )
+            })?;
+        if app_id.is_none() {
+            app_id = Some(usable_id);
+        }
+    }
 
     Ok(PhalaCvmListPage {
         page,
@@ -301,7 +301,8 @@ struct PhalaCvmListRow {
 #[derive(Debug, serde::Deserialize)]
 struct PhalaCvmList {
     #[serde(default)]
-    items: Vec<PhalaCvmListRow>,
+    success: Option<bool>,
+    items: Option<Vec<PhalaCvmListRow>>,
     #[serde(default)]
     page: Option<usize>,
     #[serde(default, rename = "totalPages", alias = "total_pages")]
@@ -933,7 +934,7 @@ mod tests {
         assert!(parse_phala_cvm_endpoint(true, b"not json").is_err());
     }
 
-    // ── phala cvms get app_id parsing ─────────────────────────────────────────
+    // ── phala cvms list parsing ──────────────────────────────────────────────
 
     #[test]
     fn a_listed_cvm_is_found_by_its_operator_chosen_name() {
@@ -942,38 +943,45 @@ mod tests {
             {"app_id":"app_mine","name":"gm-testnet-zai-a"}
         ]}"#;
 
-        let found = parse_phala_cvm_app_id_by_name(stdout, "gm-testnet-zai-a")
-            .expect("a readable list must parse");
+        let found = parse_phala_cvm_list_page(stdout, "gm-testnet-zai-a")
+            .expect("a readable list must parse")
+            .app_id;
 
         assert_eq!(found.as_deref(), Some("app_mine"));
     }
 
     #[test]
     fn current_phala_cli_field_names_are_accepted() {
-        let stdout = br#"{"items":[
+        let stdout = br#"{"success":true,"page":1,"pageSize":50,"total":1,"totalPages":1,"items":[
             {"appId":"app_mine","cvmName":"gm-miner-near-1"}
         ]}"#;
 
-        let found = parse_phala_cvm_app_id_by_name(stdout, "gm-miner-near-1")
-            .expect("current phala CLI list output must parse");
+        let found = parse_phala_cvm_list_page(stdout, "gm-miner-near-1")
+            .expect("current phala CLI list output must parse")
+            .app_id;
 
         assert_eq!(found.as_deref(), Some("app_mine"));
     }
 
     #[test]
     fn a_name_absent_from_a_readable_list_is_free() {
-        let stdout = br#"{"items":[{"app_id":"app_other","name":"gm-testnet-other"}]}"#;
+        let stdout = br#"{"success":true,"page":1,"pageSize":50,"total":1,"totalPages":1,"items":[{"app_id":"app_other","name":"gm-testnet-other"}]}"#;
 
-        let found =
-            parse_phala_cvm_app_id_by_name(stdout, "gm-testnet-zai-a").expect("list must parse");
+        let found = parse_phala_cvm_list_page(stdout, "gm-testnet-zai-a")
+            .expect("list must parse")
+            .app_id;
 
         assert_eq!(found, None, "a name nobody holds is free");
     }
 
     #[test]
     fn an_empty_workspace_leaves_every_name_free() {
-        let found = parse_phala_cvm_app_id_by_name(br#"{"items":[]}"#, "gm-testnet-zai-a")
-            .expect("an empty list must parse");
+        let found = parse_phala_cvm_list_page(
+            br#"{"success":true,"page":1,"pageSize":50,"total":0,"totalPages":1,"items":[]}"#,
+            "gm-testnet-zai-a",
+        )
+        .expect("an empty list must parse")
+        .app_id;
 
         assert_eq!(found, None);
     }
@@ -1024,6 +1032,38 @@ mod tests {
     }
 
     #[test]
+    fn a_page_without_items_is_not_treated_as_a_free_name() {
+        let result = parse_phala_cvm_list_page(
+            br#"{"success":true,"page":1,"totalPages":1}"#,
+            "gm-testnet-colliding",
+        );
+
+        assert!(result.is_err(), "missing items must fail closed");
+    }
+
+    #[test]
+    fn an_explicitly_failed_phala_page_is_not_treated_as_a_free_name() {
+        let result = parse_phala_cvm_list_page(
+            br#"{"success":false,"page":1,"totalPages":1,"items":[]}"#,
+            "gm-testnet-colliding",
+        );
+
+        assert!(result.is_err(), "success=false must fail closed");
+    }
+
+    #[test]
+    fn a_matching_phala_row_without_a_usable_app_id_is_not_free() {
+        for app_id in ["null", "\"\""] {
+            let stdout = format!(
+                "{{\"success\":true,\"page\":1,\"totalPages\":1,\"items\":[{{\"name\":\"gm-testnet-colliding\",\"app_id\":{app_id}}}]}}"
+            );
+            let result = parse_phala_cvm_list_page(stdout.as_bytes(), "gm-testnet-colliding");
+
+            assert!(result.is_err(), "app_id {app_id} must fail closed");
+        }
+    }
+
+    #[test]
     fn paginated_phala_list_requests_carry_the_page_number() {
         assert_eq!(
             build_phala_cvm_list_args(2),
@@ -1035,7 +1075,7 @@ mod tests {
     fn an_unreadable_list_is_an_error_not_an_empty_one() {
         // The whole point: "could not ask" must never read as "name is free",
         // or the collision preflight skips itself exactly when it is needed.
-        let err = parse_phala_cvm_app_id_by_name(b"not json", "gm-testnet-zai-a")
+        let err = parse_phala_cvm_list_page(b"not json", "gm-testnet-zai-a")
             .expect_err("an unparseable list must not read as an absent CVM");
 
         assert!(err.to_string().contains("phala cvms list"), "{err}");
