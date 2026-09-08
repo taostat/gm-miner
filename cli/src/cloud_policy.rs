@@ -51,10 +51,10 @@ pub fn is_reviewed_bedrock_binding(provider: &str, model: &str, upstream_model: 
         == Some(REVIEWED_BEDROCK_UPSTREAM_MODEL)
 }
 
-/// The selected cloud adapter for `provider`, if this local config says one is
-/// active. A configured `direct` selector takes precedence over old worker
-/// records: changing the selector back to a direct key restores direct bulk
-/// declarations while the old CVM record remains available for recovery.
+/// The explicitly selected cloud adapter for `provider` in the local config.
+/// Historical worker records do not establish the current provider-wide
+/// selection: a hotkey may have direct siblings or workers created elsewhere.
+/// The registry remains authoritative for per-worker admission.
 #[must_use]
 pub fn configured_cloud_backend(config: &Config, provider: &str) -> Option<&'static str> {
     let selector = config
@@ -67,30 +67,11 @@ pub fn configured_cloud_backend(config: &Config, provider: &str) -> Option<&'sta
         });
 
     match (provider, selector) {
-        ("anthropic", Some("bedrock")) => return Some("bedrock"),
-        ("anthropic", Some("foundry")) => return Some("foundry"),
-        ("openai", Some("azure")) => return Some("azure"),
-        // An explicit direct selector means the currently selected supply is
-        // direct even if an older worker record used a cloud adapter.
-        (_, Some("direct")) => return None,
-        _ => {}
+        ("anthropic", Some("bedrock")) => Some("bedrock"),
+        ("anthropic", Some("foundry")) => Some("foundry"),
+        ("openai", Some("azure")) => Some("azure"),
+        _ => None,
     }
-
-    // Configs written before selectors were persisted can still identify a
-    // cloud worker through its per-worker provenance map. Unknown backends are
-    // intentionally ignored here; registry admission remains the authority.
-    config
-        .active_network_entry()
-        .into_iter()
-        .flat_map(|network| network.workers.iter())
-        .filter_map(|worker| worker.backends.as_ref())
-        .filter_map(|backends| backends.get(provider).map(String::as_str))
-        .find_map(|backend| match (provider, backend) {
-            ("anthropic", "bedrock") => Some("bedrock"),
-            ("anthropic", "foundry") => Some("foundry"),
-            ("openai", "azure") => Some("azure"),
-            _ => None,
-        })
 }
 
 #[cfg(test)]
@@ -173,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_worker_provenance_is_used_without_a_selector() {
+    fn historical_cloud_worker_does_not_establish_current_selection() {
         let mut networks = HashMap::new();
         networks.insert(
             "mainnet".to_owned(),
@@ -192,9 +173,31 @@ mod tests {
             networks,
             ..Default::default()
         };
-        assert_eq!(
-            configured_cloud_backend(&config, "anthropic"),
-            Some("bedrock")
-        );
+        assert_eq!(configured_cloud_backend(&config, "anthropic"), None);
+    }
+
+    #[test]
+    fn mixed_worker_history_does_not_hide_direct_bulk_supply() {
+        let config = Config {
+            networks: HashMap::from([(
+                "mainnet".to_owned(),
+                NetworkEntry {
+                    workers: vec![
+                        WorkerRecord {
+                            backends: Some(BTreeMap::from([
+                                ("anthropic".to_owned(), "foundry".to_owned()),
+                                ("openai".to_owned(), "azure".to_owned()),
+                            ])),
+                            ..Default::default()
+                        },
+                        WorkerRecord::default(),
+                    ],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(configured_cloud_backend(&config, "anthropic"), None);
+        assert_eq!(configured_cloud_backend(&config, "openai"), None);
     }
 }
