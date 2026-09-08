@@ -17,6 +17,7 @@
 //!                      (the hidden `list-products` alias runs the same code)
 //!   pricing          — rank your offers against the eligible field
 //!   sources          — list sourcing routes with capability vs admission status
+//!   image-canary     — testnet-only funded native Gemini image reconciliation
 //!   update           — upgrade gmcli in place to the latest release
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
 //!   worker list      — list the hotkey's live workers
@@ -60,6 +61,7 @@ use crate::commands::doctor::cmd_doctor;
 use crate::commands::earnings::cmd_earnings;
 use crate::commands::fun::{cmd_gm, cmd_moon};
 use crate::commands::hotkey::cmd_register_hotkey;
+use crate::commands::image_canary::cmd_image_canary;
 use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::pricing::cmd_pricing;
@@ -170,8 +172,8 @@ enum Command {
         anthropic: Option<String>,
 
         /// Anthropic transport selector: direct, bedrock, or foundry.
-        /// Cloud transport capability is not registry admission; only the
-        /// exact reviewed Bedrock binding is currently routable.
+        /// Cloud transport capability is not registry admission; Bedrock and
+        /// Foundry remain unavailable pending verified model and transport bindings.
         #[arg(long)]
         anthropic_upstream: Option<String>,
 
@@ -370,6 +372,29 @@ enum Command {
         gmcli --network testnet check-streaming")]
     CheckStreaming,
 
+    /// Run the funded, native Gemini image canary against testnet.
+    ///
+    /// This command first checks that both Gemini image SKUs have a live
+    /// eligible route, then sends exactly one non-streaming
+    /// `generateContent` request per SKU at one 1K image and reconciles the
+    /// settled nUSD against the buyer balance when `/v1/credits` is available.
+    /// It is deliberately not part of `check-streaming`: image generation is
+    /// paid and must never run as a generic health probe.
+    #[command(after_help = "Examples:\n  \
+        GM_API_KEY=... gmcli --network testnet image-canary\n  \
+        gmcli --network testnet image-canary --buyer-api-key ...")]
+    ImageCanary {
+        /// Funded GM buyer key (not the Google provider key). Prefer
+        /// `GM_API_KEY` so the secret is not placed in shell history.
+        #[arg(long = "buyer-api-key", env = "GM_API_KEY", value_name = "KEY")]
+        buyer_api_key: Option<String>,
+
+        /// Override the testnet gateway URL for local/mock verification.
+        /// Production runs should use the network default.
+        #[arg(long, env = "GM_GATEWAY_URL")]
+        gateway_url: Option<String>,
+    },
+
     /// Record the hotkey your miner serves under.
     ///
     /// Two flows. If you already registered a hotkey elsewhere (a browser
@@ -412,7 +437,7 @@ enum Command {
     ///
     /// Before sending, prints what the discount works out to per Mtok on
     /// every dimension the product prices — input and output, plus prompt
-    /// cache, audio and long-context rates where the model has them — and
+    /// cache, audio, image and long-context rates where the model has them — and
     /// asks you to confirm the discount.
     #[command(after_help = "Examples:\n  \
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
@@ -429,18 +454,16 @@ enum Command {
         #[arg(long)]
         model: String,
 
-        /// Reviewed upstream model id for a cloud-backed offer. Currently the
-        /// only admitted cloud binding is Bedrock
-        /// `anthropic/claude-sonnet-4-6` with
-        /// `anthropic.claude-sonnet-4-6-v1`; Azure, Foundry and other Bedrock
-        /// combinations remain pending review.
+        /// Upstream model id for a legacy cloud declaration or transport diagnostic.
+        /// A known model id does not authorize cloud supply: Bedrock, Azure and
+        /// Foundry remain unavailable pending verified transport provenance.
         #[arg(long = "upstream-model", value_name = "ID")]
         upstream_model: Option<String>,
 
         /// Percent off retail; range [0, 99.90]. You will receive
         /// (100 - PCT)% of retail on every dimension the product prices
         /// (e.g. `--discount-pct 10.5` means you keep 89.5% of every
-        /// per-Mtok dollar, on input, output, and any cache, audio or
+        /// per-Mtok dollar, on input, output, and any cache, audio, image or
         /// long-context rate the model carries). `0` is at retail; the
         /// `99.90` cap keeps the per-request revenue strictly positive.
         #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
@@ -895,6 +918,22 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             cmd_check_streaming(cfg).await
+        }
+        Command::ImageCanary {
+            buyer_api_key,
+            gateway_url,
+        } => {
+            let cfg = load_config(explicit_network, api_url)?;
+            let network = cfg.resolved_network();
+            // Let the handler enforce the network gate before checking the
+            // optional key, so a bare/default mainnet invocation always
+            // refuses as testnet-only rather than looking like a key error.
+            cmd_image_canary(
+                network,
+                gateway_url.as_deref(),
+                buyer_api_key.as_deref().unwrap_or_default(),
+            )
+            .await
         }
         Command::RegisterHotkey {
             hotkey_ss58,
@@ -1782,6 +1821,32 @@ mod tests {
                 discount_bp: 500,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn clap_parses_testnet_image_canary_options() {
+        use super::Network;
+
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "--network",
+            "testnet",
+            "image-canary",
+            "--buyer-api-key",
+            "buyer-secret",
+            "--gateway-url",
+            "http://127.0.0.1:8787",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.explicit_network(), Some(Network::Testnet));
+        assert!(matches!(
+            cli.command,
+            Command::ImageCanary {
+                buyer_api_key: Some(ref key),
+                gateway_url: Some(ref url),
+            } if key == "buyer-secret" && url == "http://127.0.0.1:8787"
         ));
     }
 

@@ -3,22 +3,19 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-08-26**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-09-08**. This is a miner setup matrix, not a buyer product
 catalog. It distinguishes transport capability from registry admission:
 
 * A direct/API-key source is declarable when the registry publishes the route
   and the worker passes its normal capability checks.
-* A cloud adapter being able to answer HTTP is not enough to make its model
-  supply routable. The only reviewed cloud binding today is Bedrock
-  `anthropic/claude-sonnet-4-6` with the exact Mantle id
-  `anthropic.claude-sonnet-4-6-v1`.
-* Azure OpenAI, Microsoft Foundry, and every other Bedrock model/id
-  combination remain transport-capable but non-admissible until an
-  authoritative binding is reviewed. Do not declare those as cloud supply.
+* Direct Anthropic/OpenAI supply additionally requires verified key slots enforced
+  inside the miner runtime.
+* Bedrock, Azure OpenAI and Microsoft Foundry are transport-capable but unavailable
+  as buyer supply until model identity and transport provenance are independently
+  verified. A known model id or a successful HTTP probe is not sufficient.
 
 The backticked `provider/model` is the pair to pass to
-`gmcli declare-product` for a direct route. For the one reviewed Bedrock route,
-also pass `--upstream-model anthropic.claude-sonnet-4-6-v1`. See
+`gmcli declare-product` for a direct route. See
 [sourcing.md](sourcing.md) for complete commands and route selection rules. Run
 `gmcli sources` against your chosen network before deploying: it is the live
 authority for which explicit routes that registry has published.
@@ -30,19 +27,21 @@ authority for which explicit routes that registry has published.
 | `claude-opus-4-7` | Anthropic API: `anthropic/claude-opus-4-7` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
 | `claude-opus-4-8` | Anthropic API: `anthropic/claude-opus-4-8` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
 | `claude-opus-5` | Anthropic API: `anthropic/claude-opus-5` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
-| `claude-sonnet-4-6` | Anthropic API: `anthropic/claude-sonnet-4-6` (`--anthropic`); **Bedrock only with `--upstream-model anthropic.claude-sonnet-4-6-v1`**; Microsoft Foundry: transport only, no reviewed registry binding |
+| `claude-sonnet-4-6` | Anthropic API: `anthropic/claude-sonnet-4-6` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, pending verified provenance |
 | `claude-sonnet-5` | Anthropic API: `anthropic/claude-sonnet-5` (`--anthropic`); AWS Bedrock / Microsoft Foundry: transport only, no reviewed registry binding |
 | `DeepSeek V3.2 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V3.2-TEE` (`--chutes`) |
 | `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`); Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`); NEAR confidential inference: `near/deepseek-ai/DeepSeek-V4-Flash` (`--near`) |
 | `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`); NEAR confidential inference: `near/google/gemma-4-31B-it` (`--near`) |
+| `Gemini 3.1 Flash Lite Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-lite-image` (`--google`) |
+| `Gemini 3.1 Flash Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-image` (`--google`) |
 | `Gemini 3.1 Pro Preview` | Google: `gemini/gemini-3.1-pro-preview` (`--google`) |
 | `Gemini 3.5 Flash` | Google: `gemini/gemini-3.5-flash` (`--google`) |
 | `GLM-5.1 TEE` | Chutes: `chutes/zai-org/GLM-5.1-TEE` (`--chutes`); NEAR confidential inference: `near/zai-org/GLM-5.1-FP8` (`--near`) |
 | `GLM-5.2` | Z.ai API: `zai/glm-5.2` (`--zai`); DeepInfra: `deepinfra/zai-org/GLM-5.2` (`--deepinfra`); Engy: `engy/glm-5.2` (`--engy`); KubeTEE: `kubetee/z-ai/glm-5.2` (`--kubetee`); Moonmath ZRO: `moonmath/glm-5.2` (`--moonmath`) |
 | `GLM-5.2 TEE` | Chutes: `chutes/zai-org/GLM-5.2-TEE` (`--chutes`); NEAR confidential inference: `near/z-ai/glm-5.2` (`--near`) |
-| `GLM-5.3` | Z.ai API: `zai/glm-5.3` (`--zai`) |
-| `GLM-5.3-Flash` | Z.ai API: `zai/glm-5.3-flash` (`--zai`); KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`) |
+| `GLM-5.3` | Z.ai API: `zai/glm-5.3` (`--zai`); KubeTEE: `kubetee/z-ai/glm-5.3` (`--kubetee`); Engy: `engy/glm-5.3` (`--engy`) |
+| `GLM-5.3-Flash` | Z.ai API: `zai/glm-5.3-flash` (`--zai`); KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`); Engy: `engy/glm-5.3-flash` (`--engy`) |
 | `GPT-5.4` | OpenAI API: `openai/gpt-5.4` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
 | `GPT-5.4 mini` | OpenAI API: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
 | `GPT-5.4 nano` | OpenAI API: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI: transport only, no reviewed registry binding |
@@ -68,3 +67,27 @@ authority for which explicit routes that registry has published.
 | `Qwen3.8 27B` | Engy: `engy/qwen3.8-27b` (`--engy`); DeepInfra: `deepinfra/Qwen/Qwen3.8-27B` (`--deepinfra`) |
 | `Qwen3.8 27B TEE` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
 | `Qwen3.8-Flash-Next` | KubeTEE: `kubetee/qwen/qwen3.8-flash-next` (`--kubetee`) |
+
+The two Gemini image SKUs use the native
+`POST /v1beta/models/{model}:generateContent` request shape. Envoy forwards
+that path and body unchanged to Google's Gemini API; there is no Interactions
+route in the MVP. Routine capability/health probes stay text-only and must not
+request image output, so a probe does not create a paid image.
+
+These definitions, publication, discovery, and declaration are supported on
+both networks. Pass `--network` explicitly when changing an image offer so the
+intended registry is unambiguous. A funded comparison is available only as the
+deliberate
+`gmcli --network testnet image-canary` command; it checks
+`/v1/models?api_shape=generateContent` for both live eligible SKUs, sends one
+non-streaming native request per SKU with `candidateCount=1`, `imageSize=1K`,
+`responseModalities=["IMAGE"]`, and no `tools`/grounding, then prints model,
+request id, usage dimensions, settled nUSD, and optional before/after balance.
+The canary captures only response and balance reconciliation evidence;
+validator, finalizer, and dashboard evidence belongs to a separate GM
+runbook check. It never prints its prompt, generated image, or either key.
+See [`image-canary.md`](image-canary.md).
+
+`gmcli check-streaming` also skips these native image SKUs because its
+streaming check targets the OpenAI-compatible SSE surface; it never sends an
+image-generation probe.

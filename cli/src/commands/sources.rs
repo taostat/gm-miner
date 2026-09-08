@@ -6,9 +6,7 @@ use anyhow::{Context as _, Result};
 
 use gm_miner_cli::{
     client::RegistryClient,
-    cloud_policy::{
-        configured_cloud_backend, is_reviewed_bedrock_binding, REVIEWED_BEDROCK_UPSTREAM_MODEL,
-    },
+    cloud_policy::configured_cloud_backend,
     config::Config,
     network::Network,
     pricing::{extra_dimension_count, format_usd},
@@ -116,12 +114,12 @@ const SOURCE_HEADERS: [&str; 6] = [
 
 const CLOUD_ADMISSION_NOTICE: [&str; 3] = [
     "Capability is not admission: a cloud transport probe only proves that the adapter can answer.",
-    "Current cloud admission: direct/API-key routes remain usable; only exact Bedrock",
-    "anthropic/claude-sonnet-4-6 → anthropic.claude-sonnet-4-6-v1 is reviewed. Azure OpenAI,",
+    "Direct Anthropic/OpenAI routes require verified key slots enforced inside the miner.",
+    "Bedrock, Azure OpenAI and Foundry are transport-only:",
 ];
 
 const CLOUD_ADMISSION_NOTICE_TAIL: &str =
-    "Foundry, and every other Bedrock model binding remain pending authoritative review.";
+    "model names and declared backend labels do not establish trusted transport provenance.";
 
 /// A no-table result: the two lines of `why`, then the shared tail. Both empty
 /// states end at the same two pointers, so a third cannot forget the doc link.
@@ -221,9 +219,6 @@ fn route_row(source: &SourceProduct, config: Option<&Config>) -> Vec<String> {
 fn admission_cell(source: &SourceProduct, config: Option<&Config>) -> String {
     if let Some(backend) = configured_cloud_backend_for(config, &source.provider) {
         return match backend {
-            "bedrock" if source.model == "claude-sonnet-4-6" => {
-                "Bedrock: exact ID reviewed".to_owned()
-            }
             "bedrock" => "Bedrock: binding pending".to_owned(),
             "foundry" => "Foundry: binding pending".to_owned(),
             "azure" => "Azure: binding pending".to_owned(),
@@ -231,9 +226,6 @@ fn admission_cell(source: &SourceProduct, config: Option<&Config>) -> String {
         };
     }
     match source.provider.as_str() {
-        "anthropic" if source.model == "claude-sonnet-4-6" => {
-            "direct; Bedrock exact ID only".to_owned()
-        }
         "anthropic" => "direct only; Bedrock/Foundry pending".to_owned(),
         "openai" => "direct only; Azure pending".to_owned(),
         _ => "direct / reviewed route".to_owned(),
@@ -429,23 +421,10 @@ fn declare_lines(sources: &[SourceProduct], config: Option<&Config>) -> Vec<Stri
         lines.push(String::new());
         lines.push("Cloud route bindings are restricted to reviewed identities:".to_owned());
         for source in cloud_ready {
-            if source.provider == "anthropic"
-                && is_reviewed_bedrock_binding(
-                    source.provider.as_str(),
-                    source.model.as_str(),
-                    REVIEWED_BEDROCK_UPSTREAM_MODEL,
-                )
-            {
-                lines.push(format!(
-                    "  gmcli declare-product --provider {} --model {} --discount-pct <pct> --upstream-model {}  # exact Bedrock binding",
-                    source.provider, source.model, REVIEWED_BEDROCK_UPSTREAM_MODEL
-                ));
-            } else {
-                lines.push(format!(
-                    "  {}/{}: no reviewed cloud binding currently; do not declare it as cloud supply",
-                    source.provider, source.model
-                ));
-            }
+            lines.push(format!(
+                "  {}/{}: no verified cloud transport binding; do not declare it as cloud supply",
+                source.provider, source.model
+            ));
         }
     }
     lines
@@ -781,7 +760,7 @@ mod tests {
                 "anthropic",
                 "claude-sonnet-4-6",
                 "bedrock",
-                "Bedrock: exact ID reviewed",
+                "Bedrock: binding pending",
             ),
             (
                 "anthropic",
@@ -808,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_reviewed_bedrock_route_gets_explicit_binding_guidance() {
+    fn known_bedrock_model_id_does_not_get_usable_supply_guidance() {
         let config = config_with_backend("anthropic", "bedrock");
         let rendered = render_sources_with_config(
             Network::Mainnet,
@@ -822,9 +801,9 @@ mod tests {
         )
         .join("\n");
 
-        assert!(rendered.contains("Bedrock: exact ID reviewed"));
-        assert!(rendered
-            .contains("--upstream-model anthropic.claude-sonnet-4-6-v1  # exact Bedrock binding"));
+        assert!(rendered.contains("Bedrock: binding pending"));
+        assert!(rendered.contains("no verified cloud transport binding"));
+        assert!(!rendered.contains("--upstream-model"));
         assert!(!rendered.contains(
             "gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct <pct>\n"
         ));

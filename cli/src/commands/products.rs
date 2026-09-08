@@ -6,9 +6,7 @@ use anyhow::{bail, Context as _, Result};
 
 use gm_miner_cli::{
     client::RegistryClient,
-    cloud_policy::{
-        configured_cloud_backend, is_reviewed_bedrock_binding, REVIEWED_BEDROCK_UPSTREAM_MODEL,
-    },
+    cloud_policy::configured_cloud_backend,
     dependency::confirm,
     pricing::{
         effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
@@ -371,7 +369,7 @@ pub(crate) async fn cmd_declare_products(
 /// Remove configured cloud-backed products from a bulk declaration and explain
 /// why they were not sent. Bulk requests intentionally omit `upstream_model`;
 /// direct/API-key products remain eligible, while cloud products need an
-/// explicit reviewed binding (currently only the exact Bedrock tuple).
+/// independently verified model and transport binding.
 fn skip_cloud_bulk_targets(client: &RegistryClient, targets: &mut Vec<&Product>) -> Result<usize> {
     let mut skipped_cloud: Vec<(String, String, String)> = Vec::new();
     targets.retain(|product| {
@@ -397,13 +395,6 @@ fn skip_cloud_bulk_targets(client: &RegistryClient, targets: &mut Vec<&Product>)
         println!(
             "  {provider}/{model} ({backend}) — transport capability is not registry admission; reviewed binding required."
         );
-        if is_reviewed_bedrock_binding(provider, model, REVIEWED_BEDROCK_UPSTREAM_MODEL)
-            && backend == "bedrock"
-        {
-            println!(
-                "    Declare explicitly with `gmcli declare-product --provider {provider} --model {model} --upstream-model {REVIEWED_BEDROCK_UPSTREAM_MODEL}`."
-            );
-        }
     }
     if targets.is_empty() {
         bail!(
@@ -428,7 +419,7 @@ pub(crate) enum DeclareOutcome {
 /// What the fan-out is about to commit to, one product per line, with the
 /// dimensions beyond input/output listed beneath the products that price them.
 ///
-/// The whole catalog at one discount is dozens of products; expanding all ten
+/// The whole catalog at one discount is dozens of products; expanding all twelve
 /// dimensions for each would bury the two that matter. Expanding only what a
 /// product actually prices keeps the common row to one line and still shows
 /// every absolute figure the discount works out to.
@@ -868,6 +859,7 @@ fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
 )]
 mod tests {
     use gm_miner_cli::config::{Config, NetworkEntry, ProviderKeys, TokenEntry};
+    use gm_miner_cli::network::Network;
     use wiremock::{
         matchers::{body_json, method, path},
         Mock, MockServer, ResponseTemplate,
@@ -880,9 +872,13 @@ mod tests {
     }
 
     fn config_for(server: &MockServer) -> Config {
+        config_for_network(server, Network::Testnet)
+    }
+
+    fn config_for_network(server: &MockServer, network: Network) -> Config {
         let mut networks = std::collections::HashMap::new();
         networks.insert(
-            "testnet".to_owned(),
+            network.as_str().to_owned(),
             NetworkEntry {
                 api_url: Some(server.uri()),
                 tokens: Some(TokenEntry {
@@ -894,7 +890,7 @@ mod tests {
             },
         );
         Config {
-            active_network: Some("testnet".to_owned()),
+            active_network: Some(network.as_str().to_owned()),
             networks,
             ..Default::default()
         }
@@ -1021,6 +1017,94 @@ mod tests {
 
         assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
         assert_eq!(hits(&server, "GET", "/miners/products/sources").await, 1);
+    }
+
+    #[tokio::test]
+    async fn mainnet_permits_a_gemini_image_declaration() {
+        let server = MockServer::start().await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-image",
+                "status": "active",
+                "retail_price": retail(500_000_000, 3_000_000_000),
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-image",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+        let mut client = RegistryClient::new(config_for_network(&server, Network::Mainnet));
+
+        cmd_declare_product(
+            &mut client,
+            &Provider::Gemini,
+            "gemini-3.1-flash-image",
+            500,
+            DeclareArgs::default(),
+        )
+        .await
+        .expect("mainnet permits the image offer");
+
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+    }
+
+    #[tokio::test]
+    async fn testnet_permits_a_gemini_image_declaration() {
+        let server = MockServer::start().await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-image",
+                "status": "active",
+                "retail_price": retail(500_000_000, 3_000_000_000),
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-image",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for_network(&server, Network::Testnet));
+        cmd_declare_product(
+            &mut client,
+            &Provider::Gemini,
+            "gemini-3.1-flash-image",
+            500,
+            DeclareArgs::default(),
+        )
+        .await
+        .expect("explicit testnet permits the image offer");
+
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+    }
+
+    #[test]
+    fn image_products_remain_in_the_declaration_filter() {
+        let image = Product {
+            provider: "gemini".to_owned(),
+            model: "gemini-3.1-flash-lite-image".to_owned(),
+            status: "active".to_owned(),
+            retail_price: serde_json::from_value(retail(500_000_000, 3_000_000_000))
+                .expect("decode image retail"),
+        };
+        let products = [image];
+        let targets = filter_catalog(&products, Some(&Provider::Gemini));
+        assert_eq!(targets.len(), 1);
     }
 
     #[tokio::test]
@@ -1195,6 +1279,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mainnet_fan_out_declares_gemini_image_products() {
+        let server = MockServer::start().await;
+        mount_catalog(
+            &server,
+            serde_json::json!([
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3.1-flash-lite-image",
+                    "status": "active",
+                    "retail_price": retail(500_000_000, 3_000_000_000),
+                },
+                {
+                    "provider": "gemini",
+                    "model": "gemini-3.1-flash-image",
+                    "status": "active",
+                    "retail_price": retail(500_000_000, 3_000_000_000),
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "status": "active",
+                    "retail_price": retail(3_000_000_000, 15_000_000_000),
+                },
+            ]),
+        )
+        .await;
+        mount_routes(
+            &server,
+            serde_json::json!([
+                {
+                    "route_id": 1,
+                    "provider": "gemini",
+                    "model": "gemini-3.1-flash-lite-image",
+                    "buyer_provider": "gemini",
+                    "buyer_model": "gemini-3.1-flash-lite-image",
+                    "retail_price": retail(500_000_000, 3_000_000_000),
+                    "capable_worker_count": 1,
+                    "already_offered": false,
+                },
+                {
+                    "route_id": 2,
+                    "provider": "gemini",
+                    "model": "gemini-3.1-flash-image",
+                    "buyer_provider": "gemini",
+                    "buyer_model": "gemini-3.1-flash-image",
+                    "retail_price": retail(500_000_000, 3_000_000_000),
+                    "capable_worker_count": 1,
+                    "already_offered": false,
+                },
+                {
+                    "route_id": 3,
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "buyer_provider": "anthropic",
+                    "buyer_model": "claude-sonnet-4-6",
+                    "retail_price": retail(3_000_000_000, 15_000_000_000),
+                    "capable_worker_count": 1,
+                    "already_offered": false,
+                },
+            ]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-lite-image",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-image",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for_network(&server, Network::Mainnet));
+        let outcome = cmd_declare_products(&mut client, None, 500, true)
+            .await
+            .expect("mainnet fan-out includes image products");
+
+        assert_eq!(outcome, DeclareOutcome::Declared);
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 3);
+    }
+
+    #[tokio::test]
     async fn bulk_skips_cloud_products_without_sending_an_unbound_request() {
         let server = MockServer::start().await;
         mount_catalog(
@@ -1279,6 +1463,8 @@ mod tests {
             cache_write_1h_per_mtok_ndollars: Some(500),
             audio_input_per_mtok_ndollars: Some(500),
             audio_output_per_mtok_ndollars: Some(500),
+            image_input_per_mtok_ndollars: Some(500),
+            image_output_per_mtok_ndollars: Some(500),
             cache_storage_per_mtok_hour_ndollars: Some(500),
             long_context_threshold_tokens: Some(200_000),
             long_context_input_per_mtok_ndollars: Some(500),
@@ -1330,7 +1516,7 @@ mod tests {
         // columns after it must still start where the header's do.
         let rendered = lines.join("\n");
         assert!(
-            rendered.contains("$0.000894999 in / $0.000000894 out per Mtok (+8 more)"),
+            rendered.contains("$0.000894999 in / $0.000000894 out per Mtok (+10 more)"),
             "{rendered}"
         );
         let eligible_at = lines[0]
@@ -1360,6 +1546,8 @@ mod tests {
             input_per_mtok_ndollars: 3_000_000_000,
             output_per_mtok_ndollars: 15_000_000_000,
             cache_read_per_mtok_ndollars: Some(300_000_000),
+            image_input_per_mtok_ndollars: Some(500_000_000),
+            image_output_per_mtok_ndollars: Some(60_000_000_000),
             ..Default::default()
         };
         let dims_plain = RetailDimensions {
@@ -1403,7 +1591,19 @@ mod tests {
         assert!(
             rendered
                 .lines()
-                .any(|line| line.ends_with("cache read  $0.300 → $0.2685")),
+                .any(|line| line.ends_with("cache read     $0.300 → $0.2685")),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.ends_with("image input    $0.500 → $0.4475")),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.ends_with("image output  $60.000 → $53.700")),
             "{rendered}"
         );
         assert!(!rendered.contains("glm-5.2"), "{rendered}");
@@ -1441,6 +1641,8 @@ mod tests {
                             "input_per_mtok_ndollars": 3_000_000_000_u64,
                             "output_per_mtok_ndollars": 15_000_000_000_u64,
                             "cache_read_per_mtok_ndollars": 300_000_000_u64,
+                            "image_input_per_mtok_ndollars": 500_000_000_u64,
+                            "image_output_per_mtok_ndollars": 60_000_000_000_u64,
                         },
                     },
                 },
@@ -1466,7 +1668,19 @@ mod tests {
         assert!(
             rendered
                 .lines()
-                .any(|line| line.ends_with("cache read  $0.300 → $0.2685")),
+                .any(|line| line.ends_with("cache read     $0.300 → $0.2685")),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.ends_with("image input    $0.500 → $0.4475")),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.ends_with("image output  $60.000 → $53.700")),
             "{rendered}"
         );
         assert!(
@@ -1474,14 +1688,14 @@ mod tests {
             "{rendered}"
         );
         // The two-dimension product contributes exactly one line: no "not
-        // priced" filler for the eight dimensions it does not carry.
+        // priced" filler for the ten dimensions it does not carry.
         assert_eq!(rendered.matches("zai/glm-5.2").count(), 1, "{rendered}");
     }
 
     #[test]
     fn a_catalog_declaration_keeps_its_layout() {
         // A product that prices only the two anchors must not gain an
-        // "Also priced" block listing eight dimensions it does not have.
+        // "Also priced" block listing ten dimensions it does not have.
         let dims = RetailDimensions {
             input_per_mtok_ndollars: 3_000_000_000,
             output_per_mtok_ndollars: 15_000_000_000,
@@ -1510,6 +1724,8 @@ mod tests {
             output_per_mtok_ndollars: 15_000_000_000,
             cache_read_per_mtok_ndollars: Some(300_000_000),
             cache_write_5m_per_mtok_ndollars: Some(3_750_000_000),
+            image_input_per_mtok_ndollars: Some(500_000_000),
+            image_output_per_mtok_ndollars: Some(60_000_000_000),
             long_context_threshold_tokens: Some(200_000),
             long_context_input_per_mtok_ndollars: Some(6_000_000_000),
             ..Default::default()
@@ -1524,9 +1740,11 @@ mod tests {
                 "  Also priced  : Retail → you receive, per Mtok",
                 // $0.2685 and $3.35625, not a truncated $0.268 / $3.356: the
                 // received figure is shown to the nano-dollar it is paid at.
-                "      cache read      $0.300 → $0.2685",
-                "      cache write 5m  $3.750 → $3.35625",
-                "      long-ctx input  $6.000 → $5.370",
+                "      cache read       $0.300 → $0.2685",
+                "      cache write 5m   $3.750 → $3.35625",
+                "      image input      $0.500 → $0.4475",
+                "      image output    $60.000 → $53.700",
+                "      long-ctx input   $6.000 → $5.370",
                 "      long-ctx rates apply above 200000 input tokens",
                 "  Sent as      : 10.5% off, not the figures above.",
                 "                 The registry resolves them against its own retail.",

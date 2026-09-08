@@ -43,8 +43,11 @@ explains the table and how to set each upstream up.
 | `qwen/qwen3.6-35b-a3b` | `engy/qwen3.6-35b-a3b` | `api.engy.ai` | `--engy` |
 | `qwen/qwen3.8-27b` | `engy/qwen3.8-27b` | `api.engy.ai` | `--engy` |
 | `ornith/ornith-1.5-397b` | `engy/ornith-1.5-397b` | `api.engy.ai` | `--engy` |
+| `zai/glm-5.3` | `engy/glm-5.3` | `api.engy.ai` | `--engy` |
+| `zai/glm-5.3-flash` | `engy/glm-5.3-flash` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-flash` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
+| `zai/glm-5.3` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
 | `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | `llm.kubetee.ai` | `--kubetee` |
@@ -65,6 +68,23 @@ they are dispatch targets, not products a buyer can request by name. The
 route, including self routes. It falls back to the older cross-product-only
 endpoint while reporting a registry that predates the complete route catalog.
 
+### Gemini image products
+
+`gemini/gemini-3.1-flash-lite-image` and
+`gemini/gemini-3.1-flash-image` are buyer products served through Google's
+native `generateContent` API. Set the Google provider key with
+`gmcli set-api-keys --google ...`, deploy, and use an explicit `--network`
+when declaring either product. Their definitions are available on both
+networks so pricing, status, and catalog payloads can decode their image input
+and output dimensions.
+
+The provider key is not a buyer key. To deliberately verify the two native
+routes, use the paid [testnet image canary](image-canary.md), which requires a
+funded testnet GM buyer key and captures response/balance reconciliation
+evidence for the two settled charges. It is not a worker health probe and is
+never run by `gmcli check-streaming`; validator, finalizer, and dashboard
+evidence is a separate GM runbook concern.
+
 ### Cloud transport variants and admission
 
 The image retains three backend transports for capability testing and future
@@ -74,17 +94,17 @@ not evidence of admission:
 
 | Buyer product | Route | Selector |
 |---|---|---|
-| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — only `anthropic/claude-sonnet-4-6` with `anthropic.claude-sonnet-4-6-v1` is currently reviewed |
+| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — transport only, pending verified provenance |
 | `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) — transport only, pending binding |
 | `openai/*` | Azure OpenAI | `--openai-upstream azure` — transport only, pending binding |
 
 Same idea, different mechanism — selectors are set once per worker and apply to
 every model from that provider, but they do not grant cloud admission. Use
-direct/API-key providers for ordinary declarations. Use
-`gmcli declare-product --provider anthropic --model claude-sonnet-4-6
---upstream-model anthropic.claude-sonnet-4-6-v1` only for the exact reviewed
-Bedrock route. Azure, Foundry and other Bedrock combinations must not be
-declared as cloud supply until an authoritative binding is published.
+direct/API-key providers for ordinary declarations. Direct Anthropic/OpenAI
+routes require verified key slots enforced inside the miner runtime. Cloud
+admission needs independent evidence of both the actual transport and model;
+a known Bedrock model id alone is not enough. Do not declare cloud adapters
+as usable supply until that evidence is supported.
 
 ## One lottery entry per worker
 
@@ -103,8 +123,8 @@ your rate per Mtok = buyer_retail[dimension] x (10000 - discount_bp) / 10000
 ```
 
 The discount applies to every dimension the buyer product prices — input and
-output always, plus prompt-cache, audio and long-context rates where the model
-has them. So for `zai/glm-5.2` at a buyer retail of $1.40 in / $4.40 out,
+output always, plus prompt-cache, audio, image and long-context rates where the
+model has them. So for `zai/glm-5.2` at a buyer retail of $1.40 in / $4.40 out,
 declaring any of its routes at `--discount-pct 5` pays you:
 
 ```
@@ -175,12 +195,16 @@ gmcli declare-product --provider engy --model kimi-k3 --discount-pct 5
 gmcli declare-product --provider engy --model deepseek-v4-flash-0731 --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.6-35b-a3b --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.8-27b --discount-pct 5
+gmcli declare-product --provider engy --model glm-5.3 --discount-pct 5
+gmcli declare-product --provider engy --model glm-5.3-flash --discount-pct 5
+gmcli declare-product --provider engy --model ornith-1.5-397b --discount-pct 5
 gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5
 gmcli declare-product --provider deepinfra --model moonshotai/Kimi-K3 --discount-pct 5
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash-0731 --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.6-35B-A3B --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.8-27B --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
+gmcli declare-product --provider kubetee --model z-ai/glm-5.3 --discount-pct 5
 gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
 gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5

@@ -3,7 +3,7 @@
 //! Every table here used to carry a hand-picked width per column, and every
 //! one of them was picked against a `$3.000` example. Prices now render to
 //! whatever precision they need (`pricing::format_usd`), so a cheap model puts
-//! `$0.000894999 in / $0.000000894 out per Mtok (+8 more)` in a cell chosen to
+//! `$0.000894999 in / $0.000000894 out per Mtok (+10 more)` in a cell chosen to
 //! hold twelve characters — and the columns after it shift off their headers,
 //! in exactly the views meant to make cheap models legible. A width measured
 //! from the data cannot be outgrown.

@@ -208,7 +208,7 @@ pub fn parse_phala_cvm_app_id_by_name(stdout: &[u8], app_name: &str) -> Result<O
 struct PhalaCvmListRow {
     #[serde(alias = "app_id", alias = "appId")]
     app_id: Option<String>,
-    #[serde(alias = "name", alias = "cvm")]
+    #[serde(alias = "name", alias = "cvm", alias = "cvmName")]
     name: Option<String>,
 }
 
@@ -852,6 +852,18 @@ mod tests {
 
         let found = parse_phala_cvm_app_id_by_name(stdout, "gm-testnet-zai-a")
             .expect("a readable list must parse");
+
+        assert_eq!(found.as_deref(), Some("app_mine"));
+    }
+
+    #[test]
+    fn current_phala_cli_field_names_are_accepted() {
+        let stdout = br#"{"items":[
+            {"appId":"app_mine","cvmName":"gm-miner-near-1"}
+        ]}"#;
+
+        let found = parse_phala_cvm_app_id_by_name(stdout, "gm-miner-near-1")
+            .expect("current phala CLI list output must parse");
 
         assert_eq!(found.as_deref(), Some("app_mine"));
     }

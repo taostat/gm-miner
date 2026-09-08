@@ -10,9 +10,9 @@ You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, M
 DeepInfra, KubeTEE, Engy, Moonmath, NEAR AI Cloud, or Bedrock/Foundry/Azure transport backends
 behind the existing Anthropic/OpenAI routes) and your own funded
 [Phala Cloud](https://cloud.phala.network) account. Transport capability is not registry
-admission: today only exact Bedrock `anthropic/claude-sonnet-4-6` with Mantle id
-`anthropic.claude-sonnet-4-6-v1` is cloud-admissible. Azure OpenAI, Foundry and every other
-Bedrock model combination remain pending authoritative reviewed bindings. The `gmcli` tool
+admission: Bedrock, Azure OpenAI and Foundry remain unavailable as buyer supply until
+both model identity and transport provenance are independently verified. Direct Anthropic/OpenAI
+routes use verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 
 | Path | Description |
@@ -152,13 +152,36 @@ available to you. A single worker can serve only one route per model, so run two
 two upstreams for the same model. Run `gmcli sources` to see the routes your registry currently
 publishes, and read [sourcing routes](docs/sourcing.md) for setup and settlement details.
 
+The Gemini image-generation products `gemini-3.1-flash-lite-image` and
+`gemini-3.1-flash-image` use Google's native
+`POST /v1beta/models/{model}:generateContent` API. They are not OpenAI-compatible
+chat routes. Their definitions are available on both networks, so pricing,
+status, and catalog payloads can decode every image dimension. Select the
+network whose offer you intend to change:
+
+```sh
+gmcli --network testnet declare-product \
+  --provider gemini --model gemini-3.1-flash-image --discount-pct 5
+
+gmcli --network mainnet declare-product \
+  --provider gemini --model gemini-3.1-flash-image --discount-pct 5
+```
+
+Capability and health checks use a text-only Gemini request and do not generate
+a paid image. When you intentionally want to spend one small native image
+request per SKU on testnet, use the [Gemini image canary](docs/image-canary.md);
+it preflights both live eligible offers and prints only safe response/balance
+reconciliation evidence. Downstream validator, finalizer, and dashboard
+evidence is a separate GM runbook check. See the [provider support
+matrix](docs/provider-model-support.md) for the provider-side setup.
+
 The image contains cloud transport adapters for Bedrock, Azure OpenAI and Foundry, but transport
 capability is not registry admission. Configure these adapters for transport testing or a future
 reviewed binding; do not advertise their responses as usable supply until the registry admits the
 exact route.
 
-The one currently reviewed cloud route is `anthropic/claude-sonnet-4-6` through AWS Bedrock. Select
-Bedrock and provide the Bedrock region and API key:
+For Bedrock transport testing, select the adapter and provide the region and API key.
+This does not make the worker routable:
 
 ```sh
 gmcli set-api-keys \
@@ -202,12 +225,10 @@ Foundry](docs/foundry-setup.md) before your first Foundry deploy. Foundry routes
 *deployment* name, but do not declare it as cloud supply until a reviewed binding is published.
 
 Azure OpenAI must have deployments named exactly like the gm model id for transport, for example
-`gpt-4o`; the miner does not rewrite Azure model ids. Bedrock model-id translation is handled by
-the gateway before requests reach the miner. Only the exact reviewed Bedrock route above may be
-declared with its Mantle id; all other Bedrock combinations remain pending. Worker backend provenance is auto-derived from these
-selectors when you deploy: the Anthropic-side upstream wins, so `anthropic-upstream=bedrock`
-registers `bedrock` and `anthropic-upstream=foundry` registers `foundry`; otherwise
-`openai-upstream=azure` registers `azure`, and direct workers omit the backend field. Bedrock,
+`gpt-4o`; the miner does not rewrite Azure model ids. A recognized Bedrock model id is not
+sufficient for admission either. The CLI derives a per-provider `backends` map from these
+selectors when you deploy; this is configuration metadata, not verified transport provenance.
+Direct workers send an empty map. Bedrock,
 Azure and Foundry keys are single-slot in this release; semicolons in `BEDROCK_API_KEY`,
 `AZURE_OPENAI_API_KEY` or `AZURE_FOUNDRY_API_KEY` are rejected.
 
@@ -248,7 +269,7 @@ payout: a 10% discount means you keep 90% of each per-Mtok dollar.
 
 Fan one discount across the whole catalog. Bulk declaration retains direct/API-key providers, but
 explicitly skips cloud-backed providers because it never sends an `upstream_model` binding. A
-transport-capable Azure, Foundry or non-reviewed Bedrock worker is not usable registry supply:
+transport-capable Azure, Foundry or Bedrock worker is not usable registry supply:
 
 ```sh
 gmcli declare-products --discount-pct 5
@@ -262,25 +283,21 @@ gmcli declare-products --provider openai --discount-pct 10
 ```
 
 If the selected provider uses Bedrock, Foundry or Azure, bulk declaration refuses/skips those
-offers and explains the pending binding. Declare the one reviewed Bedrock route explicitly:
-
-Or declare a single offer:
+offers and explains the pending binding. To declare a single direct/API-key offer:
 
 ```sh
 gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5
-gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 \
-  --upstream-model anthropic.claude-sonnet-4-6-v1
 ```
 
 `--discount-pct` accepts a value in `[0, 99.90]` with up to two decimal places (e.g. `10.5`).
 `0` means at retail; `99.90` is the cap (keeps per-request revenue strictly positive).
-Use `--upstream-model` only for an authoritative binding. Currently that means the exact Bedrock
-tuple above (`anthropic/claude-sonnet-4-6` → `anthropic.claude-sonnet-4-6-v1`). Azure, Foundry and
-other Bedrock combinations are transport-capable only and must not be declared as cloud supply.
+Use the registry-owned source model for direct routes; do not override it with a deployment
+name. Legacy Bedrock ids remain representable for audit and transport diagnostics, but no cloud
+adapter currently has the independent provenance needed to serve buyer traffic.
 
 Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price
 you would receive on **every dimension the product prices** — input and output, plus prompt
-cache, audio and long-context rates where the model has them — print those figures, and ask you
+cache, audio, image and long-context rates where the model has them — print those figures, and ask you
 to confirm. Dimensions a model does not price are not listed. Pass `--yes` to skip the prompt;
 a non-interactive stdin skips it too, so scripted declarations keep working unchanged.
 
@@ -358,6 +375,7 @@ gmcli worker remove <worker_id>
 | `gmcli earnings` | On-chain hotkey emission from the subnet metagraph (requires btcli) |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |
+| `gmcli image-canary` | Testnet-only, funded native Gemini image preflight and two-SKU settlement reconciliation (paid; never part of health checks) |
 | `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
 | `gmcli worker list` | List workers with per-worker status and last attestation |
@@ -377,6 +395,11 @@ GMCLI_CONFIG_DIR=/path/to/dir gmcli login
 
 The `GM_REGISTRY_URL` env var overrides the registry API URL for a single run without
 persisting it.
+
+The paid image canary uses a buyer key, not a provider key. Set `GM_API_KEY` (or
+pass `--buyer-api-key`) and run it with `--network testnet`. It defaults to the
+testnet gateway; `GM_GATEWAY_URL` is available only as a per-run override for
+local/mock verification. See [docs/image-canary.md](docs/image-canary.md).
 
 ## Troubleshooting
 

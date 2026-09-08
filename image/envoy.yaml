@@ -304,6 +304,30 @@ static_resources:
                       body_format_override:
                         json_format:
                           error: "miner saturated — request rate limited"
+                    ## ── Upstream-failure response body ──────────────────
+                    ##  Envoy's own local replies for an upstream that
+                    ##  never connected, reset, or refused the stream
+                    ##  (flags UF/UC/UR/URX) default to a plain-text 503.
+                    ##  Map them to a JSON 502 so the gateway parses one
+                    ##  error shape and can attribute the failure to the
+                    ##  miner→provider hop. Provider-origin error
+                    ##  responses are not local replies and pass through
+                    ##  byte-for-byte — the gateway's 429/drain
+                    ##  classifiers read those bodies. This body's
+                    ##  wording must never contain a provider-drain
+                    ##  phrase (quota / credit / billing / account /
+                    ##  api key): the gateway matches those substrings on
+                    ##  any status and would cool the whole provider
+                    ##  scope instead of counting one 5xx.
+                    - filter:
+                        response_flag_filter:
+                          flags: ["UF", "UC", "UR", "URX"]
+                      status_code: 502
+                      body_format_override:
+                        json_format:
+                          error:
+                            type: "envoy_upstream_error"
+                            message: "upstream request failed"
                 route_config:
                   name: provider_routes
                   virtual_hosts:
@@ -398,6 +422,24 @@ static_resources:
                             ##  which an idle-only cap would cut mid-generation. Applied
                             ##  uniformly across the provider routes below.
                             timeout: 1800s
+                            ##  One in-CVM retry against the upstream, pre-response only:
+                            ##  Envoy retries solely before response headers commit
+                            ##  downstream, so a retried request can never duplicate a
+                            ##  stream the gateway already started billing. 429 is
+                            ##  deliberately absent (no retriable_status_codes): the
+                            ##  gateway's cooldown scoping reads the 429 status and body,
+                            ##  and a miner-side retry would hide quota exhaustion while
+                            ##  hammering a rate-limited upstream. No per_try_timeout —
+                            ##  a per-try clock would guillotine long generations. A
+                            ##  request body past the connection buffer cannot be
+                            ##  replayed; Envoy then skips the retry rather than failing.
+                            ##  Applied uniformly across the provider routes below; the
+                            ##  attestd, NEAR, and benchmark routes deliberately carry no
+                            ##  retry — it would mask a loopback service failure or
+                            ##  distort the benchmark measurement surface.
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -445,6 +487,9 @@ static_resources:
                               substitution: "/openai/v1/\\1"
                             ## gm:openai-path-rewrite-end
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -472,6 +517,9 @@ static_resources:
                             cluster: chutes
                             host_rewrite_literal: llm.chutes.ai
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -497,6 +545,9 @@ static_resources:
                                 regex: "^/v1/(.*)$"
                               substitution: "/api/paas/v4/\\1"
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -519,6 +570,9 @@ static_resources:
                             cluster: moonshot
                             host_rewrite_literal: api.moonshot.ai
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -547,6 +601,9 @@ static_resources:
                                 regex: "^/v1/(.*)$"
                               substitution: "/v1/openai/\\1"
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -569,6 +626,9 @@ static_resources:
                             cluster: engy
                             host_rewrite_literal: api.engy.ai
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -591,6 +651,9 @@ static_resources:
                             cluster: kubetee
                             host_rewrite_literal: llm.kubetee.ai
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -612,6 +675,9 @@ static_resources:
                             cluster: moonmath
                             host_rewrite_literal: zro.moonmath.ai
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig
@@ -632,6 +698,9 @@ static_resources:
                             cluster: gemini
                             host_rewrite_literal: generativelanguage.googleapis.com
                             timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
                           request_headers_to_remove:
                             - x-gm-request-id
                             - x-gm-gateway-sig

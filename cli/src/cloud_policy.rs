@@ -1,13 +1,16 @@
-//! The registry's current cloud-provider admission boundary.
+//! Cloud model-ID compatibility and transport-selection helpers.
 //!
 //! Cloud adapters prove that a worker can speak a provider's transport. They
 //! do not, by themselves, prove that the registry has an authoritative model
-//! binding for the route. Keep the small amount of policy the CLI needs here
-//! so command help and bulk-declaration safety do not drift apart.
+//! binding for the route or which backend is actually used. All cloud
+//! transports remain unavailable for routing pending independent provenance.
+//! Keep these helpers together so diagnostics and bulk-declaration guidance
+//! do not confuse model-ID compatibility with transport admission.
 
 use crate::config::Config;
 
-/// The only Bedrock route currently covered by a reviewed registry binding.
+/// The only Bedrock model-ID tuple currently covered by registry normalization.
+/// This does not authorize the worker's cloud transport.
 pub const REVIEWED_BEDROCK_PROVIDER: &str = "anthropic";
 pub const REVIEWED_BEDROCK_MODEL: &str = "claude-sonnet-4-6";
 pub const REVIEWED_BEDROCK_UPSTREAM_MODEL: &str = "anthropic.claude-sonnet-4-6-v1";
@@ -40,9 +43,8 @@ pub fn normalize_bedrock_upstream_model(
 }
 
 /// Return true only for the exact Bedrock provider/model/upstream tuple the
-/// registry currently admits. The adapters remain available for future
-/// reviewed bindings; this predicate is deliberately narrower than transport
-/// capability.
+/// registry recognizes for legacy diagnostics. This is not routing admission;
+/// the worker's actual backend also needs independently verified provenance.
 #[must_use]
 pub fn is_reviewed_bedrock_binding(provider: &str, model: &str, upstream_model: &str) -> bool {
     normalize_bedrock_upstream_model(provider, model, upstream_model)
@@ -98,7 +100,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     #[test]
-    fn only_the_reviewed_bedrock_tuple_is_admitted() {
+    fn only_the_reviewed_bedrock_tuple_is_recognized() {
         assert!(is_reviewed_bedrock_binding(
             "anthropic",
             "claude-sonnet-4-6",

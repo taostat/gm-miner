@@ -189,6 +189,34 @@ fn product_catalog_response_parses_wrapper_shape() {
 }
 
 #[test]
+fn product_catalog_preserves_gemini_image_price_dimensions() {
+    // Image input/output are optional dimensions so old registry responses
+    // remain decodable, but image products must retain both prices all the
+    // way through the catalog response used by status and declare-product.
+    let body = serde_json::json!({
+        "products": [{
+            "provider": "gemini",
+            "model": "gemini-3.1-flash-image",
+            "status": "active",
+            "retail_price": {"dimensions": {
+                "input_per_mtok_ndollars": 1_000_000_000_u64,
+                "output_per_mtok_ndollars": 2_000_000_000_u64,
+                "image_input_per_mtok_ndollars": 500_000_000_u64,
+                "image_output_per_mtok_ndollars": 60_000_000_000_u64,
+            }},
+        }],
+        "generated_at": "2026-09-01T10:00:00Z",
+    });
+    let parsed: ProductCatalogResponse = serde_json::from_value(body).unwrap();
+    let dimensions = &parsed.products[0].retail_price.dimensions;
+    assert_eq!(dimensions.image_input_per_mtok_ndollars, Some(500_000_000));
+    assert_eq!(
+        dimensions.image_output_per_mtok_ndollars,
+        Some(60_000_000_000)
+    );
+}
+
+#[test]
 fn product_catalog_parses_a_provider_this_build_predates() {
     // The registry's GET /products is catalog-wide. A product whose upstream
     // this CLI build predates must not fail the decode of every other product

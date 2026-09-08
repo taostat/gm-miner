@@ -5,10 +5,8 @@ transport adapter for future reviewed bindings. It does **not** currently make
 Foundry a routable or registry-admissible source: an HTTP-successful Foundry
 probe is transport capability, not authoritative model admission. The current
 GM policy has no reviewed Foundry binding, so do not declare a Foundry offer or
-count it as usable supply. Azure OpenAI is in the same pending state; the only
-cloud binding currently admitted is exact Bedrock
-`anthropic/claude-sonnet-4-6` with Mantle id
-`anthropic.claude-sonnet-4-6-v1`.
+count it as usable supply. Azure OpenAI and Bedrock are in the same pending state:
+a known model id does not establish the worker's transport provenance.
 
 The rest of this guide is still useful for validating the adapter and preparing
 the Azure resource, endpoint, credentials, and deployment identity for a later

@@ -58,6 +58,21 @@ impl Network {
         }
     }
 
+    /// The buyer-facing gateway URL for this network.
+    ///
+    /// This is deliberately separate from [`Self::default_registry_url`]: a
+    /// miner's OAuth/API calls target the registry, while the optional image
+    /// canary is a funded buyer request through the gateway. The canary only
+    /// accepts [`Self::Testnet`], but keeping both coordinates here prevents a
+    /// command from deriving one hostname from the other.
+    #[must_use]
+    pub fn default_gateway_url(self) -> &'static str {
+        match self {
+            Self::Testnet => "https://test-api.saygm.com",
+            Self::Mainnet => "https://api.saygm.com",
+        }
+    }
+
     /// The config key this network is stored under (`active_network`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -122,6 +137,14 @@ mod tests {
         assert_eq!(
             Network::Mainnet.default_registry_url(),
             "https://registry.saygm.com"
+        );
+        assert_eq!(
+            Network::Testnet.default_gateway_url(),
+            "https://test-api.saygm.com"
+        );
+        assert_eq!(
+            Network::Mainnet.default_gateway_url(),
+            "https://api.saygm.com"
         );
     }
 
