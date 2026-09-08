@@ -17,8 +17,15 @@ pub(crate) static TEST_CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::
 // the shared config write lock. This lets concurrency regressions coordinate
 // with the lock attempt instead of relying on thread scheduling.
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestConfigLockEvent {
+    LockAttempt,
+    OperationCompleted,
+}
+
+#[cfg(test)]
 pub(crate) static TEST_CONFIG_LOCK_ATTEMPT: std::sync::OnceLock<
-    std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    std::sync::Mutex<Option<std::sync::mpsc::Sender<TestConfigLockEvent>>>,
 > = std::sync::OnceLock::new();
 
 /// The `sub` claim of a JWT, read without verifying the signature — the gm
@@ -928,7 +935,7 @@ fn notify_test_config_lock_attempt() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     if let Some(observer) = observer {
-        let _ = observer.send(());
+        let _ = observer.send(TestConfigLockEvent::LockAttempt);
     }
 }
 

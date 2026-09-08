@@ -292,9 +292,9 @@ fn persist_key(key: &str) -> Result<()> {
 )]
 mod tests {
     use super::{is_positive_amount, persist_key, pick_key_source, validate_key, PhalaCredits};
-    use crate::config::{self, Config, NetworkEntry, WorkerRecord};
+    use crate::config::{self, Config, NetworkEntry, TestConfigLockEvent, WorkerRecord};
     use anyhow::Context;
-    use std::sync::mpsc::{self, Receiver};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -303,14 +303,14 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
-    fn observe_next_lock_attempt() -> Receiver<()> {
+    fn observe_next_lock_event() -> (Receiver<TestConfigLockEvent>, Sender<TestConfigLockEvent>) {
         let (sender, receiver) = mpsc::channel();
-        let mut observer = crate::config::TEST_CONFIG_LOCK_ATTEMPT
+        let mut observer = config::TEST_CONFIG_LOCK_ATTEMPT
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *observer = Some(sender);
-        receiver
+        *observer = Some(sender.clone());
+        (receiver, sender)
     }
 
     fn with_temp_config_dir() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
@@ -386,6 +386,11 @@ mod tests {
 
     #[test]
     fn phala_key_persistence_preserves_a_concurrent_worker_update() {
+        const INITIAL_EVENT_WAIT: Duration = Duration::from_secs(2);
+        const RELEASE_EVENT_WAIT: Duration = Duration::from_secs(2);
+        const STALE_WRITER_WAIT: Duration = Duration::from_secs(5);
+        const OUTCOME_WAIT: Duration = Duration::from_secs(2);
+
         let (_dir, _guard) = with_temp_config_dir();
         let mut entry = NetworkEntry::default();
         entry.workers.push(WorkerRecord {
@@ -402,8 +407,9 @@ mod tests {
 
         let (stale_loaded_tx, stale_loaded_rx) = mpsc::channel();
         let (allow_stale_save_tx, allow_stale_save_rx) = mpsc::channel();
+        let (worker_result_tx, worker_result_rx) = mpsc::channel();
         let writer = thread::spawn(move || {
-            config::with_config_lock(|| {
+            let saved = config::with_config_lock(|| {
                 // This snapshot predates the key write and models a worker
                 // update already holding the shared config lock.
                 let mut stale = config::load().expect("load under lock");
@@ -411,52 +417,64 @@ mod tests {
                     .send(())
                     .map_err(|_| anyhow::anyhow!("main test thread stopped receiving"))?;
                 allow_stale_save_rx
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(STALE_WRITER_WAIT)
                     .context("timed out waiting to save stale worker update")?;
                 stale.active_entry_mut().workers[0].node_secret = "new-secret".to_owned();
                 config::save(&stale)
             })
-            .is_ok()
+            .is_ok();
+            let _ = worker_result_tx.send(saved);
         });
 
-        let stale_loaded = stale_loaded_rx.recv_timeout(Duration::from_secs(2));
+        let stale_loaded = stale_loaded_rx.recv_timeout(INITIAL_EVENT_WAIT);
         assert!(
             stale_loaded.is_ok(),
             "worker writer must load its stale snapshot within the bounded wait"
         );
 
         // Start the key write while the stale worker writer holds `.lock`.
-        // The test hook is emitted at the lock-attempt boundary, not before a
-        // scheduled thread call, so a delayed thread cannot turn the baseline
-        // into a false pass. The bounded receives only prevent a broken test
-        // from hanging forever if a worker or lock path fails.
-        let lock_attempt = observe_next_lock_attempt();
+        // The shared event channel releases the stale writer on whichever
+        // happens first: the fixed implementation's lock attempt, or the
+        // unlocked baseline's completed key write. This makes the baseline
+        // reach its stale overwrite instead of timing out first.
+        let (event_rx, completion_tx) = observe_next_lock_event();
         let (result_tx, result_rx) = mpsc::channel();
         let key_writer = thread::spawn(move || {
-            result_tx
-                .send(persist_key("test-key").is_ok())
-                .expect("send key writer result");
+            let saved = persist_key("test-key").is_ok();
+            let _ = completion_tx.send(TestConfigLockEvent::OperationCompleted);
+            let _ = result_tx.send(saved);
         });
 
-        // Fixed code emits this signal before blocking on the held lock. The
-        // baseline never emits it; it still completes its unlocked write, and
-        // the stale writer is released after this bounded failed observation.
-        let attempted = lock_attempt.recv_timeout(Duration::from_secs(2));
-        allow_stale_save_tx
-            .send(())
-            .expect("release stale worker writer");
-        assert!(writer.join().expect("writer thread must finish"));
-        let key_saved = result_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("key writer must finish after the lock is released");
-        assert!(key_saved, "key persistence must succeed");
-        key_writer.join().expect("key writer thread must finish");
-        assert!(
-            attempted.is_ok(),
-            "persist_key must enter the shared config lock before saving"
-        );
+        // Release immediately after either event. The outer timeout is
+        // independent from the stale writer's longer deadline, so a missing
+        // event cannot cause that writer to abandon its save before the test
+        // collects both outcomes.
+        let release_event = event_rx.recv_timeout(RELEASE_EVENT_WAIT);
+        let release_sent = allow_stale_save_tx.send(());
+        let worker_saved = worker_result_rx.recv_timeout(OUTCOME_WAIT);
+        let key_saved = result_rx.recv_timeout(OUTCOME_WAIT);
+        let worker_joined = if matches!(&worker_saved, Err(RecvTimeoutError::Timeout)) {
+            None
+        } else {
+            Some(writer.join().is_ok())
+        };
+        let key_joined = if matches!(&key_saved, Err(RecvTimeoutError::Timeout)) {
+            None
+        } else {
+            Some(key_writer.join().is_ok())
+        };
 
         let final_cfg = config::load().expect("reload final config");
+        assert!(release_event.is_ok(), "a bounded release event is required");
+        assert!(release_sent.is_ok(), "stale worker writer must be released");
+        assert_eq!(worker_saved, Ok(true), "stale worker writer must save");
+        assert_eq!(key_saved, Ok(true), "key persistence must succeed");
+        assert_eq!(
+            worker_joined,
+            Some(true),
+            "worker writer must finish cleanly"
+        );
+        assert_eq!(key_joined, Some(true), "key writer must finish cleanly");
         assert_eq!(
             final_cfg.phala_api_key.as_deref(),
             Some("test-key"),
@@ -470,6 +488,11 @@ mod tests {
                 .workers[0]
                 .node_secret,
             "new-secret"
+        );
+        assert_eq!(
+            release_event,
+            Ok(TestConfigLockEvent::LockAttempt),
+            "persist_key must attempt the shared config lock before completion"
         );
     }
 

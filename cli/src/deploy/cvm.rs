@@ -207,15 +207,18 @@ fn parse_phala_cvm_list_page(stdout: &[u8], app_name: &str) -> Result<PhalaCvmLi
     let total_pages = listed
         .total_pages
         .context("phala cvms list --json output is missing `totalPages`")?;
-    if page == 0 || (total_pages > 0 && page > total_pages) {
+    let items = listed
+        .items
+        .context("phala cvms list --json output is missing `items`")?;
+    if page == 0
+        || (total_pages > 0 && page > total_pages)
+        || (total_pages == 0 && (page != 1 || !items.is_empty()))
+    {
         bail!(
             "phala cvms list --json returned invalid pagination (page {page}, totalPages {total_pages})"
         );
     }
 
-    let items = listed
-        .items
-        .context("phala cvms list --json output is missing `items`")?;
     let mut app_id = None;
     for row in items {
         if row.name.as_deref() != Some(app_name) {
@@ -977,13 +980,28 @@ mod tests {
     #[test]
     fn an_empty_workspace_leaves_every_name_free() {
         let found = parse_phala_cvm_list_page(
-            br#"{"success":true,"page":1,"pageSize":50,"total":0,"totalPages":1,"items":[]}"#,
+            br#"{"success":true,"page":1,"pageSize":50,"total":0,"totalPages":0,"items":[]}"#,
             "gm-testnet-zai-a",
         )
         .expect("an empty list must parse")
         .app_id;
 
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn zero_total_pages_are_only_valid_for_an_empty_first_page() {
+        let contradictory_pages = [
+            br#"{"success":true,"page":2,"totalPages":0,"items":[]}"# as &[u8],
+            br#"{"success":true,"page":1,"totalPages":0,"items":[{"app_id":"app_other","name":"gm-testnet-other"}]}"#,
+        ];
+
+        for stdout in contradictory_pages {
+            assert!(
+                parse_phala_cvm_list_page(stdout, "gm-testnet-zai-a").is_err(),
+                "contradictory zero-page metadata must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -1029,6 +1047,29 @@ mod tests {
         });
 
         assert!(result.is_err(), "a failed page must fail closed");
+    }
+
+    #[test]
+    fn a_contradictory_zero_page_from_the_walker_is_not_treated_as_free() {
+        let page_one = br#"{
+            "success":true,"page":1,"pageSize":50,"total":51,"totalPages":2,
+            "items":[{"app_id":"app_other","name":"gm-testnet-other"}]
+        }"#;
+        let page_two = br#"{
+            "success":true,"page":2,"pageSize":50,"total":51,"totalPages":0,
+            "items":[]
+        }"#;
+        let result = find_phala_cvm_app_id_by_name(|page| {
+            parse_phala_cvm_list_page(
+                if page == 1 { page_one } else { page_two },
+                "gm-testnet-colliding",
+            )
+        });
+
+        assert!(
+            result.is_err(),
+            "the walker must propagate contradictory zero-page metadata"
+        );
     }
 
     #[test]
