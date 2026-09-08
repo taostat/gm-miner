@@ -13,6 +13,14 @@ use crate::network::Network;
 #[cfg(test)]
 pub(crate) static TEST_CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// A test-only observer for the exact point where a caller is about to acquire
+// the shared config write lock. This lets concurrency regressions coordinate
+// with the lock attempt instead of relying on thread scheduling.
+#[cfg(test)]
+pub(crate) static TEST_CONFIG_LOCK_ATTEMPT: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+> = std::sync::OnceLock::new();
+
 /// The `sub` claim of a JWT, read without verifying the signature — the gm
 /// registry verifies the token; the CLI only needs the identity it asserts.
 fn jwt_sub(token: &str) -> Option<String> {
@@ -904,10 +912,24 @@ pub fn with_config_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         .open(&path)
         .with_context(|| format!("open lockfile {}", path.display()))?;
     let mut guard = fd_lock::RwLock::new(file);
+    #[cfg(test)]
+    notify_test_config_lock_attempt();
     let _write = guard
         .write()
         .with_context(|| format!("acquire lock on {}", path.display()))?;
     f()
+}
+
+#[cfg(test)]
+fn notify_test_config_lock_attempt() {
+    let observer = TEST_CONFIG_LOCK_ATTEMPT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(observer) = observer {
+        let _ = observer.send(());
+    }
 }
 
 #[cfg(test)]

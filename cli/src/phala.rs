@@ -17,9 +17,6 @@
 
 use std::io::{IsTerminal as _, Write as _};
 
-#[cfg(test)]
-use std::sync::{mpsc::Sender, Mutex, OnceLock};
-
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
@@ -281,31 +278,11 @@ fn prompt_for_key(assume_yes: bool) -> Result<String> {
 /// Persist `key` to gmcli config (network-independent). Loads a fresh config
 /// so a concurrent edit elsewhere is not clobbered, mirroring `set-api-keys`.
 fn persist_key(key: &str) -> Result<()> {
-    #[cfg(test)]
-    notify_test_lock_attempt();
-
     config::with_config_lock(|| {
         let mut cfg: Config = config::load().context("load gmcli config")?;
         cfg.phala_api_key = Some(key.to_owned());
         config::save(&cfg).context("persist Phala Cloud API key")
     })
-}
-
-#[cfg(test)]
-static TEST_LOCK_ATTEMPT: OnceLock<Mutex<Option<Sender<()>>>> = OnceLock::new();
-
-/// Notify the concurrency regression exactly when `persist_key` enters the
-/// shared-lock path. The hook is test-only and never changes production I/O.
-#[cfg(test)]
-fn notify_test_lock_attempt() {
-    let observer = TEST_LOCK_ATTEMPT
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    if let Some(observer) = observer {
-        let _ = observer.send(());
-    }
 }
 
 #[cfg(test)]
@@ -328,7 +305,7 @@ mod tests {
 
     fn observe_next_lock_attempt() -> Receiver<()> {
         let (sender, receiver) = mpsc::channel();
-        let mut observer = super::TEST_LOCK_ATTEMPT
+        let mut observer = crate::config::TEST_CONFIG_LOCK_ATTEMPT
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
