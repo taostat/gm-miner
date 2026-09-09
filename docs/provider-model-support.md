@@ -45,7 +45,9 @@ authority for which explicit routes that registry has published.
 | Model you want to provide | Supported sources |
 |---|---|
 | `claude-fable-5` | Anthropic API: `anthropic/claude-fable-5` (`--anthropic`); Microsoft Foundry: measured-hop transport, feature-gated admission |
+| `claude-fable-5-1` | Anthropic API: `anthropic/claude-fable-5-1` (`--anthropic`); Microsoft Foundry: measured-hop transport, feature-gated admission |
 | `claude-haiku-4-5` | Anthropic API: `anthropic/claude-haiku-4-5` (`--anthropic`); Microsoft Foundry: measured-hop transport, feature-gated admission |
+| `claude-opus-4-6` | Anthropic API: `anthropic/claude-opus-4-6` (`--anthropic`); Microsoft Foundry: measured-hop transport, feature-gated admission |
 | `claude-opus-4-7` | Anthropic API: `anthropic/claude-opus-4-7` (`--anthropic`); Microsoft Foundry: measured-hop transport, feature-gated admission |
 | `claude-opus-4-8` | Anthropic API: `anthropic/claude-opus-4-8` (`--anthropic`); Microsoft Foundry: measured-hop transport, feature-gated admission |
 | `claude-opus-5` | Anthropic API: `anthropic/claude-opus-5` (`--anthropic`); Microsoft Foundry: measured-hop transport, feature-gated admission |
