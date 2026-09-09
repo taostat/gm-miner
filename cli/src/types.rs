@@ -397,6 +397,10 @@ pub struct WorkerEntry {
     pub worker_id: String,
     pub endpoint: String,
     pub status: String,
+    /// Measured compose hash for the live worker image. Older registries may
+    /// omit it; callers must then treat image provenance as unresolved.
+    #[serde(default)]
+    pub image_compose_hash: Option<String>,
     pub last_attestation_at: Option<String>,
     /// Why the registry's last probe rejected this worker, verbatim from the
     /// registry. `status` alone says `failed_attestation` and stops there, so

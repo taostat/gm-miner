@@ -131,9 +131,10 @@ pub struct WorkerRecord {
     /// the provider upstream selectors active when this worker was deployed.
     /// Stored per worker so `register-image` recovery re-sends the deployed
     /// backends instead of relabeling from whatever global config is current
-    /// later. `None` (omitted) means either a fully-direct worker or a record
-    /// written before the per-provider map — in both cases `register-image`
-    /// omits the field and the registry keeps its authoritative stored value.
+    /// later. New deployments store `Some(empty)` for a fully-direct worker;
+    /// `None` is retained only for records written before this provenance map
+    /// existed, so declaration policy treats it as unresolved rather than
+    /// direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backends: Option<std::collections::BTreeMap<String, String>>,
     /// The provider slot ids advertised at deploy time, derived from the
@@ -312,6 +313,8 @@ pub struct ProviderKeys {
     pub azure_foundry_client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_foundry_client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_foundry_deployments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +323,8 @@ pub struct ProviderKeys {
     pub azure_openai_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub azure_openai_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_openai_deployments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub azure_tenant_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -541,6 +546,12 @@ impl ProviderKeys {
     /// a required field.
     pub fn validate_upstreams(&self) -> Result<()> {
         crate::slots::validate_cloud_backend_single_keys(self)?;
+        self.validate_deployment_maps()?;
+        self.validate_anthropic_upstream()?;
+        self.validate_openai_upstream()
+    }
+
+    fn validate_anthropic_upstream(&self) -> Result<()> {
         match self.anthropic_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
             "bedrock" => {
@@ -585,6 +596,10 @@ impl ProviderKeys {
                             "--azure-foundry-client-secret",
                             self.azure_foundry_client_secret.as_deref(),
                         ),
+                        (
+                            "--foundry-deployments",
+                            self.azure_foundry_deployments.as_deref(),
+                        ),
                     ],
                 )?;
                 validate_azure_foundry_endpoint(
@@ -597,6 +612,10 @@ impl ProviderKeys {
                 )
             }
         }
+        Ok(())
+    }
+
+    fn validate_openai_upstream(&self) -> Result<()> {
         match self.openai_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
             "azure" => {
@@ -622,6 +641,10 @@ impl ProviderKeys {
                         ),
                         ("--azure-client-id", self.azure_client_id.as_deref()),
                         ("--azure-client-secret", self.azure_client_secret.as_deref()),
+                        (
+                            "--azure-deployments",
+                            self.azure_openai_deployments.as_deref(),
+                        ),
                     ],
                 )?;
                 validate_azure_openai_endpoint(
@@ -633,14 +656,66 @@ impl ProviderKeys {
         Ok(())
     }
 
+    fn validate_deployment_maps(&self) -> Result<()> {
+        for (name, provider, raw) in [
+            (
+                "AZURE_FOUNDRY_DEPLOYMENTS",
+                gm_cloud_hop::CloudProvider::Foundry,
+                self.azure_foundry_deployments.as_deref(),
+            ),
+            (
+                "AZURE_OPENAI_DEPLOYMENTS",
+                gm_cloud_hop::CloudProvider::AzureOpenAi,
+                self.azure_openai_deployments.as_deref(),
+            ),
+        ] {
+            if let Some(raw) = raw.filter(|value| !value.trim().is_empty()) {
+                gm_cloud_hop::parse_deployment_map(provider, raw)
+                    .with_context(|| format!("validate {name}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Normalize validated deployment maps before they are persisted or
+    /// rendered into the measured image's env file. The hop parser accepts
+    /// harmless boundary spaces, but the env file must carry the canonical
+    /// one-line representation rather than the operator's raw spelling.
+    ///
+    /// # Errors
+    /// Returns an error when an existing non-empty deployment map is invalid.
+    pub fn canonicalize_deployment_maps(&mut self) -> Result<()> {
+        for (name, provider, value) in [
+            (
+                "AZURE_FOUNDRY_DEPLOYMENTS",
+                gm_cloud_hop::CloudProvider::Foundry,
+                &mut self.azure_foundry_deployments,
+            ),
+            (
+                "AZURE_OPENAI_DEPLOYMENTS",
+                gm_cloud_hop::CloudProvider::AzureOpenAi,
+                &mut self.azure_openai_deployments,
+            ),
+        ] {
+            let Some(raw) = value.as_deref().filter(|raw| !raw.trim().is_empty()) else {
+                continue;
+            };
+            let map = gm_cloud_hop::parse_deployment_map(provider, raw)
+                .with_context(|| format!("validate {name}"))?;
+            *value = Some(map.canonical_string());
+        }
+        Ok(())
+    }
+
     /// Registry worker provenance as a per-provider `provider -> adapter` map.
     ///
     /// Each configured cloud upstream contributes one entry, so a worker that
     /// serves Claude on Foundry *and* GPT on Azure declares both
     /// (`{anthropic: foundry, openai: azure}`) instead of collapsing to a
     /// single scalar. An empty map means a fully-direct worker. The registry
-    /// derives the legacy scalar `backend` itself; each offer's `upstream_model`
-    /// still carries the per-model translation detail.
+    /// remains legacy provenance metadata while the deployment maps stay
+    /// inside the measured image; the registry/gateway feature fence owns
+    /// cloud admission.
     #[must_use]
     pub fn worker_backends(&self) -> std::collections::BTreeMap<String, String> {
         let mut backends = std::collections::BTreeMap::new();

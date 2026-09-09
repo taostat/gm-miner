@@ -63,6 +63,7 @@ thiserror    = { workspace = true }
 anyhow       = { workspace = true }
 reqwest      = { workspace = true }
 gm-azure-verify = { workspace = true }
+gm-cloud-hop = { workspace = true }
 axoupdater   = { workspace = true }
 chrono       = { version = "0.4", features = ["serde"] }
 dirs         = "6"
@@ -78,6 +79,7 @@ strum        = { version = "0.28", features = ["derive"] }
 wiremock     = "0.6"
 tokio        = { workspace = true }
 tempfile     = "3"
+mlua         = { version = "0.11", features = ["lua51", "vendored"] }
 chrono       = { version = "0.4", features = ["serde"] }
 rcgen        = "0.14.8"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }

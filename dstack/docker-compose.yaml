@@ -26,10 +26,13 @@
 ## header. It is declared here so it is part of the attestation-measured
 ## compose hash.
 ##
-## The runtime is two co-located processes inside one container: envoy
-## (the data plane on :8080) and gm-miner-attestd (the TEE attestation
-## server). The registry probes :8080 — `x-gm-provider` for capability,
-## and `GET /attestation/info` which envoy routes to attestd.
+## The runtime has two required servers plus one conditional measured process
+## inside one container: envoy (the data plane on :8080),
+## gm-miner-attestd (the TEE attestation server), and gm-cloud-hop when
+## Azure OpenAI or Foundry is selected. The registry probes :8080 —
+## `x-gm-provider` for capability and `GET /attestation/info`, which envoy
+## routes to attestd. The hop is loopback-only and returns to Envoy's
+## existing restricted TLS egress clusters.
 ##
 ## RA-TLS data plane (Mechanism 2 of attestation-and-identity.md): envoy
 ## terminates TLS on :8080 with a certificate minted by dstack's RA-TLS
@@ -85,6 +88,7 @@ services:
       - AZURE_FOUNDRY_RESOURCE_GROUP
       - AZURE_FOUNDRY_CLIENT_ID
       - AZURE_FOUNDRY_CLIENT_SECRET
+      - AZURE_FOUNDRY_DEPLOYMENTS
       - OPENAI_API_KEY
       - OPENAI_UPSTREAM
       - AZURE_OPENAI_ENDPOINT
@@ -94,6 +98,7 @@ services:
       - AZURE_RESOURCE_GROUP
       - AZURE_CLIENT_ID
       - AZURE_CLIENT_SECRET
+      - AZURE_OPENAI_DEPLOYMENTS
       - GOOGLE_API_KEY
       - CHUTES_API_KEY
       - ZAI_API_KEY
@@ -105,6 +110,14 @@ services:
       - NEAR_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
+      ## Hop and gateway request-sizing knobs. They are optional; the image
+      ## applies bounded defaults and the gateway cap is the fallback request
+      ## limit when no hop-specific cap is supplied.
+      - GM_GATEWAY_MAX_REQUEST_BODY_BYTES
+      - GM_CLOUD_HOP_MAX_REQUEST_BYTES
+      - GM_CLOUD_HOP_MAX_BUFFERED_BYTES
+      - GM_CLOUD_HOP_MAX_CONCURRENCY
+      - GM_CLOUD_HOP_TIMEOUT_MS
       ## Active network — `testnet` or `mainnet`. Rendered as a literal
       ## by `gmcli deploy` (not an operator env var), so the value is
       ## part of the attestation-measured compose_hash. The image's

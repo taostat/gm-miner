@@ -10,7 +10,8 @@ use chrono::Utc;
 use clap::Parser as _;
 
 use gm_miner_cli::{
-    client::RegistryClient,
+    client::{RegistryClient, UPSTREAM_MODEL_ECHO_CAPABILITY},
+    cloud_policy::{cloud_fence_required_for_image_recovery, cloud_fence_required_for_worker},
     config::{self, Config, WorkerRecord},
     dependency::{ensure_dependency, PHALA},
     deploy::{
@@ -477,6 +478,74 @@ fn image_is_slot_capable(
     approved.slot_capable()
 }
 
+/// Whether the image that will actually deploy contains the measured cloud
+/// model hop. Cloud upstreams are refused unless the registry-approved image
+/// row carries this feature, so an old gateway/image combination cannot accept
+/// a cloud slot as if it were a direct worker.
+fn image_is_model_hop_capable(
+    args: &DeployArgs,
+    approved: &ImageVersion,
+    versions: &[ImageVersion],
+) -> bool {
+    if let Some(explicit) = args.image_ref.as_deref() {
+        return versions
+            .iter()
+            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.model_hop_capable());
+    }
+    if args.image_repo.is_some() {
+        return false;
+    }
+    approved.model_hop_capable()
+}
+
+/// Keep every worker registration path behind the registry's authoritative
+/// model-echo admission fence. The image feature is checked separately after
+/// the approved image version is selected; this check protects the registry
+/// call itself from an older registry that would treat cloud provenance as an
+/// ordinary offer.
+async fn require_cloud_registration_capability(
+    client: &mut RegistryClient,
+    backends: &std::collections::BTreeMap<String, String>,
+    operation: &str,
+) -> Result<()> {
+    if backends.is_empty() {
+        return Ok(());
+    }
+    require_registry_model_echo_capability(client, operation).await
+}
+
+/// Apply the registration fence using both the worker being (re-)registered's
+/// recorded provenance and the current selector-derived map. An empty current
+/// map is not enough to bypass a cloud or unknown historical record.
+async fn require_cloud_registration_capability_for_worker(
+    client: &mut RegistryClient,
+    config: &Config,
+    app_name: &str,
+    backends: &std::collections::BTreeMap<String, String>,
+    operation: &str,
+) -> Result<()> {
+    if !cloud_fence_required_for_worker(config, app_name, backends) {
+        return Ok(());
+    }
+    if backends.is_empty() {
+        require_registry_model_echo_capability(client, operation).await
+    } else {
+        require_cloud_registration_capability(client, backends, operation).await
+    }
+}
+
+async fn require_registry_model_echo_capability(
+    client: &mut RegistryClient,
+    operation: &str,
+) -> Result<()> {
+    client
+        .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
+        .await
+        .with_context(|| {
+            format!("cloud worker {operation} requires registry capability upstream-model-echo")
+        })
+}
+
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
 /// overridden by `--image-ref`, built locally for `--image-repo`), provision
 /// it, and render the compose template around the resulting digest-pinned ref.
@@ -543,7 +612,7 @@ pub(crate) async fn cmd_deploy(
     }
 
     // Step 1: ensure provider keys are configured.
-    let keys = cfg
+    let mut keys = cfg
         .provider_keys
         .as_ref()
         .filter(|k| k.any_set())
@@ -553,14 +622,25 @@ pub(crate) async fn cmd_deploy(
                  --anthropic <key>` (and/or --openai / --google / --chutes / --zai / --moonshot / --deepinfra / --kubetee / --engy / --moonmath, \
                  or configure --anthropic-upstream bedrock / --openai-upstream azure) first"
             )
-        })?;
+        })?
+        .clone();
     keys.validate_upstreams()?;
+    keys.canonicalize_deployment_maps()?;
     // Derive once so the registry worker-create body and the local
     // WorkerRecord persist exactly the same backend provenance. The registry
     // body always sends the map (authoritative full state); the local record
-    // omits it when empty (a fully-direct worker).
+    // also stores an explicit empty map for a fully-direct worker. `None` is
+    // reserved for legacy records whose provenance was never recorded.
     let worker_backends = keys.worker_backends();
-    let recorded_backends = (!worker_backends.is_empty()).then(|| worker_backends.clone());
+    let recorded_backends = Some(worker_backends.clone());
+    require_cloud_registration_capability_for_worker(
+        client,
+        cfg,
+        &args.app_name,
+        &worker_backends,
+        "registration",
+    )
+    .await?;
 
     // Step 1b: resolve the per-worker node secret. Each worker (CVM)
     // carries its own `x-gm-node-key` secret, never shared with a sibling
@@ -587,6 +667,13 @@ pub(crate) async fn cmd_deploy(
         format_created_at(&approved.created_at),
     );
 
+    if !worker_backends.is_empty() && !image_is_model_hop_capable(args, approved, &versions) {
+        anyhow::bail!(
+            "cloud upstreams require a registry-approved image with the `upstream-model-hop` \
+             feature; select a supported hop image or wait for this image to be admitted"
+        );
+    }
+
     let is_first = *registration == WorkerRegistration::First;
     // A provisional stub from a `worker add` must stay off the worker-#1
     // registration paths even before it has a worker_id; tag it so the
@@ -601,13 +688,13 @@ pub(crate) async fn cmd_deploy(
     let (node_secret, freshly_generated) =
         node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
     let provider_slots = if image_is_slot_capable(args, approved, &versions) {
-        slots::provider_slots_for_keys(keys, &node_secret)?
+        slots::provider_slots_for_keys(&keys, &node_secret)?
     } else {
         // The target image's entrypoint predates slots: it cannot fan out
         // multi-key values or honor x-gm-upstream-slot. Refuse multi-key
         // configs before any CVM launches, and advertise nothing so the
         // worker registers as legacy.
-        slots::reject_multikey_for_legacy_image(keys)?;
+        slots::reject_multikey_for_legacy_image(&keys)?;
         std::collections::BTreeMap::new()
     };
     if freshly_generated {
@@ -657,7 +744,7 @@ pub(crate) async fn cmd_deploy(
     );
     let actual = phala.deploy(
         &target.rendered_compose,
-        keys,
+        &keys,
         &node_secret,
         registry_creds.as_ref(),
         args.boot_timeout_secs,
@@ -828,7 +915,12 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
         existing_app_name,
         backends: register_backends,
         provider_slots,
+        cloud_fence_required,
     } = register_image_context(&cfg, &mut client, app_id).await?;
+
+    if cloud_fence_required {
+        require_registry_model_echo_capability(&mut client, "recovery").await?;
+    }
 
     // register-image is a hidden re-registration path (debug / registry
     // resync), not the guided deploy: a check-only preflight with an install
@@ -935,9 +1027,10 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
 
 /// The backends `register-image` re-sends for a CVM: the recorded map for a
 /// tracked worker, else the current config's map. `None` (omitted) for a
-/// fully-direct worker, or for a record written before the per-provider map —
-/// in both cases the registry keeps its authoritative stored value rather than
-/// the CLI re-asserting a lossy guess that could narrow a mixed worker.
+/// record written before the per-provider map. With no record, a direct-only
+/// config is not enough to rewrite registry provenance, so the registry keeps
+/// its authoritative stored value rather than the CLI re-asserting a lossy
+/// guess that could narrow a mixed worker.
 fn register_image_backends(
     record: Option<&WorkerRecord>,
     cfg: &Config,
@@ -955,6 +1048,7 @@ struct RegisterImageContext {
     existing_app_name: Option<String>,
     backends: Option<std::collections::BTreeMap<String, String>>,
     provider_slots: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    cloud_fence_required: bool,
 }
 
 /// Resolve what `register-image` re-sends for the CVM `app_id`, rejecting a
@@ -1013,6 +1107,7 @@ async fn register_image_context(
         existing_app_name: tracked.map(|w| w.app_name.clone()),
         backends: register_image_backends(tracked, cfg),
         provider_slots,
+        cloud_fence_required: cloud_fence_required_for_image_recovery(cfg, tracked),
     })
 }
 
@@ -1313,6 +1408,8 @@ mod tests {
     use super::*;
     use gm_miner_cli::config::{NetworkEntry, ProviderKeys};
     use std::collections::HashMap;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cfg_with_keys(keys: ProviderKeys) -> Config {
         Config {
@@ -1321,6 +1418,153 @@ mod tests {
             networks: HashMap::from([("testnet".to_owned(), NetworkEntry::default())]),
             ..Default::default()
         }
+    }
+
+    fn registry_cfg(server: &MockServer) -> Config {
+        Config {
+            active_network: Some("testnet".to_owned()),
+            networks: HashMap::from([(
+                "testnet".to_owned(),
+                NetworkEntry {
+                    api_url: Some(server.uri()),
+                    tokens: Some(gm_miner_cli::config::TokenEntry {
+                        access_token: Some("test-token".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_worker_registration_requires_registry_model_echo_capability() {
+        let server = MockServer::start().await;
+        let mut client = RegistryClient::new(registry_cfg(&server));
+        let backends =
+            std::collections::BTreeMap::from([("openai".to_owned(), "azure".to_owned())]);
+
+        let error = require_cloud_registration_capability(&mut client, &backends, "registration")
+            .await
+            .expect_err("legacy registry must reject cloud worker registration");
+        assert!(error.to_string().contains("upstream-model-echo"));
+    }
+
+    #[tokio::test]
+    async fn cloud_worker_recovery_requires_registry_model_echo_capability() {
+        let server = MockServer::start().await;
+        let mut client = RegistryClient::new(registry_cfg(&server));
+        let backends =
+            std::collections::BTreeMap::from([("anthropic".to_owned(), "foundry".to_owned())]);
+
+        let error = require_cloud_registration_capability(&mut client, &backends, "recovery")
+            .await
+            .expect_err("legacy registry must reject cloud worker recovery");
+        assert!(error.to_string().contains("upstream-model-echo"));
+    }
+
+    #[tokio::test]
+    async fn cloud_worker_recovery_proceeds_after_registry_model_echo_capability() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(gm_miner_cli::client::CAPABILITIES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "capabilities": [gm_miner_cli::client::UPSTREAM_MODEL_ECHO_CAPABILITY],
+            })))
+            .mount(&server)
+            .await;
+        let mut client = RegistryClient::new(registry_cfg(&server));
+        let backends =
+            std::collections::BTreeMap::from([("anthropic".to_owned(), "foundry".to_owned())]);
+
+        require_cloud_registration_capability(&mut client, &backends, "recovery")
+            .await
+            .expect("capability-admitted cloud worker recovery");
+    }
+
+    #[tokio::test]
+    async fn worker_registration_fence_unions_selector_recorded_and_unknown_sources() {
+        let server = MockServer::start().await;
+        let mut config = registry_cfg(&server);
+        config.provider_keys = Some(ProviderKeys {
+            openai_upstream: Some("direct".to_owned()),
+            ..Default::default()
+        });
+        config.active_entry_mut().workers.extend([
+            WorkerRecord {
+                app_name: "recorded-cloud".to_owned(),
+                backends: Some(std::collections::BTreeMap::from([(
+                    "openai".to_owned(),
+                    "azure".to_owned(),
+                )])),
+                ..Default::default()
+            },
+            WorkerRecord {
+                app_name: "unknown-provenance".to_owned(),
+                ..Default::default()
+            },
+        ]);
+        let mut client = RegistryClient::new(config.clone());
+
+        for app_name in ["recorded-cloud", "unknown-provenance"] {
+            let error = require_cloud_registration_capability_for_worker(
+                &mut client,
+                &config,
+                app_name,
+                &std::collections::BTreeMap::new(),
+                "registration",
+            )
+            .await
+            .expect_err("historical cloud or unknown provenance must stay fenced");
+            assert!(error.to_string().contains("upstream-model-echo"));
+        }
+
+        let error = require_cloud_registration_capability_for_worker(
+            &mut client,
+            &config,
+            "new-cloud",
+            &std::collections::BTreeMap::from([("anthropic".to_owned(), "foundry".to_owned())]),
+            "registration",
+        )
+        .await
+        .expect_err("current cloud selectors must fence a new worker");
+        assert!(error.to_string().contains("upstream-model-echo"));
+    }
+
+    #[tokio::test]
+    async fn register_image_recovery_fence_does_not_trust_missing_backends() {
+        let server = MockServer::start().await;
+        let mut config = registry_cfg(&server);
+        config.active_entry_mut().workers.extend([
+            WorkerRecord {
+                app_id: "recorded-cloud".to_owned(),
+                backends: Some(std::collections::BTreeMap::from([(
+                    "openai".to_owned(),
+                    "azure".to_owned(),
+                )])),
+                ..Default::default()
+            },
+            WorkerRecord {
+                app_id: "known-direct".to_owned(),
+                backends: Some(std::collections::BTreeMap::new()),
+                ..Default::default()
+            },
+        ]);
+        let mut client = RegistryClient::new(config.clone());
+
+        let cloud = register_image_context(&config, &mut client, "recorded-cloud")
+            .await
+            .expect("recorded cloud context");
+        assert!(cloud.cloud_fence_required);
+        let direct = register_image_context(&config, &mut client, "known-direct")
+            .await
+            .expect("known direct context");
+        assert!(!direct.cloud_fence_required);
+        let unknown = register_image_context(&config, &mut client, "untracked")
+            .await
+            .expect("unknown context");
+        assert!(unknown.cloud_fence_required);
     }
 
     #[test]

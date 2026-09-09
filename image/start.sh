@@ -19,7 +19,11 @@
 #   3. gm-near-verify-proxy (when NEAR_API_KEY is configured) — verifies
 #      nonce-bound TDX, GPU, model and live TLS-key evidence on the exact
 #      upstream connection used for each NEAR inference request.
-#   4. envoy — the data plane on :8080. Terminates RA-TLS with the
+#   4. gm-cloud-hop (when Azure OpenAI or Foundry is configured) — a
+#      loopback-only measured request translator. It rewrites only the
+#      top-level JSON model member, then hands the request back to Envoy's
+#      existing TLS egress clusters; it never opens cloud TLS itself.
+#   5. envoy — the data plane on :8080. Terminates RA-TLS with the
 #      minted certificate, proxies provider inference traffic and the
 #      registry's x-gm-provider capability probes, and forwards
 #      /attestation/info to the attestation server.
@@ -42,8 +46,8 @@
 # Process supervision: required servers run in the background; this script
 # stays PID 1 and watches all of them. When any exits the
 # whole container exits non-zero so the runtime's `restart:
-# unless-stopped` policy recreates the stack — a miner missing either
-# process cannot serve the registry, so crashing fast and recovering is
+# unless-stopped` policy recreates the stack — a miner missing Envoy,
+# attestd, or the configured hop cannot serve the registry, so crashing fast and recovering is
 # the correct behaviour. The exit log names which process died and its
 # status, so a genuine crash is diagnosable from `phala cvms logs`.
 
@@ -243,6 +247,9 @@ ANTHROPIC_SAN_MATCH=exact
 ANTHROPIC_SAN_VALUE="${ANTHROPIC_HOST}"
 ANTHROPIC_STATIC_AUTH=0
 ANTHROPIC_CLOUD=0
+ANTHROPIC_CLOUD_HOP=0
+ANTHROPIC_BEDROCK_UNQUALIFIED=0
+CLOUD_HOP_ENABLED=0
 
 case "${ANTHROPIC_UPSTREAM}" in
   direct) ;;
@@ -273,17 +280,23 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_AUTH_HEADER=x-api-key
     ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(BEDROCK_API_KEY)%"
     ANTHROPIC_VERSION_APPEND_ACTION=OVERWRITE_IF_EXISTS_OR_ADD
-    ANTHROPIC_SAN_MATCH=suffix
-    ANTHROPIC_SAN_VALUE=.api.aws
+    ANTHROPIC_SAN_MATCH=exact
+    # Bedrock's route constructs this exact Mantle hostname from the bounded
+    # region; suffix matching would also admit unrelated *.api.aws certs.
+    # Bedrock remains cloud provenance for the Lua fence, but inference is
+    # rejected inside the image because it has no qualified model echo.
+    ANTHROPIC_SAN_VALUE="${ANTHROPIC_HOST}"
     ANTHROPIC_STATIC_AUTH=1
     ANTHROPIC_CLOUD=1
+    ANTHROPIC_BEDROCK_UNQUALIFIED=1
     ;;
   foundry)
     ## Microsoft Foundry serves Claude on an Anthropic-native passthrough:
     ## POST https://<resource>.services.ai.azure.com/anthropic/v1/messages,
     ## same Messages body, same `anthropic-version` header, `x-api-key` auth.
-    ## The path rewrite is identical to Bedrock's, so the envoy route needs no
-    ## Foundry-specific block. `services.ai.azure.com` is the only host
+    ## The measured cloud hop owns the model rewrite. Envoy's internal egress
+    ## route below performs the fixed path rewrite only after the hop has
+    ## validated the surface. `services.ai.azure.com` is the only host
     ## Microsoft and Anthropic document for this endpoint — do not widen it.
     if [[ -z "${AZURE_FOUNDRY_ENDPOINT:-}" ]]; then
       log "error: AZURE_FOUNDRY_ENDPOINT must be set when ANTHROPIC_UPSTREAM=foundry"
@@ -297,7 +310,7 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_HOST="$(parse_azure_host AZURE_FOUNDRY_ENDPOINT "${AZURE_FOUNDRY_ENDPOINT}")"
     validate_hostname "Microsoft Foundry" "${ANTHROPIC_HOST}"
     require_host_suffix "Microsoft Foundry" "${ANTHROPIC_HOST}" services.ai.azure.com
-    ANTHROPIC_PATH_REWRITE=1
+    ANTHROPIC_PATH_REWRITE=0
     ANTHROPIC_AUTH_HEADER=x-api-key
     ANTHROPIC_AUTH_VALUE="%ENVIRONMENT(AZURE_FOUNDRY_API_KEY)%"
     ANTHROPIC_VERSION_APPEND_ACTION=OVERWRITE_IF_EXISTS_OR_ADD
@@ -305,6 +318,8 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_SAN_VALUE=.services.ai.azure.com
     ANTHROPIC_STATIC_AUTH=1
     ANTHROPIC_CLOUD=1
+    ANTHROPIC_CLOUD_HOP=1
+    CLOUD_HOP_ENABLED=1
     ;;
   *)
     log "error: ANTHROPIC_UPSTREAM must be 'direct', 'bedrock', or 'foundry' (got '${ANTHROPIC_UPSTREAM}')"
@@ -322,6 +337,7 @@ OPENAI_SAN_VALUE="${OPENAI_HOST}"
 OPENAI_AZURE_TLS=0
 OPENAI_STATIC_AUTH=0
 OPENAI_CLOUD=0
+OPENAI_CLOUD_HOP=0
 
 case "${OPENAI_UPSTREAM}" in
   direct) ;;
@@ -348,11 +364,15 @@ case "${OPENAI_UPSTREAM}" in
     OPENAI_SAN_MATCH=suffix
     OPENAI_SAN_VALUE=".${AZURE_OPENAI_SUFFIX}"
     OPENAI_AZURE_TLS=1
-    OPENAI_PATH_REWRITE=1
+    # The measured cloud hop validates the qualified surface and rewrites the
+    # path on Envoy's internal egress leg, next to host/SNI/SAN enforcement.
+    OPENAI_PATH_REWRITE=0
     OPENAI_AUTH_HEADER=api-key
     OPENAI_AUTH_VALUE="%ENVIRONMENT(AZURE_OPENAI_API_KEY)%"
     OPENAI_STATIC_AUTH=1
     OPENAI_CLOUD=1
+    OPENAI_CLOUD_HOP=1
+    CLOUD_HOP_ENABLED=1
     ;;
   *)
     log "error: OPENAI_UPSTREAM must be 'direct' or 'azure' (got '${OPENAI_UPSTREAM}')"
@@ -430,6 +450,10 @@ fi
 
 # ── Fan direct provider keys out into per-slot process env ────────────
 validate_node_secret
+if [[ "${CLOUD_HOP_ENABLED}" -eq 1 && -z "${GM_NODE_SECRET:-}" ]]; then
+  log "error: GM_NODE_SECRET must be set when Azure OpenAI or Foundry cloud slot routing is enabled"
+  exit 1
+fi
 if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
   fan_out_slots anthropic ANTHROPIC_API_KEY
 fi
@@ -462,6 +486,12 @@ if [[ -n "${MOONMATH_API_KEY:-}" ]]; then
 fi
 if [[ -n "${NEAR_API_KEY:-}" ]]; then
   fan_out_slots near NEAR_API_KEY
+fi
+if [[ "${ANTHROPIC_UPSTREAM}" == "foundry" && -n "${AZURE_FOUNDRY_API_KEY:-}" ]]; then
+  fan_out_slots anthropic AZURE_FOUNDRY_API_KEY
+fi
+if [[ "${OPENAI_UPSTREAM}" == "azure" && -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
+  fan_out_slots openai AZURE_OPENAI_API_KEY
 fi
 
 GM_ANTHROPIC_SLOT_MAP="$(lua_slot_map "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
@@ -538,6 +568,13 @@ else
   BENCHMARK_PORT="${benchmark_default_port}"
 fi
 
+# Validate the deployment maps and resource limits before any serving process
+# starts. The binary is in the measured image; render-only tests can inject
+# its workspace-built path through GM_CLOUD_HOP_BIN.
+if [[ "${CLOUD_HOP_ENABLED}" -eq 1 ]]; then
+  "${GM_CLOUD_HOP_BIN:-gm-cloud-hop}" --validate-config
+fi
+
 # ── Gate Azure data-plane startup ─────────────────────────────────────
 # Render-only mode is an offline config check and never starts Envoy. On
 # real Azure startup, fail closed before rendering/provisioning/launching
@@ -579,6 +616,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_ANTHROPIC_VERSION_APPEND_ACTION="${ANTHROPIC_VERSION_APPEND_ACTION}" \
   GM_ANTHROPIC_STATIC_AUTH="${ANTHROPIC_STATIC_AUTH}" \
   GM_ANTHROPIC_CLOUD="$(lua_bool "${ANTHROPIC_CLOUD}")" \
+  GM_ANTHROPIC_CLOUD_HOP="${ANTHROPIC_CLOUD_HOP}" \
+  GM_ANTHROPIC_BEDROCK_UNQUALIFIED="${ANTHROPIC_BEDROCK_UNQUALIFIED}" \
   GM_ANTHROPIC_SLOT_MAP="${GM_ANTHROPIC_SLOT_MAP}" \
   GM_ANTHROPIC_DEFAULT_SLOT_ENV="${GM_ANTHROPIC_DEFAULT_SLOT_ENV}" \
   GM_ANTHROPIC_SAN_MATCH="${ANTHROPIC_SAN_MATCH}" \
@@ -590,6 +629,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_OPENAI_AUTH_VALUE="${OPENAI_AUTH_VALUE}" \
   GM_OPENAI_STATIC_AUTH="${OPENAI_STATIC_AUTH}" \
   GM_OPENAI_CLOUD="$(lua_bool "${OPENAI_CLOUD}")" \
+  GM_OPENAI_CLOUD_HOP="${OPENAI_CLOUD_HOP}" \
   GM_OPENAI_SLOT_MAP="${GM_OPENAI_SLOT_MAP}" \
   GM_OPENAI_DEFAULT_SLOT_ENV="${GM_OPENAI_DEFAULT_SLOT_ENV}" \
   GM_GEMINI_SLOT_MAP="${GM_GEMINI_SLOT_MAP}" \
@@ -638,6 +678,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     anthropic_version_append_action = ENVIRON["GM_ANTHROPIC_VERSION_APPEND_ACTION"]
     anthropic_static_auth = (ENVIRON["GM_ANTHROPIC_STATIC_AUTH"] == "1")
     anthropic_cloud = ENVIRON["GM_ANTHROPIC_CLOUD"]
+    anthropic_cloud_hop = (ENVIRON["GM_ANTHROPIC_CLOUD_HOP"] == "1")
+    anthropic_bedrock_unqualified = (ENVIRON["GM_ANTHROPIC_BEDROCK_UNQUALIFIED"] == "1")
     anthropic_slot_map = ENVIRON["GM_ANTHROPIC_SLOT_MAP"]
     anthropic_default_slot_env = ENVIRON["GM_ANTHROPIC_DEFAULT_SLOT_ENV"]
     anthropic_san_match = ENVIRON["GM_ANTHROPIC_SAN_MATCH"]
@@ -649,6 +691,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     openai_auth_value = ENVIRON["GM_OPENAI_AUTH_VALUE"]
     openai_static_auth = (ENVIRON["GM_OPENAI_STATIC_AUTH"] == "1")
     openai_cloud = ENVIRON["GM_OPENAI_CLOUD"]
+    openai_cloud_hop = (ENVIRON["GM_OPENAI_CLOUD_HOP"] == "1")
     openai_slot_map = ENVIRON["GM_OPENAI_SLOT_MAP"]
     openai_default_slot_env = ENVIRON["GM_OPENAI_DEFAULT_SLOT_ENV"]
     gemini_slot_map = ENVIRON["GM_GEMINI_SLOT_MAP"]
@@ -672,6 +715,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
     openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
+    cloud_hop_enabled = anthropic_cloud_hop || openai_cloud_hop
   }
   /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
   /^[[:space:]]*## gm:benchmark-tls-end[[:space:]]*$/   { in_tls = 0; next }
@@ -682,9 +726,27 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   /^[[:space:]]*## gm:anthropic-static-auth-begin[[:space:]]*$/ { in_anthropic_static_auth = 1; next }
   /^[[:space:]]*## gm:anthropic-static-auth-end[[:space:]]*$/   { in_anthropic_static_auth = 0; next }
   in_anthropic_static_auth && !anthropic_static_auth { next }
+  /^[[:space:]]*## gm:openai-azure-responses-reject-begin[[:space:]]*$/ { in_openai_azure_responses_reject = 1; next }
+  /^[[:space:]]*## gm:openai-azure-responses-reject-end[[:space:]]*$/   { in_openai_azure_responses_reject = 0; next }
+  in_openai_azure_responses_reject && !openai_cloud_hop { next }
+  /^[[:space:]]*## gm:anthropic-cloud-hop-route-begin[[:space:]]*$/ { in_anthropic_cloud_hop_route = 1; next }
+  /^[[:space:]]*## gm:anthropic-cloud-hop-route-end[[:space:]]*$/   { in_anthropic_cloud_hop_route = 0; next }
+  in_anthropic_cloud_hop_route && !anthropic_cloud_hop { next }
+  /^[[:space:]]*## gm:anthropic-bedrock-reject-route-begin[[:space:]]*$/ { in_anthropic_bedrock_reject_route = 1; next }
+  /^[[:space:]]*## gm:anthropic-bedrock-reject-route-end[[:space:]]*$/   { in_anthropic_bedrock_reject_route = 0; next }
+  in_anthropic_bedrock_reject_route && !anthropic_bedrock_unqualified { next }
+  /^[[:space:]]*## gm:anthropic-direct-route-begin[[:space:]]*$/ { in_anthropic_direct_route = 1; next }
+  /^[[:space:]]*## gm:anthropic-direct-route-end[[:space:]]*$/   { in_anthropic_direct_route = 0; next }
+  in_anthropic_direct_route && (anthropic_cloud_hop || anthropic_bedrock_unqualified) { next }
   /^[[:space:]]*## gm:openai-path-rewrite-begin[[:space:]]*$/ { in_openai_path_rewrite = 1; next }
   /^[[:space:]]*## gm:openai-path-rewrite-end[[:space:]]*$/   { in_openai_path_rewrite = 0; next }
   in_openai_path_rewrite && !openai_path_rewrite { next }
+  /^[[:space:]]*## gm:openai-cloud-hop-route-begin[[:space:]]*$/ { in_openai_cloud_hop_route = 1; next }
+  /^[[:space:]]*## gm:openai-cloud-hop-route-end[[:space:]]*$/   { in_openai_cloud_hop_route = 0; next }
+  in_openai_cloud_hop_route && !openai_cloud_hop { next }
+  /^[[:space:]]*## gm:openai-direct-route-begin[[:space:]]*$/ { in_openai_direct_route = 1; next }
+  /^[[:space:]]*## gm:openai-direct-route-end[[:space:]]*$/   { in_openai_direct_route = 0; next }
+  in_openai_direct_route && openai_cloud_hop { next }
   /^[[:space:]]*## gm:openai-system-tls-begin[[:space:]]*$/ { in_openai_system_tls = 1; next }
   /^[[:space:]]*## gm:openai-system-tls-end[[:space:]]*$/   { in_openai_system_tls = 0; next }
   in_openai_system_tls && openai_azure_tls { next }
@@ -694,6 +756,12 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   /^[[:space:]]*## gm:openai-static-auth-begin[[:space:]]*$/ { in_openai_static_auth = 1; next }
   /^[[:space:]]*## gm:openai-static-auth-end[[:space:]]*$/   { in_openai_static_auth = 0; next }
   in_openai_static_auth && !openai_static_auth { next }
+  /^[[:space:]]*## gm:cloud-hop-listener-begin[[:space:]]*$/ { in_cloud_hop_listener = 1; next }
+  /^[[:space:]]*## gm:cloud-hop-listener-end[[:space:]]*$/   { in_cloud_hop_listener = 0; next }
+  in_cloud_hop_listener && !cloud_hop_enabled { next }
+  /^[[:space:]]*## gm:cloud-hop-cluster-begin[[:space:]]*$/ { in_cloud_hop_cluster = 1; next }
+  /^[[:space:]]*## gm:cloud-hop-cluster-end[[:space:]]*$/   { in_cloud_hop_cluster = 0; next }
+  in_cloud_hop_cluster && !cloud_hop_enabled { next }
   {
     line = subst($0, "__GM_BENCHMARK_HOST__", bench_host)
     line = subst(line, "__GM_BENCHMARK_PORT__", bench_port)
@@ -703,6 +771,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_ANTHROPIC_AUTH_VALUE__", anthropic_auth_value)
     line = subst(line, "__GM_ANTHROPIC_VERSION_APPEND_ACTION__", anthropic_version_append_action)
     line = subst(line, "__GM_ANTHROPIC_CLOUD__", anthropic_cloud)
+    line = subst(line, "__GM_ANTHROPIC_CLOUD_HOP__", (anthropic_cloud_hop ? "true" : "false"))
     line = subst(line, "__GM_ANTHROPIC_SLOT_MAP__", anthropic_slot_map)
     line = subst(line, "__GM_ANTHROPIC_DEFAULT_SLOT_ENV__", anthropic_default_slot_env)
     line = subst(line, "__GM_ANTHROPIC_SAN_MATCH__", anthropic_san_match)
@@ -712,6 +781,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_OPENAI_AUTH_HEADER__", openai_auth_header)
     line = subst(line, "__GM_OPENAI_AUTH_VALUE__", openai_auth_value)
     line = subst(line, "__GM_OPENAI_CLOUD__", openai_cloud)
+    line = subst(line, "__GM_OPENAI_CLOUD_HOP__", (openai_cloud_hop ? "true" : "false"))
     line = subst(line, "__GM_OPENAI_SLOT_MAP__", openai_slot_map)
     line = subst(line, "__GM_OPENAI_DEFAULT_SLOT_ENV__", openai_default_slot_env)
     line = subst(line, "__GM_GEMINI_SLOT_MAP__", gemini_slot_map)
@@ -755,7 +825,7 @@ else
 fi
 
 if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" ]]; then
-  log "anthropic route proxies to AWS Bedrock at https://${ANTHROPIC_HOST}:${ANTHROPIC_PORT}"
+  log "anthropic Bedrock inference is rejected as unqualified (configured host https://${ANTHROPIC_HOST}:${ANTHROPIC_PORT} is retained only for non-inference checks)"
 fi
 if [[ "${OPENAI_UPSTREAM}" == "azure" ]]; then
   log "openai route proxies to Azure OpenAI at https://${OPENAI_HOST}:${OPENAI_PORT}"
@@ -788,6 +858,30 @@ log "minting data-plane RA-TLS certificate via dstack get_tls_key"
 gm-miner-ratls
 log "RA-TLS certificate ready"
 
+# Install the trap before starting children: Azure readiness can take time,
+# and PID 1 must forward termination even while the data plane is disabled.
+NEAR_PROXY_PID=""
+ATTESTD_PID=""
+CLOUD_HOP_PID=""
+ENVOY_PID=""
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
+shutdown() {
+  log "received signal — shutting down"
+  local -a pids=()
+  local pid
+  for pid in "${ENVOY_PID}" "${ATTESTD_PID}" "${NEAR_PROXY_PID}" "${CLOUD_HOP_PID}"; do
+    if [[ -n "${pid}" ]]; then
+      pids+=("${pid}")
+    fi
+  done
+  if [[ "${#pids[@]}" -gt 0 ]]; then
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    wait "${pids[@]}" 2>/dev/null || true
+  fi
+  exit 1
+}
+trap shutdown TERM INT
+
 # ── Launch the NEAR attestation proxy ─────────────────────────────────
 # NEAR routes exist only when a key is configured. The long-running proxy
 # verifies each inference over the exact TLS connection it forwards on and
@@ -795,7 +889,6 @@ log "RA-TLS certificate ready"
 # startup dependency: one unavailable model must not take unrelated models
 # or providers out of service. Process supervision below remains the proxy
 # readiness gate; if the proxy itself exits, the whole container exits.
-NEAR_PROXY_PID=""
 if [[ -n "${NEAR_API_KEY:-}" ]]; then
   log "starting NEAR verification proxy on 127.0.0.1:8082"
   gm-near-verify-proxy &
@@ -813,26 +906,42 @@ log "starting attestation server on ${ATTESTD_BIND_ADDR}"
 gm-miner-attestd &
 ATTESTD_PID=$!
 
+# The one-shot check predates certificate provisioning. Wait for the serving
+# verifier to refresh that evidence and start its success-anchored pollers.
+if [[ "${CLOUD_HOP_ENABLED}" -eq 1 ]]; then
+  until gm-miner-attestd --check-ready >/dev/null 2>&1; do
+    if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
+      wait "${ATTESTD_PID}" || true
+      log "error: attestation server exited before Azure readiness"
+      if [[ -n "${NEAR_PROXY_PID}" ]]; then
+        kill -TERM "${NEAR_PROXY_PID}" 2>/dev/null || true
+      fi
+      exit 1
+    fi
+    sleep 0.1
+  done
+fi
+
+# ── Launch the measured cloud hop ──────────────────────────────────────
+# The serving Azure verifier reports fresh bindings before this loopback-only
+# hop starts. The internal Envoy listener is the hop's sole egress and owns the cloud TLS
+# connection. The supervisor below treats an exit exactly like attestd/envoy.
+if [[ "${CLOUD_HOP_ENABLED}" -eq 1 ]]; then
+  log "starting measured cloud hop on 127.0.0.1:8083"
+  "${GM_CLOUD_HOP_BIN:-gm-cloud-hop}" &
+  CLOUD_HOP_PID=$!
+fi
+
 # ── Launch envoy ──────────────────────────────────────────────────────
-# Not `exec`d: the script stays PID 1 so it can supervise both
-# processes. SIGTERM from the container runtime is forwarded to both.
+# Not `exec`d: the script stays PID 1 so it can supervise the attestation
+# server, optional hop, and Envoy. SIGTERM from the container runtime is
+# forwarded to every child.
 log "starting envoy"
 envoy \
   -c "${RENDERED_CONFIG}" \
   --log-level warn \
   --drain-time-s 10 &
 ENVOY_PID=$!
-
-# shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
-shutdown() {
-  log "received signal — shutting down"
-  local -a pids=("${ENVOY_PID}" "${ATTESTD_PID}")
-  if [[ -n "${NEAR_PROXY_PID}" ]]; then
-    pids+=("${NEAR_PROXY_PID}")
-  fi
-  kill -TERM "${pids[@]}" 2>/dev/null || true
-}
-trap shutdown TERM INT
 
 # ── Supervise all serving processes ───────────────────────────────────
 # `jobs -pr` lists only children still running. Poll it from this main shell
@@ -841,7 +950,7 @@ trap shutdown TERM INT
 # keeps the startup/supervision integration tests honest. Whichever process
 # exits first, the container must come down so the runtime's
 # `restart: unless-stopped` policy recreates the whole stack: a miner
-# missing either envoy or attestd cannot serve the registry.
+# missing Envoy, attestd, or the configured hop cannot serve the registry.
 #
 # `|| FIRST_EXIT_STATUS=$?` captures the exited child's status AND keeps
 # `set -e` from aborting the script the instant a process exits
@@ -852,6 +961,9 @@ FIRST_EXIT_PID=""
 SUPERVISED_PIDS=("${ATTESTD_PID}" "${ENVOY_PID}")
 if [[ -n "${NEAR_PROXY_PID}" ]]; then
   SUPERVISED_PIDS+=("${NEAR_PROXY_PID}")
+fi
+if [[ -n "${CLOUD_HOP_PID}" ]]; then
+  SUPERVISED_PIDS+=("${CLOUD_HOP_PID}")
 fi
 while [[ -z "${FIRST_EXIT_PID}" ]]; do
   RUNNING_PIDS=" $(jobs -pr | tr '\n' ' ') "
@@ -874,6 +986,8 @@ elif [[ -n "${NEAR_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${NEAR_PROXY_PID}" ]];
   log "error: NEAR verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 elif [[ "${FIRST_EXIT_PID}" == "${ENVOY_PID}" ]]; then
   log "error: envoy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
+elif [[ -n "${CLOUD_HOP_PID}" && "${FIRST_EXIT_PID}" == "${CLOUD_HOP_PID}" ]]; then
+  log "error: cloud hop exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 else
   log "error: a supervised process exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 fi
@@ -885,7 +999,7 @@ wait 2>/dev/null || true
 # Always exit non-zero so the container runtime's `restart:
 # unless-stopped` policy recreates the stack. A supervised process
 # exiting *at all* — even with a clean status 0 (a graceful or
-# self-initiated shutdown) — leaves the miner missing one of its two
+# self-initiated shutdown) — leaves the miner missing one of its required
 # required services, which is a failure. The exit code is only a
 # diagnostic detail: surface it when it is non-zero, otherwise exit 1
 # so a status-0 child exit is still treated as a container failure.

@@ -4,21 +4,81 @@
 )]
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
 };
 
+use mlua::Lua;
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "700ca5d597201fa90f7d4e3b7d528bcdc7a13f7a1fd63433209d6801ed34b243";
+    "1e30536909f2d5db70e7dec8a5e8eb7c9912cd3e7c30a5cb4ed8614883810522";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("cli crate must live under repo root")
         .to_owned()
+}
+
+fn cloud_hop_binary() -> PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+            let output = Command::new(cargo)
+                .current_dir(repo_root())
+                .args([
+                    "build",
+                    "-p",
+                    "gm-cloud-hop",
+                    "--bin",
+                    "gm-cloud-hop",
+                    "--message-format=json-render-diagnostics",
+                ])
+                .output()
+                .expect("build gm-cloud-hop render fixture");
+            assert!(
+                output.status.success(),
+                "building gm-cloud-hop failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let executable = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|artifact| {
+                    let is_hop_binary = artifact.get("reason").and_then(serde_json::Value::as_str)
+                        == Some("compiler-artifact")
+                        && artifact
+                            .get("target")
+                            .and_then(|target| target.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("gm-cloud-hop")
+                        && artifact
+                            .get("target")
+                            .and_then(|target| target.get("kind"))
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|kind| {
+                                kind.iter().any(|entry| entry.as_str() == Some("bin"))
+                            });
+                    is_hop_binary.then(|| {
+                        artifact
+                            .get("executable")
+                            .and_then(serde_json::Value::as_str)
+                            .map(PathBuf::from)
+                    })
+                })
+                .flatten()
+                .expect("cargo did not report the gm-cloud-hop executable");
+            if executable.is_absolute() {
+                executable
+            } else {
+                repo_root().join(executable)
+            }
+        })
+        .clone()
 }
 
 fn render_envoy<I, K, V>(vars: I) -> (std::process::ExitStatus, String, String, String)
@@ -35,6 +95,7 @@ where
         .env("PATH", "/bin:/usr/bin:/usr/local/bin")
         .env("GM_START_RENDER_ONLY", "1")
         .env("GMCLI_BIN", env!("CARGO_BIN_EXE_gmcli"))
+        .env("GM_CLOUD_HOP_BIN", cloud_hop_binary())
         .env("GM_ENVOY_TEMPLATE_PATH", root.join("image/envoy.yaml"))
         .env("GM_RENDERED_CONFIG", out.path())
         .env("GM_NETWORK", "testnet")
@@ -49,6 +110,30 @@ where
         String::from_utf8_lossy(&output.stderr).into_owned(),
         rendered,
     )
+}
+
+fn data_plane_lua(rendered: &str) -> Option<String> {
+    let (_, rendered) = rendered.split_once("default_source_code:\n")?;
+    let (_, source) = rendered.split_once("inline_string: |\n")?;
+    let source = &source[..source.find("## ── Graceful load shedding")?];
+    let indent = source
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())?;
+    Some(
+        source
+            .lines()
+            .map(|line| line.get(indent..).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn execute_lua(source: &str) {
+    Lua::new()
+        .load(source)
+        .exec()
+        .expect("embedded Lua behavior fixture must pass");
 }
 
 #[test]
@@ -469,17 +554,28 @@ fn bedrock_and_azure_render_cloud_upstreams() {
             "https://gm-resource.openai.azure.com/",
         ),
         ("AZURE_OPENAI_API_KEY", "azure-key"),
+        ("AZURE_OPENAI_DEPLOYMENTS", "gpt-5.5=azure-gpt55"),
     ]);
     assert!(status.success(), "render failed: {stderr}");
 
     assert!(rendered.contains("host_rewrite_literal: bedrock-mantle.us-west-2.api.aws"));
     assert!(rendered.contains("address: bedrock-mantle.us-west-2.api.aws"));
     assert!(rendered.contains("sni: bedrock-mantle.us-west-2.api.aws"));
-    assert!(rendered.contains("suffix: .api.aws"));
-    assert!(!rendered.contains("exact: bedrock-mantle.us-west-2.api.aws"));
-    assert!(rendered.contains("substitution: \"/anthropic/v1/messages\""));
-    assert!(rendered.contains("value: \"%ENVIRONMENT(BEDROCK_API_KEY)%\""));
-    assert!(rendered.contains("append_action: OVERWRITE_IF_EXISTS_OR_ADD"));
+    assert!(rendered.contains("exact: bedrock-mantle.us-west-2.api.aws"));
+    assert!(!rendered.contains("suffix: .api.aws"));
+    let ingress = rendered
+        .split_once("    - name: cloud_hop_egress")
+        .map_or(rendered.as_str(), |(ingress, _)| ingress);
+    assert!(
+        ingress.contains("status: 400")
+            && ingress.contains("AWS Bedrock is unqualified inside this image"),
+        "Bedrock inference must be rejected in the ingress route"
+    );
+    assert!(
+        !ingress.contains("host_rewrite_literal: bedrock-mantle.us-west-2.api.aws"),
+        "Bedrock must not have a direct ingress route to the Anthropic cluster"
+    );
+    assert!(!ingress.contains("%ENVIRONMENT(BEDROCK_API_KEY)%"));
     assert!(!rendered.contains("local function json_error"));
 
     assert!(rendered.contains("host_rewrite_literal: gm-resource.openai.azure.com"));
@@ -488,20 +584,61 @@ fn bedrock_and_azure_render_cloud_upstreams() {
     assert!(rendered.contains("filename: /etc/ssl/certs/ca-certificates.crt"));
     assert!(rendered.contains("suffix: .openai.azure.com"));
     assert!(!rendered.contains("exact: gm-resource.openai.azure.com"));
-    assert!(rendered.contains("regex: \"^/v1/(chat/completions|responses)$\""));
-    assert!(rendered.contains("substitution: \"/openai/v1/\\\\1\""));
+    assert!(rendered.contains("regex: \"^/v1/chat/completions$\""));
+    assert!(rendered.contains("substitution: \"/openai/v1/chat/completions\""));
+    assert!(!rendered.contains("regex: \"^/v1/(chat/completions|responses)$\""));
+    assert!(!rendered.contains("substitution: \"/openai/v1/\\\\1\""));
+    assert!(rendered.contains("port_value: 8083"));
+    assert!(rendered.contains("key: x-gm-cloud-hop-provider"));
     assert!(rendered.contains("key: api-key"));
-    assert!(rendered.contains("value: \"%ENVIRONMENT(AZURE_OPENAI_API_KEY)%\""));
+    assert!(rendered.contains("value: \"%ENVIRONMENT(GM_OPENAI_KEY_SLOT_1)%\""));
 }
 
 #[test]
-fn azure_openai_rewrites_both_chat_completions_and_responses() {
-    // Azure OpenAI serves its OpenAI-compatible surface under /openai/v1,
-    // so the path rewrite must map BOTH the chat-completions and the
-    // Responses-API inbound paths to their /openai/v1 forms. The gateway
-    // forwards POST /v1/responses to the miner verbatim (gm gateway,
-    // pipeline/openai_responses.rs), and an Azure miner that only rewrites
-    // chat/completions 404s every Responses request upstream.
+fn bedrock_inference_render_contract_is_structural() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "bedrock"),
+        ("BEDROCK_REGION", "us-west-2"),
+        ("BEDROCK_API_KEY", "bedrock-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert!(rendered.contains("AWS Bedrock is unqualified inside this image"));
+    assert!(
+        rendered.contains(
+            "if cfg.cloud and not cfg.cloud_hop then\n                              if requested ~= nil then\n                                slot_unavailable(handle, requested)"
+        ),
+        "supplied Bedrock slots must take the 421 unavailable-slot branch"
+    );
+}
+
+#[test]
+fn bedrock_slot_guard_executes_lua() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "bedrock"),
+        ("BEDROCK_REGION", "us-west-2"),
+        ("BEDROCK_API_KEY", "bedrock-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    let source = data_plane_lua(&rendered).expect("data-plane Lua source");
+    assert!(
+        source.contains("if requested ~= nil then")
+            && source.contains("slot_unavailable(handle, requested)"),
+        "Bedrock's supplied-slot branch must use the 421 structural contract"
+    );
+    assert!(
+        source.contains("AWS Bedrock is unqualified inside this image"),
+        "Bedrock's no-slot branch must remain the unqualified-surface rejection"
+    );
+    let mut script = source;
+    script.push_str(include_str!("fixtures/bedrock_slot_guard.lua"));
+    execute_lua(&script);
+}
+
+#[test]
+fn azure_openai_rewrites_only_qualified_chat_completions() {
+    // Azure chat completions is qualified by the dated model echo. Azure
+    // Responses is intentionally rejected because its echo is the deployment
+    // name, so only the qualified path enters the hop and egress rewrite.
     let (status, _, stderr, rendered) = render_envoy([
         ("OPENAI_UPSTREAM", "azure"),
         (
@@ -509,6 +646,7 @@ fn azure_openai_rewrites_both_chat_completions_and_responses() {
             "https://gm-resource.openai.azure.com/",
         ),
         ("AZURE_OPENAI_API_KEY", "azure-key"),
+        ("AZURE_OPENAI_DEPLOYMENTS", "gpt-5.5=azure-gpt55"),
     ]);
     assert!(status.success(), "render failed: {stderr}");
     let route = rendered
@@ -516,13 +654,20 @@ fn azure_openai_rewrites_both_chat_completions_and_responses() {
         .and_then(|(_, rest)| rest.split_once("request_headers_to_remove"))
         .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
     assert!(
-        route.contains("regex: \"^/v1/(chat/completions|responses)$\""),
-        "rewrite must cover both OpenAI surfaces"
+        route.contains("cluster: cloud_hop") && rendered.contains("key: x-gm-cloud-hop-provider"),
+        "qualified OpenAI surfaces must enter the measured cloud hop"
     );
+    let egress = rendered
+        .split_once("stat_prefix: cloud_hop_egress_http")
+        .map_or_else(|| rendered.clone(), |(_, block)| block.to_owned());
     assert!(
-        route.contains("substitution: \"/openai/v1/\\\\1\""),
-        "rewrite must prepend /openai/v1 to the captured surface"
+        egress.contains("regex: \"^/v1/chat/completions$\"")
+            && egress.contains("substitution: \"/openai/v1/chat/completions\""),
+        "Envoy's egress cluster must rewrite the qualified chat surface"
     );
+    assert!(egress.contains("stream_idle_timeout: 1800s"));
+    assert!(!egress.contains("^/v1/(chat/completions|responses)$"));
+    assert!(rendered.contains("gm_unqualified_surface"));
 }
 
 #[test]
@@ -551,6 +696,10 @@ fn foundry_renders_anthropic_native_passthrough() {
             "https://gm-resource.services.ai.azure.com/",
         ),
         ("AZURE_FOUNDRY_API_KEY", "foundry-key"),
+        (
+            "AZURE_FOUNDRY_DEPLOYMENTS",
+            "claude-sonnet-4-6=gm-echo-test",
+        ),
     ]);
     assert!(status.success(), "render failed: {stderr}");
 
@@ -562,10 +711,11 @@ fn foundry_renders_anthropic_native_passthrough() {
     // Foundry's Anthropic passthrough takes the same path rewrite as Bedrock.
     assert!(rendered.contains("substitution: \"/anthropic/v1/messages\""));
     assert!(rendered.contains("key: x-api-key"));
-    assert!(rendered.contains("value: \"%ENVIRONMENT(AZURE_FOUNDRY_API_KEY)%\""));
+    assert!(rendered.contains("value: \"%ENVIRONMENT(GM_ANTHROPIC_KEY_SLOT_1)%\""));
     assert!(rendered.contains("append_action: OVERWRITE_IF_EXISTS_OR_ADD"));
-    // Cloud backends are single-slot: no slot fan-out Lua.
-    assert!(!rendered.contains("local function json_error"));
+    assert!(rendered.contains("GM_ANTHROPIC_KEY_SLOT_1"));
+    assert!(rendered.contains("if env_name == nil or getenv(env_name) == nil then"));
+    assert!(rendered.contains("port_value: 8084"));
     // The key never reaches the rendered config or the logs.
     assert!(!rendered.contains("foundry-key"));
     assert!(!stderr.contains("foundry-key"));
@@ -643,6 +793,7 @@ fn azure_render_uses_suffix_san_for_each_allowed_endpoint_suffix() {
             ("OPENAI_UPSTREAM", "azure"),
             ("AZURE_OPENAI_ENDPOINT", endpoint),
             ("AZURE_OPENAI_API_KEY", "azure-key"),
+            ("AZURE_OPENAI_DEPLOYMENTS", "gpt-5.5=azure-gpt55"),
         ]);
         assert!(status.success(), "render failed for {endpoint}: {stderr}");
 
@@ -673,6 +824,114 @@ fn cloud_backend_multikey_fails_fast() {
     assert!(stderr.contains("BEDROCK_API_KEY cannot contain ';'"));
     assert!(!stderr.contains("bedrock-a"));
     assert!(!stderr.contains("bedrock-b"));
+}
+
+fn assert_rendered_cloud_slot_contract(rendered: &str) {
+    let lua = data_plane_lua(rendered).expect("data-plane Lua source");
+    assert!(lua.contains("cloud = true"), "cloud slot config is missing");
+    assert!(
+        lua.contains("cloud_hop = true"),
+        "hop slot config is missing"
+    );
+    assert!(
+        lua.contains("gm_slot_unavailable") && lua.contains("[\":status\"] = \"421\""),
+        "qualified slot rejection must remain a 421"
+    );
+    assert!(
+        lua.contains("missing or invalid x-gm-node-key"),
+        "the node-secret guard must remain before slot selection"
+    );
+}
+
+fn execute_cloud_slot_fixture(rendered: &str, provider: &str, request_path: &str, slot_env: &str) {
+    let source = data_plane_lua(rendered).expect("data-plane Lua source");
+    let mut script = source;
+    script.push_str(include_str!("fixtures/cloud_slot_guard.lua"));
+    let current_key = if provider == "openai" {
+        "azure-key"
+    } else {
+        "foundry-key"
+    };
+    let script = script
+        .replace(
+            "__EXPECTED_SLOT__",
+            &gm_miner_cli::slots::derive_slot_id(provider, current_key, "test-node-secret-0001")
+                .expect("current HMAC slot"),
+        )
+        .replace(
+            "__OLD_SLOT__",
+            &gm_miner_cli::slots::derive_slot_id(
+                provider,
+                "retired-cloud-key",
+                "test-node-secret-0001",
+            )
+            .expect("old HMAC slot"),
+        )
+        .replace("__SLOT_ENV__", slot_env)
+        .replace("__PROVIDER__", provider)
+        .replace("__REQUEST_PATH__", request_path);
+    execute_lua(&script);
+}
+
+#[test]
+fn cloud_slot_guard_executes_lua_and_keeps_structural_coverage() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("OPENAI_UPSTREAM", "azure"),
+        (
+            "AZURE_OPENAI_ENDPOINT",
+            "https://gm-resource.openai.azure.com/",
+        ),
+        ("AZURE_OPENAI_API_KEY", "azure-key"),
+        ("AZURE_OPENAI_DEPLOYMENTS", "gpt-5.5=azure-gpt55"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert_rendered_cloud_slot_contract(&rendered);
+    execute_cloud_slot_fixture(
+        &rendered,
+        "openai",
+        "/v1/chat/completions",
+        "GM_OPENAI_KEY_SLOT_1",
+    );
+}
+
+#[test]
+fn foundry_slot_guard_executes_lua() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "foundry"),
+        (
+            "AZURE_FOUNDRY_ENDPOINT",
+            "https://gm-resource.services.ai.azure.com/",
+        ),
+        ("AZURE_FOUNDRY_API_KEY", "foundry-key"),
+        (
+            "AZURE_FOUNDRY_DEPLOYMENTS",
+            "claude-sonnet-4-6=gm-echo-test",
+        ),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert_rendered_cloud_slot_contract(&rendered);
+    execute_cloud_slot_fixture(
+        &rendered,
+        "anthropic",
+        "/v1/messages",
+        "GM_ANTHROPIC_KEY_SLOT_1",
+    );
+}
+
+#[test]
+fn cloud_requires_node_secret_for_slot_derivation() {
+    let (status, _, stderr, _) = render_envoy([
+        ("GM_NODE_SECRET", ""),
+        ("OPENAI_UPSTREAM", "azure"),
+        (
+            "AZURE_OPENAI_ENDPOINT",
+            "https://gm-resource.openai.azure.com/",
+        ),
+        ("AZURE_OPENAI_API_KEY", "azure-key"),
+        ("AZURE_OPENAI_DEPLOYMENTS", "gpt-5.5=azure-gpt55"),
+    ]);
+    assert!(!status.success(), "cloud slots need a node secret");
+    assert!(stderr.contains("GM_NODE_SECRET must be set"), "{stderr}");
 }
 
 #[test]

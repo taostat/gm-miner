@@ -425,6 +425,7 @@ fn wizard_provider_keys(
                 resource_group: keys.azure_foundry_resource_group,
                 client_id: keys.azure_foundry_client_id,
                 client_secret: keys.azure_foundry_client_secret,
+                deployments: keys.azure_foundry_deployments,
             },
             keys.openai,
             keys.openai_upstream,
@@ -435,6 +436,7 @@ fn wizard_provider_keys(
             keys.azure_resource_group,
             keys.azure_client_id,
             keys.azure_client_secret,
+            keys.azure_openai_deployments,
             keys.google,
             keys.chutes,
             keys.zai,
@@ -450,7 +452,10 @@ fn wizard_provider_keys(
 
 fn wizard_has_provider_key(keys: &ProviderKeys) -> bool {
     keys.anthropic.is_some()
+        || keys.bedrock_api_key.is_some()
+        || keys.azure_foundry_api_key.is_some()
         || keys.openai.is_some()
+        || keys.azure_openai_api_key.is_some()
         || keys.google.is_some()
         || keys.chutes.is_some()
         || keys.zai.is_some()
@@ -476,6 +481,7 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         azure_foundry_resource_group: None,
         azure_foundry_client_id: None,
         azure_foundry_client_secret: None,
+        azure_foundry_deployments: None,
         openai: prompt_line("OpenAI API key (blank to skip):", assume_yes)?,
         openai_upstream: None,
         azure_openai_endpoint: None,
@@ -485,6 +491,7 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         azure_resource_group: None,
         azure_client_id: None,
         azure_client_secret: None,
+        azure_openai_deployments: None,
         google: prompt_line("Google API key (blank to skip):", assume_yes)?,
         chutes: prompt_line("Chutes API key (blank to skip):", assume_yes)?,
         zai: prompt_line("Z.ai API key (blank to skip):", assume_yes)?,
@@ -510,6 +517,9 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     if keys.bedrock_api_key.is_some() {
         cmd.push_str(" --bedrock-region <region> --bedrock-api-key <key>");
     }
+    if keys.azure_foundry_deployments.is_some() {
+        cmd.push_str(" --foundry-deployments <map>");
+    }
     if keys.openai.is_some() {
         cmd.push_str(" --openai <key>");
     }
@@ -518,6 +528,9 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     }
     if keys.azure_openai_api_key.is_some() {
         cmd.push_str(" --azure-openai-endpoint <url> --azure-openai-api-key <key>");
+    }
+    if keys.azure_openai_deployments.is_some() {
+        cmd.push_str(" --azure-deployments <map>");
     }
     if keys.google.is_some() {
         cmd.push_str(" --google <key>");

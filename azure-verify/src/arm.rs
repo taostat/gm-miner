@@ -154,6 +154,8 @@ pub(crate) struct ArmDeploymentProperties {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArmDeploymentModel {
     pub(crate) format: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) version: Option<String>,
 }
 
 /// Deployments with this model format are served by Anthropic, not by Azure's
@@ -551,5 +553,33 @@ mod tests {
                 .expect("ARM child row must parse");
 
         assert_eq!(child.leaf_name(), "store");
+    }
+
+    #[test]
+    fn deployment_model_preserves_arm_name_and_version() {
+        let openai: ArmDeployment = serde_json::from_str(
+            r#"{"name":"gpt-5","properties":{"model":{
+                "format":"OpenAI","name":"gpt-5","version":"2025-08-07"
+            }}}"#,
+        )
+        .expect("Azure OpenAI deployment must parse");
+        assert_eq!(openai.properties.model.format.as_deref(), Some("OpenAI"));
+        assert_eq!(openai.properties.model.name.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            openai.properties.model.version.as_deref(),
+            Some("2025-08-07")
+        );
+
+        let foundry: ArmDeployment = serde_json::from_str(
+            r#"{"name":"claude","properties":{"model":{
+                "format":"Anthropic","name":"claude-opus-4-6","version":"1"
+            }}}"#,
+        )
+        .expect("Foundry deployment must parse");
+        assert_eq!(
+            foundry.properties.model.name.as_deref(),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(foundry.properties.model.version.as_deref(), Some("1"));
     }
 }

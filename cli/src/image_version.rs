@@ -77,7 +77,7 @@ pub struct AdminImageVersionRequest {
 
 /// Features this release's image supports. Stamped verbatim onto every
 /// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 1] = ["upstream-key-slots"];
+pub const IMAGE_FEATURES: [&str; 2] = ["upstream-key-slots", "upstream-model-hop"];
 
 /// The git provenance stamped onto a published version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -168,6 +168,41 @@ pub async fn post_admin_image_version(
     body: &AdminImageVersionRequest,
 ) -> Result<String> {
     let client = crate::client::build_http_client()?;
+    if body
+        .features
+        .iter()
+        .any(|feature| feature == "upstream-model-hop")
+    {
+        let capabilities_url = format!("{registry_url}{}", crate::client::CAPABILITIES_PATH);
+        let capabilities_response = client
+            .get(&capabilities_url)
+            .send()
+            .await
+            .with_context(|| format!("GET {capabilities_url}"))?;
+        let capabilities_status = capabilities_response.status();
+        if !capabilities_status.is_success() {
+            bail!(
+                "registry does not advertise capability 'upstream-model-echo': GET {} returned {capabilities_status}",
+                crate::client::CAPABILITIES_PATH
+            );
+        }
+        let capabilities_body = capabilities_response
+            .json::<serde_json::Value>()
+            .await
+            .context("parse registry capability response")?;
+        let advertised = crate::client::capability_is_advertised(
+            &capabilities_body,
+            crate::client::UPSTREAM_MODEL_ECHO_CAPABILITY,
+        )
+        .context("validate registry capability response")?;
+        if !advertised {
+            bail!(
+                "registry does not advertise capability '{}' in {}",
+                crate::client::UPSTREAM_MODEL_ECHO_CAPABILITY,
+                crate::client::CAPABILITIES_PATH
+            );
+        }
+    }
     let url = format!("{registry_url}{ADMIN_IMAGE_VERSIONS_PATH}");
 
     let resp = client
@@ -199,6 +234,105 @@ pub async fn post_admin_image_version(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("ok")
         .to_owned())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests intentionally panic on unexpected values"
+)]
+mod publication_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn image_publication_requires_the_upstream_model_echo_capability() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(crate::client::CAPABILITIES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "capabilities": ["other-capability"]
+            })))
+            .mount(&server)
+            .await;
+        let body = build_admin_request(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            "ghcr.io/taostat/gm-miner@sha256:abc",
+            Network::Testnet,
+            &GitProvenance::default(),
+        );
+
+        let error = post_admin_image_version(&server.uri(), "admin-key", &body)
+            .await
+            .expect_err("an image carrying upstream-model-hop must be fenced");
+        assert!(
+            error.to_string().contains("upstream-model-echo"),
+            "{error:#}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn image_publication_rejects_a_malformed_capability_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(crate::client::CAPABILITIES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "capabilities": ["upstream-model-echo", false]
+            })))
+            .mount(&server)
+            .await;
+        let body = build_admin_request(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            "ghcr.io/taostat/gm-miner@sha256:abc",
+            Network::Testnet,
+            &GitProvenance::default(),
+        );
+
+        let error = post_admin_image_version(&server.uri(), "admin-key", &body)
+            .await
+            .expect_err("a malformed capability list must be a hard fence");
+        assert!(format!("{error:#}").contains("non-string"), "{error:#}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn image_publication_posts_after_the_upstream_model_echo_capability() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(crate::client::CAPABILITIES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "capabilities": [crate::client::UPSTREAM_MODEL_ECHO_CAPABILITY]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ADMIN_IMAGE_VERSIONS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "action": "inserted"
+            })))
+            .mount(&server)
+            .await;
+        let body = build_admin_request(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            "ghcr.io/taostat/gm-miner@sha256:abc",
+            Network::Testnet,
+            &GitProvenance::default(),
+        );
+
+        assert_eq!(
+            post_admin_image_version(&server.uri(), "admin-key", &body)
+                .await
+                .expect("capability-admitted publication"),
+            "inserted"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -296,7 +430,10 @@ mod tests {
         assert!(obj.contains_key("notes"));
         assert!(obj.contains_key("image_ref"));
         // Every published row carries this release's capability stamp.
-        assert_eq!(json["features"], serde_json::json!(["upstream-key-slots"]),);
+        assert_eq!(
+            json["features"],
+            serde_json::json!(["upstream-key-slots", "upstream-model-hop"]),
+        );
     }
 
     #[test]

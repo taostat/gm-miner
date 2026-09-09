@@ -47,21 +47,29 @@ fn env_selects_azure() -> bool {
     selected("OPENAI_UPSTREAM", "azure") || selected("ANTHROPIC_UPSTREAM", "foundry")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Log to stderr, not stdout: the container entrypoint (start.sh)
-    // also logs to stderr, so a single stream keeps attestd's and the
-    // entrypoint's lines correctly interleaved in `phala cvms logs`,
-    // and an anyhow fatal-error printout (also stderr) lands in order.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+fn main() -> Result<()> {
+    run_with_runtime(run())
+}
+
+fn run_with_runtime(future: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(future);
+    // DNS uses blocking tasks that cancellation cannot stop. Once the server
+    // exits, main must return so PID 1 can stop the data plane without waiting
+    // for a stalled resolver thread to finish.
+    runtime.shutdown_background();
+    result
+}
+
+async fn run() -> Result<()> {
+    init_logging();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--check-ready"] {
+        return check_readiness(DEFAULT_BIND_ADDR).await;
+    }
     if args == [VERIFY_AZURE_ONCE_ARG] {
         tracing::info!("running one-shot Azure owner-capture verification");
         verify_azure_config_from_env()
@@ -110,49 +118,198 @@ async fn main() -> Result<()> {
     // (`OPENAI_UPSTREAM=azure`) and Claude on Microsoft Foundry
     // (`ANTHROPIC_UPSTREAM=foundry`). Either may be configured, or both.
     let azure_upstream = env_selects_azure();
-    if azure_upstream {
-        tracing::info!("verifying Azure owner-capture controls");
-        if let Err(err) = verify_azure_config_from_env().await {
-            anyhow::bail!("Azure owner-capture verification failed: {err:#}");
-        }
-    }
-
-    let app = Router::new()
-        .route("/attestation/info", get(attestation_info))
-        .with_state(provider);
+    let verified_targets = if azure_upstream {
+        verify_azure_config_from_env()
+            .await
+            .context("Azure owner-capture verification failed")?
+    } else {
+        Vec::new()
+    };
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("bind attestation server to {bind_addr}"))?;
+    let (fatal_shutdown_tx, fatal_shutdown_rx) = oneshot::channel();
+    let (_periodic_azure_verify_task, readiness) =
+        spawn_periodic_azure_verification_from_env(fatal_shutdown_tx, verified_targets)
+            .await
+            .context("start periodic Azure owner-capture verification")?;
+    let azure_shutdown_rx = azure_upstream.then_some(fatal_shutdown_rx);
+    let app = Router::new()
+        .route("/attestation/info", get(attestation_info))
+        .route(
+            "/readyz",
+            get(move || {
+                let fresh = readiness.is_fresh();
+                async move {
+                    if fresh {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
+        .with_state(provider);
     tracing::info!(bind_addr = %bind_addr, "miner attestation server listening");
 
-    let (_periodic_azure_verify_task, azure_shutdown_rx) = if azure_upstream {
-        let (fatal_shutdown_tx, fatal_shutdown_rx) = oneshot::channel();
-        let task = spawn_periodic_azure_verification_from_env(fatal_shutdown_tx)
-            .context("start periodic Azure owner-capture verification")?;
-        (task, Some(fatal_shutdown_rx))
-    } else {
-        (None, None)
+    serve_attestation(listener, app, azure_shutdown_rx).await
+}
+
+fn init_logging() {
+    // Log to stderr, not stdout: the container entrypoint (start.sh)
+    // also logs to stderr, so a single stream keeps attestd's and the
+    // entrypoint's lines correctly interleaved in `phala cvms logs`,
+    // and an anyhow fatal-error printout (also stderr) lands in order.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+}
+
+async fn check_readiness(addr: &str) -> Result<()> {
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(1))
+        .build()?
+        .get(format!("http://{addr}/readyz"))
+        .send()
+        .await
+        .context("read local Azure readiness")?;
+    anyhow::ensure!(
+        response.status() == reqwest::StatusCode::OK,
+        "Azure bindings are not ready"
+    );
+    Ok(())
+}
+
+async fn serve_attestation(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    azure_shutdown_rx: Option<oneshot::Receiver<String>>,
+) -> Result<()> {
+    let Some(azure_shutdown_rx) = azure_shutdown_rx else {
+        return axum::serve(listener, app)
+            .await
+            .context("attestation server terminated");
+    };
+    // A fatal verification failure must end the process even if an attestation
+    // request is still waiting on dstack; a graceful drain would keep Envoy alive.
+    tokio::select! {
+        result = axum::serve(listener, app) => result.context("attestation server terminated"),
+        reason = azure_shutdown_rx => {
+            let reason = reason.unwrap_or_else(|_| "periodic Azure verification task ended".to_owned());
+            anyhow::bail!("attestd stopped after periodic Azure verification failure: {reason}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "local server regression fixtures")]
+mod tests {
+    use super::{check_readiness, run_with_runtime, serve_attestation};
+    use axum::{routing::get, Router};
+    use std::{sync::Arc, time::Duration};
+    use tokio::{
+        io::AsyncWriteExt as _,
+        net::{TcpListener, TcpStream},
+        sync::{oneshot, Notify},
     };
 
-    if let Some(azure_shutdown_rx) = azure_shutdown_rx {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let reason = azure_shutdown_rx.await.unwrap_or_else(|_| {
-                    "periodic Azure owner-capture verification task ended".to_owned()
-                });
-                tracing::error!(
-                    reason = %reason,
-                    "stopping attestd after Azure owner-capture verification failure",
-                );
-            })
-            .await
-            .context("attestation server terminated")?;
-        anyhow::bail!("attestd stopped after periodic Azure owner-capture verification failure");
+    #[tokio::test]
+    async fn readiness_probe_requires_a_fresh_server_response() {
+        for code in [
+            axum::http::StatusCode::OK,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::http::StatusCode::FOUND,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("local listener");
+            let addr = listener.local_addr().expect("local address");
+            let app = Router::new().route(
+                "/readyz",
+                get(move || async move { (code, [("location", "/readyz")]) }),
+            );
+            let task = tokio::spawn(serve_attestation(listener, app, None));
+            assert_eq!(
+                check_readiness(&addr.to_string()).await.is_ok(),
+                code == axum::http::StatusCode::OK
+            );
+            task.abort();
+        }
     }
 
-    axum::serve(listener, app)
-        .await
-        .context("attestation server terminated")?;
-    Ok(())
+    #[tokio::test]
+    async fn fatal_verification_does_not_wait_for_inflight_attestation() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local listener");
+        let addr = listener.local_addr().expect("listener address");
+        let entered = Arc::new(Notify::new());
+        let notify = entered.clone();
+        let app = Router::new().route(
+            "/pending",
+            get(move || async move {
+                notify.notify_one();
+                std::future::pending::<()>().await;
+                "unreachable"
+            }),
+        );
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(serve_attestation(listener, app, Some(rx)));
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("send request");
+        entered.notified().await;
+        tx.send("stale binding".to_owned()).expect("fatal receiver");
+        let result = tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("fatal verification must bypass graceful drain")
+            .expect("server task");
+        assert!(result
+            .expect_err("fatal shutdown")
+            .to_string()
+            .contains("stale binding"));
+    }
+
+    #[test]
+    fn fatal_verification_exits_with_a_pending_blocking_task() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = run_with_runtime(async move {
+                let (entered_tx, entered_rx) = oneshot::channel();
+                tokio::task::spawn_blocking(move || {
+                    entered_tx.send(()).expect("blocking task entered");
+                    release_rx.recv().expect("release blocking task");
+                });
+                entered_rx.await.expect("blocking task running");
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let (fatal_tx, fatal_rx) = oneshot::channel();
+                fatal_tx
+                    .send("stale binding".to_owned())
+                    .expect("fatal reason");
+                started_tx.send(()).expect("fatal ready");
+                serve_attestation(listener, Router::new(), Some(fatal_rx)).await
+            });
+            finished_tx.send(result).expect("runtime result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fixture startup");
+        let result = finished_rx.recv_timeout(Duration::from_millis(200));
+        release_tx.send(()).expect("unblock fixture for cleanup");
+        thread.join().expect("runtime thread");
+        assert!(result
+            .expect("fatal shutdown must not wait for a blocking DNS task")
+            .is_err());
+    }
 }
