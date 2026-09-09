@@ -1084,10 +1084,14 @@ static_resources:
                             -- measured hop (currently Bedrock) remains direct
                             -- and must reject all registry slot headers.
                             if cfg.cloud and not cfg.cloud_hop then
-                              handle:respond(
-                                {[":status"] = "400",
-                                 ["content-type"] = "application/json"},
-                                "{\"error\":{\"type\":\"gm_unqualified_surface\",\"message\":\"AWS Bedrock is unqualified inside this image: inference is disabled\"}}")
+                              if requested ~= nil then
+                                slot_unavailable(handle, requested)
+                              else
+                                handle:respond(
+                                  {[":status"] = "400",
+                                   ["content-type"] = "application/json"},
+                                  "{\"error\":{\"type\":\"gm_unqualified_surface\",\"message\":\"AWS Bedrock is unqualified inside this image: inference is disabled\"}}")
+                              end
                               return false
                             end
                             -- A qualified adapter is reached only through the

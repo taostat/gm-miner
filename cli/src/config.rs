@@ -131,9 +131,10 @@ pub struct WorkerRecord {
     /// the provider upstream selectors active when this worker was deployed.
     /// Stored per worker so `register-image` recovery re-sends the deployed
     /// backends instead of relabeling from whatever global config is current
-    /// later. `None` (omitted) means either a fully-direct worker or a record
-    /// written before the per-provider map — in both cases `register-image`
-    /// omits the field and the registry keeps its authoritative stored value.
+    /// later. New deployments store `Some(empty)` for a fully-direct worker;
+    /// `None` is retained only for records written before this provenance map
+    /// existed, so declaration policy treats it as unresolved rather than
+    /// direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backends: Option<std::collections::BTreeMap<String, String>>,
     /// The provider slot ids advertised at deploy time, derived from the

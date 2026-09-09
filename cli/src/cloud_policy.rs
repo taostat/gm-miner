@@ -6,7 +6,14 @@
 //! and bulk-declaration guidance do not confuse transport capability with the
 //! feature-fenced model identity check.
 
-use crate::config::{Config, WorkerRecord};
+use anyhow::{Context as _, Result};
+
+use crate::{
+    client::{RegistryClient, ME_PATH},
+    config::{Config, WorkerRecord},
+    deploy::{fetch_supported_versions, normalize_hash},
+    types::{MinerStatus, WorkerEntry, WorkerListResponse},
+};
 
 /// The only Bedrock model-ID tuple currently covered by registry normalization.
 /// This does not authorize the worker's cloud transport.
@@ -17,6 +24,32 @@ pub const REVIEWED_BEDROCK_UPSTREAM_MODEL: &str = "anthropic.claude-sonnet-4-6-v
 /// model ids were canonicalized. It normalizes to [`REVIEWED_BEDROCK_UPSTREAM_MODEL`]
 /// only for the exact reviewed provider/model pair.
 pub const LEGACY_BEDROCK_UPSTREAM_MODEL: &str = "us.anthropic.claude-sonnet-4-6-v1";
+
+/// The declaration decision has two independent consequences. A live worker
+/// may need the registry's model-echo compatibility check while still being
+/// a known-direct worker that is safe to keep in a bulk declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudDeclarationPolicy {
+    pub requires_capability: bool,
+    pub exclude_from_bulk: bool,
+}
+
+impl CloudDeclarationPolicy {
+    const DIRECT: Self = Self {
+        requires_capability: false,
+        exclude_from_bulk: false,
+    };
+
+    const FENCED: Self = Self {
+        requires_capability: true,
+        exclude_from_bulk: true,
+    };
+
+    const FENCED_BUT_DIRECT: Self = Self {
+        requires_capability: true,
+        exclude_from_bulk: false,
+    };
+}
 
 /// Normalize an accepted Bedrock model id to the current Mantle id.
 ///
@@ -102,6 +135,151 @@ pub fn cloud_fence_required_for_provider(config: &Config, provider: &str) -> boo
             .into_iter()
             .flat_map(|network| network.workers.iter())
             .any(|worker| recorded_worker_requires_cloud_fence(worker, provider))
+}
+
+/// Resolve the live worker/image provenance needed before treating a
+/// declaration as direct-only.
+///
+/// A local empty worker list is not evidence that the hotkey has no cloud
+/// worker. The registry's live list and its approved image feature stamps are
+/// therefore consulted on every otherwise-unfenced declaration. Any missing
+/// link in that chain is conservative: the registry capability fence is
+/// required and bulk declaration omits the affected provider.
+pub async fn declaration_policy(
+    client: &mut RegistryClient,
+    provider: &str,
+) -> CloudDeclarationPolicy {
+    if !matches!(provider, "anthropic" | "openai") {
+        return CloudDeclarationPolicy::DIRECT;
+    }
+    if configured_cloud_backend(&client.config, provider).is_some()
+        || client
+            .config
+            .active_network_entry()
+            .into_iter()
+            .flat_map(|network| network.workers.iter())
+            .any(|worker| {
+                worker
+                    .backends
+                    .as_ref()
+                    .is_some_and(|backends| backends.contains_key(provider))
+            })
+    {
+        return CloudDeclarationPolicy::FENCED;
+    }
+
+    let has_unknown_local_worker = client
+        .config
+        .active_network_entry()
+        .into_iter()
+        .flat_map(|network| network.workers.iter())
+        .any(|worker| worker.backends.is_none());
+    let live_workers = match fetch_live_workers(client).await {
+        Ok(Some(workers)) => workers,
+        Ok(None) => {
+            return if has_unknown_local_worker {
+                CloudDeclarationPolicy::FENCED
+            } else {
+                CloudDeclarationPolicy::DIRECT
+            }
+        }
+        Err(err) => {
+            tracing::warn!(provider, error = %err, "could not resolve live worker provenance");
+            return CloudDeclarationPolicy::FENCED;
+        }
+    };
+
+    if live_workers.is_empty() {
+        // The registry answered authoritatively that this hotkey has no live
+        // worker. A legacy local record still leaves the old worker's
+        // provenance unresolved, so it remains fenced until that record is
+        // replaced by a deployment with an explicit backend map.
+        return if has_unknown_local_worker {
+            CloudDeclarationPolicy::FENCED
+        } else {
+            CloudDeclarationPolicy::DIRECT
+        };
+    }
+
+    let versions = match fetch_supported_versions(&client.config.api_url()).await {
+        Ok(versions) => versions,
+        Err(err) => {
+            tracing::warn!(provider, error = %err, "could not resolve live worker image provenance");
+            return CloudDeclarationPolicy::FENCED;
+        }
+    };
+    let local_workers = client
+        .config
+        .active_network_entry()
+        .map_or(&[][..], |network| network.workers.as_slice());
+
+    let mut has_unknown_provenance = false;
+    let mut has_cloud_provenance = false;
+    let mut has_hop_image = false;
+
+    for live_worker in &live_workers {
+        let image = live_worker.image_compose_hash.as_deref().and_then(|hash| {
+            versions
+                .iter()
+                .find(|version| normalize_hash(&version.compose_hash) == normalize_hash(hash))
+        });
+        let Some(image) = image else {
+            has_unknown_provenance = true;
+            continue;
+        };
+        has_hop_image |= image.model_hop_capable();
+
+        let Some(local_worker) = local_workers
+            .iter()
+            .find(|worker| worker.worker_id == live_worker.worker_id)
+        else {
+            has_unknown_provenance = true;
+            continue;
+        };
+        let Some(backends) = local_worker.backends.as_ref() else {
+            has_unknown_provenance = true;
+            continue;
+        };
+        has_cloud_provenance |= backends.contains_key(provider);
+    }
+
+    if has_cloud_provenance || has_unknown_provenance {
+        return CloudDeclarationPolicy::FENCED;
+    }
+    if has_hop_image {
+        // A direct worker on the hop image needs the model-echo fence, but it
+        // remains direct supply and must not disappear from a bulk set.
+        return CloudDeclarationPolicy::FENCED_BUT_DIRECT;
+    }
+    CloudDeclarationPolicy::DIRECT
+}
+
+/// Fetch the registry's live workers. A missing miner row means no worker has
+/// ever been registered; a missing worker endpoint for an existing miner is
+/// an unresolved provenance error, not proof of an empty worker list.
+async fn fetch_live_workers(client: &mut RegistryClient) -> Result<Option<Vec<WorkerEntry>>> {
+    let response = client.get(ME_PATH).await.context("GET /miners/me")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("GET /miners/me failed ({status}): {body}");
+    }
+    let miner: MinerStatus = response.json().await.context("parse /miners/me response")?;
+    let path = format!("/miners/{}/workers", miner.hotkey);
+    let response = client.get(&path).await.context("GET live workers")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("GET {path} failed ({status}): {body}");
+    }
+    let workers: WorkerListResponse = response
+        .json()
+        .await
+        .with_context(|| format!("parse {path} response"))?;
+    Ok(Some(workers.workers))
 }
 
 /// Whether registering or re-registering the named worker must pass the

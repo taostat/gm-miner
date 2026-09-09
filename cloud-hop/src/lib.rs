@@ -692,8 +692,8 @@ fn scan_object(
         cursor.skip_whitespace();
         let key_start = cursor.position;
         let key_end = scan_string(cursor)?;
-        let key = serde_json::from_slice::<String>(&cursor.body[key_start..key_end])
-            .map_err(|_| RewriteError::MalformedJson)?;
+        let is_model_key =
+            root && json_string_equals_ascii(&cursor.body[key_start..key_end], b"model");
         cursor.skip_whitespace();
         if cursor.advance() != Some(b':') {
             return Err(RewriteError::MalformedJson);
@@ -703,15 +703,17 @@ fn scan_object(
         scan_value(cursor, depth + 1, replacement, false)?;
         let value_end = cursor.position;
 
-        if root && key == "model" {
+        if is_model_key {
             if replacement.is_some() {
                 return Err(RewriteError::DuplicateModel);
             }
             if cursor.body.get(value_start) != Some(&b'"') {
                 return Err(RewriteError::ModelNotString);
             }
-            let model = serde_json::from_slice::<String>(&cursor.body[value_start..value_end])
-                .map_err(|_| RewriteError::ModelNotString)?;
+            let model = decode_bounded_json_string(
+                &cursor.body[value_start..value_end],
+                MAX_CANONICAL_NAME_BYTES,
+            )?;
             *replacement = Some(ModelMember {
                 start: value_start,
                 end: value_end,
@@ -800,6 +802,155 @@ fn scan_string(cursor: &mut JsonCursor<'_>) -> Result<usize, RewriteError> {
             Some(_) => {}
             None => return Err(RewriteError::MalformedJson),
         }
+    }
+}
+
+/// Compare a scanned JSON string with an ASCII name without allocating its
+/// decoded contents. This is used for object keys, including escaped keys,
+/// so large irrelevant keys never become owned `String`s during the scan.
+fn json_string_equals_ascii(raw: &[u8], expected: &[u8]) -> bool {
+    if raw.first() != Some(&b'"') || raw.last() != Some(&b'"') {
+        return false;
+    }
+    let mut position = 1;
+    let end = raw.len() - 1;
+    let mut expected_position = 0;
+    while position < end {
+        let Some(byte) = next_json_ascii_byte(raw, &mut position, end) else {
+            return false;
+        };
+        if expected.get(expected_position) != Some(&byte) {
+            return false;
+        }
+        expected_position += 1;
+    }
+    expected_position == expected.len()
+}
+
+fn next_json_ascii_byte(raw: &[u8], position: &mut usize, end: usize) -> Option<u8> {
+    let byte = *raw.get(*position)?;
+    *position += 1;
+    if byte != b'\\' {
+        return (byte < 0x80).then_some(byte);
+    }
+    let escaped = *raw.get(*position)?;
+    *position += 1;
+    match escaped {
+        b'"' => Some(b'"'),
+        b'\\' => Some(b'\\'),
+        b'/' => Some(b'/'),
+        b'b' => Some(0x08),
+        b'f' => Some(0x0c),
+        b'n' => Some(b'\n'),
+        b'r' => Some(b'\r'),
+        b't' => Some(b'\t'),
+        b'u' => {
+            let code = parse_hex_escape(raw, position, end)?;
+            if code <= 0x7f {
+                u8::try_from(code).ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_hex_escape(raw: &[u8], position: &mut usize, end: usize) -> Option<u32> {
+    if end.saturating_sub(*position) < 4 {
+        return None;
+    }
+    let mut value = 0_u32;
+    for _ in 0..4 {
+        let digit = hex_value(*raw.get(*position)?);
+        if digit == 0xff {
+            return None;
+        }
+        value = value.checked_mul(16)?.checked_add(u32::from(digit))?;
+        *position += 1;
+    }
+    Some(value)
+}
+
+fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0xff,
+    }
+}
+
+/// Decode only the bounded top-level model value. The scanner has already
+/// validated the string grammar; this small decoder handles escapes without
+/// serde's scratch allocation and stops before an attacker-sized canonical
+/// value can grow an owned string.
+fn decode_bounded_json_string(raw: &[u8], max_bytes: usize) -> Result<String, RewriteError> {
+    if raw.first() != Some(&b'"') || raw.last() != Some(&b'"') {
+        return Err(RewriteError::ModelNotString);
+    }
+    let mut output = String::with_capacity(max_bytes);
+    let mut position = 1;
+    let end = raw.len() - 1;
+    while position < end {
+        let character = if raw[position] == b'\\' {
+            position += 1;
+            let escaped = *raw.get(position).ok_or(RewriteError::ModelNotString)?;
+            position += 1;
+            match escaped {
+                b'"' => '"',
+                b'\\' => '\\',
+                b'/' => '/',
+                b'b' => '\u{0008}',
+                b'f' => '\u{000c}',
+                b'n' => '\n',
+                b'r' => '\r',
+                b't' => '\t',
+                b'u' => decode_unicode_escape(raw, &mut position, end)?,
+                _ => return Err(RewriteError::ModelNotString),
+            }
+        } else {
+            let remaining = std::str::from_utf8(&raw[position..end])
+                .map_err(|_| RewriteError::ModelNotString)?;
+            let character = remaining
+                .chars()
+                .next()
+                .ok_or(RewriteError::ModelNotString)?;
+            position += character.len_utf8();
+            character
+        };
+        if output.len().saturating_add(character.len_utf8()) > max_bytes {
+            return Err(RewriteError::UnmappedModel);
+        }
+        output.push(character);
+    }
+    Ok(output)
+}
+
+fn decode_unicode_escape(
+    raw: &[u8],
+    position: &mut usize,
+    end: usize,
+) -> Result<char, RewriteError> {
+    let first = parse_hex_escape(raw, position, end).ok_or(RewriteError::ModelNotString)?;
+    if (0xd800..=0xdbff).contains(&first) {
+        if end.saturating_sub(*position) < 6
+            || raw.get(*position) != Some(&b'\\')
+            || raw.get(*position + 1) != Some(&b'u')
+        {
+            return Err(RewriteError::ModelNotString);
+        }
+        *position += 2;
+        let second = parse_hex_escape(raw, position, end).ok_or(RewriteError::ModelNotString)?;
+        if !(0xdc00..=0xdfff).contains(&second) {
+            return Err(RewriteError::ModelNotString);
+        }
+        let code_point = 0x1_0000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+        char::from_u32(code_point).ok_or(RewriteError::ModelNotString)
+    } else if (0xdc00..=0xdfff).contains(&first) {
+        Err(RewriteError::ModelNotString)
+    } else {
+        char::from_u32(first).ok_or(RewriteError::ModelNotString)
     }
 }
 
@@ -1359,24 +1510,20 @@ async fn handle_request(
             return json_error(StatusCode::BAD_REQUEST, &message);
         }
     };
-    let Ok(rewrite_capacity) = u32::try_from(rewrite_capacity) else {
+    let Ok(rewrite_capacity_units) = u32::try_from(rewrite_capacity) else {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "cloud hop aggregate buffering limit reached",
         );
     };
-    let Ok(rewrite_permit) = Arc::clone(&state.buffered).try_acquire_many_owned(rewrite_capacity)
+    let Ok(mut rewrite_permit) =
+        Arc::clone(&state.buffered).try_acquire_many_owned(rewrite_capacity_units)
     else {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "cloud hop aggregate buffering limit reached",
         );
     };
-    if let Some(existing) = buffer_permit.as_mut() {
-        existing.merge(rewrite_permit);
-    } else {
-        buffer_permit = Some(rewrite_permit);
-    }
     let rewritten = match rewrite_model_bytes(selector, &body, map) {
         Ok(body) => body,
         Err(error) => {
@@ -1384,6 +1531,26 @@ async fn handle_request(
             return json_error(StatusCode::BAD_REQUEST, &message);
         }
     };
+    let rewrite_extra = rewritten.capacity().saturating_sub(rewrite_capacity);
+    if rewrite_extra > 0 {
+        let Some(extra_permit) = u32::try_from(rewrite_extra).ok().and_then(|extra| {
+            Arc::clone(&state.buffered)
+                .try_acquire_many_owned(extra)
+                .ok()
+        }) else {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cloud hop aggregate buffering limit reached",
+            );
+        };
+        rewrite_permit.merge(extra_permit);
+    }
+    // The request body and the rewritten body are separate allocations. Keep
+    // only the latter's storage reservation through the response lifetime;
+    // the request-concurrency permit remains independent in `TimedResponseBody`.
+    drop(body);
+    drop(buffer_permit.take());
+    buffer_permit = Some(rewrite_permit);
 
     match forward_request(parts, rewritten, selector, state, deadline).await {
         Ok(forwarded) => box_response(
@@ -1409,16 +1576,8 @@ async fn read_request_body(
     max_request_bytes: usize,
     buffered: Arc<Semaphore>,
 ) -> Result<(Bytes, Option<OwnedSemaphorePermit>), ReadBodyError> {
-    let permit = Some(
-        buffered
-            .try_acquire_many_owned(
-                max_request_bytes
-                    .try_into()
-                    .map_err(|_| ReadBodyError::AggregateLimit)?,
-            )
-            .map_err(|_| ReadBodyError::AggregateLimit)?,
-    );
-    let mut bytes = Vec::with_capacity(max_request_bytes);
+    let mut permit = None;
+    let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(ReadBodyError::Body)?;
         if let Ok(data) = frame.into_data() {
@@ -1429,12 +1588,56 @@ async fn read_request_body(
             if next_len > max_request_bytes {
                 return Err(ReadBodyError::TooLarge);
             }
+            reserve_buffer_capacity(&mut bytes, &mut permit, next_len, &buffered)?;
             bytes.extend_from_slice(&data);
         } else {
             return Err(ReadBodyError::Trailers);
         }
     }
     Ok((Bytes::from(bytes), permit))
+}
+
+/// Reserve only the capacity the request buffer is about to acquire. The
+/// semaphore therefore accounts for allocated storage rather than the
+/// configured maximum request size, while `reserve_exact` keeps the aggregate
+/// budget sufficient for a full request plus its rewritten copy.
+fn reserve_buffer_capacity(
+    bytes: &mut Vec<u8>,
+    permit: &mut Option<OwnedSemaphorePermit>,
+    required: usize,
+    buffered: &Arc<Semaphore>,
+) -> Result<(), ReadBodyError> {
+    if required <= bytes.capacity() {
+        return Ok(());
+    }
+    let before = bytes.capacity();
+    let requested = required - before;
+    let requested_u32 = u32::try_from(requested).map_err(|_| ReadBodyError::AggregateLimit)?;
+    let new_permit = buffered
+        .clone()
+        .try_acquire_many_owned(requested_u32)
+        .map_err(|_| ReadBodyError::AggregateLimit)?;
+    bytes.reserve_exact(requested);
+    let actual = bytes.capacity().saturating_sub(before);
+    if actual > requested {
+        let extra = actual - requested;
+        let extra_u32 = u32::try_from(extra).map_err(|_| ReadBodyError::AggregateLimit)?;
+        let extra_permit = buffered
+            .clone()
+            .try_acquire_many_owned(extra_u32)
+            .map_err(|_| ReadBodyError::AggregateLimit)?;
+        merge_buffer_permit(permit, extra_permit);
+    }
+    merge_buffer_permit(permit, new_permit);
+    Ok(())
+}
+
+fn merge_buffer_permit(slot: &mut Option<OwnedSemaphorePermit>, permit: OwnedSemaphorePermit) {
+    if let Some(existing) = slot.as_mut() {
+        existing.merge(permit);
+    } else {
+        *slot = Some(permit);
+    }
 }
 
 #[derive(Debug, Error)]
@@ -2024,6 +2227,25 @@ mod tests {
     }
 
     #[test]
+    fn large_escaped_nested_keys_do_not_change_model_rewrite() {
+        let escaped_key = r"\u006e".repeat(512 * 1024);
+        let body = format!(r#"{{"{escaped_key}":{{"{escaped_key}":true}},"model":"gpt-5.5"}}"#);
+        let rewritten =
+            rewrite_model_bytes(CloudProvider::AzureOpenAi, body.as_bytes(), &azure_map())
+                .expect("irrelevant escaped keys must be scanned without decoding");
+        assert!(rewritten.ends_with(br#""model":"my-gpt55"}"#));
+    }
+
+    #[test]
+    fn an_escaped_model_value_is_bounded_before_allocation() {
+        let body = format!(r#"{{"model":"{}"}}"#, r"\u0067".repeat(1024));
+        assert_eq!(
+            extract_model_echo(body.as_bytes()),
+            Err(RewriteError::UnmappedModel)
+        );
+    }
+
+    #[test]
     fn map_validation_rejects_unknown_duplicate_and_bad_deployment_names() {
         assert!(matches!(
             parse_deployment_map(
@@ -2179,6 +2401,41 @@ mod tests {
                 format!(r#"{{"model":"my-gpt55","padding":"{}"}}"#, "x".repeat(4096)).into_bytes(),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_small_uploads_do_not_reserve_the_full_request_cap() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let (upstream_addr, upstream_task) =
+            spawn_counted_upstream(upstream_listener, FirstResponse::Flooding);
+        let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
+        let hop_addr = hop_listener.local_addr().expect("hop address");
+        tokio::spawn(serve_with_upstream(
+            hop_listener,
+            test_config_with_request(
+                DEFAULT_REQUEST_BYTES,
+                DEFAULT_BUFFERED_BYTES,
+                4,
+                Duration::from_secs(5),
+            ),
+            upstream_addr,
+        ));
+
+        let request = || {
+            send_hop_request(
+                hop_addr,
+                vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+            )
+        };
+        let (first, second, third, fourth) =
+            tokio::join!(request(), request(), request(), request());
+        for response in [first, second, third, fourth] {
+            let response = response.expect("hop response");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        upstream_task.abort();
     }
 
     #[tokio::test]

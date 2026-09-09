@@ -3,10 +3,11 @@
 //! folds in the product table).
 
 use anyhow::{bail, Context as _, Result};
+use std::collections::BTreeMap;
 
 use gm_miner_cli::{
     client::{RegistryClient, UPSTREAM_MODEL_ECHO_CAPABILITY},
-    cloud_policy::{cloud_fence_required_for_provider, configured_cloud_backend},
+    cloud_policy::{configured_cloud_backend, declaration_policy, CloudDeclarationPolicy},
     dependency::confirm,
     pricing::{
         effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
@@ -51,9 +52,10 @@ pub(crate) async fn cmd_declare_product(
     discount_bp: u32,
     args: DeclareArgs<'_>,
 ) -> Result<()> {
-    if cloud_fence_required_for_provider(&client.config, provider.as_str()) {
+    let policy = declaration_policy(client, provider.as_str()).await;
+    if policy.requires_capability {
         let backend = configured_cloud_backend(&client.config, provider.as_str())
-            .unwrap_or("recorded/unknown");
+            .unwrap_or("live-worker compatibility");
         client
             .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
             .await
@@ -317,9 +319,10 @@ pub(crate) async fn cmd_declare_products(
         })
     });
 
-    require_cloud_bulk_capability(client, &targets).await?;
+    let policies = resolve_bulk_policies(client, &targets).await;
+    require_cloud_bulk_capability(client, &policies).await?;
 
-    let skipped_cloud = skip_cloud_bulk_targets(client, &mut targets)?;
+    let skipped_cloud = skip_cloud_bulk_targets(client, &policies, &mut targets)?;
 
     if targets.is_empty() {
         let scope =
@@ -386,39 +389,64 @@ pub(crate) async fn cmd_declare_products(
 /// understand the cloud-backed target set.
 async fn require_cloud_bulk_capability(
     client: &mut RegistryClient,
-    targets: &[&Product],
+    policies: &BTreeMap<String, CloudDeclarationPolicy>,
 ) -> Result<()> {
-    let Some(product) = targets
+    let Some((provider, _policy)) = policies
         .iter()
-        .find(|product| cloud_fence_required_for_provider(&client.config, &product.provider))
+        .find(|(_, policy)| policy.requires_capability)
     else {
         return Ok(());
     };
     let backend =
-        configured_cloud_backend(&client.config, &product.provider).unwrap_or("recorded/unknown");
+        configured_cloud_backend(&client.config, provider).unwrap_or("live-worker compatibility");
     client
         .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
         .await
         .with_context(|| {
             format!(
-                "cannot declare a bulk set containing cloud-backed products ({backend}) without registry capability upstream-model-echo"
+                "cannot declare a bulk set containing products requiring cloud compatibility verification ({backend}) without registry capability upstream-model-echo"
             )
         })
 }
 
-/// Remove configured cloud-backed products from a bulk declaration and explain
-/// why they were not sent. Bulk requests intentionally omit `upstream_model`;
-/// direct/API-key products remain eligible, while cloud products need an
-/// independently verified model and transport binding.
-fn skip_cloud_bulk_targets(client: &RegistryClient, targets: &mut Vec<&Product>) -> Result<usize> {
-    let mut skipped_cloud: Vec<(String, String, String)> = Vec::new();
+/// Resolve one live-worker policy per provider, not once per catalog row.
+/// Providers are strings on the registry wire, so a `BTreeMap` also makes the
+/// capability check and the later skip decision deterministic in tests/output.
+async fn resolve_bulk_policies(
+    client: &mut RegistryClient,
+    targets: &[&Product],
+) -> BTreeMap<String, CloudDeclarationPolicy> {
+    let mut policies = BTreeMap::new();
+    for product in targets {
+        if policies.contains_key(&product.provider) {
+            continue;
+        }
+        let policy = declaration_policy(client, &product.provider).await;
+        policies.insert(product.provider.clone(), policy);
+    }
+    policies
+}
+
+/// Remove only products whose resolved policy says a bulk request cannot
+/// establish safe direct supply. Bulk requests intentionally omit
+/// `upstream_model`; a known-direct worker remains eligible even when its hop
+/// image requires the registry compatibility fence.
+fn skip_cloud_bulk_targets(
+    client: &RegistryClient,
+    policies: &BTreeMap<String, CloudDeclarationPolicy>,
+    targets: &mut Vec<&Product>,
+) -> Result<usize> {
+    let mut skipped_products: Vec<(String, String, String)> = Vec::new();
     targets.retain(|product| {
-        if !cloud_fence_required_for_provider(&client.config, &product.provider) {
+        let Some(policy) = policies.get(&product.provider) else {
+            return true;
+        };
+        if !policy.exclude_from_bulk {
             return true;
         }
         let backend = configured_cloud_backend(&client.config, &product.provider)
-            .unwrap_or("recorded/unknown");
-        skipped_cloud.push((
+            .unwrap_or("live-worker compatibility");
+        skipped_products.push((
             product.provider.clone(),
             product.model.clone(),
             backend.to_owned(),
@@ -426,14 +454,14 @@ fn skip_cloud_bulk_targets(client: &RegistryClient, targets: &mut Vec<&Product>)
         false
     });
 
-    if skipped_cloud.is_empty() {
+    if skipped_products.is_empty() {
         return Ok(0);
     }
     println!(
-        "Skipped {} cloud-backed product(s): bulk declaration does not send an upstream model binding.",
-        skipped_cloud.len()
+        "Skipped {} product(s): compatibility verification is not complete for bulk declaration.",
+        skipped_products.len()
     );
-    for (provider, model, backend) in &skipped_cloud {
+    for (provider, model, backend) in &skipped_products {
         println!(
             "  {provider}/{model} ({backend}) — transport capability is not registry admission; reviewed binding required."
         );
@@ -443,7 +471,7 @@ fn skip_cloud_bulk_targets(client: &RegistryClient, targets: &mut Vec<&Product>)
             "bulk declaration refused: all selected products use cloud-backed providers that need a reviewed binding; no upstream_model was submitted"
         );
     }
-    Ok(skipped_cloud.len())
+    Ok(skipped_products.len())
 }
 
 /// Whether a declaration actually reached the registry.
@@ -1003,6 +1031,24 @@ mod tests {
             .await;
     }
 
+    async fn mount_live_hop_worker(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/miners/5Grw.../workers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workers": [{
+                    "worker_id": "worker-hop",
+                    "endpoint": "https://worker.example",
+                    "status": "active",
+                    "image_compose_hash": "hop-compose",
+                    "last_attestation_at": null,
+                    "supported_models": {},
+                    "provider_slot_status": {}
+                }],
+            })))
+            .mount(server)
+            .await;
+    }
+
     async fn mount_model_echo_capability(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path(gm_miner_cli::client::CAPABILITIES_PATH))
@@ -1091,6 +1137,138 @@ mod tests {
         .expect_err("a registry without the capability must refuse cloud offers");
         assert!(error.to_string().contains("upstream-model-echo"));
         assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
+    }
+
+    #[tokio::test]
+    async fn direct_selector_with_no_local_workers_still_fences_live_supply() {
+        let server = MockServer::start().await;
+        mount_me(&server, serde_json::json!([])).await;
+        mount_live_hop_worker(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/image-versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "versions": [{
+                    "compose_hash": "hop-compose",
+                    "os_image_hash": "os",
+                    "status": "supported",
+                    "notes": null,
+                    "created_at": "2026-09-09T00:00:00Z",
+                    "features": ["upstream-model-hop"]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "openai", "model": "gpt-5.5", "status": "active",
+                "retail_price": retail(1_000_000_000, 2_000_000_000),
+            }]),
+        )
+        .await;
+        mount_routes(
+            &server,
+            serde_json::json!([{
+                "route_id": 1,
+                "provider": "openai", "model": "gpt-5.5",
+                "buyer_provider": "openai", "buyer_model": "gpt-5.5",
+                "retail_price": retail(1_000_000_000, 2_000_000_000),
+                "capable_worker_count": 0,
+                "already_offered": false,
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+
+        let mut config = config_for(&server);
+        config.provider_keys = Some(ProviderKeys {
+            openai_upstream: Some("direct".to_owned()),
+            ..Default::default()
+        });
+        let mut client = RegistryClient::new(config);
+        let error = cmd_declare_product(
+            &mut client,
+            &Provider::OpenAI,
+            "gpt-5.5",
+            500,
+            DeclareArgs::default(),
+        )
+        .await
+        .expect_err("unresolved live supply must require the registry fence");
+
+        assert!(error.to_string().contains("upstream-model-echo"));
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
+    }
+
+    #[tokio::test]
+    async fn known_direct_worker_on_hop_image_stays_in_bulk_supply() {
+        let server = MockServer::start().await;
+        mount_me(&server, serde_json::json!([])).await;
+        mount_live_hop_worker(&server).await;
+        mount_model_echo_capability(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/image-versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "versions": [{
+                    "compose_hash": "hop-compose",
+                    "os_image_hash": "os",
+                    "status": "supported",
+                    "notes": null,
+                    "created_at": "2026-09-09T00:00:00Z",
+                    "features": ["upstream-model-hop"]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "openai", "model": "gpt-5.5", "status": "active",
+                "retail_price": retail(1_000_000_000, 2_000_000_000),
+            }]),
+        )
+        .await;
+        mount_routes(
+            &server,
+            serde_json::json!([{
+                "route_id": 1,
+                "provider": "openai", "model": "gpt-5.5",
+                "buyer_provider": "openai", "buyer_model": "gpt-5.5",
+                "retail_price": retail(1_000_000_000, 2_000_000_000),
+                "capable_worker_count": 1,
+                "already_offered": false,
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+
+        let mut config = config_for(&server);
+        config.active_entry_mut().workers.push(WorkerRecord {
+            worker_id: "worker-hop".to_owned(),
+            backends: Some(std::collections::BTreeMap::new()),
+            ..Default::default()
+        });
+        let mut client = RegistryClient::new(config);
+        cmd_declare_products(&mut client, Some(&Provider::OpenAI), 500, true)
+            .await
+            .expect("known direct supply must remain bulk-declarable");
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
     }
 
     #[tokio::test]

@@ -629,9 +629,10 @@ pub(crate) async fn cmd_deploy(
     // Derive once so the registry worker-create body and the local
     // WorkerRecord persist exactly the same backend provenance. The registry
     // body always sends the map (authoritative full state); the local record
-    // omits it when empty (a fully-direct worker).
+    // also stores an explicit empty map for a fully-direct worker. `None` is
+    // reserved for legacy records whose provenance was never recorded.
     let worker_backends = keys.worker_backends();
-    let recorded_backends = (!worker_backends.is_empty()).then(|| worker_backends.clone());
+    let recorded_backends = Some(worker_backends.clone());
     require_cloud_registration_capability_for_worker(
         client,
         cfg,
@@ -1026,9 +1027,10 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
 
 /// The backends `register-image` re-sends for a CVM: the recorded map for a
 /// tracked worker, else the current config's map. `None` (omitted) for a
-/// fully-direct worker, or for a record written before the per-provider map —
-/// in both cases the registry keeps its authoritative stored value rather than
-/// the CLI re-asserting a lossy guess that could narrow a mixed worker.
+/// record written before the per-provider map. With no record, a direct-only
+/// config is not enough to rewrite registry provenance, so the registry keeps
+/// its authoritative stored value rather than the CLI re-asserting a lossy
+/// guess that could narrow a mixed worker.
 fn register_image_backends(
     record: Option<&WorkerRecord>,
     cfg: &Config,

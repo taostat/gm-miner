@@ -14,7 +14,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "cd3078d3dea62623a86790c24cbb7462abc3d05f116b6eb545f7b0ecfc19c9e4";
+    "1e30536909f2d5db70e7dec8a5e8eb7c9912cd3e7c30a5cb4ed8614883810522";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -599,7 +599,7 @@ fn bedrock_and_azure_render_cloud_upstreams() {
 }
 
 #[test]
-fn bedrock_inference_is_unqualified_with_or_without_a_slot() {
+fn bedrock_inference_render_contract_is_structural() {
     let (status, _, stderr, rendered) = render_envoy([
         ("ANTHROPIC_UPSTREAM", "bedrock"),
         ("BEDROCK_REGION", "us-west-2"),
@@ -609,9 +609,109 @@ fn bedrock_inference_is_unqualified_with_or_without_a_slot() {
     assert!(rendered.contains("AWS Bedrock is unqualified inside this image"));
     assert!(
         rendered.contains(
-            "if cfg.cloud and not cfg.cloud_hop then\n                              handle:respond"
+            "if cfg.cloud and not cfg.cloud_hop then\n                              if requested ~= nil then\n                                slot_unavailable(handle, requested)"
         ),
-        "slot and no-slot Bedrock requests must share the unqualified JSON 400"
+        "supplied Bedrock slots must take the 421 unavailable-slot branch"
+    );
+}
+
+#[test]
+fn bedrock_slot_guard_behaves_with_lua_or_uses_structural_check() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "bedrock"),
+        ("BEDROCK_REGION", "us-west-2"),
+        ("BEDROCK_API_KEY", "bedrock-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    let Some(lua) = lua_interpreter() else {
+        let source = data_plane_lua(&rendered).expect("data-plane Lua source");
+        assert!(
+            source.contains("if requested ~= nil then")
+                && source.contains("slot_unavailable(handle, requested)"),
+            "Bedrock's supplied-slot branch must use the 421 structural contract"
+        );
+        assert!(
+            source.contains("AWS Bedrock is unqualified inside this image"),
+            "Bedrock's no-slot branch must remain the unqualified-surface rejection"
+        );
+        eprintln!(
+            "SKIPPED Lua execution: neither lua nor luajit is available; this is a structural check only"
+        );
+        return;
+    };
+
+    let source = data_plane_lua(&rendered).expect("data-plane Lua source");
+    let mut script = source;
+    script.push_str(
+        r#"
+local function make_headers(values)
+  local headers = {values = values}
+  function headers:get(name)
+    return self.values[name]
+  end
+  function headers:remove(name)
+    self.values[name] = nil
+  end
+  function headers:add(name, value)
+    self.values[name] = value
+  end
+  return headers
+end
+
+local function run(slot)
+  local values = {
+    [":path"] = "/v1/messages",
+    ["x-gm-provider"] = "anthropic",
+    ["x-gm-node-key"] = "test-node-secret-0001",
+  }
+  if slot ~= nil then values["x-gm-upstream-slot"] = slot end
+  local headers = make_headers(values)
+  local metadata = {}
+  function metadata:set(_, _, _) end
+  local stream_info = {}
+  function stream_info:dynamicMetadata() return metadata end
+  local status = nil
+  local body = nil
+  local handle = {}
+  function handle:headers() return headers end
+  function handle:streamInfo() return stream_info end
+  function handle:respond(response_headers, response_body)
+    status = response_headers[":status"]
+    body = response_body
+  end
+  envoy_on_request(handle)
+  return status, body
+end
+
+local status, body = run(nil)
+assert(status == "400", "Bedrock without a slot must remain unqualified")
+assert(body:find("gm_unqualified_surface", 1, true) ~= nil, "no-slot body must name the unqualified surface")
+status, body = run("bedrock-slot")
+assert(status == "421", "any supplied Bedrock slot must be unavailable")
+assert(body:find("gm_slot_unavailable", 1, true) ~= nil, "supplied-slot body must use the slot contract")
+assert(body:find("bedrock-slot", 1, true) ~= nil, "421 must name the supplied slot")
+"#,
+    );
+    let mut child = Command::new(lua)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start Bedrock Lua behavior fixture");
+    child
+        .stdin
+        .take()
+        .expect("Lua stdin")
+        .write_all(script.as_bytes())
+        .expect("write Bedrock Lua behavior fixture");
+    let output = child
+        .wait_with_output()
+        .expect("wait for Bedrock Lua behavior fixture");
+    assert!(
+        output.status.success(),
+        "Bedrock slot behavior failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -827,9 +927,9 @@ fn assert_rendered_cloud_slot_contract(rendered: &str) {
 #[test]
 #[expect(
     clippy::too_many_lines,
-    reason = "the Lua integration fixture keeps the rendered behavior contract together"
+    reason = "the Lua integration fixture keeps executable and structural contracts together"
 )]
-fn cloud_slot_guard_behaves_with_lua_or_a_render_contract() {
+fn cloud_slot_guard_behaves_with_lua_or_uses_structural_check() {
     let (status, _, stderr, rendered) = render_envoy([
         ("OPENAI_UPSTREAM", "azure"),
         (
@@ -844,7 +944,7 @@ fn cloud_slot_guard_behaves_with_lua_or_a_render_contract() {
         assert_rendered_cloud_slot_contract(&rendered);
         eprintln!(
             "SKIPPED Lua execution: neither lua nor luajit is available; \
-             evaluated the rendered cloud-slot contract in Rust"
+             this is a structural check only"
         );
         return;
     };
