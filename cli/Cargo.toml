@@ -63,7 +63,6 @@ thiserror    = { workspace = true }
 anyhow       = { workspace = true }
 reqwest      = { workspace = true }
 gm-azure-verify = { workspace = true }
-gm-cloud-hop = { workspace = true }
 axoupdater   = { workspace = true }
 chrono       = { version = "0.4", features = ["serde"] }
 dirs         = "6"
@@ -76,6 +75,7 @@ hmac         = "=0.13.0"
 strum        = { version = "0.28", features = ["derive"] }
 
 [dev-dependencies]
+serde_yaml_ng = "0.10"
 wiremock     = "0.6"
 tokio        = { workspace = true }
 tempfile     = "3"

@@ -177,40 +177,38 @@ reconciliation evidence. Downstream validator, finalizer, and dashboard
 evidence is a separate GM runbook check. See the [provider support
 matrix](docs/provider-model-support.md) for the provider-side setup.
 
-The image contains cloud transport adapters for Bedrock, Azure OpenAI and Foundry. Azure OpenAI
-chat completions and Foundry Messages use the measured in-image model hop. Azure Responses is
-rejected with a JSON 400 because its echo identifies the deployment name, not the upstream
-model. Bedrock inference is disabled: requests with a slot header return 421 and requests
-without one return 400. Cloud registration, recovery, and declaration additionally require the registry
-capability `upstream-model-echo`; deployment also requires the approved image feature
-`upstream-model-hop`.
+Azure OpenAI chat completions and Microsoft Foundry Messages forward the request body
+unchanged through Envoy's existing TLS clusters. **Name each Azure or Foundry deployment
+exactly the canonical gm model id**, such as `gpt-5.4` or `claude-opus-4-6`.
+The image verifies through ARM that a catalog-named deployment X serves model X, with
+format `OpenAI` for Azure OpenAI or `Anthropic` for Foundry, using exact ASCII comparison.
+A mismatch blocks boot or takes the worker offline at the next 60-second deployment poll.
+Non-catalog names are ignored by this binding check; a missing deployment is handled by
+the registry's per-offer probe and the gateway's upstream 404 handling.
 
-Bedrock settings remain available for legacy configuration. This image rejects Bedrock
-inference until its model echo is qualified:
+Cloud registration, recovery and declaration require registry capability
+`upstream-model-echo`; deployment also requires the approved image feature
+`upstream-model-hop`. These contract names are unchanged. The gateway checks each response's
+model echo. Azure Responses still returns a typed JSON 400 because its echo identifies the
+deployment name. Bedrock inference remains disabled: 421 with a slot header, typed 400 without.
+Azure OpenAI and Foundry each accept exactly one HMAC slot derived from their single cloud key;
+all other slot ids return 421. Cloud keys cannot contain semicolons.
 
-```sh
-gmcli set-api-keys \
-  --anthropic-upstream bedrock \
-  --bedrock-region us-west-2 \
-  --bedrock-api-key <bedrock-api-key>
-```
-
-Azure OpenAI chat completions use the measured hop and the same image/registry fences. For
-transport setup, select Azure and provide the resource endpoint, API key, and
-canonical-to-deployment map:
+Configure Azure OpenAI with its endpoint, API key and account-scoped Reader credentials:
 
 ```sh
 gmcli set-api-keys \
   --openai-upstream azure \
   --azure-openai-endpoint https://<resource>.openai.azure.com \
   --azure-openai-api-key <azure-api-key> \
-  --azure-deployments 'gpt-5.5=<deployment-name>'
+  --azure-tenant-id <tenant> \
+  --azure-subscription-id <subscription> \
+  --azure-resource-group <rg> \
+  --azure-client-id <appId> \
+  --azure-client-secret <password>
 ```
 
-Microsoft Foundry Messages use the measured hop; cloud operations require the image and registry
-gates described above. Select Foundry and provide the resource
-endpoint, its API key, a read-only Azure service principal that `attestd` uses to verify the
-account from ARM, and one deployment map entry per model you intend to serve:
+For Foundry, use its Anthropic endpoint and separate Reader credentials:
 
 ```sh
 gmcli set-api-keys \
@@ -221,34 +219,22 @@ gmcli set-api-keys \
   --azure-foundry-subscription-id <subscription> \
   --azure-foundry-resource-group <rg> \
   --azure-foundry-client-id <appId> \
-  --azure-foundry-client-secret <password> \
-  --foundry-deployments 'claude-sonnet-4-6=<deployment-name>'
+  --azure-foundry-client-secret <password>
 ```
 
-Each map is semicolon-separated `canonical=deployment` data, for example
-`gpt-5.5=my-gpt55;gpt-5.4-mini=my-gpt54-mini`. The canonical side is checked against the
-provider catalog; the deployment side is bounded to Azure's deployment-name character set. The
-map cannot select an endpoint, host, path, redirect, or proxy. Only Azure OpenAI chat completions
-and Foundry Messages enter the hop; Azure Responses is unqualified and rejected. Run `gmcli doctor` after configuring
-the maps: it sends one 1-token request per entry and compares the upstream response `model` echo
-with the canonical id.
+As of September 2026, Azure Anthropic deployment creation requires `modelProviderData`
+with `organizationName`, `countryCode`, and lowercase `industry`; only
+`api-version=2025-10-01-preview` accepts it. A deployment cannot be re-pointed in place:
+delete and recreate it. See [Foundry setup](docs/foundry-setup.md) for the creation command
+and the capture controls to clear, including the Application Insights connection Azure
+attaches to portal-created Foundry resources.
 
-Foundry needs Azure-side setup before transport testing works, and one step is easy to miss: Azure attaches an
-Application Insights connection to any Foundry resource created through the portal, and the miner
-refuses to boot while it exists. Follow [Serving Claude through Microsoft
-Foundry](docs/foundry-setup.md) before your first Foundry deploy. Foundry routes on the Azure
-*deployment* name. Keep that name inside the measured image; do not send it as the registry
-offer model. Cloud registration and declaration require both the approved image feature
-`upstream-model-hop` and the registry capability `upstream-model-echo`; the CLI refuses the
-operation when the capability endpoint is absent or does not advertise it.
+Run `gmcli doctor` before deploying. It lists the bound account's ARM deployments
+(name, format, model, version), flags every catalog-named mismatch, and sends one
+1-token request per honestly named catalog deployment, printing the echoed model beside
+the deployment name. Worker `backends` remain transport provenance; offers use the same
+canonical `provider/model` as direct supply.
 
-Azure OpenAI deployments need not be named like the gm model id: the measured hop rewrites only
-the top-level request `model` member to the mapped deployment and leaves the rest of the body
-unchanged. A recognized Bedrock model id is not sufficient for admission either. The CLI derives
-a per-provider `backends` map from the selectors when you deploy; this legacy metadata does not
-choose the hop's host or model. Direct workers send an empty map. Bedrock,
-Azure and Foundry keys are single-slot in this release; semicolons in `BEDROCK_API_KEY`,
-`AZURE_OPENAI_API_KEY` or `AZURE_FOUNDRY_API_KEY` are rejected.
 
 ### 4. Deploy your miner
 
@@ -289,7 +275,8 @@ Fan one discount across the whole catalog. Bulk declaration checks the registry'
 `upstream-model-echo` capability, retains direct/API-key providers, and explicitly skips
 cloud-backed entries because the bulk wire request has no per-deployment binding. A single cloud
 declaration can proceed only after that capability check and an approved image advertises
-`upstream-model-hop`; no deployment name is sent to the registry:
+`upstream-model-hop`. The canonical model id also names the deployment; the
+registry contract has no separate deployment-name field:
 
 ```sh
 gmcli declare-products --discount-pct 5

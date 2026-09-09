@@ -1,15 +1,15 @@
 local function make_headers(values)
-  local headers = {values = values}
+  local headers = {}
   function headers:get(name)
-    return self.values[name]
+    return self[name]
   end
   function headers:remove(name)
-    self.values[name] = nil
+    self[name] = nil
   end
   function headers:add(name, value)
-    self.values[name] = value
+    self[name] = value
   end
-  return headers
+  return setmetatable(values, {__index = headers})
 end
 
 local function run(slot, node_key)

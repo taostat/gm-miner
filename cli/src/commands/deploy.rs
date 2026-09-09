@@ -479,10 +479,10 @@ fn image_is_slot_capable(
 }
 
 /// Whether the image that will actually deploy contains the measured cloud
-/// model hop. Cloud upstreams are refused unless the registry-approved image
+/// model binding. Cloud upstreams are refused unless the registry-approved image
 /// row carries this feature, so an old gateway/image combination cannot accept
 /// a cloud slot as if it were a direct worker.
-fn image_is_model_hop_capable(
+fn image_is_cloud_binding_capable(
     args: &DeployArgs,
     approved: &ImageVersion,
     versions: &[ImageVersion],
@@ -490,12 +490,12 @@ fn image_is_model_hop_capable(
     if let Some(explicit) = args.image_ref.as_deref() {
         return versions
             .iter()
-            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.model_hop_capable());
+            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.cloud_binding_capable());
     }
     if args.image_repo.is_some() {
         return false;
     }
-    approved.model_hop_capable()
+    approved.cloud_binding_capable()
 }
 
 /// Keep every worker registration path behind the registry's authoritative
@@ -575,10 +575,6 @@ fn resolve_and_render_target(
     )
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "deploy orchestration is kept flat so the ordered operational steps stay visible"
-)]
 pub(crate) async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
@@ -586,53 +582,8 @@ pub(crate) async fn cmd_deploy(
     args: &DeployArgs,
     registration: &WorkerRegistration,
 ) -> Result<()> {
-    // Step 0: auth preflight. Every later step needs the registry — the
-    // worker-#1 guard below reads the live worker list from it, and the
-    // eventual registration must be accepted after minutes of irreversible CVM
-    // work. A missing token / 401 fails fast here with an actionable message.
-    client.preflight_auth().await?;
-
-    // Step 0a: a plain `deploy` may only target worker #1 (see guard).
-    reject_secondary_worker_deploy(cfg, client, registration, &args.app_name).await?;
-
-    // Step 0b: the `--app-name` must not already name a CVM in the operator's
-    // Phala workspace — `phala deploy` would reject it minutes from now, after
-    // the image build. Fails with the `phala cvms delete` to run.
-    preflight_cvm_name(phala, &args.app_name)?;
-
-    // Step 0c: the one-time provider-ToS acceptable-use gate. Only the first
-    // deploy gates — it is the registration that creates the hotkey identity
-    // and carries the accepted version onto the registry's miner row. A
-    // `worker add` runs only after a first deploy already accepted, so
-    // re-gating it would persist a local acceptance the worker-add body never
-    // sends to the registry, drifting the two records apart. The gate runs
-    // before any provider key is read or baked into the CVM.
-    if *registration == WorkerRegistration::First {
-        ensure_terms_accepted(cfg, args)?;
-    }
-
-    // Step 1: ensure provider keys are configured.
-    let mut keys = cfg
-        .provider_keys
-        .as_ref()
-        .filter(|k| k.any_set())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no provider keys; run `gmcli set-api-keys \
-                 --anthropic <key>` (and/or --openai / --google / --chutes / --zai / --moonshot / --deepinfra / --kubetee / --engy / --moonmath, \
-                 or configure --anthropic-upstream bedrock / --openai-upstream azure) first"
-            )
-        })?
-        .clone();
-    keys.validate_upstreams()?;
-    keys.canonicalize_deployment_maps()?;
-    // Derive once so the registry worker-create body and the local
-    // WorkerRecord persist exactly the same backend provenance. The registry
-    // body always sends the map (authoritative full state); the local record
-    // also stores an explicit empty map for a fully-direct worker. `None` is
-    // reserved for legacy records whose provenance was never recorded.
+    let keys = deploy_preflight(cfg, client, phala, args, registration).await?;
     let worker_backends = keys.worker_backends();
-    let recorded_backends = Some(worker_backends.clone());
     require_cloud_registration_capability_for_worker(
         client,
         cfg,
@@ -641,187 +592,133 @@ pub(crate) async fn cmd_deploy(
         "registration",
     )
     .await?;
-
-    // Step 1b: resolve the per-worker node secret. Each worker (CVM)
-    // carries its own `x-gm-node-key` secret, never shared with a sibling
-    // — a leaked secret burns only one worker. A re-deploy of an existing
-    // worker (matched on `--app-name`) reuses the same value so what the
-    // container bakes into env, what envoy enforces, and what the registry
-    // stores all stay in lockstep (Mechanism 1 of attestation-and-identity.md).
-    // Only worker #1 (`deploy`) may inherit a pre-multi-worker legacy
-    // secret; a `worker add` must always mint its own.
-    // The Phala CLI + API-key gate already ran in `cmd_deploy_subcommand`,
-    // which scoped the validated key onto the `phala` client. The `phala`
-    // client passed in here carries it.
-
-    // Step 3: fetch approved image versions from the registry.
     let registry_url = cfg.api_url();
     println!("Fetching approved image versions from {registry_url} ...");
     let versions = fetch_supported_versions(&registry_url).await?;
-
-    // Step 4: select the target version.
     let approved = select_version(&versions, args.version)?;
     println!(
         "Selected version {}  ({})",
         approved.notes.as_deref().unwrap_or("<no notes>"),
-        format_created_at(&approved.created_at),
+        format_created_at(&approved.created_at)
     );
-
-    if !worker_backends.is_empty() && !image_is_model_hop_capable(args, approved, &versions) {
+    if !worker_backends.is_empty() && !image_is_cloud_binding_capable(args, approved, &versions) {
         anyhow::bail!(
             "cloud upstreams require a registry-approved image with the `upstream-model-hop` \
-             feature; select a supported hop image or wait for this image to be admitted"
+             feature; select an image with cloud model binding or wait for this image to be admitted"
         );
     }
-
-    let is_first = *registration == WorkerRegistration::First;
-    // A provisional stub from a `worker add` must stay off the worker-#1
-    // registration paths even before it has a worker_id; tag it so the
-    // primary/secondary classifiers can tell it from a worker-#1 stub.
-    let provisional_secondary = !is_first;
-    // Redeploying a worker already registered under this `--app-name` keeps
-    // its registry `worker_id`: the upcoming registration returns the same id.
-    // Carrying it into the pre-registration stubs means a deploy that fails
-    // after the CVM exists does not erase the worker_id — `worker remove` can
-    // still issue the registry DELETE for the still-registered worker.
-    let existing_worker_id = existing_worker_id_for(cfg, &args.app_name);
-    let (node_secret, freshly_generated) =
-        node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
-    let provider_slots = if image_is_slot_capable(args, approved, &versions) {
-        slots::provider_slots_for_keys(&keys, &node_secret)?
-    } else {
-        // The target image's entrypoint predates slots: it cannot fan out
-        // multi-key values or honor x-gm-upstream-slot. Refuse multi-key
-        // configs before any CVM launches, and advertise nothing so the
-        // worker registers as legacy.
-        slots::reject_multikey_for_legacy_image(&keys)?;
-        std::collections::BTreeMap::new()
-    };
-    if freshly_generated {
-        println!(
-            "Generated a fresh node secret for worker '{}'.",
-            args.app_name
-        );
-        // Persist the secret before the CVM launches. If the deploy or the
-        // registry call later fails, the running envoy enforces this secret
-        // and a re-deploy with the same `--app-name` recovers it (matched on
-        // app_name); without this, a fresh secret would exist only in memory
-        // until step 9. The worker_id/app_id are filled in once Phala and the
-        // registry return — step 9 upserts this same record in place.
-        persist_worker_record(
-            cfg.active_network(),
-            WorkerRecord {
-                worker_id: existing_worker_id.clone(),
-                app_id: String::new(),
-                app_name: args.app_name.clone(),
-                node_secret: node_secret.clone(),
-                backends: recorded_backends.clone(),
-                provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
-                provisional_secondary,
-            },
-        )?;
-    }
-
-    // Step 5: resolve which image to deploy (default = the gm-published ref
-    // on the selected version) and render the compose around it.
+    let mut record = prepare_worker_record(
+        cfg,
+        args,
+        registration,
+        keys,
+        approved,
+        &versions,
+        worker_backends,
+    )?;
     let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
     println!("Resolved miner image: {}", target.image_ref);
-
-    // Step 5b: resolve private-registry pull credentials. An anonymous OCI
-    // manifest probe decides whether the image is genuinely private: a public
-    // image renders a clean deploy with no `DSTACK_DOCKER_*` env, while a
-    // private one requires the operator-set GHCR pull credentials so the
-    // CVM's pre-launch script can `docker login` and pull.
     let registry_creds = resolve_registry_credentials(&target.image_ref).await?;
-
-    // Step 6: submit the compose stack to Phala Cloud and poll until the
-    // CVM reports its measured hashes. Phala Cloud provisions the TEEPod,
-    // runs the KMS, encrypts the env vars client-side to the CVM key, and
-    // assigns the `app_id`.
     println!(
         "Deploying to Phala Cloud (boot timeout: {}s) ...",
         args.boot_timeout_secs
     );
     let actual = phala.deploy(
         &target.rendered_compose,
-        &keys,
-        &node_secret,
+        keys,
+        &record.node_secret,
         registry_creds.as_ref(),
         args.boot_timeout_secs,
     )?;
-
-    // Step 6b: stamp the Phala `app_id` onto the record the instant the CVM
-    // exists — *before* the fallible hash verification and registration. The
-    // secret is already on disk (Step 1b for a fresh worker, or the prior
-    // record on a re-deploy); recording the `app_id` now means that whatever
-    // fails next — a hash mismatch or the registry POST — `worker remove` can
-    // name the orphaned CVM and `register-image --app-id <id>` can recover the
-    // secret. A redeploy carries the existing `worker_id` so a mid-deploy
-    // failure does not erase a still-registered worker's id. `upsert` keys on
-    // `app_name`, so this updates the same record in place.
-    persist_worker_record(
-        cfg.active_network(),
-        WorkerRecord {
-            worker_id: existing_worker_id.clone(),
-            app_id: actual.app_id.clone(),
-            app_name: args.app_name.clone(),
-            node_secret: node_secret.clone(),
-            backends: recorded_backends.clone(),
-            provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
-            provisional_secondary,
-        },
-    )?;
-
-    // Step 7: verify hashes. The returned hashes are normalized
-    // (lowercased, `sha256:` prefix stripped) so the loud check and the
-    // registration in step 8 agree on the exact value.
+    // Persist the app id before fallible hash checks so failed deploys remain recoverable.
+    record.app_id.clone_from(&actual.app_id);
+    persist_worker_record(cfg.active_network(), record.clone())?;
     println!("Verifying hashes against registry approval ...");
     let verified = verify_hashes(&actual.hashes, approved)?;
     println!("  compose_hash  : OK ({})", verified.compose_sha256);
     println!("  os_image_hash : OK ({})", verified.os_image_hash);
-
-    // Step 8: register the worker, carrying its node secret so the registry
-    // stores it and serves it to the gateway, plus the CVM's endpoint. A
-    // first deploy POSTs `/miners/register` (creates the hotkey identity +
-    // worker #1); `worker add` POSTs `/miners/{hotkey}/workers`.
     println!("Registering worker with the registry ...");
-    let worker_id = register_worker(
+    record.worker_id = register_worker(
         client,
         registration,
         &WorkerImageArgs {
             compose_hash: &verified.compose_sha256,
             os_image_hash: &verified.os_image_hash,
             endpoint: &actual.endpoint,
-            node_secret: Some(&node_secret),
-            backends: Some(&worker_backends),
-            provider_slots: (!provider_slots.is_empty()).then_some(&provider_slots),
+            node_secret: Some(&record.node_secret),
+            backends: record.backends.as_ref(),
+            provider_slots: record.provider_slots.as_ref(),
             accepted_terms_version: Some(terms::CURRENT_TERMS_VERSION),
         },
     )
     .await?;
-
-    // Step 9: stamp the registry's `worker_id` and the Phala `app_id` onto
-    // the record. `upsert` keys on `app_name`, so this replaces whatever was
-    // there — a fresh secret persisted before deploy, or the prior record on
-    // a re-deploy — in place; now `worker list`/`remove` can map it back to
-    // the Phala app_id.
-    persist_worker_record(
-        cfg.active_network(),
-        WorkerRecord {
-            worker_id: worker_id.clone(),
-            app_id: actual.app_id.clone(),
-            app_name: args.app_name.clone(),
-            node_secret: node_secret.clone(),
-            backends: recorded_backends,
-            provider_slots: (!provider_slots.is_empty()).then(|| provider_slots.clone()),
-            // Registered: role is read from position, never this flag.
-            provisional_secondary: false,
-        },
-    )?;
-
-    print_deploy_summary(&worker_id, &actual.app_id, registration);
-    deploy_streaming_advisory(cfg, &actual.endpoint, &node_secret).await;
+    record.provisional_secondary = false;
+    persist_worker_record(cfg.active_network(), record.clone())?;
+    print_deploy_summary(&record.worker_id, &actual.app_id, registration);
+    deploy_streaming_advisory(cfg, &actual.endpoint, &record.node_secret).await;
     Ok(())
+}
+
+async fn deploy_preflight<'a>(
+    cfg: &'a Config,
+    client: &mut RegistryClient,
+    phala: &dyn PhalaClient,
+    args: &DeployArgs,
+    registration: &WorkerRegistration,
+) -> Result<&'a gm_miner_cli::config::ProviderKeys> {
+    client.preflight_auth().await?;
+    reject_secondary_worker_deploy(cfg, client, registration, &args.app_name).await?;
+    preflight_cvm_name(phala, &args.app_name)?;
+    if *registration == WorkerRegistration::First {
+        ensure_terms_accepted(cfg, args)?;
+    }
+    let keys = cfg.provider_keys.as_ref().filter(|keys| keys.any_set()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no provider keys; run `gmcli set-api-keys \
+             --anthropic <key>` (and/or --openai / --google / --chutes / --zai / --moonshot / --deepinfra / --kubetee / --engy / --moonmath, \
+             or configure --anthropic-upstream bedrock / --openai-upstream azure) first"
+        )
+    })?;
+    keys.validate_upstreams()?;
+    Ok(keys)
+}
+
+fn prepare_worker_record(
+    cfg: &Config,
+    args: &DeployArgs,
+    registration: &WorkerRegistration,
+    keys: &gm_miner_cli::config::ProviderKeys,
+    approved: &ImageVersion,
+    versions: &[ImageVersion],
+    backends: std::collections::BTreeMap<String, String>,
+) -> Result<WorkerRecord> {
+    let is_first = *registration == WorkerRegistration::First;
+    let (node_secret, freshly_generated) =
+        node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
+    let provider_slots = if image_is_slot_capable(args, approved, versions) {
+        slots::provider_slots_for_keys(keys, &node_secret)?
+    } else {
+        slots::reject_multikey_for_legacy_image(keys)?;
+        std::collections::BTreeMap::new()
+    };
+    let record = WorkerRecord {
+        worker_id: existing_worker_id_for(cfg, &args.app_name),
+        app_id: String::new(),
+        app_name: args.app_name.clone(),
+        node_secret,
+        backends: Some(backends),
+        provider_slots: (!provider_slots.is_empty()).then_some(provider_slots),
+        provisional_secondary: !is_first,
+    };
+    if freshly_generated {
+        println!(
+            "Generated a fresh node secret for worker '{}'.",
+            args.app_name
+        );
+        // The running CVM must never depend on a secret lost by a later failed registry call.
+        persist_worker_record(cfg.active_network(), record.clone())?;
+    }
+    Ok(record)
 }
 
 /// Print the deploy result and, for a first deploy, the next-step hint.

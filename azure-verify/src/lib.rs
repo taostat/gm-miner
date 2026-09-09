@@ -11,6 +11,8 @@
 //! Azure SDK crates, and issues read-only requests exclusively.
 
 mod arm;
+mod binding;
+mod catalog;
 mod checks;
 mod config;
 mod endpoint;
@@ -24,16 +26,18 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::arm::{ArmDeploymentList, ArmScope, PagedRead};
+use crate::binding::assert_deployment_bindings;
 use crate::checks::{
-    assert_account_binding, assert_deployment_bindings, assert_no_capture_children,
-    assert_no_diagnostic_capture, assess_streaming_configuration, log_streaming_assessment,
-    retain_observable_deployments, split_azure_governed_deployments, AI_SERVICES_KIND,
+    assert_account_binding, assert_no_capture_children, assert_no_diagnostic_capture,
+    assess_streaming_configuration, log_streaming_assessment, retain_observable_deployments,
+    split_azure_governed_deployments, AI_SERVICES_KIND,
 };
 use crate::config::{configured_targets_from_env, PeriodicAzureVerifySettings};
 use crate::endpoint::{parse_azure_endpoint, AzureEndpoint};
 use crate::periodic::run_periodic_azure_verification;
 
 pub use crate::arm::{AzureVerifier, LOGIN_BASE_URL, MANAGEMENT_BASE_URL};
+pub use crate::binding::AzureDeployment;
 pub use crate::config::{AzureProvider, AzureVerifyConfig};
 
 /// The child collections an operator can attach a prompt-content sink to. Both
@@ -81,6 +85,8 @@ pub struct AzureAudit {
     pub swept_completely: bool,
     /// One message per violation, each ending in the fix.
     pub findings: Vec<String>,
+    /// Deployments actually read, including any pages before a paging failure.
+    pub deployments: Vec<AzureDeployment>,
     /// The instant at which the complete deployment binding was successfully
     /// checked. The full audit may perform slower policy reads afterwards, so
     /// this must be captured at the binding check rather than at audit return.
@@ -130,6 +136,7 @@ impl AzureAudit {
             projects_swept: 0,
             swept_completely: true,
             findings: Vec::new(),
+            deployments: Vec::new(),
             binding_verified_at: None,
         }
     }
@@ -324,9 +331,8 @@ impl AzureVerifier {
     /// Poll only the deployment binding between full owner-capture sweeps.
     ///
     /// This intentionally performs one ARM deployment-list read per target;
-    /// capture settings remain on the slower full sweep, while a repointed or
-    /// deleted deployment stops the data plane within the one-minute poll
-    /// interval.
+    /// capture settings remain on the slower full sweep. A catalog-named
+    /// deployment serving another model stops the data plane when observed.
     ///
     /// # Errors
     /// Returns a definitive binding error or the transport error that prevented
@@ -337,12 +343,7 @@ impl AzureVerifier {
         let account = self.fetch_arm_account(config, &endpoint, &token).await?;
         assert_account_binding(config.provider, &endpoint, &account)?;
         let read = self.fetch_arm_deployments(config, &endpoint, &token).await;
-        assert_deployment_bindings(
-            config.provider,
-            &config.deployment_map,
-            &read.items,
-            read.failure.is_none(),
-        )?;
+        assert_deployment_bindings(config.provider, &read.items)?;
         if let Some(failure) = read.failure {
             return Err(failure);
         }
@@ -422,16 +423,20 @@ impl AzureVerifier {
             .await?;
 
         let deployment_read = self.fetch_arm_deployments(config, endpoint, &token).await;
-        let deployment_binding = assert_deployment_bindings(
-            config.provider,
-            &config.deployment_map,
-            &deployment_read.items,
-            deployment_read.failure.is_none(),
-        );
-        if deployment_read.failure.is_none() && deployment_binding.is_ok() {
+        let findings_before = audit.findings.len();
+        audit.deployments = deployment_read
+            .items
+            .iter()
+            .map(AzureDeployment::from)
+            .collect();
+        for deployment in &audit.deployments {
+            if let Err(error) = deployment.verify_binding(config.provider) {
+                audit.findings.push(error.to_string());
+            }
+        }
+        if deployment_read.failure.is_none() && audit.findings.len() == findings_before {
             audit.binding_verified_at = Some(Instant::now());
         }
-        audit.record(deployment_binding);
 
         // Only Azure OpenAI has an ARM-observable streaming control. Azure's RAI
         // content filter is not in Claude's inference path on Foundry, so there is
@@ -701,11 +706,6 @@ mod tests {
     fn foundry_target() -> AzureVerifyConfig {
         AzureVerifyConfig {
             provider: AzureProvider::Foundry,
-            deployment_map: gm_cloud_hop::parse_deployment_map(
-                gm_cloud_hop::CloudProvider::Foundry,
-                "claude-sonnet-4-6=foundry-sonnet",
-            )
-            .expect("foundry map"),
             endpoint: "https://acct.services.ai.azure.com".to_owned(),
             tenant_id: "tenant".to_owned(),
             subscription_id: "sub".to_owned(),
@@ -718,11 +718,6 @@ mod tests {
     fn openai_target() -> AzureVerifyConfig {
         AzureVerifyConfig {
             provider: AzureProvider::OpenAi,
-            deployment_map: gm_cloud_hop::parse_deployment_map(
-                gm_cloud_hop::CloudProvider::AzureOpenAi,
-                "gpt-5.5=gpt-5",
-            )
-            .expect("Azure OpenAI map"),
             endpoint: "https://acct.openai.azure.com".to_owned(),
             tenant_id: "tenant".to_owned(),
             subscription_id: "sub".to_owned(),
@@ -748,7 +743,7 @@ mod tests {
             &format!("{ACCOUNT_PATH}/deployments"),
             ok_json(serde_json::json!({
                 "value": [{
-                    "name": "gpt-5",
+                    "name": "gpt-5.5",
                     "properties": {
                         "model": {
                             "format": "OpenAI",
@@ -885,7 +880,7 @@ mod tests {
             &format!("{ACCOUNT_PATH}/deployments"),
             ok_json(serde_json::json!({
                 "value": [{
-                    "name": "foundry-sonnet",
+                    "name": "claude-sonnet-4-6",
                     "properties": {
                         "model": {
                             "format": "Anthropic",
@@ -902,6 +897,135 @@ mod tests {
 
     fn verifier_for(server: &MockServer) -> AzureVerifier {
         AzureVerifier::with_endpoints(reqwest::Client::new(), server.uri(), server.uri())
+    }
+
+    async fn override_deployments(server: &MockServer, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(format!("{ACCOUNT_PATH}/deployments")))
+            .respond_with(ok_json(body))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn boot_gate_rejects_every_catalog_named_mismatch() {
+        let empty = serde_json::json!({"value": []});
+        let server = foundry_arm(empty.clone(), ok_json(empty)).await;
+        override_deployments(
+            &server,
+            serde_json::json!({"value": [
+                {"name":"claude-opus-4-6","properties":{"model":{
+                    "format":"Anthropic","name":"claude-haiku-4-5","version":"1"
+                }}},
+                {"name":"claude-sonnet-4-6","properties":{"model":{
+                    "format":"OpenAI","name":"claude-sonnet-4-6","version":"1"
+                }}}
+            ]}),
+        )
+        .await;
+        let verifier = verifier_for(&server);
+        let audit = verifier
+            .audit_target(&foundry_target())
+            .await
+            .expect("audit");
+        assert_eq!(audit.deployments.len(), 2);
+        assert_eq!(audit.findings.len(), 2);
+        assert!(audit.findings[0].contains("claude-opus-4-6"));
+        assert!(audit.findings[1].contains("claude-sonnet-4-6"));
+        assert!(audit.binding_verified_at.is_none());
+        let error = verifier
+            .verify_target(&foundry_target())
+            .await
+            .expect_err("boot gate");
+        assert_eq!(
+            classify_verification_error(&error),
+            VerificationFailureKind::Definitive
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_and_poll_ignore_non_catalog_names_and_absent_deployments() {
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!([{"name":"private-deployment","properties":{}}]),
+        ] {
+            let empty = serde_json::json!({"value": []});
+            let server = foundry_arm(empty.clone(), ok_json(empty)).await;
+            override_deployments(&server, serde_json::json!({"value":value})).await;
+            let verifier = verifier_for(&server);
+            verifier
+                .verify_target(&foundry_target())
+                .await
+                .expect("boot passes");
+            verifier
+                .verify_deployment_bindings(&foundry_target())
+                .await
+                .expect("poll passes");
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_binding_violation_outranks_later_paging_failure() {
+        let empty = serde_json::json!({"value": []});
+        let server = foundry_arm(empty.clone(), ok_json(empty)).await;
+        override_deployments(
+            &server,
+            serde_json::json!({
+                "value": [{"name":"claude-opus-4-6","properties":{"model":{
+                    "format":"Anthropic","name":"claude-haiku-4-5"
+                }}}],
+                "nextLink":format!("{}/page-2", server.uri())
+            }),
+        )
+        .await;
+        mount_get(&server, "/page-2", throttled()).await;
+        let verifier = verifier_for(&server);
+        let audit = verifier
+            .audit_target(&foundry_target())
+            .await
+            .expect("observed violation");
+        assert!(!audit.swept_completely);
+        assert!(audit.binding_verified_at.is_none());
+        assert_eq!(audit.deployments.len(), 1);
+        for result in [
+            audit.into_result(),
+            verifier.verify_deployment_bindings(&foundry_target()).await,
+        ] {
+            let error = result.expect_err("observed mismatch must be definitive");
+            assert!(error.to_string().contains("claude-opus-4-6"));
+            assert_eq!(
+                classify_verification_error(&error),
+                VerificationFailureKind::Definitive
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn honest_binding_with_unread_pages_is_transient_and_never_fresh() {
+        let empty = serde_json::json!({"value": []});
+        let server = foundry_arm(empty.clone(), ok_json(empty)).await;
+        override_deployments(
+            &server,
+            serde_json::json!({
+                "value": [{"name":"claude-opus-4-6","properties":{"model":{
+                    "format":"Anthropic","name":"claude-opus-4-6"
+                }}}],
+                "nextLink":format!("{}/page-2", server.uri())
+            }),
+        )
+        .await;
+        mount_get(&server, "/page-2", throttled()).await;
+        let verifier = verifier_for(&server);
+        for result in [
+            verifier.verify_target(&foundry_target()).await,
+            verifier.verify_deployment_bindings(&foundry_target()).await,
+        ] {
+            assert_eq!(
+                classify_verification_error(&result.expect_err("incomplete list")),
+                VerificationFailureKind::Transient
+            );
+        }
     }
 
     /// THE ATTACK. The operator attaches a capture sink, then induces throttling
@@ -1031,7 +1155,7 @@ mod tests {
         .await;
         let page_1 = page_1_of_2(
             &server,
-            &serde_json::json!([{"name": "gpt-5", "properties": {"model": {
+            &serde_json::json!([{"name": "gpt-5.5", "properties": {"model": {
                 "format": "OpenAI", "name": "gpt-5.5", "version": "2025-08-07"
             }}}]),
         );
@@ -1074,7 +1198,7 @@ mod tests {
                 {"name": "unfiltered", "properties": {"model": {
                     "format": "OpenAI", "name": "gpt-5.5", "version": "2025-08-07"
                 }}},
-                {"name": "gpt-5", "properties": {
+                {"name": "gpt-5.5", "properties": {
                     "model": {"format": "OpenAI", "name": "gpt-5.5", "version": "2025-08-07"},
                     "raiPolicyName": "some-policy"
                 }}

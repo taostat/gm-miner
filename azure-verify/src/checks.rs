@@ -8,12 +8,9 @@ pub(crate) use self::streaming::{
     assess_streaming_configuration, log_streaming_assessment, retain_observable_deployments,
     split_azure_governed_deployments,
 };
-use crate::arm::{
-    ArmAccount, ArmChildResource, ArmDeployment, DiagnosticSettingsList, ARM_API_VERSION,
-};
+use crate::arm::{ArmAccount, ArmChildResource, DiagnosticSettingsList, ARM_API_VERSION};
 use crate::config::AzureProvider;
 use crate::endpoint::AzureEndpoint;
-use gm_cloud_hop::{CloudProvider, DeploymentMap};
 
 /// The account kind that carries Foundry projects, connections, and capability
 /// hosts. A classic `kind: OpenAI` account has none of those child collections.
@@ -23,88 +20,6 @@ const ALLOWED_OPENAI_ACCOUNT_KINDS: [&str; 2] = ["OpenAI", AI_SERVICES_KIND];
 /// Foundry serves Claude only from an `AIServices` account (Microsoft's own
 /// Claude reference templates create exactly that kind), so accept nothing else.
 const ALLOWED_FOUNDRY_ACCOUNT_KINDS: [&str; 1] = [AI_SERVICES_KIND];
-
-/// Verify the measured-image canonical model map against the deployments on
-/// the ARM-bound account. A complete list must contain every mapped deployment;
-/// entries observed before a pagination failure are still checked immediately.
-pub(crate) fn assert_deployment_bindings(
-    provider: AzureProvider,
-    map: &DeploymentMap,
-    deployments: &[ArmDeployment],
-    complete: bool,
-) -> Result<()> {
-    let expected_provider = match provider {
-        AzureProvider::OpenAi => CloudProvider::AzureOpenAi,
-        AzureProvider::Foundry => CloudProvider::Foundry,
-    };
-    if map.provider() != expected_provider {
-        bail!(
-            "{} deployment map belongs to {}, not {}",
-            provider.label(),
-            map.provider(),
-            expected_provider
-        );
-    }
-    let expected_format = match provider {
-        AzureProvider::OpenAi => "OpenAI",
-        AzureProvider::Foundry => "Anthropic",
-    };
-    for (canonical, deployment_name) in map.iter() {
-        let Some(deployment) = deployments
-            .iter()
-            .find(|deployment| deployment.name == deployment_name)
-        else {
-            if complete {
-                bail!(
-                    "{} deployment map entry {canonical}={deployment_name} is missing from \
-                     the ARM deployment list; remove the mapping or deploy that exact name",
-                    provider.label()
-                );
-            }
-            continue;
-        };
-        let format = deployment
-            .properties
-            .model
-            .format
-            .as_deref()
-            .unwrap_or("<missing>");
-        if format != expected_format {
-            bail!(
-                "{} deployment '{deployment_name}' for canonical model '{canonical}' has \
-                 ARM model.format '{format}', expected '{expected_format}'; refusing a \
-                 repointed or wrong-class deployment",
-                provider.label()
-            );
-        }
-        let model_name = deployment
-            .properties
-            .model
-            .name
-            .as_deref()
-            .unwrap_or("<missing>");
-        tracing::debug!(
-            deployment = %deployment_name,
-            canonical = %canonical,
-            version = deployment
-                .properties
-                .model
-                .version
-                .as_deref()
-                .unwrap_or("<missing>"),
-            "Azure deployment model binding observed",
-        );
-        if model_name != canonical {
-            bail!(
-                "{} deployment '{deployment_name}' has ARM model.name '{model_name}', \
-                 expected exact canonical model '{canonical}'; refusing a repointed, \
-                 fine-tuned, or model-router deployment",
-                provider.label()
-            );
-        }
-    }
-    Ok(())
-}
 
 pub(crate) fn assert_account_binding<'account>(
     provider: AzureProvider,
@@ -347,61 +262,6 @@ mod tests {
 
     fn account_from_json(json: &str) -> ArmAccount {
         serde_json::from_str(json).expect("fixture must parse")
-    }
-
-    fn deployment_from_json(json: &str) -> ArmDeployment {
-        serde_json::from_str(json).expect("deployment fixture must parse")
-    }
-
-    fn openai_map() -> DeploymentMap {
-        gm_cloud_hop::parse_deployment_map(CloudProvider::AzureOpenAi, "gpt-5.5=gpt-5")
-            .expect("Azure map must parse")
-    }
-
-    #[test]
-    fn deployment_binding_requires_exact_arm_format_and_model_name() {
-        let deployment = deployment_from_json(
-            r#"{"name":"gpt-5","properties":{"model":{
-                "format":"OpenAI","name":"gpt-5.5","version":"2025-08-07"
-            }}}"#,
-        );
-        assert!(assert_deployment_bindings(
-            AzureProvider::OpenAi,
-            &openai_map(),
-            &[deployment],
-            true
-        )
-        .is_ok());
-
-        for (format, name, expected) in [
-            ("Anthropic", "gpt-5.5", "model.format"),
-            ("OpenAI", "gpt-5", "model.name"),
-        ] {
-            let deployment = deployment_from_json(&format!(
-                r#"{{"name":"gpt-5","properties":{{"model":{{
-                    "format":"{format}","name":"{name}","version":"2025-08-07"
-                }}}}}}"#
-            ));
-            let error = assert_deployment_bindings(
-                AzureProvider::OpenAi,
-                &openai_map(),
-                &[deployment],
-                true,
-            )
-            .expect_err("wrong ARM deployment binding must fail")
-            .to_string();
-            assert!(error.contains(expected), "{error}");
-        }
-    }
-
-    #[test]
-    fn deployment_binding_missing_entry_is_only_unknown_on_an_incomplete_page() {
-        let map = openai_map();
-        assert!(assert_deployment_bindings(AzureProvider::OpenAi, &map, &[], false).is_ok());
-        let error = assert_deployment_bindings(AzureProvider::OpenAi, &map, &[], true)
-            .expect_err("a complete ARM list must contain every mapped deployment")
-            .to_string();
-        assert!(error.contains("missing"), "{error}");
     }
 
     fn valid_account_json() -> &'static str {

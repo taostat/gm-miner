@@ -62,10 +62,10 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// not values, so every miner produces the same `compose_hash`. The order
 /// matches `render_env_file`: Anthropic direct/Bedrock/Foundry, `OpenAI`
 /// direct/Azure, Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, Engy,
-/// Moonmath, deployment maps, node secret, hop/gateway sizing.
+/// Moonmath and the node secret.
 /// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
 /// gm image is public and those vars do not appear in `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 37] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -77,7 +77,6 @@ const CANONICAL_ALLOWED_ENVS: [&str; 37] = [
     "AZURE_FOUNDRY_RESOURCE_GROUP",
     "AZURE_FOUNDRY_CLIENT_ID",
     "AZURE_FOUNDRY_CLIENT_SECRET",
-    "AZURE_FOUNDRY_DEPLOYMENTS",
     "OPENAI_API_KEY",
     "OPENAI_UPSTREAM",
     "AZURE_OPENAI_ENDPOINT",
@@ -87,7 +86,6 @@ const CANONICAL_ALLOWED_ENVS: [&str; 37] = [
     "AZURE_RESOURCE_GROUP",
     "AZURE_CLIENT_ID",
     "AZURE_CLIENT_SECRET",
-    "AZURE_OPENAI_DEPLOYMENTS",
     "GOOGLE_API_KEY",
     "CHUTES_API_KEY",
     "ZAI_API_KEY",
@@ -98,11 +96,6 @@ const CANONICAL_ALLOWED_ENVS: [&str; 37] = [
     "MOONMATH_API_KEY",
     "NEAR_API_KEY",
     "GM_NODE_SECRET",
-    "GM_GATEWAY_MAX_REQUEST_BODY_BYTES",
-    "GM_CLOUD_HOP_MAX_REQUEST_BYTES",
-    "GM_CLOUD_HOP_MAX_BUFFERED_BYTES",
-    "GM_CLOUD_HOP_MAX_CONCURRENCY",
-    "GM_CLOUD_HOP_TIMEOUT_MS",
 ];
 
 /// The pinned dstack OS image's published reproducible `os_image_hash`.
@@ -235,25 +228,20 @@ pub fn compute_compose_hash(image_ref: &str, network: Network) -> anyhow::Result
 mod tests {
     use super::*;
 
-    /// The testnet image ref whose `app_compose` hashes to the registry's
-    /// approved baseline below — the gm-published public miner image for the
-    /// current testnet-supported NEAR candidate. Must track a supported
-    /// image version: when a new `ImageVersion` is published, bump both this
-    /// ref and `REGISTRY_TESTNET_COMPOSE_HASH` to the live registry row.
+    /// Image reference for the historical registry-approved compose fixture.
+    /// Only a verified registry approval can replace this baseline.
     const TESTNET_IMAGE_REF: &str =
         "ghcr.io/taostat/gm-miner@sha256:11f99ebde0d1acb944669be8fd0215086e8857de4324ae3fbeab2fcb42c72299";
 
-    /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
-    /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
-    /// keys, cloud upstream settings, and node secret).
-    ///
+    /// Registry-approved hash of `approved-compose.yaml`, `TESTNET_IMAGE_REF`
+    /// and `APPROVED_BASELINE_ALLOWED_ENVS`.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
         "81e5f2b7544840f5394dd76940a6cf75558a4e822e7992670972af9cca695377";
     /// Candidate hash for this branch's measured compose. It is deliberately
     /// separate from the approved baseline: the baseline proves historical
     /// reproducibility while this pin makes candidate drift visible.
     const CANDIDATE_TESTNET_COMPOSE_HASH: &str =
-        "8e35319272dc44c84bac27f24b3362e968961690fdcd692692075dde12beea53";
+        "6d41a82c6c49def6e6e84b182fe9d89e60621da21482c74543b2e1d8630210f2";
 
     const APPROVED_BASELINE_ALLOWED_ENVS: [&str; 30] = [
         "ANTHROPIC_API_KEY",
@@ -288,23 +276,12 @@ mod tests {
         "GM_NODE_SECRET",
     ];
 
-    fn approved_baseline_template() -> String {
-        let current_runtime = "      ## Hop and gateway request-sizing knobs. They are optional; the image\n      ## applies bounded defaults and the gateway cap is the fallback request\n      ## limit when no hop-specific cap is supplied.\n      - GM_GATEWAY_MAX_REQUEST_BODY_BYTES\n      - GM_CLOUD_HOP_MAX_REQUEST_BYTES\n      - GM_CLOUD_HOP_MAX_BUFFERED_BYTES\n      - GM_CLOUD_HOP_MAX_CONCURRENCY\n      - GM_CLOUD_HOP_TIMEOUT_MS\n";
-        let current_comment = "## The runtime has two required servers plus one conditional measured process\n## inside one container: envoy (the data plane on :8080),\n## gm-miner-attestd (the TEE attestation server), and gm-cloud-hop when\n## Azure OpenAI or Foundry is selected. The registry probes :8080 —\n## `x-gm-provider` for capability and `GET /attestation/info`, which envoy\n## routes to attestd. The hop is loopback-only and returns to Envoy's\n## existing restricted TLS egress clusters.\n";
-        let approved_comment = "## The runtime is two co-located processes inside one container: envoy\n## (the data plane on :8080) and gm-miner-attestd (the TEE attestation\n## server). The registry probes :8080 — `x-gm-provider` for capability,\n## and `GET /attestation/info` which envoy routes to attestd.\n";
-        COMPOSE_TEMPLATE
-            .replace(current_runtime, "")
-            .replace("      - AZURE_FOUNDRY_DEPLOYMENTS\n", "")
-            .replace("      - AZURE_OPENAI_DEPLOYMENTS\n", "")
-            .replace(current_comment, approved_comment)
-    }
-
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {
         let compose = build_app_compose_from(
             TESTNET_IMAGE_REF,
             Network::Testnet,
-            &approved_baseline_template(),
+            include_str!("../tests/fixtures/approved-compose.yaml"),
             &APPROVED_BASELINE_ALLOWED_ENVS,
         )
         .expect("approved baseline compose must compute");

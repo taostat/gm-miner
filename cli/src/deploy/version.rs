@@ -40,7 +40,7 @@ impl ImageVersion {
     /// `true` when this image's measured entrypoint contains the cloud model
     /// translation hop and its qualified Envoy routes.
     #[must_use]
-    pub fn model_hop_capable(&self) -> bool {
+    pub fn cloud_binding_capable(&self) -> bool {
         self.features.iter().any(|f| f == "upstream-model-hop")
     }
 }

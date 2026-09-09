@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["attestd", "azure-verify", "cli", "cloud-hop"]
+members = ["attestd", "azure-verify", "cli"]
 
 [workspace.package]
-version = "0.4.16-dev"
+version = "0.4.17-dev"
 edition = "2021"
 # 1.88 is the floor of the locked dependency tree: the dstack-sdk ->
 # alloy chain (pulled in by the attestd crate) requires rustc 1.88+
@@ -47,7 +47,6 @@ dstack-sdk = "0.1"
 # cargo-dist family that builds the releases it updates from.
 axoupdater = "0.10"
 gm-azure-verify = { path = "azure-verify" }
-gm-cloud-hop = { path = "cloud-hop" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

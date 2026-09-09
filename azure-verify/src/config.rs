@@ -2,7 +2,6 @@ use std::env::VarError;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use gm_cloud_hop::{parse_deployment_map, CloudProvider, DeploymentMap};
 
 const DEFAULT_VERIFY_INTERVAL_SECS: u64 = 15 * 60;
 const MIN_VERIFY_INTERVAL_SECS: u64 = 60;
@@ -43,9 +42,6 @@ impl AzureProvider {
 #[derive(Debug, Clone)]
 pub struct AzureVerifyConfig {
     pub provider: AzureProvider,
-    /// The canonical model to ARM deployment binding baked into the measured
-    /// image. The verifier checks every entry against the bound account.
-    pub deployment_map: DeploymentMap,
     pub endpoint: String,
     pub tenant_id: String,
     pub subscription_id: String,
@@ -65,7 +61,6 @@ impl AzureVerifyConfig {
     fn openai_from_env() -> Result<Self> {
         Ok(Self {
             provider: AzureProvider::OpenAi,
-            deployment_map: required_map("AZURE_OPENAI_DEPLOYMENTS", CloudProvider::AzureOpenAi)?,
             endpoint: required_env("AZURE_OPENAI_ENDPOINT")?,
             tenant_id: required_env("AZURE_TENANT_ID")?,
             subscription_id: required_env("AZURE_SUBSCRIPTION_ID")?,
@@ -82,7 +77,6 @@ impl AzureVerifyConfig {
     fn foundry_from_env() -> Result<Self> {
         Ok(Self {
             provider: AzureProvider::Foundry,
-            deployment_map: required_map("AZURE_FOUNDRY_DEPLOYMENTS", CloudProvider::Foundry)?,
             endpoint: required_env("AZURE_FOUNDRY_ENDPOINT")?,
             tenant_id: required_env("AZURE_FOUNDRY_TENANT_ID")?,
             subscription_id: required_env("AZURE_FOUNDRY_SUBSCRIPTION_ID")?,
@@ -91,11 +85,6 @@ impl AzureVerifyConfig {
             client_secret: required_env("AZURE_FOUNDRY_CLIENT_SECRET")?,
         })
     }
-}
-
-fn required_map(name: &'static str, provider: CloudProvider) -> Result<DeploymentMap> {
-    let raw = required_env(name)?;
-    parse_deployment_map(provider, &raw).with_context(|| format!("validate {name}"))
 }
 
 /// Every Azure account this worker's upstream selectors put in the request

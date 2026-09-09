@@ -62,7 +62,7 @@ use crate::commands::earnings::cmd_earnings;
 use crate::commands::fun::{cmd_gm, cmd_moon};
 use crate::commands::hotkey::cmd_register_hotkey;
 use crate::commands::image_canary::cmd_image_canary;
-use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
+use crate::commands::keys::SetApiKeysArgs;
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::pricing::cmd_pricing;
 use crate::commands::products::{
@@ -137,10 +137,6 @@ impl Cli {
 }
 
 #[derive(Subcommand)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "clap command variants keep their parsed fields inline; set-api-keys carries many provider options"
-)]
 enum Command {
     /// Persist provider API keys to ~/.gmcli/config.json (mode 0600).
     ///
@@ -160,114 +156,15 @@ enum Command {
         gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
           --bedrock-api-key brk-...\n  \
         gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
-          --azure-openai-api-key ... --azure-deployments gpt-5.5=my-gpt55\n  \
+          --azure-openai-api-key ...\n  \
         gmcli set-api-keys --anthropic-upstream foundry \\\n  \
           --azure-foundry-endpoint https://my-resource.services.ai.azure.com \\\n  \
           --azure-foundry-api-key ... --azure-foundry-tenant-id ... \\\n  \
           --azure-foundry-subscription-id ... --azure-foundry-resource-group ... \\\n  \
-          --azure-foundry-client-id ... --azure-foundry-client-secret ... \\\n  \
-          --foundry-deployments claude-sonnet-4-6=my-sonnet")]
+          --azure-foundry-client-id ... --azure-foundry-client-secret ...")]
     SetApiKeys {
-        /// Anthropic API key (sk-ant-...).
-        #[arg(long)]
-        anthropic: Option<String>,
-
-        /// Anthropic transport selector: direct, bedrock, or foundry.
-        /// Foundry uses the measured model hop; cloud operations also require
-        /// the registry capability `upstream-model-echo`. Bedrock remains a
-        /// disabled inference transport in this image.
-        #[arg(long)]
-        anthropic_upstream: Option<String>,
-
-        /// AWS Bedrock region for `ANTHROPIC_UPSTREAM=bedrock`.
-        #[arg(long)]
-        bedrock_region: Option<String>,
-
-        /// AWS Bedrock API key for `ANTHROPIC_UPSTREAM=bedrock`.
-        #[arg(long)]
-        bedrock_api_key: Option<String>,
-
-        /// Microsoft Foundry (Claude on Azure) settings and deployment map.
         #[command(flatten)]
-        foundry: FoundryArgs,
-
-        /// `OpenAI` API key (sk-...).
-        #[arg(long)]
-        openai: Option<String>,
-
-        /// `OpenAI` transport selector: direct or azure. Azure uses the
-        /// measured model hop; offers still require feature admission.
-        #[arg(long)]
-        openai_upstream: Option<String>,
-
-        /// Azure `OpenAI` endpoint URL or host for `OPENAI_UPSTREAM=azure`.
-        #[arg(long)]
-        azure_openai_endpoint: Option<String>,
-
-        /// Azure `OpenAI` API key for `OPENAI_UPSTREAM=azure`.
-        #[arg(long)]
-        azure_openai_api_key: Option<String>,
-
-        /// Azure tenant ID for ARM verification when `OPENAI_UPSTREAM=azure`.
-        #[arg(long)]
-        azure_tenant_id: Option<String>,
-
-        /// Azure subscription ID for ARM verification when `OPENAI_UPSTREAM=azure`.
-        #[arg(long)]
-        azure_subscription_id: Option<String>,
-
-        /// Azure resource group for ARM verification when `OPENAI_UPSTREAM=azure`.
-        #[arg(long)]
-        azure_resource_group: Option<String>,
-
-        /// Azure client ID for ARM verification when `OPENAI_UPSTREAM=azure`.
-        #[arg(long)]
-        azure_client_id: Option<String>,
-
-        /// Azure client secret for ARM verification when `OPENAI_UPSTREAM=azure`.
-        #[arg(long)]
-        azure_client_secret: Option<String>,
-
-        /// Canonical-to-deployment map for Azure `OpenAI` chat completions,
-        /// formatted as `canonical=deployment;canonical=deployment`.
-        #[arg(long)]
-        azure_deployments: Option<String>,
-
-        /// Google API key.
-        #[arg(long)]
-        google: Option<String>,
-
-        /// Chutes API key (cpk_...).
-        #[arg(long)]
-        chutes: Option<String>,
-
-        /// Z.ai API key.
-        #[arg(long)]
-        zai: Option<String>,
-
-        /// Moonshot API key.
-        #[arg(long)]
-        moonshot: Option<String>,
-
-        /// `DeepInfra` API key.
-        #[arg(long)]
-        deepinfra: Option<String>,
-
-        /// `KubeTEE` API key.
-        #[arg(long)]
-        kubetee: Option<String>,
-
-        /// Engy API key.
-        #[arg(long)]
-        engy: Option<String>,
-
-        /// Moonmath ZRO API key (sk-...).
-        #[arg(long)]
-        moonmath: Option<String>,
-
-        /// NEAR AI Cloud API key.
-        #[arg(long)]
-        near: Option<String>,
+        flags: Box<SetApiKeysArgs>,
     },
 
     /// Deploy the miner to Phala Cloud with trust-correct hash verification.
@@ -462,7 +359,7 @@ enum Command {
 
         /// Legacy upstream model id for transport diagnostics. Cloud offers use
         /// the canonical model id after the image and registry gates pass; the
-        /// deployment map stays inside the measured image.
+        /// deployment must use the canonical model name.
         #[arg(long = "upstream-model", value_name = "ID")]
         upstream_model: Option<String>,
 
@@ -834,71 +731,37 @@ async fn main() -> Result<()> {
     dispatch(cli).await
 }
 
-/// Resolve the global flags and run the selected subcommand. Split from
-/// [`main`] so the startup banner/tracing setup stays separate from the
-/// per-command routing.
-#[expect(
-    clippy::too_many_lines,
-    reason = "top-level CLI dispatch is intentionally a flat subcommand match"
-)]
-async fn dispatch(cli: Cli) -> Result<()> {
-    let explicit_network = cli.explicit_network();
-    let api_url = cli.api_url.clone();
+struct DispatchContext {
+    network: Option<Network>,
+    api_url: Option<String>,
+}
 
+impl DispatchContext {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            network: cli.explicit_network(),
+            api_url: cli.api_url.clone(),
+        }
+    }
+
+    fn config(&self) -> Result<gm_miner_cli::config::Config> {
+        load_config(self.network, self.api_url.clone())
+    }
+
+    async fn authenticated_config(&self) -> Result<gm_miner_cli::config::Config> {
+        ensure_fresh_token(self.config()?).await
+    }
+
+    async fn client(&self) -> Result<RegistryClient> {
+        Ok(RegistryClient::new(self.authenticated_config().await?))
+    }
+}
+
+async fn dispatch(cli: Cli) -> Result<()> {
+    let context = DispatchContext::from_cli(&cli);
     match cli.command {
-        Command::SetApiKeys {
-            anthropic,
-            anthropic_upstream,
-            bedrock_region,
-            bedrock_api_key,
-            foundry,
-            openai,
-            openai_upstream,
-            azure_openai_endpoint,
-            azure_openai_api_key,
-            azure_tenant_id,
-            azure_subscription_id,
-            azure_resource_group,
-            azure_client_id,
-            azure_client_secret,
-            azure_deployments,
-            google,
-            chutes,
-            zai,
-            moonshot,
-            deepinfra,
-            kubetee,
-            engy,
-            moonmath,
-            near,
-        } => cmd_set_api_keys(
-            explicit_network,
-            anthropic,
-            anthropic_upstream,
-            bedrock_region,
-            bedrock_api_key,
-            foundry,
-            openai,
-            openai_upstream,
-            azure_openai_endpoint,
-            azure_openai_api_key,
-            azure_tenant_id,
-            azure_subscription_id,
-            azure_resource_group,
-            azure_client_id,
-            azure_client_secret,
-            azure_deployments,
-            google,
-            chutes,
-            zai,
-            moonshot,
-            deepinfra,
-            kubetee,
-            engy,
-            moonmath,
-            near,
-        ),
-        Command::Init { yes } => cmd_init(explicit_network, api_url, yes).await,
+        Command::SetApiKeys { flags } => flags.run(context.network),
+        Command::Init { yes } => cmd_init(context.network, context.api_url, yes).await,
         Command::Gm => {
             cmd_gm();
             Ok(())
@@ -908,37 +771,27 @@ async fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Deploy { flags } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
             cmd_deploy_subcommand(
-                cfg,
+                context.authenticated_config().await?,
                 deploy_args_from_flags(*flags),
                 WorkerRegistration::First,
             )
             .await
         }
-        Command::Worker { command } => dispatch_worker(command, explicit_network, api_url).await,
-        Command::Login { no_browser } => cmd_login(explicit_network, api_url, !no_browser).await,
-        Command::Doctor => {
-            let cfg = load_config(explicit_network, api_url)?;
-            cmd_doctor(cfg).await
+        Command::Worker { command } => {
+            dispatch_worker(command, context.network, context.api_url).await
         }
-        Command::CheckStreaming => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            cmd_check_streaming(cfg).await
+        Command::Login { no_browser } => {
+            cmd_login(context.network, context.api_url, !no_browser).await
         }
+        Command::Doctor => cmd_doctor(context.config()?).await,
+        Command::CheckStreaming => cmd_check_streaming(context.authenticated_config().await?).await,
         Command::ImageCanary {
             buyer_api_key,
             gateway_url,
         } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let network = cfg.resolved_network();
-            // Let the handler enforce the network gate before checking the
-            // optional key, so a bare/default mainnet invocation always
-            // refuses as testnet-only rather than looking like a key error.
             cmd_image_canary(
-                network,
+                context.config()?.resolved_network(),
                 gateway_url.as_deref(),
                 buyer_api_key.as_deref().unwrap_or_default(),
             )
@@ -949,47 +802,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
             wallet,
             hotkey,
             yes,
-        } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            cmd_register_hotkey(&cfg, hotkey_ss58, wallet, hotkey, yes)
-        }
+        } => cmd_register_hotkey(&context.config()?, hotkey_ss58, wallet, hotkey, yes),
         Command::RegisterImage { app_id } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            cmd_register_image_subcommand(cfg, &app_id).await
+            cmd_register_image_subcommand(context.authenticated_config().await?, &app_id).await
         }
         Command::PublishImageVersion { flags } => {
-            // No OAuth: the registry admin key authenticates the publish, and
-            // the registry URL comes from the network default or --api-url.
-            let cfg = load_config(explicit_network, api_url)?;
-            cmd_publish_image_version(&cfg, *flags).await
+            cmd_publish_image_version(&context.config()?, *flags).await
         }
         Command::SlotEnv { provider, env_var } => cmd_slot_env(&provider, &env_var),
-        Command::ListProducts | Command::Status => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
-            cmd_status(&mut client).await
-        }
-        Command::Pricing => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
-            cmd_pricing(&mut client).await
-        }
-        Command::Sources => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
-            cmd_sources(&mut client).await
-        }
-        // No config and no login: an upgrade must work for a miner whose stored
-        // token has expired, which is exactly the miner most likely to be stale.
+        Command::ListProducts | Command::Status => cmd_status(&mut context.client().await?).await,
+        Command::Pricing => cmd_pricing(&mut context.client().await?).await,
+        Command::Sources => cmd_sources(&mut context.client().await?).await,
         Command::Update => cmd_update().await,
-        Command::Earnings { yes } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            cmd_earnings(&cfg, yes)
-        }
+        Command::Earnings { yes } => cmd_earnings(&context.config()?, yes),
         Command::DeclareProduct {
             provider,
             model,
@@ -997,11 +822,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             discount_bp,
             yes,
         } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
             cmd_declare_product(
-                &mut client,
+                &mut context.client().await?,
                 &provider,
                 &model,
                 discount_bp,
@@ -1016,31 +838,21 @@ async fn dispatch(cli: Cli) -> Result<()> {
             provider,
             discount_bp,
             yes,
-        } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
-            // A declined confirmation exits 0: the miner asked for nothing to
-            // happen and nothing did. Only `init` branches on the outcome,
-            // because only it goes on to claim the step is done.
-            cmd_declare_products(&mut client, provider.as_ref(), discount_bp, yes)
-                .await
-                .map(|_| ())
-        }
+        } => cmd_declare_products(
+            &mut context.client().await?,
+            provider.as_ref(),
+            discount_bp,
+            yes,
+        )
+        .await
+        .map(|_| ()),
         Command::UndeclareProduct { provider, model } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
-            cmd_undeclare_product(&mut client, &provider, &model).await
+            cmd_undeclare_product(&mut context.client().await?, &provider, &model).await
         }
-        // `all` carries no information beyond `provider.is_none()` once clap
-        // has enforced the exactly-one-scope group, so it is not bound here.
-        Command::UndeclareProducts { provider, all: _ } => {
-            let cfg = load_config(explicit_network, api_url)?;
-            let cfg = ensure_fresh_token(cfg).await?;
-            let mut client = RegistryClient::new(cfg);
-            cmd_undeclare_products(&mut client, provider.as_ref()).await
-        }
+        Command::UndeclareProducts {
+            provider,
+            all: _all,
+        } => cmd_undeclare_products(&mut context.client().await?, provider.as_ref()).await,
     }
 }
 

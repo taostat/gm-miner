@@ -187,7 +187,7 @@ pub async fn declaration_policy(
 
     let mut has_unknown_provenance = false;
     let mut has_cloud_provenance = false;
-    let mut has_hop_image = false;
+    let mut has_binding_image = false;
 
     for live_worker in &live_workers {
         let image = live_worker.image_compose_hash.as_deref().and_then(|hash| {
@@ -199,7 +199,7 @@ pub async fn declaration_policy(
             has_unknown_provenance = true;
             continue;
         };
-        has_hop_image |= image.model_hop_capable();
+        has_binding_image |= image.cloud_binding_capable();
 
         let Some(local_worker) = local_workers
             .iter()
@@ -214,8 +214,8 @@ pub async fn declaration_policy(
     if has_cloud_provenance || has_unknown_provenance {
         return CloudDeclarationPolicy::FENCED;
     }
-    if has_hop_image {
-        // A direct worker on the hop image needs the model-echo fence, but it
+    if has_binding_image {
+        // A direct worker on a cloud-binding-capable image needs the model-echo fence, but it
         // remains direct supply and must not disappear from a bulk set.
         return CloudDeclarationPolicy::FENCED_BUT_DIRECT;
     }

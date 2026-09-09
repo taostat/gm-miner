@@ -1209,7 +1209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_direct_worker_on_hop_image_stays_in_bulk_supply() {
+    async fn known_direct_worker_on_cloud_binding_image_stays_in_bulk_supply() {
         let server = MockServer::start().await;
         mount_me(&server, serde_json::json!([])).await;
         mount_live_hop_worker(&server).await;
