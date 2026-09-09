@@ -3,11 +3,10 @@
 This guide sets up an Azure AI Foundry resource and the measured Foundry model
 hop. It does **not** by itself make Foundry a routable or registry-admissible
 source: an HTTP-successful Foundry probe is transport capability, not
-authoritative model admission. The current registry/gateway release still
-fences cloud offers; admission requires the image feature
-`upstream-model-hop` and the corresponding response-echo check. Azure OpenAI
-uses the same feature fence, while Bedrock's hop is disabled pending live echo
-evidence.
+authoritative model admission. Cloud registration, recovery, and declaration
+also require a registry that advertises `upstream-model-echo`; the deployed
+image must advertise `upstream-model-hop`. Azure OpenAI chat completions uses
+the same gates, while Azure Responses and Bedrock remain unqualified.
 
 The rest of this guide prepares the Azure resource, endpoint, credentials, and
 deployment map. It covers the Azure side — the resource, the connections and
@@ -233,10 +232,10 @@ a CVM that crashloops.
 gmcli deploy
 ```
 
-The current registry still rejects Foundry as a cloud route until the
-`upstream-model-hop` image feature and gateway echo check are admitted. Do not
-use `--upstream-model`: once that compatibility fence is live, declare a
-Foundry offer exactly like the direct product, for example:
+The CLI refuses Foundry registration or declaration when the registry does not
+advertise `upstream-model-echo` or the selected image lacks
+`upstream-model-hop`. Do not use `--upstream-model`: declare a Foundry offer
+exactly like the direct product, for example:
 
 ```sh
 gmcli declare-product --provider anthropic \

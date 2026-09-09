@@ -7,9 +7,18 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    convert::Infallible,
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use http_body_util::{BodyExt as _, Full};
+use http_body_util::{combinators::BoxBody, BodyExt as _, Full};
 use hyper::{
     body::{Body as _, Bytes, Incoming},
     header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
@@ -21,13 +30,13 @@ use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
-    time::timeout,
+    time::{timeout_at, Instant, Sleep},
 };
 
 /// The cloud adapters whose request surfaces are qualified for this hop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudProvider {
-    /// Azure `OpenAI` chat completions and Responses.
+    /// Azure `OpenAI` chat completions.
     AzureOpenAi,
     /// Microsoft Foundry Anthropic Messages.
     Foundry,
@@ -68,6 +77,154 @@ impl CloudProvider {
             Self::Bedrock => BEDROCK_MODEL_IDS,
         }
     }
+}
+
+/// A request surface in the cloud qualification matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudSurface {
+    /// Azure `OpenAI` `/openai/v1/chat/completions`.
+    AzureChatCompletions,
+    /// Azure `OpenAI` `/openai/v1/responses`.
+    AzureResponses,
+    /// Microsoft Foundry `/anthropic/v1/messages`.
+    FoundryMessages,
+    /// The future Bedrock Mantle messages surface.
+    BedrockMessages,
+}
+
+impl CloudSurface {
+    /// The public API path represented by this row.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::AzureChatCompletions => "/v1/chat/completions",
+            Self::AzureResponses => "/v1/responses",
+            Self::FoundryMessages | Self::BedrockMessages => "/v1/messages",
+        }
+    }
+}
+
+/// Whether a surface/mode has an authoritative upstream model echo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qualification {
+    /// True when the model echo is suitable for registry/gateway admission.
+    pub qualified: bool,
+    /// Evidence-backed explanation shown by doctor and rejection paths.
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualificationRow {
+    provider: CloudProvider,
+    surface: CloudSurface,
+    streaming: bool,
+    qualification: Qualification,
+}
+
+const QUALIFIED_MODEL_ECHO_REASON: &str =
+    "2026-09-09 live echo identifies the upstream model (dated Azure model or Foundry model)";
+pub const AZURE_RESPONSES_UNQUALIFIED_REASON: &str =
+    "2026-09-09 live Azure Responses echo identifies the deployment name, not the upstream model; ARM-attested deployment binding is not shipped";
+const BEDROCK_UNQUALIFIED_REASON: &str =
+    "Bedrock is unqualified: no authoritative live model echo has been admitted";
+
+// Evidence date: 2026-09-09, gm's own Azure account, alias gm-echo-test.
+const QUALIFICATION_MATRIX: &[QualificationRow] = &[
+    // Evidence date: 2026-09-09. Azure chat non-streaming echoed gpt-5-2025-08-07.
+    QualificationRow {
+        provider: CloudProvider::AzureOpenAi,
+        surface: CloudSurface::AzureChatCompletions,
+        streaming: false,
+        qualification: Qualification {
+            qualified: true,
+            reason: QUALIFIED_MODEL_ECHO_REASON,
+        },
+    },
+    // Evidence date: 2026-09-09. Azure chat streaming echoed the dated model after its annotation frame.
+    QualificationRow {
+        provider: CloudProvider::AzureOpenAi,
+        surface: CloudSurface::AzureChatCompletions,
+        streaming: true,
+        qualification: Qualification {
+            qualified: true,
+            reason: QUALIFIED_MODEL_ECHO_REASON,
+        },
+    },
+    // Evidence date: 2026-09-09. Azure Responses non-streaming echoed gm-echo-test, the deployment name.
+    QualificationRow {
+        provider: CloudProvider::AzureOpenAi,
+        surface: CloudSurface::AzureResponses,
+        streaming: false,
+        qualification: Qualification {
+            qualified: false,
+            reason: AZURE_RESPONSES_UNQUALIFIED_REASON,
+        },
+    },
+    // Evidence date: 2026-09-09. Azure Responses response.created echoed gm-echo-test, the deployment name.
+    QualificationRow {
+        provider: CloudProvider::AzureOpenAi,
+        surface: CloudSurface::AzureResponses,
+        streaming: true,
+        qualification: Qualification {
+            qualified: false,
+            reason: AZURE_RESPONSES_UNQUALIFIED_REASON,
+        },
+    },
+    // Evidence date: 2026-09-09. Foundry Messages non-streaming echoed claude-sonnet-4-6.
+    QualificationRow {
+        provider: CloudProvider::Foundry,
+        surface: CloudSurface::FoundryMessages,
+        streaming: false,
+        qualification: Qualification {
+            qualified: true,
+            reason: QUALIFIED_MODEL_ECHO_REASON,
+        },
+    },
+    // Evidence date: 2026-09-09. Foundry Messages streaming message_start echoed claude-sonnet-4-6.
+    QualificationRow {
+        provider: CloudProvider::Foundry,
+        surface: CloudSurface::FoundryMessages,
+        streaming: true,
+        qualification: Qualification {
+            qualified: true,
+            reason: QUALIFIED_MODEL_ECHO_REASON,
+        },
+    },
+    // Evidence date: 2026-09-09. Bedrock has no qualifying echo evidence.
+    QualificationRow {
+        provider: CloudProvider::Bedrock,
+        surface: CloudSurface::BedrockMessages,
+        streaming: false,
+        qualification: Qualification {
+            qualified: false,
+            reason: BEDROCK_UNQUALIFIED_REASON,
+        },
+    },
+    // Evidence date: 2026-09-09. Bedrock has no qualifying echo evidence.
+    QualificationRow {
+        provider: CloudProvider::Bedrock,
+        surface: CloudSurface::BedrockMessages,
+        streaming: true,
+        qualification: Qualification {
+            qualified: false,
+            reason: BEDROCK_UNQUALIFIED_REASON,
+        },
+    },
+];
+
+/// Look up the checked-in adapter/surface/streaming qualification row.
+#[must_use]
+pub fn qualification(
+    provider: CloudProvider,
+    surface: CloudSurface,
+    streaming: bool,
+) -> Option<Qualification> {
+    QUALIFICATION_MATRIX
+        .iter()
+        .find(|row| {
+            row.provider == provider && row.surface == surface && row.streaming == streaming
+        })
+        .map(|row| row.qualification)
 }
 
 /// Azure `OpenAI` canonical IDs known by the miner's current provider catalog.
@@ -169,6 +326,16 @@ impl DeploymentMap {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Serialize the validated map in one deterministic, single-line form.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        self.entries
+            .iter()
+            .map(|(canonical, deployment)| format!("{canonical}={deployment}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
 }
 
 /// Deployment-map validation failure.
@@ -182,6 +349,8 @@ pub enum DeploymentMapError {
     TooManyEntries,
     #[error("deployment map entry {entry} is empty")]
     EmptyEntry { entry: usize },
+    #[error("deployment map must not contain carriage returns or newlines")]
+    ContainsNewline,
     #[error("deployment map entry {entry} must contain exactly one '='")]
     InvalidSeparator { entry: usize },
     #[error("canonical model in deployment map entry {entry} is empty")]
@@ -221,6 +390,9 @@ pub fn parse_deployment_map(
     provider: CloudProvider,
     raw: &str,
 ) -> Result<DeploymentMap, DeploymentMapError> {
+    if raw.contains(['\r', '\n']) {
+        return Err(DeploymentMapError::ContainsNewline);
+    }
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(DeploymentMapError::Empty);
@@ -352,13 +524,16 @@ pub fn rewrite_model_bytes(
         return Err(RewriteError::TopLevelNotObject);
     }
     let mut replacement = None;
-    scan_object(&mut cursor, 0, true, map, &mut replacement)?;
+    scan_object(&mut cursor, 0, true, &mut replacement)?;
     cursor.skip_whitespace();
     if cursor.position != body.len() {
         return Err(RewriteError::MalformedJson);
     }
-    let Some((start, end, deployment)) = replacement else {
+    let Some(ModelMember { start, end, model }) = replacement else {
         return Err(RewriteError::MissingModel);
+    };
+    let Some(deployment) = map.get(&model) else {
+        return Err(RewriteError::UnmappedModel);
     };
 
     let mut rewritten = Vec::with_capacity(body.len() + deployment.len());
@@ -368,6 +543,34 @@ pub fn rewrite_model_bytes(
     rewritten.push(b'"');
     rewritten.extend_from_slice(&body[end..]);
     Ok(rewritten)
+}
+
+/// Extract the unique top-level string `model` member using the same strict
+/// scanner and duplicate-key rule as [`rewrite_model_bytes`].
+///
+/// This is used by `gmcli doctor` for upstream response echoes. A generic
+/// `serde_json::Value` would silently keep the last duplicate key and could
+/// turn an ambiguous response into a false identity pass.
+///
+/// # Errors
+/// Returns a [`RewriteError`] when the body is invalid JSON, is not a
+/// top-level object, or has a missing, duplicated, or non-string `model`.
+pub fn extract_model_echo(body: &[u8]) -> Result<String, RewriteError> {
+    std::str::from_utf8(body).map_err(|_| RewriteError::InvalidUtf8)?;
+    let mut cursor = JsonCursor { body, position: 0 };
+    cursor.skip_whitespace();
+    if cursor.peek() != Some(b'{') {
+        return Err(RewriteError::TopLevelNotObject);
+    }
+    let mut member = None;
+    scan_object(&mut cursor, 0, true, &mut member)?;
+    cursor.skip_whitespace();
+    if cursor.position != body.len() {
+        return Err(RewriteError::MalformedJson);
+    }
+    member
+        .map(|member| member.model)
+        .ok_or(RewriteError::MissingModel)
 }
 
 /// Exact echo match plus a provider-owned dated model suffix. The suffix forms
@@ -399,6 +602,12 @@ struct JsonCursor<'a> {
     position: usize,
 }
 
+struct ModelMember {
+    start: usize,
+    end: usize,
+    model: String,
+}
+
 impl JsonCursor<'_> {
     fn peek(&self) -> Option<u8> {
         self.body.get(self.position).copied()
@@ -421,8 +630,7 @@ fn scan_object(
     cursor: &mut JsonCursor<'_>,
     depth: usize,
     root: bool,
-    map: &DeploymentMap,
-    replacement: &mut Option<(usize, usize, String)>,
+    replacement: &mut Option<ModelMember>,
 ) -> Result<(), RewriteError> {
     if depth > MAX_JSON_DEPTH || cursor.advance() != Some(b'{') {
         return Err(RewriteError::MalformedJson);
@@ -445,7 +653,7 @@ fn scan_object(
         }
         cursor.skip_whitespace();
         let value_start = cursor.position;
-        scan_value(cursor, depth + 1, map, replacement, false)?;
+        scan_value(cursor, depth + 1, replacement, false)?;
         let value_end = cursor.position;
 
         if root && key == "model" {
@@ -457,10 +665,11 @@ fn scan_object(
             }
             let model = serde_json::from_slice::<String>(&cursor.body[value_start..value_end])
                 .map_err(|_| RewriteError::ModelNotString)?;
-            let Some(deployment) = map.get(&model) else {
-                return Err(RewriteError::UnmappedModel);
-            };
-            *replacement = Some((value_start, value_end, deployment.to_owned()));
+            *replacement = Some(ModelMember {
+                start: value_start,
+                end: value_end,
+                model,
+            });
         }
 
         cursor.skip_whitespace();
@@ -475,8 +684,7 @@ fn scan_object(
 fn scan_value(
     cursor: &mut JsonCursor<'_>,
     depth: usize,
-    map: &DeploymentMap,
-    replacement: &mut Option<(usize, usize, String)>,
+    replacement: &mut Option<ModelMember>,
     root: bool,
 ) -> Result<(), RewriteError> {
     if depth > MAX_JSON_DEPTH {
@@ -487,8 +695,8 @@ fn scan_value(
             scan_string(cursor)?;
             Ok(())
         }
-        Some(b'{') => scan_object(cursor, depth, root, map, replacement),
-        Some(b'[') => scan_array(cursor, depth, map, replacement),
+        Some(b'{') => scan_object(cursor, depth, root, replacement),
+        Some(b'[') => scan_array(cursor, depth, replacement),
         Some(b't') => scan_literal(cursor, b"true"),
         Some(b'f') => scan_literal(cursor, b"false"),
         Some(b'n') => scan_literal(cursor, b"null"),
@@ -500,8 +708,7 @@ fn scan_value(
 fn scan_array(
     cursor: &mut JsonCursor<'_>,
     depth: usize,
-    map: &DeploymentMap,
-    replacement: &mut Option<(usize, usize, String)>,
+    replacement: &mut Option<ModelMember>,
 ) -> Result<(), RewriteError> {
     cursor.advance();
     cursor.skip_whitespace();
@@ -511,7 +718,7 @@ fn scan_array(
     }
     loop {
         cursor.skip_whitespace();
-        scan_value(cursor, depth + 1, map, replacement, false)?;
+        scan_value(cursor, depth + 1, replacement, false)?;
         cursor.skip_whitespace();
         match cursor.advance() {
             Some(b',') => {}
@@ -716,10 +923,15 @@ fn selector_is(name: &str, expected: &str) -> bool {
 }
 
 fn env_or_gateway_cap() -> Option<String> {
-    std::env::var("GM_CLOUD_HOP_MAX_REQUEST_BYTES")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("GM_GATEWAY_MAX_REQUEST_BODY_BYTES").ok())
+    request_cap_value(
+        std::env::var("GM_CLOUD_HOP_MAX_REQUEST_BYTES").ok(),
+        std::env::var("GM_GATEWAY_MAX_REQUEST_BODY_BYTES").ok(),
+    )
+}
+
+fn request_cap_value(hop: Option<String>, gateway: Option<String>) -> Option<String> {
+    hop.filter(|value| !value.trim().is_empty())
+        .or_else(|| gateway.filter(|value| !value.trim().is_empty()))
 }
 
 fn parse_optional_map(
@@ -775,7 +987,95 @@ fn bounded_u64(
     Ok(value)
 }
 
-type ResponseBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+type ResponseBody = BoxBody<Bytes, ResponseBodyError>;
+
+#[derive(Debug, Error)]
+enum ResponseBodyError {
+    #[error("upstream response body failed")]
+    Upstream(#[source] hyper::Error),
+    #[error("cloud hop response body timed out")]
+    Timeout,
+}
+
+struct TimedResponseBody {
+    body: Incoming,
+    request_permit: Option<OwnedSemaphorePermit>,
+    buffer_permit: Option<OwnedSemaphorePermit>,
+    deadline: Instant,
+    idle_sleep: Pin<Box<Sleep>>,
+    idle_timeout: Duration,
+    finished: bool,
+}
+
+impl TimedResponseBody {
+    fn new(
+        body: Incoming,
+        request_permit: OwnedSemaphorePermit,
+        buffer_permit: Option<OwnedSemaphorePermit>,
+        deadline: Instant,
+    ) -> Self {
+        let idle_timeout = deadline.saturating_duration_since(Instant::now());
+        Self {
+            body,
+            request_permit: Some(request_permit),
+            buffer_permit,
+            deadline,
+            idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
+            idle_timeout,
+            finished: false,
+        }
+    }
+
+    fn release_permits(&mut self) {
+        self.request_permit.take();
+        self.buffer_permit.take();
+    }
+}
+
+impl hyper::body::Body for TimedResponseBody {
+    type Data = Bytes;
+    type Error = ResponseBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if Instant::now() >= this.deadline {
+            this.finished = true;
+            this.release_permits();
+            return Poll::Ready(Some(Err(ResponseBodyError::Timeout)));
+        }
+        if this.idle_sleep.as_mut().poll(context).is_ready() {
+            this.finished = true;
+            this.release_permits();
+            return Poll::Ready(Some(Err(ResponseBodyError::Timeout)));
+        }
+
+        match Pin::new(&mut this.body).poll_frame(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                this.finished = true;
+                this.release_permits();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                this.idle_sleep
+                    .as_mut()
+                    .reset(Instant::now() + this.idle_timeout);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.finished = true;
+                this.release_permits();
+                Poll::Ready(Some(Err(ResponseBodyError::Upstream(error))))
+            }
+        }
+    }
+}
 
 /// Serve the hop and forward to Envoy's fixed loopback egress listener.
 ///
@@ -848,6 +1148,7 @@ async fn handle_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Response<ResponseBody> {
+    let deadline = Instant::now() + state.config.timeout;
     let Some(selector) = request
         .headers()
         .get("x-gm-cloud-hop-provider")
@@ -871,7 +1172,13 @@ async fn handle_request(
             "cloud hop is not configured for this provider",
         );
     };
-    if request.method() != Method::POST || !supported_surface(selector, request.uri().path()) {
+    if request.method() != Method::POST {
+        return json_error(StatusCode::NOT_FOUND, "cloud hop surface is not enabled");
+    }
+    if selector == CloudProvider::AzureOpenAi && request.uri().path() == "/v1/responses" {
+        return json_error(StatusCode::BAD_REQUEST, AZURE_RESPONSES_UNQUALIFIED_REASON);
+    }
+    if !supported_surface(selector, request.uri().path()) {
         return json_error(StatusCode::NOT_FOUND, "cloud hop surface is not enabled");
     }
     if usize::try_from(request.body().size_hint().lower())
@@ -896,11 +1203,8 @@ async fn handle_request(
         }
     }
 
-    let Ok(Ok(request_permit)) = timeout(
-        state.config.timeout,
-        Arc::clone(&state.requests).acquire_owned(),
-    )
-    .await
+    let Ok(Ok(request_permit)) =
+        timeout_at(deadline, Arc::clone(&state.requests).acquire_owned()).await
     else {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -908,8 +1212,8 @@ async fn handle_request(
         );
     };
     let (parts, request_body) = request.into_parts();
-    let (body, buffer_permits) = match timeout(
-        state.config.timeout,
+    let (body, mut buffer_permit) = match timeout_at(
+        deadline,
         read_request_body(
             request_body,
             state.config.max_request_bytes,
@@ -950,6 +1254,31 @@ async fn handle_request(
             )
         }
     };
+    let rewrite_capacity = match rewrite_capacity(&body, map) {
+        Ok(capacity) => capacity,
+        Err(error) => {
+            let message = error.to_string();
+            return json_error(StatusCode::BAD_REQUEST, &message);
+        }
+    };
+    let Ok(rewrite_capacity) = u32::try_from(rewrite_capacity) else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cloud hop aggregate buffering limit reached",
+        );
+    };
+    let Ok(rewrite_permit) = Arc::clone(&state.buffered).try_acquire_many_owned(rewrite_capacity)
+    else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cloud hop aggregate buffering limit reached",
+        );
+    };
+    if let Some(existing) = buffer_permit.as_mut() {
+        existing.merge(rewrite_permit);
+    } else {
+        buffer_permit = Some(rewrite_permit);
+    }
     let rewritten = match rewrite_model_bytes(selector, &body, map) {
         Ok(body) => body,
         Err(error) => {
@@ -958,8 +1287,8 @@ async fn handle_request(
         }
     };
 
-    match forward_request(parts, rewritten, selector, state).await {
-        Ok(response) => box_response(response, request_permit, buffer_permits),
+    match forward_request(parts, rewritten, selector, state, deadline).await {
+        Ok(response) => box_response(response, request_permit, buffer_permit, deadline),
         Err(error) => {
             tracing::warn!(error = %error, "cloud hop upstream forwarding failed");
             json_error(
@@ -974,9 +1303,9 @@ async fn read_request_body(
     mut body: Incoming,
     max_request_bytes: usize,
     buffered: Arc<Semaphore>,
-) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), ReadBodyError> {
+) -> Result<(Bytes, Option<OwnedSemaphorePermit>), ReadBodyError> {
     let mut bytes = Vec::new();
-    let mut permits = Vec::new();
+    let mut permit: Option<OwnedSemaphorePermit> = None;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(ReadBodyError::Body)?;
         if let Ok(data) = frame.into_data() {
@@ -987,7 +1316,7 @@ async fn read_request_body(
             if next_len > max_request_bytes {
                 return Err(ReadBodyError::TooLarge);
             }
-            let permit = if data.is_empty() {
+            let frame_permit = if data.is_empty() {
                 None
             } else {
                 Some(
@@ -1002,14 +1331,18 @@ async fn read_request_body(
                 )
             };
             bytes.extend_from_slice(&data);
-            if let Some(permit) = permit {
-                permits.push(permit);
+            if let Some(frame_permit) = frame_permit {
+                if let Some(existing) = permit.as_mut() {
+                    existing.merge(frame_permit);
+                } else {
+                    permit = Some(frame_permit);
+                }
             }
         } else {
             return Err(ReadBodyError::Trailers);
         }
     }
-    Ok((Bytes::from(bytes), permits))
+    Ok((Bytes::from(bytes), permit))
 }
 
 #[derive(Debug, Error)]
@@ -1026,7 +1359,7 @@ enum ReadBodyError {
 
 fn supported_surface(provider: CloudProvider, path: &str) -> bool {
     match provider {
-        CloudProvider::AzureOpenAi => matches!(path, "/v1/chat/completions" | "/v1/responses"),
+        CloudProvider::AzureOpenAi => path == "/v1/chat/completions",
         CloudProvider::Foundry => path == "/v1/messages",
         CloudProvider::Bedrock => false,
     }
@@ -1037,6 +1370,7 @@ async fn forward_request(
     body: Vec<u8>,
     selector: CloudProvider,
     state: Arc<ProxyState>,
+    deadline: Instant,
 ) -> Result<Response<Incoming>, ForwardError> {
     let headers_to_remove = parts
         .headers
@@ -1063,26 +1397,20 @@ async fn forward_request(
             .map_err(|_| ForwardError::HeaderValue)?,
     );
     let request = Request::from_parts(parts, Full::new(Bytes::from(body)));
-    let stream = timeout(
-        state.config.timeout,
-        TcpStream::connect(state.upstream_addr),
-    )
-    .await
-    .map_err(|_| ForwardError::Timeout)??;
+    let stream = timeout_at(deadline, TcpStream::connect(state.upstream_addr))
+        .await
+        .map_err(|_| ForwardError::Timeout)??;
     let io = TokioIo::new(stream);
-    let (mut sender, connection) = timeout(
-        state.config.timeout,
-        hyper::client::conn::http1::handshake(io),
-    )
-    .await
-    .map_err(|_| ForwardError::Timeout)?
-    .map_err(ForwardError::Http)?;
+    let (mut sender, connection) = timeout_at(deadline, hyper::client::conn::http1::handshake(io))
+        .await
+        .map_err(|_| ForwardError::Timeout)?
+        .map_err(ForwardError::Http)?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             tracing::debug!(error = %error, "cloud hop egress connection ended");
         }
     });
-    timeout(state.config.timeout, sender.send_request(request))
+    timeout_at(deadline, sender.send_request(request))
         .await
         .map_err(|_| ForwardError::Timeout)?
         .map_err(ForwardError::Http)
@@ -1091,20 +1419,21 @@ async fn forward_request(
 fn box_response(
     response: Response<Incoming>,
     request_permit: OwnedSemaphorePermit,
-    buffer_permits: Vec<OwnedSemaphorePermit>,
+    buffer_permit: Option<OwnedSemaphorePermit>,
+    deadline: Instant,
 ) -> Response<ResponseBody> {
     let (parts, body) = response.into_parts();
-    let body = body
-        .map_frame(move |frame| {
-            // Keep both admission permits until the response body is dropped,
-            // not merely until upstream response headers arrive. This makes
-            // the limits describe complete in-flight cloud requests and keeps
-            // aggregate request storage accounted for during a long stream.
-            let _ = (&request_permit, &buffer_permits);
-            frame
-        })
-        .boxed();
+    let body = TimedResponseBody::new(body, request_permit, buffer_permit, deadline);
+    let body = BoxBody::new(body);
     Response::from_parts(parts, body)
+}
+
+fn rewrite_capacity(body: &[u8], map: &DeploymentMap) -> Result<usize, RewriteError> {
+    let model = extract_model_echo(body)?;
+    let deployment = map.get(&model).ok_or(RewriteError::UnmappedModel)?;
+    body.len()
+        .checked_add(deployment.len())
+        .ok_or(RewriteError::MalformedJson)
 }
 
 #[derive(Debug, Error)]
@@ -1154,8 +1483,13 @@ mod tests {
     use std::{
         collections::VecDeque,
         pin::Pin,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
         task::{Context, Poll},
     };
+    use tokio::sync::oneshot;
 
     struct ChunkBody {
         chunks: VecDeque<Bytes>,
@@ -1171,6 +1505,143 @@ mod tests {
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             Poll::Ready(self.chunks.pop_front().map(|chunk| Ok(Frame::data(chunk))))
         }
+    }
+
+    struct StalledBody;
+
+    impl hyper::body::Body for StalledBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    struct FirstChunkThenPending {
+        sent: bool,
+    }
+
+    impl hyper::body::Body for FirstChunkThenPending {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.sent {
+                Poll::Pending
+            } else {
+                self.sent = true;
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"first")))))
+            }
+        }
+    }
+
+    fn quick_test_body() -> BoxBody<Bytes, Infallible> {
+        Full::new(Bytes::from_static(b"ok"))
+            .map_err(|never: Infallible| match never {})
+            .boxed()
+    }
+
+    async fn send_hop_request(
+        hop_addr: SocketAddr,
+        chunks: Vec<Bytes>,
+    ) -> Result<Response<Incoming>, hyper::Error> {
+        send_hop_request_to(hop_addr, "/v1/chat/completions", chunks).await
+    }
+
+    async fn send_hop_request_to(
+        hop_addr: SocketAddr,
+        path: &str,
+        chunks: Vec<Bytes>,
+    ) -> Result<Response<Incoming>, hyper::Error> {
+        let stream = TcpStream::connect(hop_addr).await.expect("hop connect");
+        let io = TokioIo::new(stream);
+        let (mut sender, connection) = http1::handshake(io).await.expect("hop handshake");
+        tokio::spawn(connection);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("x-gm-cloud-hop-provider", "azure-openai")
+            .header(CONTENT_TYPE, "application/json")
+            .body(ChunkBody {
+                chunks: chunks.into_iter().collect(),
+            })
+            .expect("request");
+        sender.send_request(request).await
+    }
+
+    fn test_config(
+        max_buffered_bytes: usize,
+        max_concurrency: usize,
+        timeout: Duration,
+    ) -> CloudHopConfig {
+        CloudHopConfig {
+            azure_openai: Some(azure_map()),
+            foundry: Some(foundry_map()),
+            max_request_bytes: 1024 * 1024,
+            max_buffered_bytes,
+            max_concurrency,
+            timeout,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FirstResponse {
+        Stalled,
+        ChunkThenPending,
+    }
+
+    fn spawn_counted_upstream(
+        listener: TcpListener,
+        first_response: FirstResponse,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let address = listener.local_addr().expect("upstream address");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let accept_task = tokio::spawn({
+            let request_count = Arc::clone(&request_count);
+            async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let request_count = Arc::clone(&request_count);
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let request_number = request_count.fetch_add(1, Ordering::SeqCst);
+                            async move {
+                                let _ = request
+                                    .into_body()
+                                    .collect()
+                                    .await
+                                    .expect("upstream request body");
+                                let body = if request_number == 0 {
+                                    match first_response {
+                                        FirstResponse::Stalled => BoxBody::new(StalledBody),
+                                        FirstResponse::ChunkThenPending => {
+                                            BoxBody::new(FirstChunkThenPending { sent: false })
+                                        }
+                                    }
+                                } else {
+                                    quick_test_body()
+                                };
+                                Ok::<_, Infallible>(Response::new(body))
+                            }
+                        });
+                        let _ = server_http1::Builder::new()
+                            .serve_connection(io, service)
+                            .await;
+                    });
+                }
+            }
+        });
+        (address, accept_task)
     }
 
     fn azure_map() -> DeploymentMap {
@@ -1275,6 +1746,102 @@ mod tests {
     }
 
     #[test]
+    fn model_echo_extraction_uses_the_strict_duplicate_rule() {
+        assert_eq!(
+            extract_model_echo(br#" { "model": "gpt-5.5", "usage": {} } "#)
+                .expect("unique model echo"),
+            "gpt-5.5"
+        );
+        assert_eq!(
+            extract_model_echo(br#"{"model":"gpt-5.5","model":"other"}"#)
+                .expect_err("duplicate model is ambiguous"),
+            RewriteError::DuplicateModel
+        );
+    }
+
+    #[test]
+    fn qualification_matrix_matches_the_live_surface_evidence() {
+        for streaming in [false, true] {
+            assert!(qualification(
+                CloudProvider::AzureOpenAi,
+                CloudSurface::AzureChatCompletions,
+                streaming,
+            )
+            .is_some_and(|row| row.qualified));
+            assert!(qualification(
+                CloudProvider::Foundry,
+                CloudSurface::FoundryMessages,
+                streaming,
+            )
+            .is_some_and(|row| row.qualified));
+            assert!(!qualification(
+                CloudProvider::AzureOpenAi,
+                CloudSurface::AzureResponses,
+                streaming,
+            )
+            .is_some_and(|row| row.qualified));
+            assert!(!qualification(
+                CloudProvider::Bedrock,
+                CloudSurface::BedrockMessages,
+                streaming,
+            )
+            .is_some_and(|row| row.qualified));
+        }
+    }
+
+    #[tokio::test]
+    async fn azure_responses_is_rejected_with_an_explanatory_json_error() {
+        let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
+        let hop_addr = hop_listener.local_addr().expect("hop address");
+        tokio::spawn(serve_with_upstream(
+            hop_listener,
+            test_config(2 * 1024 * 1024, 1, Duration::from_secs(5)),
+            "127.0.0.1:1".parse().expect("unused upstream address"),
+        ));
+
+        let mut response = send_hop_request_to(
+            hop_addr,
+            "/v1/responses",
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        )
+        .await
+        .expect("hop response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        let body = response
+            .body_mut()
+            .collect()
+            .await
+            .expect("error body")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("JSON error body");
+        assert!(body.contains("gm_cloud_hop_invalid_request"));
+        assert!(body.contains(AZURE_RESPONSES_UNQUALIFIED_REASON));
+    }
+
+    #[test]
+    fn gateway_body_cap_is_used_only_when_hop_cap_is_absent() {
+        assert_eq!(
+            request_cap_value(Some("123".to_owned()), Some("456".to_owned())),
+            Some("123".to_owned())
+        );
+        assert_eq!(
+            request_cap_value(Some("  ".to_owned()), Some("456".to_owned())),
+            Some("456".to_owned())
+        );
+        assert_eq!(request_cap_value(None, Some(" ".to_owned())), None);
+    }
+
+    #[test]
+    fn rewrite_storage_capacity_covers_the_original_and_new_buffers() {
+        let body = br#"{"model":"gpt-5.5"}"#;
+        assert_eq!(
+            rewrite_capacity(body, &azure_map()),
+            Ok(body.len() + "my-gpt55".len())
+        );
+    }
+
+    #[test]
     fn map_validation_rejects_unknown_duplicate_and_bad_deployment_names() {
         assert!(matches!(
             parse_deployment_map(
@@ -1303,6 +1870,19 @@ mod tests {
             parse_deployment_map(CloudProvider::Foundry, "claude-sonnet-4-6=aa;"),
             Err(DeploymentMapError::EmptyEntry { .. })
         ));
+        assert!(matches!(
+            parse_deployment_map(CloudProvider::Foundry, "claude-sonnet-4-6=gm-echo\n-test"),
+            Err(DeploymentMapError::ContainsNewline)
+        ));
+        let canonical = parse_deployment_map(
+            CloudProvider::AzureOpenAi,
+            " gpt-5.6 = prod_gpt56 ; gpt-5.5 = azure-gpt55 ",
+        )
+        .expect("boundary whitespace is normalized");
+        assert_eq!(
+            canonical.canonical_string(),
+            "gpt-5.5=azure-gpt55;gpt-5.6=prod_gpt56"
+        );
     }
 
     #[test]
@@ -1347,7 +1927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_status_headers_and_stream_frames_pass_through() {
+    async fn fragmented_upload_fits_the_constant_buffer_budget() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("upstream bind");
@@ -1355,19 +1935,254 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.expect("upstream accept");
             let io = TokioIo::new(stream);
-            let service = service_fn(|_request: Request<Incoming>| async {
-                Ok::<_, Infallible>(
-                    Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header("x-upstream-marker", "preserve-me")
-                        .body(ChunkBody {
-                            chunks: VecDeque::from([
-                                Bytes::from_static(b"first-"),
-                                Bytes::from_static(b"second"),
-                            ]),
-                        })
-                        .expect("response"),
-                )
+            let service = service_fn(|request: Request<Incoming>| async move {
+                let _ = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("fragmented request body");
+                Ok::<_, Infallible>(Response::new(quick_test_body()))
+            });
+            server_http1::Builder::new()
+                .serve_connection(io, service)
+                .await
+                .expect("upstream serve");
+        });
+
+        let original = Bytes::from_static(br#"{"model":"gpt-5.5"}"#);
+        let rewrite_storage = rewrite_capacity(&original, &azure_map()).expect("rewrite size");
+        let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
+        let hop_addr = hop_listener.local_addr().expect("hop address");
+        tokio::spawn(serve_with_upstream(
+            hop_listener,
+            test_config(original.len() + rewrite_storage, 1, Duration::from_secs(5)),
+            upstream_addr,
+        ));
+
+        let split = 3;
+        let mut response = send_hop_request(
+            hop_addr,
+            vec![original.slice(..split), original.slice(split..)],
+        )
+        .await
+        .expect("hop response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = response
+            .body_mut()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        assert_eq!(response_body, Bytes::from_static(b"ok"));
+    }
+
+    #[tokio::test]
+    async fn stalled_upstream_body_times_out_and_releases_admission() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let (upstream_addr, upstream_task) =
+            spawn_counted_upstream(upstream_listener, FirstResponse::Stalled);
+        let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
+        let hop_addr = hop_listener.local_addr().expect("hop address");
+        tokio::spawn(serve_with_upstream(
+            hop_listener,
+            test_config(2 * 1024 * 1024, 1, Duration::from_millis(100)),
+            upstream_addr,
+        ));
+
+        let mut first = send_hop_request(
+            hop_addr,
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        )
+        .await
+        .expect("first hop response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let timed_out = tokio::time::timeout(Duration::from_secs(1), first.body_mut().frame())
+            .await
+            .expect("response timeout task");
+        assert!(matches!(timed_out, Some(Err(_))));
+
+        let mut second = send_hop_request(
+            hop_addr,
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        )
+        .await
+        .expect("second hop response");
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .body_mut()
+                .collect()
+                .await
+                .expect("second response body")
+                .to_bytes(),
+            Bytes::from_static(b"ok")
+        );
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_holds_admission_until_response_body_is_dropped() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let (upstream_addr, upstream_task) =
+            spawn_counted_upstream(upstream_listener, FirstResponse::ChunkThenPending);
+        let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
+        let hop_addr = hop_listener.local_addr().expect("hop address");
+        tokio::spawn(serve_with_upstream(
+            hop_listener,
+            test_config(2 * 1024 * 1024, 1, Duration::from_secs(5)),
+            upstream_addr,
+        ));
+
+        let mut first = send_hop_request(
+            hop_addr,
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        )
+        .await
+        .expect("first hop response");
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .body_mut()
+                .frame()
+                .await
+                .expect("first response frame")
+                .expect("first response data")
+                .into_data()
+                .expect("first response frame data"),
+            Bytes::from_static(b"first")
+        );
+
+        let mut second_task = tokio::spawn(send_hop_request(
+            hop_addr,
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second_task)
+                .await
+                .is_err(),
+            "a slow consumer must retain the only request permit"
+        );
+        drop(first);
+        let mut second = second_task
+            .await
+            .expect("second request task")
+            .expect("second response");
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = second
+            .body_mut()
+            .collect()
+            .await
+            .expect("second response body");
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_response_body_releases_admission() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let (upstream_addr, upstream_task) =
+            spawn_counted_upstream(upstream_listener, FirstResponse::ChunkThenPending);
+        let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
+        let hop_addr = hop_listener.local_addr().expect("hop address");
+        tokio::spawn(serve_with_upstream(
+            hop_listener,
+            test_config(2 * 1024 * 1024, 1, Duration::from_secs(5)),
+            upstream_addr,
+        ));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let response_task = tokio::spawn(async move {
+            let mut response = send_hop_request(
+                hop_addr,
+                vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+            )
+            .await
+            .expect("first hop response");
+            let _ = response
+                .body_mut()
+                .frame()
+                .await
+                .expect("first response frame")
+                .expect("first response data");
+            ready_tx.send(()).expect("response readiness receiver");
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.expect("response readiness");
+        response_task.abort();
+        let _ = response_task.await;
+
+        let mut second = send_hop_request(
+            hop_addr,
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        )
+        .await
+        .expect("second hop response");
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = second
+            .body_mut()
+            .collect()
+            .await
+            .expect("second response body");
+        upstream_task.abort();
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the passthrough test keeps request, response, and lifecycle assertions together"
+    )]
+    #[tokio::test]
+    async fn response_status_headers_and_stream_frames_pass_through() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let upstream_addr = upstream_listener.local_addr().expect("upstream address");
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let observed_tx = Arc::new(Mutex::new(Some(observed_tx)));
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("upstream accept");
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |request: Request<Incoming>| {
+                let observed_tx = observed_tx.lock().expect("observation sender lock").take();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let body = body.collect().await.expect("forwarded body").to_bytes();
+                    if let Some(observed_tx) = observed_tx {
+                        observed_tx
+                            .send((
+                                parts.uri.path().to_owned(),
+                                parts
+                                    .headers
+                                    .get("x-gm-cloud-hop-provider")
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_owned),
+                                parts.headers.contains_key("x-gm-node-key"),
+                                parts.headers.contains_key("x-gm-upstream-slot"),
+                                parts
+                                    .headers
+                                    .get(CONTENT_LENGTH)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_owned),
+                                body,
+                            ))
+                            .expect("observation receiver");
+                    }
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header("x-upstream-marker", "preserve-me")
+                            .body(ChunkBody {
+                                chunks: VecDeque::from([
+                                    Bytes::from_static(b"first-"),
+                                    Bytes::from_static(b"second"),
+                                ]),
+                            })
+                            .expect("response"),
+                    )
+                }
             });
             server_http1::Builder::new()
                 .serve_connection(io, service)
@@ -1395,10 +2210,21 @@ mod tests {
             .method(Method::POST)
             .uri("/v1/chat/completions")
             .header("x-gm-cloud-hop-provider", "azure-openai")
+            .header("x-gm-node-key", "must-not-forward")
+            .header("x-gm-upstream-slot", "must-not-forward")
+            .header("x-gm-request-id", "request-id")
             .header(CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from_static(br#"{"model":"gpt-5.5"}"#)))
             .expect("request");
         let mut response = sender.send_request(request).await.expect("hop response");
+        let (path, provider, has_node_key, has_slot, content_length, body) =
+            observed_rx.await.expect("forwarded request observation");
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(provider.as_deref(), Some("azure-openai"));
+        assert!(!has_node_key);
+        assert!(!has_slot);
+        assert_eq!(content_length.as_deref(), Some("20"));
+        assert_eq!(body, Bytes::from_static(br#"{"model":"my-gpt55"}"#));
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()["x-upstream-marker"], "preserve-me");
         let first = response

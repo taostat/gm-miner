@@ -173,8 +173,9 @@ enum Command {
         anthropic: Option<String>,
 
         /// Anthropic transport selector: direct, bedrock, or foundry.
-        /// Foundry uses the measured model hop; cloud offers still require
-        /// registry/gateway admission of `upstream-model-hop`.
+        /// Foundry uses the measured model hop; cloud operations also require
+        /// the registry capability `upstream-model-echo`. Bedrock remains a
+        /// direct, unqualified transport.
         #[arg(long)]
         anthropic_upstream: Option<String>,
 
@@ -227,7 +228,7 @@ enum Command {
         #[arg(long)]
         azure_client_secret: Option<String>,
 
-        /// Canonical-to-deployment map for Azure `OpenAI` chat and Responses,
+        /// Canonical-to-deployment map for Azure `OpenAI` chat completions,
         /// formatted as `canonical=deployment;canonical=deployment`.
         #[arg(long)]
         azure_deployments: Option<String>,
@@ -460,7 +461,7 @@ enum Command {
         model: String,
 
         /// Legacy upstream model id for transport diagnostics. Cloud offers use
-        /// the canonical model id once `upstream-model-hop` is admitted; the
+        /// the canonical model id after the image and registry gates pass; the
         /// deployment map stays inside the measured image.
         #[arg(long = "upstream-model", value_name = "ID")]
         upstream_model: Option<String>,
@@ -489,9 +490,9 @@ enum Command {
     ///
     /// Discovers products via the public `GET /products` endpoint, filters
     /// by `--provider` when set, then POSTs one offer per surviving direct
-    /// entry. Cloud-backed providers are explicitly skipped/refused until the
-    /// registry/gateway `upstream-model-hop` feature fence is admitted; after
-    /// that they use the same canonical declaration as direct entries.
+    /// entry. Cloud-backed providers are checked against the registry's
+    /// `upstream-model-echo` capability and skipped because bulk requests carry
+    /// no deployment binding.
     /// Per-product failures are reported individually and do not abort the
     /// loop — the final summary lists ok/err counts.
     ///

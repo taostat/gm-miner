@@ -3,18 +3,19 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-09-08**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-09-09**. This is a miner setup matrix, not a buyer product
 catalog. It distinguishes transport capability from registry admission:
 
 * A direct/API-key source is declarable when the registry publishes the route
   and the worker passes its normal capability checks.
 * Direct Anthropic/OpenAI supply additionally requires verified key slots enforced
   inside the miner runtime.
-* Azure OpenAI chat/Responses and Microsoft Foundry Messages have a measured
-  canonical-to-deployment hop in the image, but remain unavailable as buyer
-  supply until the registry/gateway admits `upstream-model-hop` and verifies the
-  upstream response `model` echo. Bedrock's hop is disabled until its echo is
-  observed. A known model id or a successful HTTP probe is not sufficient.
+* Azure OpenAI chat completions and Microsoft Foundry Messages have a measured
+  canonical-to-deployment hop in the image. They require the image feature
+  `upstream-model-hop` and registry capability `upstream-model-echo` before
+  registration or declaration. Azure Responses is unqualified because its echo
+  is the deployment name; Bedrock is direct and unqualified. A known model id or
+  a successful HTTP probe is not sufficient.
 
 For Azure OpenAI, configure `--azure-deployments
 canonical=deployment;canonical=deployment`. For Foundry, configure
@@ -22,9 +23,14 @@ canonical=deployment;canonical=deployment`. For Foundry, configure
 validates the canonical side against the provider catalog and treats the
 deployment side as data only; it cannot select a host, path, redirect, or
 proxy. `gmcli doctor` sends one 1-token request per entry and prints the echoed
-model beside the canonical id. Once the image feature and gateway fence are
-admitted, cloud offers are declared with the same canonical
+model beside the canonical id. Once the image feature and registry capability
+are admitted, cloud offers are declared with the same canonical
 `provider/model` as direct offers.
+
+Fine-tune and other model-class qualification is not decidable inside the image
+from the provider echo alone. It remains a documented registry/gateway residual:
+the echo rule must attest that the returned model belongs to the declared
+catalog class before admitting an offer.
 
 The backticked `provider/model` is the pair to pass to
 `gmcli declare-product` for a direct route. See

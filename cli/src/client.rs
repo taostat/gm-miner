@@ -134,6 +134,14 @@ pub async fn get_auth_config(api_url: &str) -> Result<AuthConfig> {
 /// the preflight and `gmcli status` agree on the URL.
 pub const ME_PATH: &str = "/miners/me";
 
+/// Registry endpoint whose capability list gates cloud-backed registration
+/// and product declaration.
+pub const CAPABILITIES_PATH: &str = "/capabilities";
+/// JSON field returned by [`CAPABILITIES_PATH`].
+pub const CAPABILITIES_FIELD: &str = "capabilities";
+/// Registry-side admission capability for model-echo-backed cloud bindings.
+pub const UPSTREAM_MODEL_ECHO_CAPABILITY: &str = "upstream-model-echo";
+
 pub struct RegistryClient {
     pub config: Config,
     client: Client,
@@ -284,6 +292,45 @@ impl RegistryClient {
             .context("authentication preflight (GET /miners/me)")?;
         Ok(())
     }
+
+    /// Require a capability advertised by the registry before sending a
+    /// registration or declaration that depends on it.
+    ///
+    /// A missing endpoint, a 404, a malformed response, or a missing field is
+    /// deliberately treated as "not advertised". This keeps an older or
+    /// legacy registry from accepting a cloud offer as an ordinary offer.
+    ///
+    /// # Errors
+    /// Returns an error when the endpoint cannot be read, does not return a
+    /// successful JSON capability list, or does not contain `capability`.
+    pub async fn require_capability(&mut self, capability: &str) -> Result<()> {
+        let response = self.get(CAPABILITIES_PATH).await?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(
+                "registry does not advertise capability '{capability}': GET {CAPABILITIES_PATH} returned {status}"
+            );
+        }
+        let body = response
+            .text()
+            .await
+            .context("read registry capability response")?;
+        let payload: Value = serde_json::from_str(&body).with_context(|| {
+            format!("registry capability response from {CAPABILITIES_PATH} is not valid JSON")
+        })?;
+        let Some(values) = payload.get(CAPABILITIES_FIELD).and_then(Value::as_array) else {
+            bail!(
+                "registry does not advertise capability '{capability}': response is missing JSON field '{CAPABILITIES_FIELD}'"
+            );
+        };
+        if !values
+            .iter()
+            .any(|value| value.as_str() == Some(capability))
+        {
+            bail!("registry does not advertise capability '{capability}' in {CAPABILITIES_PATH}");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -304,7 +351,12 @@ mod tests {
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{build_data_plane_probe_client, build_http_client};
+    use super::{
+        build_data_plane_probe_client, build_http_client, RegistryClient, CAPABILITIES_PATH,
+        UPSTREAM_MODEL_ECHO_CAPABILITY,
+    };
+    use crate::config::{Config, NetworkEntry, TokenEntry};
+    use wiremock::matchers::method;
 
     /// The gmcli HTTP client must never follow a redirect. The streaming
     /// probe sends the worker's `x-gm-node-key` to a miner-controlled
@@ -340,6 +392,75 @@ mod tests {
         // `server` drops here; the `.expect(1)` verifies the origin was hit
         // exactly once — a followed redirect would dial the unroutable
         // target instead and error before this assertion.
+    }
+
+    #[tokio::test]
+    async fn registry_capability_gate_accepts_the_model_echo_capability() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path(CAPABILITIES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"capabilities": [UPSTREAM_MODEL_ECHO_CAPABILITY]}),
+            ))
+            .mount(&server)
+            .await;
+        let config = Config {
+            active_network: Some("testnet".to_owned()),
+            networks: std::collections::HashMap::from([(
+                "testnet".to_owned(),
+                NetworkEntry {
+                    api_url: Some(server.uri()),
+                    tokens: Some(TokenEntry {
+                        access_token: Some("test-token".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        RegistryClient::new(config)
+            .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
+            .await
+            .expect("capability is advertised");
+    }
+
+    #[tokio::test]
+    async fn registry_capability_gate_rejects_404_and_missing_field() {
+        for body in [
+            (
+                404,
+                serde_json::json!({"capabilities": [UPSTREAM_MODEL_ECHO_CAPABILITY]}),
+            ),
+            (200, serde_json::json!({"healthy": true})),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(wiremock::matchers::path(CAPABILITIES_PATH))
+                .respond_with(ResponseTemplate::new(body.0).set_body_json(body.1))
+                .mount(&server)
+                .await;
+            let config = Config {
+                active_network: Some("testnet".to_owned()),
+                networks: std::collections::HashMap::from([(
+                    "testnet".to_owned(),
+                    NetworkEntry {
+                        api_url: Some(server.uri()),
+                        tokens: Some(TokenEntry {
+                            access_token: Some("test-token".to_owned()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            };
+            let error = RegistryClient::new(config)
+                .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
+                .await
+                .expect_err("missing capability must be a hard fence");
+            assert!(error.to_string().contains("does not advertise capability"));
+        }
     }
 
     /// Starts a bare HTTPS listener on `127.0.0.1` presenting a freshly

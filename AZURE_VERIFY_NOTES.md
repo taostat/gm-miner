@@ -163,9 +163,11 @@ accounts in different tenants, subscriptions, or resource groups.
 The measured image keeps the deployment name in
 `AZURE_FOUNDRY_DEPLOYMENTS=canonical=deployment;...` and rewrites the request's
 top-level `model` member on the qualified Messages surface. The deployment name
-is not sent as the registry offer's model id. Cloud offers remain fenced until
-the registry and gateway admit `upstream-model-hop` and verify the response
-`model` echo.
+is not sent as the registry offer's model id. Cloud registration, recovery, and
+declaration require the image feature `upstream-model-hop` and the registry
+capability `upstream-model-echo`. Azure OpenAI chat completions and Foundry
+Messages are qualified by their model echo; Azure Responses is rejected because
+its echo is the deployment name, and Bedrock remains unqualified.
 
 The operator procedure for satisfying these checks — which resource kind to
 create, the `az` calls that list and clear the connections, capability hosts and

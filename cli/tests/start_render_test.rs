@@ -4,21 +4,81 @@
 )]
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::OnceLock,
 };
 
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "700ca5d597201fa90f7d4e3b7d528bcdc7a13f7a1fd63433209d6801ed34b243";
+    "6d26ba055aab3eaf9f976c8505e35b65331e42cdbeb3777a2ba393f94915738a";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("cli crate must live under repo root")
         .to_owned()
+}
+
+fn cloud_hop_binary() -> PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+            let output = Command::new(cargo)
+                .current_dir(repo_root())
+                .args([
+                    "build",
+                    "-p",
+                    "gm-cloud-hop",
+                    "--bin",
+                    "gm-cloud-hop",
+                    "--message-format=json-render-diagnostics",
+                ])
+                .output()
+                .expect("build gm-cloud-hop render fixture");
+            assert!(
+                output.status.success(),
+                "building gm-cloud-hop failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let executable = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|artifact| {
+                    let is_hop_binary = artifact.get("reason").and_then(serde_json::Value::as_str)
+                        == Some("compiler-artifact")
+                        && artifact
+                            .get("target")
+                            .and_then(|target| target.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("gm-cloud-hop")
+                        && artifact
+                            .get("target")
+                            .and_then(|target| target.get("kind"))
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|kind| {
+                                kind.iter().any(|entry| entry.as_str() == Some("bin"))
+                            });
+                    is_hop_binary.then(|| {
+                        artifact
+                            .get("executable")
+                            .and_then(serde_json::Value::as_str)
+                            .map(PathBuf::from)
+                    })
+                })
+                .flatten()
+                .expect("cargo did not report the gm-cloud-hop executable");
+            if executable.is_absolute() {
+                executable
+            } else {
+                repo_root().join(executable)
+            }
+        })
+        .clone()
 }
 
 fn render_envoy<I, K, V>(vars: I) -> (std::process::ExitStatus, String, String, String)
@@ -35,7 +95,7 @@ where
         .env("PATH", "/bin:/usr/bin:/usr/local/bin")
         .env("GM_START_RENDER_ONLY", "1")
         .env("GMCLI_BIN", env!("CARGO_BIN_EXE_gmcli"))
-        .env("GM_CLOUD_HOP_BIN", root.join("target/debug/gm-cloud-hop"))
+        .env("GM_CLOUD_HOP_BIN", cloud_hop_binary())
         .env("GM_ENVOY_TEMPLATE_PATH", root.join("image/envoy.yaml"))
         .env("GM_RENDERED_CONFIG", out.path())
         .env("GM_NETWORK", "testnet")
@@ -49,6 +109,34 @@ where
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
         rendered,
+    )
+}
+
+fn lua_interpreter() -> Option<String> {
+    ["lua", "luajit"].into_iter().find_map(|candidate| {
+        Command::new(candidate)
+            .arg("-v")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| candidate.to_owned())
+    })
+}
+
+fn data_plane_lua(rendered: &str) -> Option<String> {
+    let (_, rendered) = rendered.split_once("default_source_code:\n")?;
+    let (_, source) = rendered.split_once("inline_string: |\n")?;
+    let source = &source[..source.find("## ── Graceful load shedding")?];
+    let indent = source
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())?;
+    Some(
+        source
+            .lines()
+            .map(|line| line.get(indent..).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
 }
 
@@ -490,8 +578,10 @@ fn bedrock_and_azure_render_cloud_upstreams() {
     assert!(rendered.contains("filename: /etc/ssl/certs/ca-certificates.crt"));
     assert!(rendered.contains("suffix: .openai.azure.com"));
     assert!(!rendered.contains("exact: gm-resource.openai.azure.com"));
-    assert!(rendered.contains("regex: \"^/v1/(chat/completions|responses)$\""));
-    assert!(rendered.contains("substitution: \"/openai/v1/\\\\1\""));
+    assert!(rendered.contains("regex: \"^/v1/chat/completions$\""));
+    assert!(rendered.contains("substitution: \"/openai/v1/chat/completions\""));
+    assert!(!rendered.contains("regex: \"^/v1/(chat/completions|responses)$\""));
+    assert!(!rendered.contains("substitution: \"/openai/v1/\\\\1\""));
     assert!(rendered.contains("port_value: 8083"));
     assert!(rendered.contains("key: x-gm-cloud-hop-provider"));
     assert!(rendered.contains("key: api-key"));
@@ -499,13 +589,10 @@ fn bedrock_and_azure_render_cloud_upstreams() {
 }
 
 #[test]
-fn azure_openai_rewrites_both_chat_completions_and_responses() {
-    // Azure OpenAI serves its OpenAI-compatible surface under /openai/v1,
-    // so the path rewrite must map BOTH the chat-completions and the
-    // Responses-API inbound paths to their /openai/v1 forms. The gateway
-    // forwards POST /v1/responses to the miner verbatim (gm gateway,
-    // pipeline/openai_responses.rs), and an Azure miner that only rewrites
-    // chat/completions 404s every Responses request upstream.
+fn azure_openai_rewrites_only_qualified_chat_completions() {
+    // Azure chat completions is qualified by the dated model echo. Azure
+    // Responses is intentionally rejected because its echo is the deployment
+    // name, so only the qualified path enters the hop and egress rewrite.
     let (status, _, stderr, rendered) = render_envoy([
         ("OPENAI_UPSTREAM", "azure"),
         (
@@ -528,10 +615,12 @@ fn azure_openai_rewrites_both_chat_completions_and_responses() {
         .split_once("stat_prefix: cloud_hop_egress_http")
         .map_or_else(|| rendered.clone(), |(_, block)| block.to_owned());
     assert!(
-        egress.contains("regex: \"^/v1/(chat/completions|responses)$\"")
-            && egress.contains("substitution: \"/openai/v1/\\\\1\""),
-        "Envoy's existing egress cluster must rewrite both OpenAI surfaces"
+        egress.contains("regex: \"^/v1/chat/completions$\"")
+            && egress.contains("substitution: \"/openai/v1/chat/completions\""),
+        "Envoy's egress cluster must rewrite the qualified chat surface"
     );
+    assert!(!egress.contains("^/v1/(chat/completions|responses)$"));
+    assert!(rendered.contains("gm_unqualified_surface"));
 }
 
 #[test]
@@ -691,7 +780,7 @@ fn cloud_backend_multikey_fails_fast() {
 }
 
 #[test]
-fn cloud_slot_guard_returns_421_for_absent_or_unknown_slot() {
+fn cloud_slot_guard_behaves_when_lua_is_available() {
     let (status, _, stderr, rendered) = render_envoy([
         ("OPENAI_UPSTREAM", "azure"),
         (
@@ -702,11 +791,98 @@ fn cloud_slot_guard_returns_421_for_absent_or_unknown_slot() {
         ("AZURE_OPENAI_DEPLOYMENTS", "gpt-5.5=azure-gpt55"),
     ]);
     assert!(status.success(), "render failed: {stderr}");
-    assert!(rendered.contains("if requested == nil then"));
-    assert!(rendered.contains("slot_unavailable(handle, \"\")"));
-    assert!(rendered.contains("if env_name == nil or getenv(env_name) == nil then"));
-    assert!(rendered.contains("slot_unavailable(handle, requested)"));
-    assert!(rendered.contains("gm_slot_unavailable"));
+    let Some(lua) = lua_interpreter() else {
+        eprintln!("skipping Lua slot behavior test: no lua or luajit in PATH");
+        return;
+    };
+    let source = data_plane_lua(&rendered).expect("data-plane Lua source");
+    let mut script = source;
+    script.push_str(
+        r#"
+local original_getenv = os.getenv
+os.getenv = function(name)
+  if name == "GM_OPENAI_KEY_SLOT_1" then
+    return "test-azure-key"
+  end
+  return original_getenv(name)
+end
+
+local valid_slot = nil
+for slot_id, _ in pairs(slot_config.openai.slots) do
+  valid_slot = slot_id
+  break
+end
+assert(valid_slot ~= nil, "the qualified Azure cloud slot must be rendered")
+
+local function make_headers(values)
+  local headers = {values = values}
+  function headers:get(name)
+    return self.values[name]
+  end
+  function headers:remove(name)
+    self.values[name] = nil
+  end
+  function headers:add(name, value)
+    self.values[name] = value
+  end
+  return headers
+end
+
+local function run(node_key, slot)
+  local values = {
+    [":path"] = "/v1/chat/completions",
+    ["x-gm-provider"] = "openai",
+  }
+  if node_key ~= nil then values["x-gm-node-key"] = node_key end
+  if slot ~= nil then values["x-gm-upstream-slot"] = slot end
+  local headers = make_headers(values)
+  local metadata = {}
+  function metadata:set(_, _) end
+  local stream_info = {}
+  function stream_info:dynamicMetadata() return metadata end
+  local status = nil
+  local body = nil
+  local handle = {}
+  function handle:headers() return headers end
+  function handle:streamInfo() return stream_info end
+  function handle:respond(response_headers, response_body)
+    status = response_headers[":status"]
+    body = response_body
+  end
+  envoy_on_request(handle)
+  return status, body
+end
+
+local status = run("test-node-secret-0001", valid_slot)
+assert(status == nil, "authenticated qualified slot must proceed")
+status = run(nil, valid_slot)
+assert(status == "401", "missing node key must be rejected")
+status, body = run("test-node-secret-0001", "wrong-slot")
+assert(status == "421", "wrong cloud slot must be rejected")
+assert(body:find("wrong-slot", 1, true) ~= nil, "421 must name the wrong slot")
+"#,
+    );
+    let mut child = Command::new(lua)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start Lua behavior fixture");
+    child
+        .stdin
+        .take()
+        .expect("Lua stdin")
+        .write_all(script.as_bytes())
+        .expect("write Lua behavior fixture");
+    let output = child
+        .wait_with_output()
+        .expect("wait for Lua behavior fixture");
+    assert!(
+        output.status.success(),
+        "Lua slot behavior failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

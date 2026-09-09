@@ -667,6 +667,36 @@ impl ProviderKeys {
         Ok(())
     }
 
+    /// Normalize validated deployment maps before they are persisted or
+    /// rendered into the measured image's env file. The hop parser accepts
+    /// harmless boundary spaces, but the env file must carry the canonical
+    /// one-line representation rather than the operator's raw spelling.
+    ///
+    /// # Errors
+    /// Returns an error when an existing non-empty deployment map is invalid.
+    pub fn canonicalize_deployment_maps(&mut self) -> Result<()> {
+        for (name, provider, value) in [
+            (
+                "AZURE_FOUNDRY_DEPLOYMENTS",
+                gm_cloud_hop::CloudProvider::Foundry,
+                &mut self.azure_foundry_deployments,
+            ),
+            (
+                "AZURE_OPENAI_DEPLOYMENTS",
+                gm_cloud_hop::CloudProvider::AzureOpenAi,
+                &mut self.azure_openai_deployments,
+            ),
+        ] {
+            let Some(raw) = value.as_deref().filter(|raw| !raw.trim().is_empty()) else {
+                continue;
+            };
+            let map = gm_cloud_hop::parse_deployment_map(provider, raw)
+                .with_context(|| format!("validate {name}"))?;
+            *value = Some(map.canonical_string());
+        }
+        Ok(())
+    }
+
     /// Registry worker provenance as a per-provider `provider -> adapter` map.
     ///
     /// Each configured cloud upstream contributes one entry, so a worker that

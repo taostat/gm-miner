@@ -5,7 +5,7 @@
 use anyhow::{bail, Context as _, Result};
 
 use gm_miner_cli::{
-    client::RegistryClient,
+    client::{RegistryClient, UPSTREAM_MODEL_ECHO_CAPABILITY},
     cloud_policy::configured_cloud_backend,
     dependency::confirm,
     pricing::{
@@ -51,6 +51,16 @@ pub(crate) async fn cmd_declare_product(
     discount_bp: u32,
     args: DeclareArgs<'_>,
 ) -> Result<()> {
+    if let Some(backend) = configured_cloud_backend(&client.config, provider.as_str()) {
+        client
+            .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot declare cloud-backed {provider}/{model} ({backend}) without registry capability upstream-model-echo"
+                )
+            })?;
+    }
     let catalog = fetch_catalog(client).await?;
     let catalog_hit = catalog
         .products
@@ -305,6 +315,8 @@ pub(crate) async fn cmd_declare_products(
         })
     });
 
+    require_cloud_bulk_capability(client, &targets).await?;
+
     let skipped_cloud = skip_cloud_bulk_targets(client, &mut targets)?;
 
     if targets.is_empty() {
@@ -364,6 +376,30 @@ pub(crate) async fn cmd_declare_products(
     }
     println!("Next: gmcli status   (confirm offers + eligibility)");
     Ok(DeclareOutcome::Declared)
+}
+
+/// A bulk declaration still has to observe the registry's cloud admission
+/// fence even though it skips sending unbound cloud offers. Without this
+/// check an old registry could accept the direct subset while appearing to
+/// understand the cloud-backed target set.
+async fn require_cloud_bulk_capability(
+    client: &mut RegistryClient,
+    targets: &[&Product],
+) -> Result<()> {
+    let Some(backend) = targets
+        .iter()
+        .find_map(|product| configured_cloud_backend(&client.config, &product.provider))
+    else {
+        return Ok(());
+    };
+    client
+        .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot declare a bulk set containing cloud-backed products ({backend}) without registry capability upstream-model-echo"
+            )
+        })
 }
 
 /// Remove configured cloud-backed products from a bulk declaration and explain
@@ -961,6 +997,16 @@ mod tests {
             .await;
     }
 
+    async fn mount_model_echo_capability(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(gm_miner_cli::client::CAPABILITIES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "capabilities": [gm_miner_cli::client::UPSTREAM_MODEL_ECHO_CAPABILITY],
+            })))
+            .mount(server)
+            .await;
+    }
+
     async fn mount_declare(server: &MockServer, expected_body: serde_json::Value) {
         Mock::given(method("POST"))
             .and(path("/miners/products"))
@@ -1017,6 +1063,67 @@ mod tests {
 
         assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
         assert_eq!(hits(&server, "GET", "/miners/products/sources").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cloud_single_declaration_requires_registry_model_echo_capability() {
+        let server = MockServer::start().await;
+        let mut client = RegistryClient::new(config_for(&server));
+        client.config.provider_keys = Some(ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            ..Default::default()
+        });
+
+        let error = cmd_declare_product(
+            &mut client,
+            &Provider::OpenAI,
+            "gpt-5.5",
+            500,
+            DeclareArgs::default(),
+        )
+        .await
+        .expect_err("a registry without the capability must refuse cloud offers");
+        assert!(error.to_string().contains("upstream-model-echo"));
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_cloud_single_declaration_posts_after_registry_capability_check() {
+        let server = MockServer::start().await;
+        mount_model_echo_capability(&server).await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "openai", "model": "gpt-5.5", "status": "active",
+                "retail_price": retail(1_000_000_000, 2_000_000_000),
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+        let mut client = RegistryClient::new(config_for(&server));
+        client.config.provider_keys = Some(ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            ..Default::default()
+        });
+
+        cmd_declare_product(
+            &mut client,
+            &Provider::OpenAI,
+            "gpt-5.5",
+            500,
+            DeclareArgs::default(),
+        )
+        .await
+        .expect("capability-admitted cloud offer should be sent");
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
     }
 
     #[tokio::test]
@@ -1379,8 +1486,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_cloud_declaration_requires_registry_model_echo_capability() {
+        let server = MockServer::start().await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active",
+                "retail_price": retail(3_000_000_000, 15_000_000_000),
+            }]),
+        )
+        .await;
+        mount_routes(
+            &server,
+            serde_json::json!([{
+                "route_id": 1,
+                "provider": "anthropic", "model": "claude-sonnet-4-6",
+                "buyer_provider": "anthropic", "buyer_model": "claude-sonnet-4-6",
+                "retail_price": retail(3_000_000_000, 15_000_000_000),
+                "capable_worker_count": 1, "already_offered": false,
+            }]),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        client.config.provider_keys = Some(ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            ..Default::default()
+        });
+        let error = cmd_declare_products(&mut client, None, 500, true)
+            .await
+            .expect_err("legacy registry must reject a cloud bulk declaration");
+        assert!(error.to_string().contains("upstream-model-echo"));
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
+    }
+
+    #[tokio::test]
     async fn bulk_skips_cloud_products_without_sending_an_unbound_request() {
         let server = MockServer::start().await;
+        mount_model_echo_capability(&server).await;
         mount_catalog(
             &server,
             serde_json::json!([

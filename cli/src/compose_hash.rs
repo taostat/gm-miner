@@ -62,10 +62,10 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// not values, so every miner produces the same `compose_hash`. The order
 /// matches `render_env_file`: Anthropic direct/Bedrock/Foundry, `OpenAI`
 /// direct/Azure, Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, Engy,
-/// Moonmath, deployment maps, node secret.
+/// Moonmath, deployment maps, node secret, hop/gateway sizing.
 /// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
 /// gm image is public and those vars do not appear in `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 32] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 37] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -98,6 +98,11 @@ const CANONICAL_ALLOWED_ENVS: [&str; 32] = [
     "MOONMATH_API_KEY",
     "NEAR_API_KEY",
     "GM_NODE_SECRET",
+    "GM_GATEWAY_MAX_REQUEST_BODY_BYTES",
+    "GM_CLOUD_HOP_MAX_REQUEST_BYTES",
+    "GM_CLOUD_HOP_MAX_BUFFERED_BYTES",
+    "GM_CLOUD_HOP_MAX_CONCURRENCY",
+    "GM_CLOUD_HOP_TIMEOUT_MS",
 ];
 
 /// The pinned dstack OS image's published reproducible `os_image_hash`.
@@ -144,12 +149,26 @@ const RELEASE_FLAGS: [(&str, bool); 9] = [
 /// Returns an error if the compose template cannot be rendered (a missing
 /// placeholder — a template bug).
 fn build_app_compose(image_ref: &str, network: Network) -> anyhow::Result<BTreeMap<String, Value>> {
-    let docker_compose_file = render_compose(COMPOSE_TEMPLATE, image_ref, network.as_str())?;
+    build_app_compose_from(
+        image_ref,
+        network,
+        COMPOSE_TEMPLATE,
+        &CANONICAL_ALLOWED_ENVS,
+    )
+}
+
+fn build_app_compose_from(
+    image_ref: &str,
+    network: Network,
+    compose_template: &str,
+    allowed_envs: &[&str],
+) -> anyhow::Result<BTreeMap<String, Value>> {
+    let docker_compose_file = render_compose(compose_template, image_ref, network.as_str())?;
 
     let mut compose: BTreeMap<String, Value> = BTreeMap::new();
     compose.insert(
         "allowed_envs".to_owned(),
-        Value::from(CANONICAL_ALLOWED_ENVS.to_vec()),
+        Value::from(allowed_envs.to_vec()),
     );
     compose.insert(
         "docker_compose_file".to_owned(),
@@ -230,20 +249,81 @@ mod tests {
     ///
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
         "81e5f2b7544840f5394dd76940a6cf75558a4e822e7992670972af9cca695377";
+    /// Candidate hash for this branch's measured compose. It is deliberately
+    /// separate from the approved baseline: the baseline proves historical
+    /// reproducibility while this pin makes candidate drift visible.
+    const CANDIDATE_TESTNET_COMPOSE_HASH: &str =
+        "8e35319272dc44c84bac27f24b3362e968961690fdcd692692075dde12beea53";
+
+    const APPROVED_BASELINE_ALLOWED_ENVS: [&str; 30] = [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_UPSTREAM",
+        "BEDROCK_REGION",
+        "BEDROCK_API_KEY",
+        "AZURE_FOUNDRY_ENDPOINT",
+        "AZURE_FOUNDRY_API_KEY",
+        "AZURE_FOUNDRY_TENANT_ID",
+        "AZURE_FOUNDRY_SUBSCRIPTION_ID",
+        "AZURE_FOUNDRY_RESOURCE_GROUP",
+        "AZURE_FOUNDRY_CLIENT_ID",
+        "AZURE_FOUNDRY_CLIENT_SECRET",
+        "OPENAI_API_KEY",
+        "OPENAI_UPSTREAM",
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_TENANT_ID",
+        "AZURE_SUBSCRIPTION_ID",
+        "AZURE_RESOURCE_GROUP",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "GOOGLE_API_KEY",
+        "CHUTES_API_KEY",
+        "ZAI_API_KEY",
+        "MOONSHOT_API_KEY",
+        "DEEPINFRA_API_KEY",
+        "KUBETEE_API_KEY",
+        "ENGY_API_KEY",
+        "MOONMATH_API_KEY",
+        "NEAR_API_KEY",
+        "GM_NODE_SECRET",
+    ];
+
+    fn approved_baseline_template() -> String {
+        let current_runtime = "      ## Hop and gateway request-sizing knobs. They are optional; the image\n      ## applies bounded defaults and the gateway cap is the fallback request\n      ## limit when no hop-specific cap is supplied.\n      - GM_GATEWAY_MAX_REQUEST_BODY_BYTES\n      - GM_CLOUD_HOP_MAX_REQUEST_BYTES\n      - GM_CLOUD_HOP_MAX_BUFFERED_BYTES\n      - GM_CLOUD_HOP_MAX_CONCURRENCY\n      - GM_CLOUD_HOP_TIMEOUT_MS\n";
+        let current_comment = "## The runtime has two required servers plus one conditional measured process\n## inside one container: envoy (the data plane on :8080),\n## gm-miner-attestd (the TEE attestation server), and gm-cloud-hop when\n## Azure OpenAI or Foundry is selected. The registry probes :8080 —\n## `x-gm-provider` for capability and `GET /attestation/info`, which envoy\n## routes to attestd. The hop is loopback-only and returns to Envoy's\n## existing restricted TLS egress clusters.\n";
+        let approved_comment = "## The runtime is two co-located processes inside one container: envoy\n## (the data plane on :8080) and gm-miner-attestd (the TEE attestation\n## server). The registry probes :8080 — `x-gm-provider` for capability,\n## and `GET /attestation/info` which envoy routes to attestd.\n";
+        COMPOSE_TEMPLATE
+            .replace(current_runtime, "")
+            .replace("      - AZURE_FOUNDRY_DEPLOYMENTS\n", "")
+            .replace("      - AZURE_OPENAI_DEPLOYMENTS\n", "")
+            .replace(current_comment, approved_comment)
+    }
 
     #[test]
-    #[ignore = "the new measured image has no registry-approved compose hash until it is published and admitted"]
     fn reproduces_registry_approved_testnet_compose_hash() {
-        let computed = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet)
-            .expect("offline compose hash must compute");
+        let compose = build_app_compose_from(
+            TESTNET_IMAGE_REF,
+            Network::Testnet,
+            &approved_baseline_template(),
+            &APPROVED_BASELINE_ALLOWED_ENVS,
+        )
+        .expect("approved baseline compose must compute");
+        let computed = hash_app_compose(&compose).expect("offline compose hash must compute");
         assert_eq!(
             computed, REGISTRY_TESTNET_COMPOSE_HASH,
-            "offline compose_hash must reproduce the live registry-approved testnet hash \
-             byte-for-byte; the anchor must track the newest supported image version. If this \
-             fails after a compose/env/image change, bump TESTNET_IMAGE_REF and \
-             REGISTRY_TESTNET_COMPOSE_HASH to the live registry routing-table row and publish \
-             a new ImageVersion to the registry"
+            "approved baseline fixture must remain byte-for-byte reproducible"
         );
+    }
+
+    #[test]
+    fn candidate_compose_hash_fixture_is_deterministic() {
+        let first = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet)
+            .expect("candidate compose hash must compute");
+        let second = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet)
+            .expect("candidate compose hash must compute");
+        assert_eq!(first, second);
+        assert_eq!(first, CANDIDATE_TESTNET_COMPOSE_HASH);
+        assert_eq!(first.len(), 64);
     }
 
     /// The canonical serialization is sorted-key + compact: the rendered

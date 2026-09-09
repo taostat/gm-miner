@@ -10,9 +10,11 @@ You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, M
 DeepInfra, KubeTEE, Engy, Moonmath, NEAR AI Cloud, or Bedrock/Foundry/Azure transport backends
 behind the existing Anthropic/OpenAI routes) and your own funded
 [Phala Cloud](https://cloud.phala.network) account. Transport capability is not registry
-admission: Bedrock, Azure OpenAI and Foundry remain unavailable as buyer supply until
-both model identity and transport provenance are independently verified. Direct Anthropic/OpenAI
-routes use verified key slots enforced by the miner runtime. The `gmcli` tool
+admission: Azure OpenAI chat completions and Foundry Messages are qualified only when the
+image's `upstream-model-hop` feature and the registry's `upstream-model-echo` capability are
+both present. Azure Responses is unqualified because its echo is the deployment name, and
+Bedrock remains a direct, unqualified transport with slot headers rejected. Direct
+Anthropic/OpenAI routes use verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 
 | Path | Description |
@@ -176,10 +178,12 @@ evidence is a separate GM runbook check. See the [provider support
 matrix](docs/provider-model-support.md) for the provider-side setup.
 
 The image contains cloud transport adapters for Bedrock, Azure OpenAI and Foundry. Azure OpenAI
-chat/Responses and Foundry Messages use the measured in-image model hop; Bedrock's hop remains
-disabled until its upstream model echo has been observed. Transport capability is not registry
-admission: cloud supply is fenced until the registry and gateway admit the image feature
-`upstream-model-hop` and enforce the response-model check.
+chat completions and Foundry Messages use the measured in-image model hop. Azure Responses is
+rejected with a JSON 400 because its echo identifies the deployment name, not the upstream
+model. Bedrock remains on its direct transport and rejects every slot header; it is not routed
+through the hop. Cloud registration, recovery, and declaration additionally require the registry
+capability `upstream-model-echo`; deployment also requires the approved image feature
+`upstream-model-hop`.
 
 For Bedrock transport testing, select the adapter and provide the region and API key.
 This does not make the worker routable:
@@ -191,8 +195,9 @@ gmcli set-api-keys \
   --bedrock-api-key <bedrock-api-key>
 ```
 
-Azure OpenAI uses the same measured hop and feature fence. For transport setup, select Azure and
-provide the resource endpoint, API key, and canonical-to-deployment map:
+Azure OpenAI chat completions use the measured hop and the same image/registry fences. For
+transport setup, select Azure and provide the resource endpoint, API key, and
+canonical-to-deployment map:
 
 ```sh
 gmcli set-api-keys \
@@ -202,8 +207,8 @@ gmcli set-api-keys \
   --azure-deployments 'gpt-5.5=<deployment-name>'
 ```
 
-Microsoft Foundry remains feature-gated in the current registry/gateway release, but the image
-now measures the canonical-to-deployment translation. Select Foundry and provide the resource
+Microsoft Foundry Messages use the measured hop; cloud operations require the image and registry
+gates described above. Select Foundry and provide the resource
 endpoint, its API key, a read-only Azure service principal that `attestd` uses to verify the
 account from ARM, and one deployment map entry per model you intend to serve:
 
@@ -223,8 +228,8 @@ gmcli set-api-keys \
 Each map is semicolon-separated `canonical=deployment` data, for example
 `gpt-5.5=my-gpt55;gpt-5.4-mini=my-gpt54-mini`. The canonical side is checked against the
 provider catalog; the deployment side is bounded to Azure's deployment-name character set. The
-map cannot select an endpoint, host, path, redirect, or proxy. Only the qualified Azure OpenAI
-chat/Responses and Foundry Messages surfaces enter the hop. Run `gmcli doctor` after configuring
+map cannot select an endpoint, host, path, redirect, or proxy. Only Azure OpenAI chat completions
+and Foundry Messages enter the hop; Azure Responses is unqualified and rejected. Run `gmcli doctor` after configuring
 the maps: it sends one 1-token request per entry and compares the upstream response `model` echo
 with the canonical id.
 
@@ -233,8 +238,9 @@ Application Insights connection to any Foundry resource created through the port
 refuses to boot while it exists. Follow [Serving Claude through Microsoft
 Foundry](docs/foundry-setup.md) before your first Foundry deploy. Foundry routes on the Azure
 *deployment* name. Keep that name inside the measured image; do not send it as the registry
-offer model. Cloud supply stays fenced until the registry and gateway admit `upstream-model-hop`
-and verify the response `model` echo.
+offer model. Cloud registration and declaration require both the approved image feature
+`upstream-model-hop` and the registry capability `upstream-model-echo`; the CLI refuses the
+operation when the capability endpoint is absent or does not advertise it.
 
 Azure OpenAI deployments need not be named like the gm model id: the measured hop rewrites only
 the top-level request `model` member to the mapped deployment and leaves the rest of the body
@@ -279,11 +285,11 @@ gmcli doctor
 Tell the registry which models you serve and at what discount off retail. The discount sets your
 payout: a 10% discount means you keep 90% of each per-Mtok dollar.
 
-Fan one discount across the whole catalog. Until the separate registry/gateway echo-check release
-is admitted, bulk declaration retains direct/API-key providers and explicitly skips cloud-backed
-providers. Once an approved image advertises `upstream-model-hop` and the registry/gateway
-compatibility fence is live, cloud offers use the same canonical product declaration as direct
-offers; no deployment name is sent to the registry:
+Fan one discount across the whole catalog. Bulk declaration checks the registry's
+`upstream-model-echo` capability, retains direct/API-key providers, and explicitly skips
+cloud-backed entries because the bulk wire request has no per-deployment binding. A single cloud
+declaration can proceed only after that capability check and an approved image advertises
+`upstream-model-hop`; no deployment name is sent to the registry:
 
 ```sh
 gmcli declare-products --discount-pct 5
@@ -296,8 +302,8 @@ gmcli declare-products --provider anthropic --discount-pct 5
 gmcli declare-products --provider openai --discount-pct 10
 ```
 
-If the selected provider uses Bedrock, Foundry or Azure on the current registry release, bulk
-declaration refuses/skips those offers and explains the pending feature admission. To declare a
+If the selected provider uses Bedrock, Foundry or Azure, bulk declaration skips those offers and
+explains that a binding is not sent by the bulk request. To declare a
 single direct/API-key offer:
 
 ```sh
@@ -307,9 +313,9 @@ gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-
 `--discount-pct` accepts a value in `[0, 99.90]` with up to two decimal places (e.g. `10.5`).
 `0` means at retail; `99.90` is the cap (keeps per-request revenue strictly positive).
 Use the registry-owned source model for every admitted route; do not override it with a deployment
-name. After `upstream-model-hop` admission, a cloud offer is declared exactly like its direct
-counterpart. Legacy Bedrock ids remain representable for audit and transport diagnostics, but the
-Bedrock hop is disabled pending live echo evidence.
+name. After both admission checks, a qualified cloud offer is declared exactly like its direct
+counterpart. Azure Responses and Bedrock remain unqualified; legacy Bedrock ids remain
+representable for audit and transport diagnostics.
 
 Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price
 you would receive on **every dimension the product prices** — input and output, plus prompt

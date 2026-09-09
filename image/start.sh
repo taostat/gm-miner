@@ -282,6 +282,8 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_SAN_MATCH=exact
     # Bedrock's route constructs this exact Mantle hostname from the bounded
     # region; suffix matching would also admit unrelated *.api.aws certs.
+    # Bedrock remains a direct, unqualified route: it is marked as cloud
+    # provenance for the Lua slot fence, but it never enables the measured hop.
     ANTHROPIC_SAN_VALUE="${ANTHROPIC_HOST}"
     ANTHROPIC_STATIC_AUTH=1
     ANTHROPIC_CLOUD=1
@@ -483,9 +485,6 @@ fi
 if [[ -n "${NEAR_API_KEY:-}" ]]; then
   fan_out_slots near NEAR_API_KEY
 fi
-if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" && -n "${BEDROCK_API_KEY:-}" ]]; then
-  fan_out_slots anthropic BEDROCK_API_KEY
-fi
 if [[ "${ANTHROPIC_UPSTREAM}" == "foundry" && -n "${AZURE_FOUNDRY_API_KEY:-}" ]]; then
   fan_out_slots anthropic AZURE_FOUNDRY_API_KEY
 fi
@@ -603,11 +602,6 @@ fi
 #      when the URL is https; dropped (the cluster stays plain HTTP/1.1)
 #      when it is http.
 RENDERED_CONFIG="${GM_RENDERED_CONFIG:-/tmp/envoy.rendered.yaml}"
-if [[ "${ANTHROPIC_CLOUD}" == "1" || "${OPENAI_CLOUD}" == "1" ]]; then
-  CLOUD_SLOT_ENFORCEMENT=1
-else
-  CLOUD_SLOT_ENFORCEMENT=0
-fi
 GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_BENCHMARK_HOST="${BENCHMARK_HOST}" \
   GM_BENCHMARK_PORT="${BENCHMARK_PORT}" \
@@ -633,7 +627,6 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_OPENAI_STATIC_AUTH="${OPENAI_STATIC_AUTH}" \
   GM_OPENAI_CLOUD="$(lua_bool "${OPENAI_CLOUD}")" \
   GM_OPENAI_CLOUD_HOP="${OPENAI_CLOUD_HOP}" \
-  GM_CLOUD_SLOT_ENFORCEMENT="${CLOUD_SLOT_ENFORCEMENT}" \
   GM_OPENAI_SLOT_MAP="${GM_OPENAI_SLOT_MAP}" \
   GM_OPENAI_DEFAULT_SLOT_ENV="${GM_OPENAI_DEFAULT_SLOT_ENV}" \
   GM_GEMINI_SLOT_MAP="${GM_GEMINI_SLOT_MAP}" \
@@ -718,7 +711,6 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
     openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
-    cloud_slot_enforcement = (ENVIRON["GM_CLOUD_SLOT_ENFORCEMENT"] == "1")
     cloud_hop_enabled = anthropic_cloud_hop || openai_cloud_hop
   }
   /^[[:space:]]*## gm:benchmark-tls-begin[[:space:]]*$/ { in_tls = 1; next }
@@ -730,12 +722,9 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   /^[[:space:]]*## gm:anthropic-static-auth-begin[[:space:]]*$/ { in_anthropic_static_auth = 1; next }
   /^[[:space:]]*## gm:anthropic-static-auth-end[[:space:]]*$/   { in_anthropic_static_auth = 0; next }
   in_anthropic_static_auth && !anthropic_static_auth { next }
-  /^[[:space:]]*-- gm:cloud-slot-reject-begin[[:space:]]*$/ { in_cloud_slot_reject = 1; next }
-  /^[[:space:]]*-- gm:cloud-slot-reject-end[[:space:]]*$/   { in_cloud_slot_reject = 0; next }
-  in_cloud_slot_reject && cloud_slot_enforcement { next }
-  /^[[:space:]]*-- gm:cloud-slot-accept-begin[[:space:]]*$/ { in_cloud_slot_accept = 1; next }
-  /^[[:space:]]*-- gm:cloud-slot-accept-end[[:space:]]*$/   { in_cloud_slot_accept = 0; next }
-  in_cloud_slot_accept && !cloud_slot_enforcement { next }
+  /^[[:space:]]*## gm:openai-azure-responses-reject-begin[[:space:]]*$/ { in_openai_azure_responses_reject = 1; next }
+  /^[[:space:]]*## gm:openai-azure-responses-reject-end[[:space:]]*$/   { in_openai_azure_responses_reject = 0; next }
+  in_openai_azure_responses_reject && !openai_cloud_hop { next }
   /^[[:space:]]*## gm:anthropic-cloud-hop-route-begin[[:space:]]*$/ { in_anthropic_cloud_hop_route = 1; next }
   /^[[:space:]]*## gm:anthropic-cloud-hop-route-end[[:space:]]*$/   { in_anthropic_cloud_hop_route = 0; next }
   in_anthropic_cloud_hop_route && !anthropic_cloud_hop { next }
@@ -775,6 +764,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_ANTHROPIC_AUTH_VALUE__", anthropic_auth_value)
     line = subst(line, "__GM_ANTHROPIC_VERSION_APPEND_ACTION__", anthropic_version_append_action)
     line = subst(line, "__GM_ANTHROPIC_CLOUD__", anthropic_cloud)
+    line = subst(line, "__GM_ANTHROPIC_CLOUD_HOP__", (anthropic_cloud_hop ? "true" : "false"))
     line = subst(line, "__GM_ANTHROPIC_SLOT_MAP__", anthropic_slot_map)
     line = subst(line, "__GM_ANTHROPIC_DEFAULT_SLOT_ENV__", anthropic_default_slot_env)
     line = subst(line, "__GM_ANTHROPIC_SAN_MATCH__", anthropic_san_match)
@@ -784,6 +774,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_OPENAI_AUTH_HEADER__", openai_auth_header)
     line = subst(line, "__GM_OPENAI_AUTH_VALUE__", openai_auth_value)
     line = subst(line, "__GM_OPENAI_CLOUD__", openai_cloud)
+    line = subst(line, "__GM_OPENAI_CLOUD_HOP__", (openai_cloud_hop ? "true" : "false"))
     line = subst(line, "__GM_OPENAI_SLOT_MAP__", openai_slot_map)
     line = subst(line, "__GM_OPENAI_DEFAULT_SLOT_ENV__", openai_default_slot_env)
     line = subst(line, "__GM_GEMINI_SLOT_MAP__", gemini_slot_map)

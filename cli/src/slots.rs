@@ -114,9 +114,10 @@ fn add_provider_slots(
 /// Compute registry-advertised provider slot ids for direct and cloud
 /// upstreams.
 ///
-/// A selected cloud upstream contributes exactly one slot for its provider;
-/// the cloud key is single-slot while direct providers retain their existing
-/// semicolon-separated behavior.
+/// A selected qualified cloud upstream contributes exactly one slot for its
+/// provider; the cloud key is single-slot while direct providers retain their
+/// existing semicolon-separated behavior. Unqualified Bedrock contributes no
+/// slot because the image deliberately rejects every Bedrock slot header.
 ///
 /// # Errors
 /// Returns an error when a cloud-backend key contains `;`, or when any direct
@@ -137,20 +138,13 @@ pub fn provider_slots_for_keys(
         }
     }
 
-    match keys.anthropic_upstream.as_deref() {
-        Some("bedrock") => add_provider_slots(
-            &mut slots,
-            "anthropic",
-            keys.bedrock_api_key.as_deref(),
-            node_secret,
-        )?,
-        Some("foundry") => add_provider_slots(
+    if keys.anthropic_upstream.as_deref() == Some("foundry") {
+        add_provider_slots(
             &mut slots,
             "anthropic",
             keys.azure_foundry_api_key.as_deref(),
             node_secret,
-        )?,
-        _ => {}
+        )?;
     }
     if keys.openai_upstream.as_deref() == Some("azure") {
         add_provider_slots(
@@ -311,10 +305,10 @@ mod tests {
     const SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     #[test]
-    fn cloud_backend_advertises_one_slot_and_keeps_direct_slots() {
+    fn qualified_cloud_backend_advertises_one_slot_and_keeps_direct_slots() {
         let keys = ProviderKeys {
-            anthropic_upstream: Some("bedrock".to_owned()),
-            bedrock_api_key: Some("bedrock-key".to_owned()),
+            anthropic_upstream: Some("foundry".to_owned()),
+            azure_foundry_api_key: Some("foundry-key".to_owned()),
             google: Some("g-a;g-b".to_owned()),
             ..ProviderKeys::default()
         };
@@ -324,15 +318,26 @@ mod tests {
     }
 
     #[test]
-    fn cloud_backend_slot_id_uses_cloud_provider_namespace() {
+    fn qualified_cloud_slot_id_uses_cloud_provider_namespace() {
+        let keys = ProviderKeys {
+            anthropic_upstream: Some("foundry".to_owned()),
+            azure_foundry_api_key: Some("foundry-key".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("cloud slot");
+        let expected = derive_slot_id("anthropic", "foundry-key", SECRET).expect("slot id");
+        assert_eq!(slots["anthropic"], [expected]);
+    }
+
+    #[test]
+    fn unqualified_bedrock_does_not_advertise_a_rejected_slot() {
         let keys = ProviderKeys {
             anthropic_upstream: Some("bedrock".to_owned()),
             bedrock_api_key: Some("bedrock-key".to_owned()),
             ..ProviderKeys::default()
         };
-        let slots = provider_slots_for_keys(&keys, SECRET).expect("cloud slot");
-        let expected = derive_slot_id("anthropic", "bedrock-key", SECRET).expect("slot id");
-        assert_eq!(slots["anthropic"], [expected]);
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("direct Bedrock route");
+        assert!(!slots.contains_key("anthropic"));
     }
 
     #[test]

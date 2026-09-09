@@ -19,6 +19,17 @@ pub const COMPOSE_TEMPLATE: &str = include_str!("../../../dstack/docker-compose.
 /// `phala deploy --pre-launch-script`.
 pub const PRELAUNCH_SCRIPT: &str = include_str!("../../../dstack/prelaunch.sh");
 
+/// Runtime sizing knobs passed through the measured compose and env file.
+/// Keep this order aligned with `CANONICAL_ALLOWED_ENVS` and the compose
+/// service's `environment` list.
+const CLOUD_HOP_RUNTIME_ENVS: [&str; 5] = [
+    "GM_GATEWAY_MAX_REQUEST_BODY_BYTES",
+    "GM_CLOUD_HOP_MAX_REQUEST_BYTES",
+    "GM_CLOUD_HOP_MAX_BUFFERED_BYTES",
+    "GM_CLOUD_HOP_MAX_CONCURRENCY",
+    "GM_CLOUD_HOP_TIMEOUT_MS",
+];
+
 /// Placeholder substituted with the active network name (`testnet` /
 /// `mainnet`) at compose render time. A literal in the rendered compose,
 /// so its value is part of the attestation-measured `compose_hash`.
@@ -38,14 +49,56 @@ const GM_NETWORK_PLACEHOLDER: &str = "__GM_NETWORK__";
 /// 401, the registry capability probe excludes it, and no pool forms. The
 /// name order matches `CANONICAL_ALLOWED_ENVS`.
 ///
-/// Extracted as a pure function so the exact env-file contents can be
-/// asserted in tests without touching the filesystem.
-#[must_use]
+/// The final five runtime settings are read from the process environment at
+/// render time; the rest of the content comes from the supplied arguments.
+/// The filesystem write is kept separate so the exact env-file contents can
+/// be asserted in tests without touching disk.
+///
+/// # Errors
+/// Returns an error when either deployment map is invalid.
 pub fn render_env_file(
     env_vars: &ProviderKeys,
     node_secret: &str,
     registry_creds: Option<&RegistryCredentials>,
-) -> String {
+) -> Result<String> {
+    render_env_file_with_runtime(env_vars, node_secret, registry_creds, |name| {
+        std::env::var(name).ok()
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the env-file order is kept beside the canonical provider field list"
+)]
+fn render_env_file_with_runtime<F>(
+    env_vars: &ProviderKeys,
+    node_secret: &str,
+    registry_creds: Option<&RegistryCredentials>,
+    runtime_value: F,
+) -> Result<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let foundry_deployments = env_vars
+        .azure_foundry_deployments
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            gm_cloud_hop::parse_deployment_map(gm_cloud_hop::CloudProvider::Foundry, value)
+                .map(|map| map.canonical_string())
+                .with_context(|| "validate AZURE_FOUNDRY_DEPLOYMENTS")
+        })
+        .transpose()?;
+    let azure_openai_deployments = env_vars
+        .azure_openai_deployments
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            gm_cloud_hop::parse_deployment_map(gm_cloud_hop::CloudProvider::AzureOpenAi, value)
+                .map(|map| map.canonical_string())
+                .with_context(|| "validate AZURE_OPENAI_DEPLOYMENTS")
+        })
+        .transpose()?;
     let mut lines = String::new();
     for (name, value) in [
         ("ANTHROPIC_API_KEY", env_vars.anthropic.as_deref()),
@@ -80,10 +133,7 @@ pub fn render_env_file(
             "AZURE_FOUNDRY_CLIENT_SECRET",
             env_vars.azure_foundry_client_secret.as_deref(),
         ),
-        (
-            "AZURE_FOUNDRY_DEPLOYMENTS",
-            env_vars.azure_foundry_deployments.as_deref(),
-        ),
+        ("AZURE_FOUNDRY_DEPLOYMENTS", foundry_deployments.as_deref()),
         ("OPENAI_API_KEY", env_vars.openai.as_deref()),
         ("OPENAI_UPSTREAM", env_vars.openai_upstream.as_deref()),
         (
@@ -110,7 +160,7 @@ pub fn render_env_file(
         ),
         (
             "AZURE_OPENAI_DEPLOYMENTS",
-            env_vars.azure_openai_deployments.as_deref(),
+            azure_openai_deployments.as_deref(),
         ),
         ("GOOGLE_API_KEY", env_vars.google.as_deref()),
         ("CHUTES_API_KEY", env_vars.chutes.as_deref()),
@@ -133,6 +183,15 @@ pub fn render_env_file(
     lines.push_str(node_secret);
     lines.push('\n');
 
+    for name in CLOUD_HOP_RUNTIME_ENVS {
+        lines.push_str(name);
+        lines.push('=');
+        if let Some(value) = runtime_value(name) {
+            lines.push_str(&value);
+        }
+        lines.push('\n');
+    }
+
     // Private-registry pull credentials, consumed by the CVM's pre-launch
     // script (`docker login` before pulling the private miner image).
     if let Some(creds) = registry_creds {
@@ -147,7 +206,7 @@ pub fn render_env_file(
         lines.push('\n');
     }
 
-    lines
+    Ok(lines)
 }
 
 /// Write the provider keys + node secret + registry credentials to
@@ -167,7 +226,7 @@ pub(crate) fn write_env_file(
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let lines = render_env_file(env_vars, node_secret, registry_creds);
+    let lines = render_env_file(env_vars, node_secret, registry_creds)?;
 
     let parent = env_path
         .parent()
@@ -348,7 +407,7 @@ mod tests {
             azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
             ..ProviderKeys::default()
         };
-        let body = render_env_file(&keys, "node-secret-xyz", None);
+        let body = render_env_file(&keys, "node-secret-xyz", None).expect("render env file");
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
         assert!(body.contains("CHUTES_API_KEY=cpk-chutes\n"));
         assert!(body.contains("ZAI_API_KEY=zai-key\n"));
@@ -376,10 +435,32 @@ mod tests {
             openai: Some("sk-a;sk-b".to_owned()),
             ..ProviderKeys::default()
         };
-        let body = render_env_file(&keys, "node-secret", None);
+        let body = render_env_file(&keys, "node-secret", None).expect("render env file");
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant-a; sk-ant-b \n"));
         assert!(body.contains("OPENAI_API_KEY=sk-a;sk-b\n"));
         assert!(!body.contains("GM_ANTHROPIC_KEY_SLOT_"));
+    }
+
+    #[test]
+    fn render_env_file_canonicalizes_valid_maps_and_rejects_newlines() {
+        let keys = ProviderKeys {
+            azure_openai_deployments: Some(
+                " gpt-5.6 = prod_gpt56 ; gpt-5.5 = azure-gpt55 ".to_owned(),
+            ),
+            ..ProviderKeys::default()
+        };
+        let body = render_env_file(&keys, "node-secret", None).expect("valid map renders");
+        assert!(body.contains("AZURE_OPENAI_DEPLOYMENTS=gpt-5.5=azure-gpt55;gpt-5.6=prod_gpt56\n"));
+        assert!(!body.contains("AZURE_OPENAI_DEPLOYMENTS= gpt"));
+
+        let mut keys = keys;
+        keys.azure_openai_deployments = Some("gpt-5.5=\nmy-deployment".to_owned());
+        let error = render_env_file(&keys, "node-secret", None)
+            .expect_err("a newline cannot be persisted into an env assignment");
+        assert!(
+            format!("{error:#}").contains("carriage returns or newlines"),
+            "{error:#}"
+        );
     }
 
     /// Every canonical provider key NAME is present on its own line — in the
@@ -396,7 +477,7 @@ mod tests {
             chutes: Some("cpk-only".to_owned()),
             ..ProviderKeys::default()
         };
-        let body = render_env_file(&keys, "node-secret", None);
+        let body = render_env_file(&keys, "node-secret", None).expect("render env file");
         let names: Vec<&str> = body
             .lines()
             .filter_map(|l| l.split('=').next())
@@ -437,9 +518,36 @@ mod tests {
                 "MOONMATH_API_KEY",
                 "NEAR_API_KEY",
                 "GM_NODE_SECRET",
+                "GM_GATEWAY_MAX_REQUEST_BODY_BYTES",
+                "GM_CLOUD_HOP_MAX_REQUEST_BYTES",
+                "GM_CLOUD_HOP_MAX_BUFFERED_BYTES",
+                "GM_CLOUD_HOP_MAX_CONCURRENCY",
+                "GM_CLOUD_HOP_TIMEOUT_MS",
             ],
             "the env file must declare every canonical name in CANONICAL_ALLOWED_ENVS order"
         );
+    }
+
+    #[test]
+    fn render_env_file_plumbs_effective_hop_limits() {
+        let body =
+            render_env_file_with_runtime(&ProviderKeys::default(), "node-secret", None, |name| {
+                match name {
+                    "GM_GATEWAY_MAX_REQUEST_BODY_BYTES" => Some("131072".to_owned()),
+                    "GM_CLOUD_HOP_MAX_REQUEST_BYTES" => Some("65536".to_owned()),
+                    "GM_CLOUD_HOP_MAX_BUFFERED_BYTES" => Some("262144".to_owned()),
+                    "GM_CLOUD_HOP_MAX_CONCURRENCY" => Some("8".to_owned()),
+                    "GM_CLOUD_HOP_TIMEOUT_MS" => Some("15000".to_owned()),
+                    _ => None,
+                }
+            })
+            .expect("render effective hop settings");
+
+        assert!(body.contains("GM_GATEWAY_MAX_REQUEST_BODY_BYTES=131072\n"));
+        assert!(body.contains("GM_CLOUD_HOP_MAX_REQUEST_BYTES=65536\n"));
+        assert!(body.contains("GM_CLOUD_HOP_MAX_BUFFERED_BYTES=262144\n"));
+        assert!(body.contains("GM_CLOUD_HOP_MAX_CONCURRENCY=8\n"));
+        assert!(body.contains("GM_CLOUD_HOP_TIMEOUT_MS=15000\n"));
     }
 
     /// When private-registry credentials are supplied, all three
@@ -452,7 +560,7 @@ mod tests {
             username: "miner-bot".to_owned(),
             password: "ghp_token".to_owned(),
         };
-        let body = render_env_file(&keys, "node-secret", Some(&creds));
+        let body = render_env_file(&keys, "node-secret", Some(&creds)).expect("render env file");
         assert!(body.contains("DSTACK_DOCKER_REGISTRY=ghcr.io\n"));
         assert!(body.contains("DSTACK_DOCKER_USERNAME=miner-bot\n"));
         assert!(body.contains("DSTACK_DOCKER_PASSWORD=ghp_token\n"));

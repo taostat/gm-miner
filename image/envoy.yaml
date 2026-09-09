@@ -490,13 +490,12 @@ static_resources:
 
                         ## gm:anthropic-direct-route-end
                         ## gm:openai-cloud-hop-route-begin
-                        ## ── Azure OpenAI qualified surfaces ─────────────────
-                        ##  Chat completions and Responses are the only Azure
-                        ##  surfaces admitted to the measured hop.
+                        ## ── Azure OpenAI qualified chat surface ─────────────
+                        ##  Chat completions is qualified by the 2026-09-09
+                        ##  dated-model echo. Azure Responses is deliberately
+                        ##  rejected below: its echo is the deployment name.
                         - match:
-                            safe_regex:
-                              google_re2: {}
-                              regex: "^/v1/(chat/completions|responses)$"
+                            path: "/v1/chat/completions"
                             headers:
                               - name: "x-gm-provider"
                                 string_match:
@@ -517,6 +516,35 @@ static_resources:
                                 value: "azure-openai"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
                         ## gm:openai-cloud-hop-route-end
+                        ## gm:openai-azure-responses-reject-begin
+                        ## ── Azure OpenAI Responses qualification fence ─────
+                        ##  The live response.created/non-streaming echo is the
+                        ##  deployment name (`gm-echo-test`), not the model.
+                        ##  Keep this explicit JSON 400 before the generic
+                        ##  OpenAI route so an Azure Responses request cannot
+                        ##  silently bypass the measured hop.
+                        - match:
+                            path: "/v1/responses"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "openai"
+                          direct_response:
+                            status: 400
+                            body:
+                              inline_string: '{"error":{"type":"gm_unqualified_surface","message":"Azure OpenAI Responses is unqualified: the response model echo is the deployment name, not the upstream model"}}'
+                          response_headers_to_add:
+                            - header:
+                                key: content-type
+                                value: application/json
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                          request_headers_to_remove:
+                            - authorization
+                            - api-key
+                            - x-api-key
+                            - x-gm-node-key
+                            - x-gm-upstream-slot
+                        ## gm:openai-azure-responses-reject-end
                         ## gm:openai-direct-route-begin
                         ## ── OpenAI ──────────────────────────────────────────
                         ##  Enabled only when OPENAI_API_KEY is set.
@@ -531,19 +559,17 @@ static_resources:
                             host_rewrite_literal: __GM_OPENAI_HOST__
                             ## gm:openai-path-rewrite-begin
                             ##  Azure OpenAI serves its OpenAI-compatible
-                            ##  surface under /openai/v1, so the inbound
-                            ##  /v1/chat/completions and /v1/responses
-                            ##  paths (the latter the Responses API, which
-                            ##  the gateway forwards verbatim) are rewritten
-                            ##  to their /openai/v1 forms. Direct
+                            ##  chat-completions surface under /openai/v1, so
+                            ##  the inbound /v1/chat/completions path is
+                            ##  rewritten to its /openai/v1 form. Direct
                             ##  api.openai.com serves both under /v1, so the
                             ##  rewrite is dropped entirely for `direct` via
                             ##  OPENAI_PATH_REWRITE.
                             regex_rewrite:
                               pattern:
                                 google_re2: {}
-                                regex: "^/v1/(chat/completions|responses)$"
-                              substitution: "/openai/v1/\\1"
+                                regex: "^/v1/chat/completions$"
+                              substitution: "/openai/v1/chat/completions"
                             ## gm:openai-path-rewrite-end
                             timeout: 1800s
                             retry_policy:
@@ -880,12 +906,14 @@ static_resources:
                           local slot_config = {
                             anthropic = {
                               cloud = __GM_ANTHROPIC_CLOUD__,
+                              cloud_hop = __GM_ANTHROPIC_CLOUD_HOP__,
                               direct_env = "ANTHROPIC_API_KEY",
                               default_env = __GM_ANTHROPIC_DEFAULT_SLOT_ENV__,
                               slots = __GM_ANTHROPIC_SLOT_MAP__,
                             },
                             openai = {
                               cloud = __GM_OPENAI_CLOUD__,
+                              cloud_hop = __GM_OPENAI_CLOUD_HOP__,
                               direct_env = "OPENAI_API_KEY",
                               default_env = __GM_OPENAI_DEFAULT_SLOT_ENV__,
                               slots = __GM_OPENAI_SLOT_MAP__,
@@ -1025,17 +1053,20 @@ static_resources:
                               return true
                             end
 
-                            -- gm:cloud-slot-reject-begin
-                            if cfg.cloud then
+                            -- A cloud adapter that is not routed through the
+                            -- measured hop (currently Bedrock) remains direct
+                            -- and must reject all registry slot headers.
+                            if cfg.cloud and not cfg.cloud_hop then
                               if requested ~= nil then
                                 slot_unavailable(handle, requested)
                                 return false
                               end
                               return true
                             end
-                            -- gm:cloud-slot-reject-end
-                            -- gm:cloud-slot-accept-begin
-                            if cfg.cloud then
+                            -- A qualified adapter is reached only through the
+                            -- hop route and may accept its one authenticated
+                            -- cloud slot there.
+                            if cfg.cloud and cfg.cloud_hop then
                               if requested == nil then
                                 slot_unavailable(handle, "")
                                 return false
@@ -1050,8 +1081,6 @@ static_resources:
                               -- request. No direct key is selected here.
                               return true
                             end
-                            -- gm:cloud-slot-accept-end
-
                             local env_name = nil
                             if requested ~= nil then
                               env_name = cfg.slots[requested]
@@ -1235,9 +1264,7 @@ static_resources:
                       domains: ["*"]
                       routes:
                         - match:
-                            safe_regex:
-                              google_re2: {}
-                              regex: "^/v1/(chat/completions|responses)$"
+                            path: "/v1/chat/completions"
                             headers:
                               - name: x-gm-cloud-hop-provider
                                 string_match:
@@ -1248,8 +1275,8 @@ static_resources:
                             regex_rewrite:
                               pattern:
                                 google_re2: {}
-                                regex: "^/v1/(chat/completions|responses)$"
-                              substitution: "/openai/v1/\\1"
+                                regex: "^/v1/chat/completions$"
+                              substitution: "/openai/v1/chat/completions"
                             timeout: 1800s
                           request_headers_to_remove:
                             - authorization

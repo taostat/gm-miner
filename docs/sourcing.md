@@ -87,26 +87,28 @@ evidence is a separate GM runbook concern.
 
 ### Cloud transport variants and admission
 
-The image retains three cloud transports. Azure OpenAI chat/Responses and
-Foundry Messages pass through a measured model hop; Bedrock's hop is wired but
-disabled until its upstream echo is observed. Selecting one per worker does
+The image retains three cloud transports. Azure OpenAI chat completions and
+Foundry Messages pass through a measured model hop. Azure Responses is
+explicitly rejected because its echo is the deployment name, while Bedrock stays
+on its direct, unqualified transport and rejects slot headers. Selecting one per worker does
 **not** make every model on that provider a registry-admissible route, and a
 successful upstream probe is not evidence of admission:
 
 | Buyer product | Route | Selector |
 |---|---|---|
-| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — legacy transport only; measured hop disabled pending echo evidence |
-| `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` plus `--foundry-deployments canonical=deployment;...` (see [foundry-setup.md](foundry-setup.md)) — measured transport, feature-gated admission |
-| `openai/*` | Azure OpenAI | `--openai-upstream azure` plus `--azure-deployments canonical=deployment;...` — measured transport, feature-gated admission |
+| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — direct legacy transport only; unqualified and no slot headers |
+| `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` plus `--foundry-deployments canonical=deployment;...` (see [foundry-setup.md](foundry-setup.md)) — qualified measured transport |
+| `openai/*` | Azure OpenAI chat completions | `--openai-upstream azure` plus `--azure-deployments canonical=deployment;...` — qualified measured transport; `/v1/responses` is rejected |
 
 Same idea, different mechanism — selectors and maps are set once per worker.
 The map format is `canonical=deployment;canonical=deployment`; its values are
 data only and do not choose hosts, paths, redirects, or proxy settings. Use
-direct/API-key providers for ordinary declarations while the separate
-registry/gateway echo-check release is pending. Once the registry admits the
-image feature `upstream-model-hop` and the gateway fence is live, declare a
-cloud route with the same canonical `provider/model` as a direct route; do not
-send the deployment name with the offer. Direct Anthropic/OpenAI routes still
+direct/API-key providers for ordinary declarations when a cloud binding is not
+configured. The CLI requires both the image feature `upstream-model-hop` and
+registry capability `upstream-model-echo` before cloud registration, recovery,
+or declaration; it refuses legacy registries. Declare a qualified cloud route
+with the same canonical `provider/model` as a direct route; do not send the
+deployment name with the offer. Direct Anthropic/OpenAI routes still
 require verified key slots enforced inside the miner runtime.
 
 ## One lottery entry per worker
@@ -263,9 +265,9 @@ line, from the offers it can see — it knows whether a provider is offered now,
 not whether a probe has finished, so give a fresh declaration a cycle before
 reading anything into its count.
 
-Note that the current `declare-products` fan-out skips cloud-backed entries
-until that feature fence is admitted. After admission, those cloud entries are
-ordinary canonical catalog offers, just like direct entries; the deployment map
+Note that the current `declare-products` fan-out checks `upstream-model-echo`
+but skips cloud-backed entries because its bulk request has no per-deployment
+binding. Use `declare-product` for one qualified cloud route; the deployment map
 remains inside the measured image and is not part of the declaration.
 
 To withdraw a route later, `gmcli undeclare-product --provider engy --model

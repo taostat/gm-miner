@@ -1,13 +1,14 @@
 //! `gmcli doctor` — a preflight checklist run before deploying.
 
-use std::time::Duration;
-
 use anyhow::{bail, Context as _, Result};
 
 use gm_azure_verify::{AzureProvider, AzureVerifier, AzureVerifyConfig};
-use gm_cloud_hop::{echo_matches_model, parse_deployment_map, rewrite_model_bytes, CloudProvider};
+use gm_cloud_hop::{
+    echo_matches_model, extract_model_echo, parse_deployment_map, qualification,
+    rewrite_model_bytes, CloudProvider, CloudSurface,
+};
 use gm_miner_cli::{
-    client::RegistryClient,
+    client::{build_http_client, RegistryClient},
     config::{Config, ProviderKeys},
     network::Network,
     types::MinerStatus,
@@ -296,10 +297,7 @@ async fn cloud_identity_checks(keys: Option<&ProviderKeys>) -> Vec<Check> {
     let Some(keys) = keys else {
         return Vec::new();
     };
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-    {
+    let client = match build_http_client() {
         Ok(client) => client,
         Err(err) => {
             return vec![Check::fail(
@@ -321,6 +319,10 @@ async fn cloud_identity_checks(keys: Option<&ProviderKeys>) -> Vec<Check> {
             )
             .await,
         );
+        checks.push(unqualified_surface_check(
+            CloudProvider::AzureOpenAi,
+            CloudSurface::AzureResponses,
+        ));
     }
     if keys.anthropic_upstream.as_deref() == Some("foundry") {
         checks.extend(
@@ -334,9 +336,24 @@ async fn cloud_identity_checks(keys: Option<&ProviderKeys>) -> Vec<Check> {
             .await,
         );
     }
-    // Bedrock is deliberately not probed: its hop table is disabled until a
-    // live Mantle response proves the authoritative model echo.
+    if keys.anthropic_upstream.as_deref() == Some("bedrock") {
+        checks.push(unqualified_surface_check(
+            CloudProvider::Bedrock,
+            CloudSurface::BedrockMessages,
+        ));
+    }
     checks
+}
+
+fn unqualified_surface_check(provider: CloudProvider, surface: CloudSurface) -> Check {
+    let detail = qualification(provider, surface, false).map_or_else(
+        || "no qualification row is present".to_owned(),
+        |row| row.reason.to_owned(),
+    );
+    Check::info(
+        format!("Cloud model echo ({provider} {})", surface.path()),
+        format!("skipped: surface is unqualified ({detail})"),
+    )
 }
 
 async fn mapped_cloud_checks(
@@ -419,17 +436,28 @@ async fn cloud_identity_check(
     if !status.is_success() {
         return Check::fail(label, format!("cloud endpoint returned {status}"));
     }
-    let response = match response.json::<serde_json::Value>().await {
-        Ok(response) => response,
-        Err(err) => return Check::fail(label, format!("response was not valid JSON: {err}")),
+    let response_body = match response.bytes().await {
+        Ok(response_body) => response_body,
+        Err(err) => return Check::fail(label, format!("could not read response body: {err}")),
     };
-    let Some(echo) = response.get("model").and_then(serde_json::Value::as_str) else {
-        return Check::fail(
-            label,
-            format!("response has no string model echo (expected {canonical})"),
-        );
+    let echo = match extract_model_echo(&response_body) {
+        Ok(echo) => echo,
+        Err(gm_cloud_hop::RewriteError::DuplicateModel) => {
+            return Check::fail(
+                label,
+                format!(
+                    "response has duplicate top-level model keys; refusing an ambiguous echo (expected {canonical})"
+                ),
+            )
+        }
+        Err(err) => {
+            return Check::fail(
+                label,
+                format!("response has no unambiguous string model echo: {err} (expected {canonical})"),
+            )
+        }
     };
-    if !echo_matches_model(canonical, echo) {
+    if !echo_matches_model(canonical, &echo) {
         return Check::fail(
             label,
             format!("model substitution: expected {canonical}, upstream echoed {echo}"),
@@ -838,10 +866,87 @@ mod tests {
             ..ProviderKeys::default()
         };
         let checks = cloud_identity_checks(Some(&keys)).await;
-        assert_eq!(checks.len(), 1);
+        assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].status, Status::Pass);
         assert!(checks[0].note.contains("canonical=gpt-5.5"));
         assert!(checks[0].note.contains("echo=gpt-5.5-2026-04-23"));
+        assert_eq!(checks[1].status, Status::Info);
+    }
+
+    #[tokio::test]
+    async fn cloud_identity_check_rejects_duplicate_model_echo_keys() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"model":"gpt-5.5","model":"other"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let keys = ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            azure_openai_endpoint: Some(server.uri()),
+            azure_openai_api_key: Some("azure-key".to_owned()),
+            azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let checks = cloud_identity_checks(Some(&keys)).await;
+        assert_eq!(
+            checks.len(),
+            2,
+            "the qualified check plus skipped Responses"
+        );
+        assert_eq!(checks[0].status, Status::Fail);
+        assert!(checks[0].note.contains("duplicate top-level model"));
+        assert_eq!(checks[1].status, Status::Info);
+        assert!(checks[1].note.contains("skipped"));
+    }
+
+    #[tokio::test]
+    async fn cloud_identity_probe_does_not_follow_cross_host_redirect() {
+        let origin = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/redirect-target", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+
+        let keys = ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            azure_openai_endpoint: Some(origin.uri()),
+            azure_openai_api_key: Some("azure-key".to_owned()),
+            azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let checks = cloud_identity_checks(Some(&keys)).await;
+        assert_eq!(checks[0].status, Status::Fail);
+        assert!(target
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn bedrock_surface_is_reported_skipped_without_a_probe() {
+        let checks = cloud_identity_checks(Some(&ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_region: Some("us-east-1".to_owned()),
+            bedrock_api_key: Some("bedrock-key".to_owned()),
+            ..ProviderKeys::default()
+        }))
+        .await;
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Info);
+        assert!(checks[0].note.contains("skipped"));
+        assert!(checks[0].note.contains("unqualified"));
     }
 
     #[test]

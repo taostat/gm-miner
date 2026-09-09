@@ -393,6 +393,7 @@ pub(crate) fn cmd_set_api_keys(
         if let Some(k) = near {
             keys.near = Some(k);
         }
+        keys.canonicalize_deployment_maps()?;
         let lines = summary_lines(keys);
 
         config::save(&cfg).context("save config")?;

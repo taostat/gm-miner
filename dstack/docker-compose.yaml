@@ -110,6 +110,14 @@ services:
       - NEAR_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
+      ## Hop and gateway request-sizing knobs. They are optional; the image
+      ## applies bounded defaults and the gateway cap is the fallback request
+      ## limit when no hop-specific cap is supplied.
+      - GM_GATEWAY_MAX_REQUEST_BODY_BYTES
+      - GM_CLOUD_HOP_MAX_REQUEST_BYTES
+      - GM_CLOUD_HOP_MAX_BUFFERED_BYTES
+      - GM_CLOUD_HOP_MAX_CONCURRENCY
+      - GM_CLOUD_HOP_TIMEOUT_MS
       ## Active network — `testnet` or `mainnet`. Rendered as a literal
       ## by `gmcli deploy` (not an operator env var), so the value is
       ## part of the attestation-measured compose_hash. The image's
