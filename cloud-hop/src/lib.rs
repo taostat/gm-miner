@@ -19,7 +19,7 @@ use std::{
 
 use http_body_util::{combinators::BoxBody, BodyExt as _, Full};
 use hyper::{
-    body::{Body as _, Bytes, Incoming},
+    body::{Body as _, Buf, Bytes, Incoming},
     header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
     service::service_fn,
     Method, Request, Response, StatusCode,
@@ -1205,7 +1205,6 @@ enum ResponseBodyError {
 struct TimedResponseBody {
     body: Incoming,
     request_permit: Option<OwnedSemaphorePermit>,
-    buffer_permit: Option<OwnedSemaphorePermit>,
     deadline: Instant,
     watchdog: Option<AbortHandle>,
     upstream_connection: Option<AbortHandle>,
@@ -1216,7 +1215,6 @@ impl TimedResponseBody {
     fn new(
         body: Incoming,
         request_permit: OwnedSemaphorePermit,
-        buffer_permit: Option<OwnedSemaphorePermit>,
         deadline: Instant,
         cancellation: watch::Sender<bool>,
         upstream_connection: AbortHandle,
@@ -1229,7 +1227,6 @@ impl TimedResponseBody {
         Self {
             body,
             request_permit: Some(request_permit),
-            buffer_permit,
             deadline,
             watchdog: Some(watchdog),
             upstream_connection: Some(upstream_connection),
@@ -1246,7 +1243,6 @@ impl TimedResponseBody {
             upstream_connection.abort();
         }
         self.request_permit.take();
-        self.buffer_permit.take();
     }
 }
 
@@ -1461,7 +1457,7 @@ async fn handle_request(
         );
     };
     let (parts, request_body) = request.into_parts();
-    let (body, mut buffer_permit) = match timeout_at(
+    let body = match timeout_at(
         deadline,
         read_request_body(
             request_body,
@@ -1503,7 +1499,7 @@ async fn handle_request(
             )
         }
     };
-    let rewrite_capacity = match rewrite_capacity(&body, map) {
+    let rewrite_capacity = match rewrite_capacity(body.as_ref(), map) {
         Ok(capacity) => capacity,
         Err(error) => {
             let message = error.to_string();
@@ -1524,7 +1520,7 @@ async fn handle_request(
             "cloud hop aggregate buffering limit reached",
         );
     };
-    let rewritten = match rewrite_model_bytes(selector, &body, map) {
+    let rewritten = match rewrite_model_bytes(selector, body.as_ref(), map) {
         Ok(body) => body,
         Err(error) => {
             let message = error.to_string();
@@ -1545,18 +1541,16 @@ async fn handle_request(
         };
         rewrite_permit.merge(extra_permit);
     }
-    // The request body and the rewritten body are separate allocations. Keep
-    // only the latter's storage reservation through the response lifetime;
-    // the request-concurrency permit remains independent in `TimedResponseBody`.
+    // Bind the rewritten allocation's reservation to the bytes sent through
+    // hyper. The transport can hold those bytes after this function returns,
+    // so the reservation must follow that ownership rather than the response.
+    let rewritten = BufferedBytes::new(Bytes::from(rewritten), Some(rewrite_permit));
     drop(body);
-    drop(buffer_permit.take());
-    buffer_permit = Some(rewrite_permit);
 
     match forward_request(parts, rewritten, selector, state, deadline).await {
         Ok(forwarded) => box_response(
             forwarded.response,
             request_permit,
-            buffer_permit,
             deadline,
             cancellation,
             forwarded.connection_abort,
@@ -1575,7 +1569,7 @@ async fn read_request_body(
     mut body: Incoming,
     max_request_bytes: usize,
     buffered: Arc<Semaphore>,
-) -> Result<(Bytes, Option<OwnedSemaphorePermit>), ReadBodyError> {
+) -> Result<BufferedBytes, ReadBodyError> {
     let mut permit = None;
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
@@ -1594,7 +1588,44 @@ async fn read_request_body(
             return Err(ReadBodyError::Trailers);
         }
     }
-    Ok((Bytes::from(bytes), permit))
+    Ok(BufferedBytes::new(Bytes::from(bytes), permit))
+}
+
+/// A request allocation and the semaphore reservation that accounts for it.
+/// Keeping them in one `Buf` value makes the reservation follow the allocation
+/// through hyper's transport-held request frames until the bytes are dropped.
+struct BufferedBytes {
+    bytes: Bytes,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl BufferedBytes {
+    fn new(bytes: Bytes, permit: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            bytes,
+            _permit: permit,
+        }
+    }
+}
+
+impl AsRef<[u8]> for BufferedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Buf for BufferedBytes {
+    fn remaining(&self) -> usize {
+        self.bytes.remaining()
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.bytes.chunk()
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.bytes.advance(count);
+    }
 }
 
 /// Reserve only the capacity the request buffer is about to acquire. The
@@ -1672,7 +1703,7 @@ fn surface_for_path(provider: CloudProvider, path: &str) -> Option<CloudSurface>
 
 async fn forward_request(
     mut parts: hyper::http::request::Parts,
-    body: Vec<u8>,
+    body: BufferedBytes,
     selector: CloudProvider,
     state: Arc<ProxyState>,
     deadline: Instant,
@@ -1692,7 +1723,8 @@ async fn forward_request(
     parts.headers.remove(TRANSFER_ENCODING);
     parts.headers.insert(
         CONTENT_LENGTH,
-        HeaderValue::from_str(&body.len().to_string()).map_err(|_| ForwardError::HeaderValue)?,
+        HeaderValue::from_str(&body.as_ref().len().to_string())
+            .map_err(|_| ForwardError::HeaderValue)?,
     );
     parts.headers.insert(
         "x-gm-cloud-hop-provider",
@@ -1701,7 +1733,7 @@ async fn forward_request(
             .parse()
             .map_err(|_| ForwardError::HeaderValue)?,
     );
-    let request = Request::from_parts(parts, Full::new(Bytes::from(body)));
+    let request = Request::from_parts(parts, Full::new(body));
     let stream = timeout_at(deadline, TcpStream::connect(state.upstream_addr))
         .await
         .map_err(|_| ForwardError::Timeout)??;
@@ -1740,7 +1772,6 @@ struct ForwardedResponse {
 fn box_response(
     response: Response<Incoming>,
     request_permit: OwnedSemaphorePermit,
-    buffer_permit: Option<OwnedSemaphorePermit>,
     deadline: Instant,
     cancellation: watch::Sender<bool>,
     upstream_connection: AbortHandle,
@@ -1749,7 +1780,6 @@ fn box_response(
     let body = TimedResponseBody::new(
         body,
         request_permit,
-        buffer_permit,
         deadline,
         cancellation,
         upstream_connection,
@@ -2401,6 +2431,52 @@ mod tests {
                 format!(r#"{{"model":"my-gpt55","padding":"{}"}}"#, "x".repeat(4096)).into_bytes(),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn round4_uploaded_storage_is_released_before_response_completion() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let upstream_addr = upstream_listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream_listener.accept().await.expect("accept");
+                tokio::spawn(async move {
+                    let service = service_fn(|request: Request<Incoming>| async move {
+                        let uploaded = request.into_body().collect().await.expect("upload");
+                        drop(uploaded);
+                        Ok::<_, Infallible>(Response::new(StalledBody))
+                    });
+                    let _ = server_http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let hop_addr = hop_listener.local_addr().expect("addr");
+        tokio::spawn(serve_with_upstream(
+            hop_listener,
+            test_config_with_request(
+                4096,
+                required_buffered_bytes(4096),
+                4,
+                Duration::from_secs(5),
+            ),
+            upstream_addr,
+        ));
+        let original = Bytes::from(format!(
+            r#"{{"model":"gpt-5.5","padding":"{}"}}"#,
+            "x".repeat(4000)
+        ));
+        let first = send_hop_request(hop_addr, vec![original.clone()])
+            .await
+            .expect("first");
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = send_hop_request(hop_addr, vec![original])
+            .await
+            .expect("second");
+        assert_eq!(second.status(), StatusCode::OK, "first upload was consumed and freed; its open response must hold only a concurrency permit");
+        drop(first);
     }
 
     #[tokio::test]

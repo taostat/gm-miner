@@ -42,9 +42,9 @@ impl VerificationOperation {
     }
 }
 
-/// A deployment check may not remain in flight indefinitely: after two poll
-/// intervals without a completed verification, the binding is stale and the
-/// data plane must stop rather than serving on an unverified deployment.
+/// A deployment binding must be successfully reverified within two poll
+/// intervals of boot or the previous successful verification. The data plane
+/// must stop rather than serving on an unverified deployment.
 const DEPLOYMENT_STALE_INTERVALS: u32 = 2;
 
 pub(crate) async fn run_periodic_azure_verification(
@@ -152,20 +152,39 @@ async fn run_deployment_binding_loop(
         .deployment_interval
         .checked_mul(DEPLOYMENT_STALE_INTERVALS)
         .unwrap_or(Duration::MAX);
+    // The boot gate verified this target before this loop was spawned. Keep
+    // the target's staleness deadline anchored to that successful verification
+    // rather than starting a fresh timeout for every poll attempt.
+    let mut stale_deadline = tokio::time::Instant::now() + cycle_timeout;
 
     loop {
-        interval.tick().await;
-        let result = match tokio::time::timeout(
-            cycle_timeout,
-            verifier.verify_deployment_bindings(&state.config),
+        if tokio::time::timeout_at(stale_deadline, interval.tick())
+            .await
+            .is_err()
+        {
+            let _ = failure_tx.send(stale_failure_message());
+            return;
+        }
+
+        let result = match tokio::time::timeout_at(
+            stale_deadline,
+            tokio::time::timeout(
+                cycle_timeout,
+                verifier.verify_deployment_bindings(&state.config),
+            ),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "deployment binding verification became stale after {DEPLOYMENT_STALE_INTERVALS} deployment intervals"
+            Err(_) => Err(stale_failure()),
+            Ok(Err(_)) if tokio::time::Instant::now() >= stale_deadline => {
+                Err(stale_failure())
+            }
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "deployment binding verification exceeded its {DEPLOYMENT_STALE_INTERVALS}-interval cycle timeout"
             )),
+            Ok(Ok(result)) => result,
         };
+        let successful = result.is_ok();
         if let Some(reason) = record_result(
             &mut state,
             result,
@@ -175,7 +194,20 @@ async fn run_deployment_binding_loop(
             let _ = failure_tx.send(reason);
             return;
         }
+        if successful {
+            stale_deadline = tokio::time::Instant::now() + cycle_timeout;
+        }
     }
+}
+
+fn stale_failure() -> anyhow::Error {
+    anyhow::anyhow!(stale_failure_message())
+}
+
+fn stale_failure_message() -> String {
+    format!(
+        "deployment binding verification became stale after {DEPLOYMENT_STALE_INTERVALS} deployment intervals without a successful verification"
+    )
 }
 
 fn record_result(
@@ -292,6 +324,102 @@ mod tests {
             capture_failures: 0,
             deployment_failures: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn round4_staleness_survives_fast_transient_polls() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let verifier =
+            AzureVerifier::with_endpoints(reqwest::Client::new(), server.uri(), server.uri());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PeriodicAzureVerifySettings {
+            interval: Duration::from_secs(30),
+            deployment_interval: Duration::from_millis(100),
+            transient_failure_limit: 3,
+        };
+        let task = tokio::spawn(run_deployment_binding_loop(
+            verifier,
+            state().config,
+            settings,
+            tx,
+        ));
+        let result = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await;
+        task.abort();
+        assert!(
+            result.is_ok(),
+            "no definitive stale failure after 2.5 intervals without successful verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn round4_staleness_interrupts_a_stalled_deployment_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tenant/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "arm-token"
+            })))
+            .mount(&server)
+            .await;
+        let account_path =
+            "/subscriptions/subscription/resourceGroups/resource-group/providers/Microsoft.CognitiveServices/accounts/acct";
+        Mock::given(method("GET"))
+            .and(path(account_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": account_path,
+                "kind": "AIServices",
+                "properties": {
+                    "customSubDomainName": "acct",
+                    "endpoint": "https://acct.services.ai.azure.com/"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{account_path}/deployments")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(500))
+                    .set_body_json(serde_json::json!({
+                        "value": [{
+                            "name": "foundry-sonnet",
+                            "properties": {
+                                "model": {
+                                    "format": "Anthropic",
+                                    "name": "claude-sonnet-4-6",
+                                    "version": "1"
+                                }
+                            }
+                        }]
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let verifier =
+            AzureVerifier::with_endpoints(reqwest::Client::new(), server.uri(), server.uri());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PeriodicAzureVerifySettings {
+            interval: Duration::from_secs(30),
+            deployment_interval: Duration::from_millis(100),
+            transient_failure_limit: 3,
+        };
+        let task = tokio::spawn(run_deployment_binding_loop(
+            verifier,
+            state().config,
+            settings,
+            tx,
+        ));
+        let result = tokio::time::timeout(Duration::from_millis(350), rx.recv())
+            .await
+            .expect("stalled deployment read must not outlive the stale deadline")
+            .expect("stale deployment read must report a failure");
+        task.abort();
+        assert!(result.contains("became stale"), "{result}");
     }
 
     #[tokio::test]
