@@ -111,9 +111,12 @@ fn add_provider_slots(
     Ok(())
 }
 
-/// Compute registry-advertised provider slot ids for direct upstreams only.
+/// Compute registry-advertised provider slot ids for direct and cloud
+/// upstreams.
 ///
-/// Cloud backend key vars are v1 single-slot and must not contain semicolons.
+/// A selected cloud upstream contributes exactly one slot for its provider;
+/// the cloud key is single-slot while direct providers retain their existing
+/// semicolon-separated behavior.
 ///
 /// # Errors
 /// Returns an error when a cloud-backend key contains `;`, or when any direct
@@ -123,29 +126,39 @@ pub fn provider_slots_for_keys(
     node_secret: &str,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     validate_cloud_backend_single_keys(keys)?;
-    let backends = keys.worker_backends();
-    if !backends.is_empty() {
-        // v1: a worker with any cloud backend is single-slot for EVERY provider
-        // — the registry rejects slot claims from backend workers and its
-        // control loop never probes them. Advertising slots for the direct
-        // providers (gemini, chutes, zai, moonshot, the non-backend of anthropic/openai)
-        // would 422 the registration after the CVM has already launched, and
-        // multi-key values there would sit silently unused, so both are refused
-        // up front. A mixed worker (Claude on Foundry + GPT on Azure) is two
-        // cloud providers, so it too advertises no slots.
-        reject_multikey_for_cloud_backend(keys, &backends)?;
-        return Ok(BTreeMap::new());
-    }
-
-    // Walks `direct_key` rather than listing providers here: it already nulls a
-    // provider routed to a cloud backend, and `add_provider_slots` no-ops on a
-    // null value, so the two together reproduce the per-provider gating without
-    // a second copy of it that a new variant could be missed from.
+    // Walks `direct_key` rather than listing direct providers here: it already
+    // nulls a provider routed to a cloud backend, and `add_provider_slots`
+    // no-ops on a null value. This preserves the direct-provider slot behavior
+    // while leaving cloud slots to the explicit adapter branches below.
     let mut slots = BTreeMap::new();
     for provider in Provider::iter() {
         if let Some((_, value)) = keys.direct_key(&provider) {
             add_provider_slots(&mut slots, provider.as_str(), value, node_secret)?;
         }
+    }
+
+    match keys.anthropic_upstream.as_deref() {
+        Some("bedrock") => add_provider_slots(
+            &mut slots,
+            "anthropic",
+            keys.bedrock_api_key.as_deref(),
+            node_secret,
+        )?,
+        Some("foundry") => add_provider_slots(
+            &mut slots,
+            "anthropic",
+            keys.azure_foundry_api_key.as_deref(),
+            node_secret,
+        )?,
+        _ => {}
+    }
+    if keys.openai_upstream.as_deref() == Some("azure") {
+        add_provider_slots(
+            &mut slots,
+            "openai",
+            keys.azure_openai_api_key.as_deref(),
+            node_secret,
+        )?;
     }
     Ok(slots)
 }
@@ -298,33 +311,41 @@ mod tests {
     const SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     #[test]
-    fn cloud_backend_suppresses_all_slot_advertisement() {
-        let keys = ProviderKeys {
-            anthropic_upstream: Some("bedrock".to_owned()),
-            bedrock_api_key: Some("bedrock-key".to_owned()),
-            google: Some("g-key".to_owned()),
-            ..ProviderKeys::default()
-        };
-        let slots = provider_slots_for_keys(&keys, SECRET).expect("mixed setup deploys");
-        assert!(
-            slots.is_empty(),
-            "backend workers advertise no slots for any provider",
-        );
-    }
-
-    #[test]
-    fn cloud_backend_rejects_direct_multikey() {
+    fn cloud_backend_advertises_one_slot_and_keeps_direct_slots() {
         let keys = ProviderKeys {
             anthropic_upstream: Some("bedrock".to_owned()),
             bedrock_api_key: Some("bedrock-key".to_owned()),
             google: Some("g-a;g-b".to_owned()),
             ..ProviderKeys::default()
         };
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("mixed setup deploys");
+        assert_eq!(slots["anthropic"].len(), 1);
+        assert_eq!(slots["gemini"].len(), 2);
+    }
+
+    #[test]
+    fn cloud_backend_slot_id_uses_cloud_provider_namespace() {
+        let keys = ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_api_key: Some("bedrock-key".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("cloud slot");
+        let expected = derive_slot_id("anthropic", "bedrock-key", SECRET).expect("slot id");
+        assert_eq!(slots["anthropic"], [expected]);
+    }
+
+    #[test]
+    fn cloud_backend_rejects_cloud_multikey() {
+        let keys = ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_api_key: Some("bedrock-a;bedrock-b".to_owned()),
+            ..ProviderKeys::default()
+        };
         let err = provider_slots_for_keys(&keys, SECRET).expect_err("multi-key must fail");
-        assert!(err.to_string().contains("GOOGLE_API_KEY"));
-        assert!(err.to_string().contains("bedrock"));
+        assert!(err.to_string().contains("BEDROCK_API_KEY"));
         assert!(
-            !err.to_string().contains("g-a"),
+            !err.to_string().contains("bedrock-a"),
             "no key material in errors"
         );
     }
@@ -445,19 +466,6 @@ mod tests {
         };
         let slots = provider_slots_for_keys(&keys, SECRET).expect("slots");
         assert_eq!(slots["moonmath"].len(), 2);
-    }
-
-    #[test]
-    fn cloud_backend_semicolon_is_fatal() {
-        let keys = ProviderKeys {
-            anthropic_upstream: Some("bedrock".to_owned()),
-            bedrock_api_key: Some("bedrock-a;bedrock-b".to_owned()),
-            ..ProviderKeys::default()
-        };
-        let err = provider_slots_for_keys(&keys, SECRET).expect_err("must fail");
-        assert!(err
-            .to_string()
-            .contains("BEDROCK_API_KEY cannot contain ';'"));
     }
 
     #[test]

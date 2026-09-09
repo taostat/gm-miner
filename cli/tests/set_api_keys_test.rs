@@ -438,6 +438,7 @@ fn validate_upstreams_rejects_non_https_azure_endpoint() {
             azure_resource_group: Some("rg".to_owned()),
             azure_client_id: Some("client".to_owned()),
             azure_client_secret: Some("secret".to_owned()),
+            azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
             ..ProviderKeys::default()
         };
         let err = keys.validate_upstreams().unwrap_err().to_string();
@@ -459,6 +460,7 @@ fn validate_upstreams_rejects_non_allowed_azure_endpoint() {
         azure_resource_group: Some("rg".to_owned()),
         azure_client_id: Some("client".to_owned()),
         azure_client_secret: Some("secret".to_owned()),
+        azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
         ..ProviderKeys::default()
     };
     let err = keys.validate_upstreams().unwrap_err().to_string();
@@ -482,6 +484,7 @@ fn validate_upstreams_accepts_complete_cloud_and_direct() {
         azure_resource_group: Some("rg".to_owned()),
         azure_client_id: Some("client".to_owned()),
         azure_client_secret: Some("secret".to_owned()),
+        azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
         ..ProviderKeys::default()
     };
     assert!(complete.validate_upstreams().is_ok());

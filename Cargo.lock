@@ -2343,6 +2343,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gm-cloud-hop"
+version = "0.4.15"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "gm-miner-attestd"
 version = "0.4.15"
 dependencies = [
@@ -2386,6 +2401,7 @@ dependencies = [
  "dirs",
  "fd-lock",
  "gm-azure-verify",
+ "gm-cloud-hop",
  "hex",
  "hmac 0.13.0",
  "open",

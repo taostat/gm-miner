@@ -477,6 +477,26 @@ fn image_is_slot_capable(
     approved.slot_capable()
 }
 
+/// Whether the image that will actually deploy contains the measured cloud
+/// model hop. Cloud upstreams are refused unless the registry-approved image
+/// row carries this feature, so an old gateway/image combination cannot accept
+/// a cloud slot as if it were a direct worker.
+fn image_is_model_hop_capable(
+    args: &DeployArgs,
+    approved: &ImageVersion,
+    versions: &[ImageVersion],
+) -> bool {
+    if let Some(explicit) = args.image_ref.as_deref() {
+        return versions
+            .iter()
+            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.model_hop_capable());
+    }
+    if args.image_repo.is_some() {
+        return false;
+    }
+    approved.model_hop_capable()
+}
+
 /// Resolve the image source (default = the gm-published `supported_image_ref`,
 /// overridden by `--image-ref`, built locally for `--image-repo`), provision
 /// it, and render the compose template around the resulting digest-pinned ref.
@@ -586,6 +606,13 @@ pub(crate) async fn cmd_deploy(
         approved.notes.as_deref().unwrap_or("<no notes>"),
         format_created_at(&approved.created_at),
     );
+
+    if !worker_backends.is_empty() && !image_is_model_hop_capable(args, approved, &versions) {
+        anyhow::bail!(
+            "cloud upstreams require a registry-approved image with the `upstream-model-hop` \
+             feature; select a supported hop image or wait for this image to be admitted"
+        );
+    }
 
     let is_first = *registration == WorkerRegistration::First;
     // A provisional stub from a `worker add` must stay off the worker-#1

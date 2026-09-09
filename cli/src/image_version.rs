@@ -77,7 +77,7 @@ pub struct AdminImageVersionRequest {
 
 /// Features this release's image supports. Stamped verbatim onto every
 /// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 1] = ["upstream-key-slots"];
+pub const IMAGE_FEATURES: [&str; 2] = ["upstream-key-slots", "upstream-model-hop"];
 
 /// The git provenance stamped onto a published version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -296,7 +296,10 @@ mod tests {
         assert!(obj.contains_key("notes"));
         assert!(obj.contains_key("image_ref"));
         // Every published row carries this release's capability stamp.
-        assert_eq!(json["features"], serde_json::json!(["upstream-key-slots"]),);
+        assert_eq!(
+            json["features"],
+            serde_json::json!(["upstream-key-slots", "upstream-model-hop"]),
+        );
     }
 
     #[test]

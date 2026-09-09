@@ -160,20 +160,21 @@ enum Command {
         gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
           --bedrock-api-key brk-...\n  \
         gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
-          --azure-openai-api-key ...\n  \
+          --azure-openai-api-key ... --azure-deployments gpt-5.5=my-gpt55\n  \
         gmcli set-api-keys --anthropic-upstream foundry \\\n  \
           --azure-foundry-endpoint https://my-resource.services.ai.azure.com \\\n  \
           --azure-foundry-api-key ... --azure-foundry-tenant-id ... \\\n  \
           --azure-foundry-subscription-id ... --azure-foundry-resource-group ... \\\n  \
-          --azure-foundry-client-id ... --azure-foundry-client-secret ...")]
+          --azure-foundry-client-id ... --azure-foundry-client-secret ... \\\n  \
+          --foundry-deployments claude-sonnet-4-6=my-sonnet")]
     SetApiKeys {
         /// Anthropic API key (sk-ant-...).
         #[arg(long)]
         anthropic: Option<String>,
 
         /// Anthropic transport selector: direct, bedrock, or foundry.
-        /// Cloud transport capability is not registry admission; Bedrock and
-        /// Foundry remain unavailable pending verified model and transport bindings.
+        /// Foundry uses the measured model hop; cloud offers still require
+        /// registry/gateway admission of `upstream-model-hop`.
         #[arg(long)]
         anthropic_upstream: Option<String>,
 
@@ -185,8 +186,7 @@ enum Command {
         #[arg(long)]
         bedrock_api_key: Option<String>,
 
-        /// Microsoft Foundry (Claude on Azure) transport settings.
-        /// Foundry remains pending an authoritative registry binding.
+        /// Microsoft Foundry (Claude on Azure) settings and deployment map.
         #[command(flatten)]
         foundry: FoundryArgs,
 
@@ -194,8 +194,8 @@ enum Command {
         #[arg(long)]
         openai: Option<String>,
 
-        /// `OpenAI` transport selector: direct or azure. Azure remains
-        /// pending an authoritative registry binding.
+        /// `OpenAI` transport selector: direct or azure. Azure uses the
+        /// measured model hop; offers still require feature admission.
         #[arg(long)]
         openai_upstream: Option<String>,
 
@@ -226,6 +226,11 @@ enum Command {
         /// Azure client secret for ARM verification when `OPENAI_UPSTREAM=azure`.
         #[arg(long)]
         azure_client_secret: Option<String>,
+
+        /// Canonical-to-deployment map for Azure `OpenAI` chat and Responses,
+        /// formatted as `canonical=deployment;canonical=deployment`.
+        #[arg(long)]
+        azure_deployments: Option<String>,
 
         /// Google API key.
         #[arg(long)]
@@ -454,9 +459,9 @@ enum Command {
         #[arg(long)]
         model: String,
 
-        /// Upstream model id for a legacy cloud declaration or transport diagnostic.
-        /// A known model id does not authorize cloud supply: Bedrock, Azure and
-        /// Foundry remain unavailable pending verified transport provenance.
+        /// Legacy upstream model id for transport diagnostics. Cloud offers use
+        /// the canonical model id once `upstream-model-hop` is admitted; the
+        /// deployment map stays inside the measured image.
         #[arg(long = "upstream-model", value_name = "ID")]
         upstream_model: Option<String>,
 
@@ -484,8 +489,9 @@ enum Command {
     ///
     /// Discovers products via the public `GET /products` endpoint, filters
     /// by `--provider` when set, then POSTs one offer per surviving direct
-    /// entry. Cloud-backed providers that need a reviewed model binding are
-    /// explicitly skipped/refused because bulk requests carry no upstream id.
+    /// entry. Cloud-backed providers are explicitly skipped/refused until the
+    /// registry/gateway `upstream-model-hop` feature fence is admitted; after
+    /// that they use the same canonical declaration as direct entries.
     /// Per-product failures are reported individually and do not abort the
     /// loop — the final summary lists ok/err counts.
     ///
@@ -493,7 +499,7 @@ enum Command {
     /// and asks you to confirm the discount once for the whole batch.
     #[command(after_help = "Examples:\n  \
         gmcli declare-products --discount-pct 5            # direct/API-key catalog entries\n  \
-        gmcli declare-products --provider openai --discount-pct 10  # direct only; Azure pending")]
+        gmcli declare-products --provider openai --discount-pct 10  # direct + admitted Azure")]
     DeclareProducts {
         /// Optional provider filter. When set, only products from this
         /// provider are declared. Omit to fan out over the whole catalog.
@@ -854,6 +860,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             azure_resource_group,
             azure_client_id,
             azure_client_secret,
+            azure_deployments,
             google,
             chutes,
             zai,
@@ -879,6 +886,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             azure_resource_group,
             azure_client_id,
             azure_client_secret,
+            azure_deployments,
             google,
             chutes,
             zai,

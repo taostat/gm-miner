@@ -1,8 +1,11 @@
 //! `gmcli doctor` — a preflight checklist run before deploying.
 
-use anyhow::{bail, Result};
+use std::time::Duration;
+
+use anyhow::{bail, Context as _, Result};
 
 use gm_azure_verify::{AzureProvider, AzureVerifier, AzureVerifyConfig};
+use gm_cloud_hop::{echo_matches_model, parse_deployment_map, rewrite_model_bytes, CloudProvider};
 use gm_miner_cli::{
     client::RegistryClient,
     config::{Config, ProviderKeys},
@@ -13,7 +16,7 @@ use gm_miner_cli::{
 use crate::commands::persist::try_refresh_token;
 
 /// The state of one `doctor` checklist line.
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Status {
     /// Ready — nothing to do.
     Pass,
@@ -106,14 +109,23 @@ pub(crate) async fn cmd_doctor(cfg: Config) -> Result<()> {
     // `login_check`/`hotkey_check` report the true state.
     let cfg = try_refresh_token(cfg).await;
 
+    let provider_keys = provider_keys_check(&cfg);
+    // Do not let the echo probe send a provider key until the exact same
+    // selector, endpoint allowlist, required fields, and deployment-map
+    // validation used by deploy has passed. This keeps a malformed or
+    // attacker-edited endpoint from becoming a doctor-time credential sink.
+    let provider_keys_valid = !provider_keys.is_failure();
     let mut checks = vec![
         network_check(network, &cfg),
         login_check(&cfg),
-        provider_keys_check(&cfg),
+        provider_keys,
         phala_cli_check(),
         phala_api_key_check(&cfg),
     ];
     checks.extend(azure_checks(cfg.provider_keys.as_ref()).await);
+    if provider_keys_valid {
+        checks.extend(cloud_identity_checks(cfg.provider_keys.as_ref()).await);
+    }
     checks.push(hotkey_check(cfg).await);
 
     for check in &checks {
@@ -272,6 +284,197 @@ async fn azure_checks(keys: Option<&ProviderKeys>) -> Vec<Check> {
         checks.push(azure_check(&verifier, target).await);
     }
     checks
+}
+
+/// Probe every mapped canonical model once before deployment. The hop is not
+/// normally running on the operator's host, so doctor uses the same measured
+/// rewrite function and sends the resulting request directly to the qualified
+/// cloud endpoint. The image's Envoy topology performs the identical rewrite
+/// on CVM traffic; this check catches a bad deployment map before a CVM is
+/// paid for without inventing a provider-side model echo.
+async fn cloud_identity_checks(keys: Option<&ProviderKeys>) -> Vec<Check> {
+    let Some(keys) = keys else {
+        return Vec::new();
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return vec![Check::fail(
+                "Cloud model echo preflight",
+                format!("couldn't build an HTTPS client: {err}"),
+            )]
+        }
+    };
+    let mut checks = Vec::new();
+
+    if keys.openai_upstream.as_deref() == Some("azure") {
+        checks.extend(
+            mapped_cloud_checks(
+                &client,
+                CloudProvider::AzureOpenAi,
+                keys.azure_openai_endpoint.as_deref(),
+                keys.azure_openai_api_key.as_deref(),
+                keys.azure_openai_deployments.as_deref(),
+            )
+            .await,
+        );
+    }
+    if keys.anthropic_upstream.as_deref() == Some("foundry") {
+        checks.extend(
+            mapped_cloud_checks(
+                &client,
+                CloudProvider::Foundry,
+                keys.azure_foundry_endpoint.as_deref(),
+                keys.azure_foundry_api_key.as_deref(),
+                keys.azure_foundry_deployments.as_deref(),
+            )
+            .await,
+        );
+    }
+    // Bedrock is deliberately not probed: its hop table is disabled until a
+    // live Mantle response proves the authoritative model echo.
+    checks
+}
+
+async fn mapped_cloud_checks(
+    client: &reqwest::Client,
+    provider: CloudProvider,
+    endpoint: Option<&str>,
+    api_key: Option<&str>,
+    raw_map: Option<&str>,
+) -> Vec<Check> {
+    let Some(raw_map) = raw_map else {
+        return Vec::new();
+    };
+    let map = match parse_deployment_map(provider, raw_map) {
+        Ok(map) => map,
+        Err(err) => {
+            return vec![Check::fail(
+                format!("Cloud deployment map ({provider})"),
+                format!("invalid map: {err}"),
+            )]
+        }
+    };
+    let Some(endpoint) = endpoint else {
+        return vec![Check::fail(
+            format!("Cloud model echo preflight ({provider})"),
+            "endpoint is missing; set the selected cloud upstream first",
+        )];
+    };
+    let Some(api_key) = api_key else {
+        return vec![Check::fail(
+            format!("Cloud model echo preflight ({provider})"),
+            "API key is missing; set the selected cloud upstream first",
+        )];
+    };
+
+    let mut checks = Vec::with_capacity(map.len());
+    for (canonical, deployment) in map.iter() {
+        checks.push(
+            cloud_identity_check(client, provider, endpoint, api_key, canonical, deployment).await,
+        );
+    }
+    checks
+}
+
+async fn cloud_identity_check(
+    client: &reqwest::Client,
+    provider: CloudProvider,
+    endpoint: &str,
+    api_key: &str,
+    canonical: &str,
+    deployment: &str,
+) -> Check {
+    let label = format!("Cloud model echo ({provider}/{canonical})");
+    let (path, body) = match cloud_probe_body(provider, canonical, deployment) {
+        Ok(probe) => probe,
+        Err(err) => return Check::fail(label, format!("couldn't build probe: {err:#}")),
+    };
+    let url = match cloud_probe_url(endpoint, path) {
+        Ok(url) => url,
+        Err(err) => return Check::fail(label, format!("invalid cloud endpoint: {err:#}")),
+    };
+
+    let mut request = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            match provider {
+                CloudProvider::AzureOpenAi => "api-key",
+                CloudProvider::Foundry | CloudProvider::Bedrock => "x-api-key",
+            },
+            api_key,
+        );
+    if provider == CloudProvider::Foundry {
+        request = request.header("anthropic-version", "2023-06-01");
+    }
+    let response = match request.body(body).send().await {
+        Ok(response) => response,
+        Err(err) => return Check::fail(label, format!("request failed: {err}")),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Check::fail(label, format!("cloud endpoint returned {status}"));
+    }
+    let response = match response.json::<serde_json::Value>().await {
+        Ok(response) => response,
+        Err(err) => return Check::fail(label, format!("response was not valid JSON: {err}")),
+    };
+    let Some(echo) = response.get("model").and_then(serde_json::Value::as_str) else {
+        return Check::fail(
+            label,
+            format!("response has no string model echo (expected {canonical})"),
+        );
+    };
+    if !echo_matches_model(canonical, echo) {
+        return Check::fail(
+            label,
+            format!("model substitution: expected {canonical}, upstream echoed {echo}"),
+        );
+    }
+    Check::pass(label, format!("canonical={canonical} echo={echo}"))
+}
+
+fn cloud_probe_url(endpoint: &str, path: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(endpoint).context("parse endpoint URL")?;
+    url.set_path(path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn cloud_probe_body(
+    provider: CloudProvider,
+    canonical: &str,
+    deployment: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    let (path, value) = match provider {
+        CloudProvider::AzureOpenAi => (
+            "/openai/v1/chat/completions",
+            serde_json::json!({
+                "model": canonical,
+                "messages": [{"role": "user", "content": "Reply with one token."}],
+                "max_completion_tokens": 1,
+                "stream": false,
+            }),
+        ),
+        CloudProvider::Foundry => (
+            "/anthropic/v1/messages",
+            serde_json::json!({
+                "model": canonical,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "Reply with one token."}],
+            }),
+        ),
+        CloudProvider::Bedrock => bail!("Bedrock cloud hop is disabled"),
+    };
+    let body = serde_json::to_vec(&value).context("serialize doctor probe")?;
+    let map = parse_deployment_map(provider, &format!("{canonical}={deployment}"))?;
+    let rewritten = rewrite_model_bytes(provider, &body, &map)?;
+    Ok((path, rewritten))
 }
 
 /// Blank every GUID out of a message before printing it.
@@ -473,12 +676,19 @@ async fn hotkey_check(cfg: Config) -> Check {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test fixtures panic when their declared setup is unexpectedly invalid"
+)]
 mod tests {
-    use super::{azure_check, azure_checks, provider_keys_check, Status};
+    use super::{
+        azure_check, azure_checks, cloud_identity_checks, cloud_probe_body, cloud_probe_url,
+        provider_keys_check, Status,
+    };
     use gm_azure_verify::{AzureProvider, AzureVerifier, AzureVerifyConfig};
     use gm_miner_cli::config::{Config, ProviderKeys};
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cfg(keys: ProviderKeys) -> Config {
@@ -495,7 +705,7 @@ mod tests {
             ..ProviderKeys::default()
         }));
 
-        assert!(check.status == Status::Fail);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.label.contains("Provider keys usable"));
         assert!(
             check.note.contains("no usable provider keys"),
@@ -512,7 +722,7 @@ mod tests {
             ..ProviderKeys::default()
         }));
 
-        assert!(check.status == Status::Fail);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.label.contains("Provider upstream config"));
         assert!(
             check.note.contains("--bedrock-region"),
@@ -530,7 +740,7 @@ mod tests {
             ..ProviderKeys::default()
         }));
 
-        assert!(check.status == Status::Pass);
+        assert_eq!(check.status, Status::Pass);
         assert!(check.note.contains("upstream config valid"));
     }
 
@@ -545,10 +755,11 @@ mod tests {
             azure_resource_group: Some("rg".to_owned()),
             azure_client_id: Some("client".to_owned()),
             azure_client_secret: Some("secret".to_owned()),
+            azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
             ..ProviderKeys::default()
         }));
 
-        assert!(check.status == Status::Pass);
+        assert_eq!(check.status, Status::Pass);
         assert!(check.note.contains("upstream config valid"));
     }
 
@@ -562,6 +773,7 @@ mod tests {
             azure_foundry_resource_group: Some("rg".to_owned()),
             azure_foundry_client_id: Some("client".to_owned()),
             azure_foundry_client_secret: Some("secret".to_owned()),
+            azure_foundry_deployments: Some("claude-sonnet-4-6=foundry-sonnet".to_owned()),
             ..ProviderKeys::default()
         }
     }
@@ -569,8 +781,67 @@ mod tests {
     #[test]
     fn complete_foundry_config_passes() {
         let check = provider_keys_check(&cfg(complete_foundry_keys()));
-        assert!(check.status == Status::Pass);
+        assert_eq!(check.status, Status::Pass);
         assert!(check.note.contains("upstream config valid"));
+    }
+
+    #[test]
+    fn cloud_probe_body_uses_the_measured_rewrite() {
+        let (path, body) = cloud_probe_body(
+            gm_cloud_hop::CloudProvider::Foundry,
+            "claude-sonnet-4-6",
+            "gm-echo-test",
+        )
+        .expect("probe body");
+        assert_eq!(path, "/anthropic/v1/messages");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(body["model"], "gm-echo-test");
+        assert_eq!(body["max_tokens"], 1);
+    }
+
+    #[test]
+    fn cloud_probe_url_discards_endpoint_path_query_and_fragment() {
+        let url = cloud_probe_url(
+            "https://acct.openai.azure.com/old/path?api-version=1#fragment",
+            "/openai/v1/chat/completions",
+        )
+        .expect("url");
+        assert_eq!(
+            url.as_str(),
+            "https://acct.openai.azure.com/openai/v1/chat/completions"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_identity_check_sends_one_rewritten_probe_and_checks_echo() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/chat/completions"))
+            .and(header("api-key", "azure-key"))
+            .and(body_json(json!({
+                "model": "azure-gpt55",
+                "messages": [{"role": "user", "content": "Reply with one token."}],
+                "max_completion_tokens": 1,
+                "stream": false,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "gpt-5.5-2026-04-23"
+            })))
+            .mount(&server)
+            .await;
+
+        let keys = ProviderKeys {
+            openai_upstream: Some("azure".to_owned()),
+            azure_openai_endpoint: Some(server.uri()),
+            azure_openai_api_key: Some("azure-key".to_owned()),
+            azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let checks = cloud_identity_checks(Some(&keys)).await;
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Pass);
+        assert!(checks[0].note.contains("canonical=gpt-5.5"));
+        assert!(checks[0].note.contains("echo=gpt-5.5-2026-04-23"));
     }
 
     #[test]
@@ -579,7 +850,7 @@ mod tests {
         keys.azure_foundry_client_secret = None;
         let check = provider_keys_check(&cfg(keys));
 
-        assert!(check.status == Status::Fail);
+        assert_eq!(check.status, Status::Fail);
         assert!(
             check.note.contains("--azure-foundry-client-secret"),
             "{}",
@@ -593,7 +864,7 @@ mod tests {
         keys.azure_foundry_endpoint = Some("https://acct.openai.azure.com".to_owned());
         let check = provider_keys_check(&cfg(keys));
 
-        assert!(check.status == Status::Fail);
+        assert_eq!(check.status, Status::Fail);
         assert!(
             check.note.contains("services.ai.azure.com"),
             "{}",
@@ -739,7 +1010,7 @@ mod tests {
         let server = foundry_arm(empty.clone(), empty).await;
         let check = azure_check(&verifier_for(&server), &foundry_target()).await;
 
-        assert!(check.status == Status::Pass, "{}", check.note);
+        assert_eq!(check.status, Status::Pass, "{}", check.note);
         assert!(check.label.contains("Microsoft Foundry"), "{}", check.label);
         assert!(
             check.note.contains("acct.services.ai.azure.com") && check.note.contains("1 project"),
@@ -756,7 +1027,7 @@ mod tests {
         let server = foundry_arm(app_insights_connection(), json!({"value": []})).await;
         let check = azure_check(&verifier_for(&server), &foundry_target()).await;
 
-        assert!(check.status == Status::Fail);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.note.contains("AppInsights"), "{}", check.note);
         assert!(check.note.contains("crashloop"), "{}", check.note);
         assert!(
@@ -775,7 +1046,7 @@ mod tests {
         let server = foundry_arm(json!({"value": []}), app_insights_connection()).await;
         let check = azure_check(&verifier_for(&server), &foundry_target()).await;
 
-        assert!(check.status == Status::Fail);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.note.contains("project 'p1'"), "{}", check.note);
         assert!(
             check.note.contains(&format!(
@@ -800,7 +1071,7 @@ mod tests {
             .await;
 
         let check = azure_check(&verifier_for(&server), &foundry_target()).await;
-        assert!(check.status == Status::Fail);
+        assert_eq!(check.status, Status::Fail);
         assert!(check.note.contains("couldn't verify"), "{}", check.note);
         assert!(check.note.contains("service principal"), "{}", check.note);
     }
@@ -834,6 +1105,6 @@ mod tests {
         let mut keys = complete_foundry_keys();
         keys.azure_foundry_client_secret = None;
         assert!(azure_checks(Some(&keys)).await.is_empty());
-        assert!(provider_keys_check(&cfg(keys)).status == Status::Fail);
+        assert_eq!(provider_keys_check(&cfg(keys)).status, Status::Fail);
     }
 }

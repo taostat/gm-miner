@@ -80,6 +80,10 @@ pub fn render_env_file(
             "AZURE_FOUNDRY_CLIENT_SECRET",
             env_vars.azure_foundry_client_secret.as_deref(),
         ),
+        (
+            "AZURE_FOUNDRY_DEPLOYMENTS",
+            env_vars.azure_foundry_deployments.as_deref(),
+        ),
         ("OPENAI_API_KEY", env_vars.openai.as_deref()),
         ("OPENAI_UPSTREAM", env_vars.openai_upstream.as_deref()),
         (
@@ -103,6 +107,10 @@ pub fn render_env_file(
         (
             "AZURE_CLIENT_SECRET",
             env_vars.azure_client_secret.as_deref(),
+        ),
+        (
+            "AZURE_OPENAI_DEPLOYMENTS",
+            env_vars.azure_openai_deployments.as_deref(),
         ),
         ("GOOGLE_API_KEY", env_vars.google.as_deref()),
         ("CHUTES_API_KEY", env_vars.chutes.as_deref()),
@@ -336,12 +344,16 @@ mod tests {
             google: None,
             chutes: Some("cpk-chutes".to_owned()),
             zai: Some("zai-key".to_owned()),
+            azure_foundry_deployments: Some("claude-sonnet-4-6=foundry-sonnet".to_owned()),
+            azure_openai_deployments: Some("gpt-5.5=azure-gpt55".to_owned()),
             ..ProviderKeys::default()
         };
         let body = render_env_file(&keys, "node-secret-xyz", None);
         assert!(body.contains("ANTHROPIC_API_KEY=sk-ant\n"));
         assert!(body.contains("CHUTES_API_KEY=cpk-chutes\n"));
         assert!(body.contains("ZAI_API_KEY=zai-key\n"));
+        assert!(body.contains("AZURE_FOUNDRY_DEPLOYMENTS=claude-sonnet-4-6=foundry-sonnet\n"));
+        assert!(body.contains("AZURE_OPENAI_DEPLOYMENTS=gpt-5.5=azure-gpt55\n"));
         assert!(body.contains("GM_NODE_SECRET=node-secret-xyz\n"));
         // Unset keys are emitted as empty-value lines so their names still
         // land in the CVM's measured allowed_envs.
@@ -404,6 +416,7 @@ mod tests {
                 "AZURE_FOUNDRY_RESOURCE_GROUP",
                 "AZURE_FOUNDRY_CLIENT_ID",
                 "AZURE_FOUNDRY_CLIENT_SECRET",
+                "AZURE_FOUNDRY_DEPLOYMENTS",
                 "OPENAI_API_KEY",
                 "OPENAI_UPSTREAM",
                 "AZURE_OPENAI_ENDPOINT",
@@ -413,6 +426,7 @@ mod tests {
                 "AZURE_RESOURCE_GROUP",
                 "AZURE_CLIENT_ID",
                 "AZURE_CLIENT_SECRET",
+                "AZURE_OPENAI_DEPLOYMENTS",
                 "GOOGLE_API_KEY",
                 "CHUTES_API_KEY",
                 "ZAI_API_KEY",

@@ -55,7 +55,7 @@ The account's diagnostic-settings list must be empty. Presence of any setting fa
 
 After the startup gate passes and the listener binds, `attestd` re-runs the same Azure owner-capture verification periodically, including the deployment streaming-mode check. The default re-verification interval is 900 seconds; values below 60 seconds are clamped to 60 seconds. Transient verification errors such as Azure management/login network errors, timeouts, HTTP 408/429/5xx responses, or response decode failures are tolerated for 3 consecutive checks by default. A definitive verification failure, such as `raiMonitorConfig` becoming non-null, endpoint binding changing, account kind changing, async filtering being disabled, or other policy mismatch, stops `attestd` immediately with a non-zero exit so the container restarts and the boot-time gate blocks serving.
 
-Envoy validates the Azure upstream against the system CA bundle with an exact DNS SAN pin for the configured host. Root pinning was dropped because it is out of scope for the operator threat model — a miner operator cannot obtain a valid cert for a Microsoft-owned hostname regardless of the trusted-root set — and a pinned bundle would fail closed if Microsoft rotates its Azure PKI. Direct `api.openai.com` uses the same system CA bundle and SAN pin approach.
+Envoy validates the Azure OpenAI and Foundry upstreams against the system CA bundle with their configured DNS SAN suffix rules. Bedrock is tighter: its SAN is matched exactly against the constructed `bedrock-mantle.<region>.api.aws` host. Root pinning was dropped because it is out of scope for the operator threat model — a miner operator cannot obtain a valid cert for a Microsoft-owned hostname regardless of the trusted-root set — and a pinned bundle would fail closed if Microsoft rotates its Azure PKI. Direct `api.openai.com` uses the same system CA bundle and exact SAN pin approach.
 
 ## Required miner configuration
 
@@ -64,6 +64,7 @@ Azure miners must provide:
 - `OPENAI_UPSTREAM=azure`
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_DEPLOYMENTS=canonical=deployment;...`
 - `AZURE_TENANT_ID`
 - `AZURE_SUBSCRIPTION_ID`
 - `AZURE_RESOURCE_GROUP`
@@ -78,7 +79,7 @@ Azure deployments must use a content-filter RAI policy configured for asynchrono
 
 The owner-capture checks enforce that the Azure OpenAI account is bound to the configured endpoint by ARM identity, has no secondary storage or monitoring sinks attached (`userOwnedStorage`, `raiMonitorConfig`), and that every deployment uses asynchronous content filtering so completions are never buffered server-side before delivery. These checks run at container startup and repeat every 15 minutes; a policy violation detected after startup terminates `attestd` and restarts the container.
 
-Network operators on the path between the miner CVM and Azure observe only TLS-encrypted ciphertext. Prompt content stays confidential end-to-end through Envoy: the RA-TLS data plane is terminated inside the TEE, and the Azure upstream connection is validated against the system CA bundle with an exact DNS SAN pin for the configured Azure host. The ARM account binding checks verify that the endpoint belongs to the miner's own resource, not a third-party account.
+Network operators on the path between the miner CVM and Azure observe only TLS-encrypted ciphertext. Prompt content stays confidential end-to-end through Envoy: the RA-TLS data plane is terminated inside the TEE, and the Azure OpenAI and Foundry upstream connections are validated against the system CA bundle with their configured DNS SAN suffix rules. Bedrock is tighter: its SAN is matched exactly against the constructed `bedrock-mantle.<region>.api.aws` host. The ARM account binding checks verify that the Azure endpoint belongs to the miner's own resource, not a third-party account.
 
 The account must export nothing. The diagnostic-settings list must be **empty** — presence of any setting is the failure, enabled or not, whatever its categories, whatever its destination. This is a property of the account, not of the upstream it serves, so it applies to Azure `OpenAI` and Foundry alike. `AIServices` accounts additionally must have no connections and no capability hosts, on the account and on every project.
 
@@ -152,15 +153,19 @@ read. The connection gate above is what neutralizes it.
 ### Required miner configuration
 
 `ANTHROPIC_UPSTREAM=foundry`, `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_API_KEY`,
+`AZURE_FOUNDRY_DEPLOYMENTS=canonical=deployment;...`,
 plus a read-only Entra service principal for ARM: `AZURE_FOUNDRY_TENANT_ID`,
 `AZURE_FOUNDRY_SUBSCRIPTION_ID`, `AZURE_FOUNDRY_RESOURCE_GROUP`,
 `AZURE_FOUNDRY_CLIENT_ID`, `AZURE_FOUNDRY_CLIENT_SECRET`. These are separate from
 the `AZURE_*` Azure `OpenAI` variables on purpose: a worker may hold the two
 accounts in different tenants, subscriptions, or resource groups.
 
-Offers are declared with `--upstream-model <deployment-name>`: Foundry routes on
-the *deployment* name, which defaults to the model id but does not have to match
-it.
+The measured image keeps the deployment name in
+`AZURE_FOUNDRY_DEPLOYMENTS=canonical=deployment;...` and rewrites the request's
+top-level `model` member on the qualified Messages surface. The deployment name
+is not sent as the registry offer's model id. Cloud offers remain fenced until
+the registry and gateway admit `upstream-model-hop` and verify the response
+`model` echo.
 
 The operator procedure for satisfying these checks — which resource kind to
 create, the `az` calls that list and clear the connections, capability hosts and

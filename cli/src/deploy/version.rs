@@ -36,6 +36,13 @@ impl ImageVersion {
     pub fn slot_capable(&self) -> bool {
         self.features.iter().any(|f| f == "upstream-key-slots")
     }
+
+    /// `true` when this image's measured entrypoint contains the cloud model
+    /// translation hop and its qualified Envoy routes.
+    #[must_use]
+    pub fn model_hop_capable(&self) -> bool {
+        self.features.iter().any(|f| f == "upstream-model-hop")
+    }
 }
 
 /// Response body from `GET /image-versions?status=supported`.

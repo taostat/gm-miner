@@ -30,9 +30,9 @@ fn validate_selector(name: &str, value: &str, allowed: &[&str]) -> Result<()> {
 /// The `ANTHROPIC_UPSTREAM=foundry` transport flag group: the Claude-on-Azure
 /// data-plane endpoint and key, plus the read-only Entra service principal
 /// `attestd` uses to verify the Foundry account carries no owner-capture
-/// controls. Foundry remains transport-capable but has no authoritative GM
-/// model binding yet; configuring it does not make supply routable. Grouped so
-/// the seven flags travel as one argument instead of widening an already-long
+/// controls. The deployment map is data-only; registry/gateway admission and
+/// echo verification are a separate image-feature gate. Grouped so
+/// the eight settings travel as one argument instead of widening an already-long
 /// handler signature.
 #[derive(Debug, Default, clap::Args)]
 pub(crate) struct FoundryArgs {
@@ -65,6 +65,11 @@ pub(crate) struct FoundryArgs {
     /// Azure client secret for Foundry ARM verification.
     #[arg(long = "azure-foundry-client-secret")]
     pub(crate) client_secret: Option<String>,
+
+    /// Canonical-to-deployment map for qualified Foundry Messages models,
+    /// formatted as `canonical=deployment;canonical=deployment`.
+    #[arg(long = "foundry-deployments")]
+    pub(crate) deployments: Option<String>,
 }
 
 impl FoundryArgs {
@@ -83,10 +88,15 @@ impl FoundryArgs {
             ),
             ("azure-foundry-client-id", self.client_id.as_deref()),
             ("azure-foundry-client-secret", self.client_secret.as_deref()),
+            ("foundry-deployments", self.deployments.as_deref()),
         ] {
             if let Some(value) = value {
                 validate_key(name, value)?;
             }
+        }
+        if let Some(value) = self.deployments.as_deref() {
+            gm_cloud_hop::parse_deployment_map(gm_cloud_hop::CloudProvider::Foundry, value)
+                .context("validate --foundry-deployments")?;
         }
         Ok(())
     }
@@ -112,6 +122,9 @@ impl FoundryArgs {
         }
         if let Some(v) = self.client_secret {
             keys.azure_foundry_client_secret = Some(v);
+        }
+        if let Some(v) = self.deployments {
+            keys.azure_foundry_deployments = Some(v);
         }
     }
 }
@@ -152,6 +165,7 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
             keys.azure_foundry_resource_group.as_ref(),
             keys.azure_foundry_client_id.as_ref(),
             keys.azure_foundry_client_secret.as_ref(),
+            keys.azure_foundry_deployments.as_ref(),
         ],
     );
     group("openai", &[keys.openai.as_ref()]);
@@ -165,6 +179,7 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
             keys.azure_resource_group.as_ref(),
             keys.azure_client_id.as_ref(),
             keys.azure_client_secret.as_ref(),
+            keys.azure_openai_deployments.as_ref(),
         ],
     );
     group("google", &[keys.google.as_ref()]);
@@ -208,6 +223,7 @@ pub(crate) fn cmd_set_api_keys(
     azure_resource_group: Option<String>,
     azure_client_id: Option<String>,
     azure_client_secret: Option<String>,
+    azure_deployments: Option<String>,
     google: Option<String>,
     chutes: Option<String>,
     zai: Option<String>,
@@ -258,6 +274,11 @@ pub(crate) fn cmd_set_api_keys(
     }
     if let Some(ref v) = azure_client_secret {
         validate_key("azure-client-secret", v)?;
+    }
+    if let Some(ref v) = azure_deployments {
+        validate_key("azure-deployments", v)?;
+        gm_cloud_hop::parse_deployment_map(gm_cloud_hop::CloudProvider::AzureOpenAi, v)
+            .context("validate --azure-deployments")?;
     }
     if let Some(ref k) = google {
         validate_key("google", k)?;
@@ -342,6 +363,9 @@ pub(crate) fn cmd_set_api_keys(
         if let Some(v) = azure_client_secret {
             keys.azure_client_secret = Some(v);
         }
+        if let Some(v) = azure_deployments {
+            keys.azure_openai_deployments = Some(v);
+        }
         if let Some(k) = google {
             keys.google = Some(k);
         }
@@ -378,8 +402,8 @@ pub(crate) fn cmd_set_api_keys(
     // Report what is now configured — never print a key's value.
     if lines.is_empty() {
         println!(
-            "No keys stored (pass --anthropic, --openai, --google, --chutes, --zai, --moonshot, \
-             --deepinfra, --kubetee, --engy, --moonmath, --near, --bedrock-api-key, --azure-foundry-api-key, or --azure-openai-api-key to set one)."
+            "No keys stored (pass a provider key or a cloud deployment map such as \
+             --foundry-deployments or --azure-deployments to set one)."
         );
     } else {
         println!("Provider keys updated.");
@@ -406,6 +430,7 @@ mod tests {
             azure_foundry_resource_group: Some("rg".to_owned()),
             azure_foundry_client_id: Some("client".to_owned()),
             azure_foundry_client_secret: Some("secret".to_owned()),
+            azure_foundry_deployments: Some("claude-sonnet-4-6=foundry-sonnet".to_owned()),
             ..ProviderKeys::default()
         }
     }

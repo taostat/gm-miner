@@ -1433,6 +1433,7 @@ mod tests {
             azure_foundry_resource_group: Some("resource-group".to_owned()),
             azure_foundry_client_id: Some("client".to_owned()),
             azure_foundry_client_secret: Some("client-secret".to_owned()),
+            azure_foundry_deployments: Some("claude-sonnet-4-6=foundry-sonnet".to_owned()),
             ..ProviderKeys::default()
         };
 

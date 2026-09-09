@@ -1,16 +1,16 @@
 # Serving Claude through Microsoft Foundry
 
-This guide sets up an Azure AI Foundry resource and preserves the Foundry
-transport adapter for future reviewed bindings. It does **not** currently make
-Foundry a routable or registry-admissible source: an HTTP-successful Foundry
-probe is transport capability, not authoritative model admission. The current
-GM policy has no reviewed Foundry binding, so do not declare a Foundry offer or
-count it as usable supply. Azure OpenAI and Bedrock are in the same pending state:
-a known model id does not establish the worker's transport provenance.
+This guide sets up an Azure AI Foundry resource and the measured Foundry model
+hop. It does **not** by itself make Foundry a routable or registry-admissible
+source: an HTTP-successful Foundry probe is transport capability, not
+authoritative model admission. The current registry/gateway release still
+fences cloud offers; admission requires the image feature
+`upstream-model-hop` and the corresponding response-echo check. Azure OpenAI
+uses the same feature fence, while Bedrock's hop is disabled pending live echo
+evidence.
 
-The rest of this guide is still useful for validating the adapter and preparing
-the Azure resource, endpoint, credentials, and deployment identity for a later
-binding review. It covers the Azure side — the resource, the connections and
+The rest of this guide prepares the Azure resource, endpoint, credentials, and
+deployment map. It covers the Azure side — the resource, the connections and
 settings that must not exist on it, the read-only service principal, and the
 deployment name — then the `gmcli` command that consumes the result.
 
@@ -183,9 +183,11 @@ az cognitiveservices account deployment list -n <ACCOUNT> -g <RG> \
   --query "[].{deployment:name, model:properties.model.name, format:properties.model.format}" -o table
 ```
 
-The `deployment` column is the upstream identity that a future reviewed binding
-would carry. Record it for that review; it is not currently an instruction to
-declare a Foundry offer.
+The `deployment` column is the upstream identity for the hop. Add one
+`canonical=deployment` entry for each model you intend to serve; entries are
+separated with semicolons. The canonical id must be a known Foundry catalog
+model, and the deployment name is data only: it cannot select an endpoint,
+host, path, redirect, or proxy.
 
 ## 7. Configure gmcli
 
@@ -201,14 +203,21 @@ gmcli set-api-keys \
   --azure-foundry-subscription-id <subscription> \
   --azure-foundry-resource-group <rg> \
   --azure-foundry-client-id <appId> \
-  --azure-foundry-client-secret <password>
+  --azure-foundry-client-secret <password> \
+  --foundry-deployments 'claude-sonnet-4-6=<deployment-name>'
 ```
 
-All seven fields are required together: `gmcli` rejects a partial Foundry group
-rather than deploying something that will fail its boot gate. The values are
-baked into the miner container at deploy time and stay inside the TEE. The
-Foundry API key is single-slot — semicolon-separated multi-key lists are not
-accepted for it.
+All eight fields are required together: `gmcli` rejects a partial Foundry group
+rather than deploying something that will fail its boot gate or start an
+unmapped hop. Add more entries as
+`canonical=deployment;canonical=deployment`. The values are baked into the
+miner container at deploy time and stay inside the TEE. The Foundry API key is
+single-slot — semicolon-separated multi-key lists are not accepted for it.
+
+The measured hop rewrites only the top-level request `model` member before the
+existing Envoy Foundry egress cluster. It preserves the rest of the request and
+passes the upstream response through unchanged. It is enabled only for the
+native Foundry Messages surface.
 
 Run `gmcli doctor` before spending a deploy on it. Doctor does not merely check
 that the group is complete: it runs the *same* owner-capture sweep `attestd` runs
@@ -218,17 +227,24 @@ capability host or diagnostic setting is still attached, doctor names it and
 prints the `az` command that clears it, here rather than after you have paid for
 a CVM that crashloops.
 
-## 8. Deploy and validate transport (do not declare Foundry supply)
+## 8. Deploy and validate transport
 
 ```sh
 gmcli deploy
 ```
 
-The deploy keeps the adapter available for a controlled transport check, but
-the registry currently rejects Foundry as an unbound cloud backend. Do not run
-`gmcli declare-product` for Foundry, with or without `--upstream-model`; that
-would claim supply the registry cannot route. If a reviewed binding is later
-published, its release notes will provide the exact declaration identity.
+The current registry still rejects Foundry as a cloud route until the
+`upstream-model-hop` image feature and gateway echo check are admitted. Do not
+use `--upstream-model`: once that compatibility fence is live, declare a
+Foundry offer exactly like the direct product, for example:
+
+```sh
+gmcli declare-product --provider anthropic \
+  --model claude-sonnet-4-6 --discount-pct 5
+```
+
+The deployment name stays in the measured image map; it is never the registry
+offer's model id.
 
 If the account still has a connection, a capability host or a diagnostic setting
 on it, the CVM starts, the boot gate fails, the container exits non-zero, and the
@@ -261,4 +277,4 @@ deployment name.
 | `gmcli set-api-keys` rejects the endpoint | The endpoint must end in `.services.ai.azure.com`. The `cognitiveservices.azure.com` host ARM reports is not the Foundry passthrough (step 2) |
 | Verification fails on account kind | The resource is `kind=OpenAI` (classic Azure OpenAI), not `kind=AIServices`. Create a Foundry resource (step 1) |
 | ARM read fails at boot | The service principal cannot see the account. Confirm the `Reader` assignment is scoped to `<ACCOUNT_ID>` and the tenant/subscription/resource-group fields match it (step 5) |
-| Upstream 404s on a model gm lists | The offer is missing `--upstream-model <deployment-name>`, or the deployment name differs from the model id (steps 6 and 8) |
+| Upstream 404s on a model gm lists | The deployment map is missing the canonical model or names a deployment that does not exist; verify `--foundry-deployments canonical=deployment` and run `gmcli doctor` (steps 6 and 8) |

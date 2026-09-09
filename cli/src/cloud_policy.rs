@@ -1,11 +1,10 @@
 //! Cloud model-ID compatibility and transport-selection helpers.
 //!
-//! Cloud adapters prove that a worker can speak a provider's transport. They
-//! do not, by themselves, prove that the registry has an authoritative model
-//! binding for the route or which backend is actually used. All cloud
-//! transports remain unavailable for routing pending independent provenance.
-//! Keep these helpers together so diagnostics and bulk-declaration guidance
-//! do not confuse model-ID compatibility with transport admission.
+//! Cloud adapters now carry their canonical-to-deployment data through the
+//! measured image hop, but the separate registry/gateway response-echo check
+//! still owns routing admission. Keep these helpers together so diagnostics
+//! and bulk-declaration guidance do not confuse transport capability with the
+//! feature-fenced model identity check.
 
 use crate::config::Config;
 
