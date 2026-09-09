@@ -7,6 +7,27 @@ use std::path::PathBuf;
 
 use crate::network::Network;
 
+// Unit tests in sibling modules can point the process-global config directory
+// at separate tempdirs. They must share one guard so a test never reads
+// another test's temporary config.
+#[cfg(test)]
+pub(crate) static TEST_CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// A test-only observer for the exact point where a caller is about to acquire
+// the shared config write lock. This lets concurrency regressions coordinate
+// with the lock attempt instead of relying on thread scheduling.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestConfigLockEvent {
+    LockAttempt,
+    OperationCompleted,
+}
+
+#[cfg(test)]
+pub(crate) static TEST_CONFIG_LOCK_ATTEMPT: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::mpsc::Sender<TestConfigLockEvent>>>,
+> = std::sync::OnceLock::new();
+
 /// The `sub` claim of a JWT, read without verifying the signature — the gm
 /// registry verifies the token; the CLI only needs the identity it asserts.
 fn jwt_sub(token: &str) -> Option<String> {
@@ -973,10 +994,24 @@ pub fn with_config_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         .open(&path)
         .with_context(|| format!("open lockfile {}", path.display()))?;
     let mut guard = fd_lock::RwLock::new(file);
+    #[cfg(test)]
+    notify_test_config_lock_attempt();
     let _write = guard
         .write()
         .with_context(|| format!("acquire lock on {}", path.display()))?;
     f()
+}
+
+#[cfg(test)]
+fn notify_test_config_lock_attempt() {
+    let observer = TEST_CONFIG_LOCK_ATTEMPT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(observer) = observer {
+        let _ = observer.send(TestConfigLockEvent::LockAttempt);
+    }
 }
 
 #[cfg(test)]
@@ -1492,15 +1527,13 @@ mod tests {
     // serialises every test that points the config dir at its own tempdir —
     // otherwise parallel tests would clobber each other's `GMCLI_CONFIG_DIR`.
 
-    use std::sync::{Mutex, MutexGuard};
-
-    static CONFIG_DIR_ENV: Mutex<()> = Mutex::new(());
+    use std::sync::MutexGuard;
 
     /// Point `GMCLI_CONFIG_DIR` at a fresh tempdir for the duration of the
     /// returned guard's scope. Holds the env mutex so concurrent on-disk tests
     /// don't fight over the variable.
     fn with_temp_config_dir() -> (tempfile::TempDir, MutexGuard<'static, ()>) {
-        let guard = CONFIG_DIR_ENV
+        let guard = super::TEST_CONFIG_DIR_ENV
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("create tempdir");

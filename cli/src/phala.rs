@@ -278,9 +278,11 @@ fn prompt_for_key(assume_yes: bool) -> Result<String> {
 /// Persist `key` to gmcli config (network-independent). Loads a fresh config
 /// so a concurrent edit elsewhere is not clobbered, mirroring `set-api-keys`.
 fn persist_key(key: &str) -> Result<()> {
-    let mut cfg: Config = config::load().context("load gmcli config")?;
-    cfg.phala_api_key = Some(key.to_owned());
-    config::save(&cfg).context("persist Phala Cloud API key")
+    config::with_config_lock(|| {
+        let mut cfg: Config = config::load().context("load gmcli config")?;
+        cfg.phala_api_key = Some(key.to_owned());
+        config::save(&cfg).context("persist Phala Cloud API key")
+    })
 }
 
 #[cfg(test)]
@@ -289,11 +291,37 @@ fn persist_key(key: &str) -> Result<()> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{is_positive_amount, pick_key_source, validate_key, PhalaCredits};
+    use super::{is_positive_amount, persist_key, pick_key_source, validate_key, PhalaCredits};
+    use crate::config::{self, Config, NetworkEntry, TestConfigLockEvent, WorkerRecord};
+    use anyhow::Context;
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
     use wiremock::{
         matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
     };
+
+    fn observe_next_lock_event() -> (Receiver<TestConfigLockEvent>, Sender<TestConfigLockEvent>) {
+        let (sender, receiver) = mpsc::channel();
+        let mut observer = config::TEST_CONFIG_LOCK_ATTEMPT
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *observer = Some(sender.clone());
+        (receiver, sender)
+    }
+
+    fn with_temp_config_dir() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::config::TEST_CONFIG_DIR_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // SAFETY: this test holds the process-local guard for its whole scope.
+        unsafe { std::env::set_var("GMCLI_CONFIG_DIR", dir.path()) };
+        (dir, guard)
+    }
 
     #[test]
     fn positive_amount_parsing() {
@@ -354,6 +382,118 @@ mod tests {
         assert_eq!(source.key, "env-key");
         assert!(pick_key_source(Some("  "), Some(""), Some("\t")).is_none());
         assert!(pick_key_source(None, None, None).is_none());
+    }
+
+    #[test]
+    fn phala_key_persistence_preserves_a_concurrent_worker_update() {
+        const INITIAL_EVENT_WAIT: Duration = Duration::from_secs(2);
+        const RELEASE_EVENT_WAIT: Duration = Duration::from_secs(2);
+        const STALE_WRITER_WAIT: Duration = Duration::from_secs(5);
+        const OUTCOME_WAIT: Duration = Duration::from_secs(2);
+
+        let (_dir, _guard) = with_temp_config_dir();
+        let mut entry = NetworkEntry::default();
+        entry.workers.push(WorkerRecord {
+            worker_id: "worker-1".to_owned(),
+            app_id: "app-1".to_owned(),
+            app_name: "miner-1".to_owned(),
+            node_secret: "old-secret".to_owned(),
+            ..Default::default()
+        });
+        let mut cfg = Config::default();
+        cfg.networks.insert("mainnet".to_owned(), entry);
+        cfg.active_network = Some("mainnet".to_owned());
+        config::save(&cfg).expect("seed config");
+
+        let (stale_loaded_tx, stale_loaded_rx) = mpsc::channel();
+        let (allow_stale_save_tx, allow_stale_save_rx) = mpsc::channel();
+        let (worker_result_tx, worker_result_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let saved = config::with_config_lock(|| {
+                // This snapshot predates the key write and models a worker
+                // update already holding the shared config lock.
+                let mut stale = config::load().expect("load under lock");
+                stale_loaded_tx
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("main test thread stopped receiving"))?;
+                allow_stale_save_rx
+                    .recv_timeout(STALE_WRITER_WAIT)
+                    .context("timed out waiting to save stale worker update")?;
+                stale.active_entry_mut().workers[0].node_secret = "new-secret".to_owned();
+                config::save(&stale)
+            })
+            .is_ok();
+            let _ = worker_result_tx.send(saved);
+        });
+
+        let stale_loaded = stale_loaded_rx.recv_timeout(INITIAL_EVENT_WAIT);
+        assert!(
+            stale_loaded.is_ok(),
+            "worker writer must load its stale snapshot within the bounded wait"
+        );
+
+        // Start the key write while the stale worker writer holds `.lock`.
+        // The shared event channel releases the stale writer on whichever
+        // happens first: the fixed implementation's lock attempt, or the
+        // unlocked baseline's completed key write. This makes the baseline
+        // reach its stale overwrite instead of timing out first.
+        let (event_rx, completion_tx) = observe_next_lock_event();
+        let (result_tx, result_rx) = mpsc::channel();
+        let key_writer = thread::spawn(move || {
+            let saved = persist_key("test-key").is_ok();
+            let _ = completion_tx.send(TestConfigLockEvent::OperationCompleted);
+            let _ = result_tx.send(saved);
+        });
+
+        // Release immediately after either event. The outer timeout is
+        // independent from the stale writer's longer deadline, so a missing
+        // event cannot cause that writer to abandon its save before the test
+        // collects both outcomes.
+        let release_event = event_rx.recv_timeout(RELEASE_EVENT_WAIT);
+        let release_sent = allow_stale_save_tx.send(());
+        let worker_saved = worker_result_rx.recv_timeout(OUTCOME_WAIT);
+        let key_saved = result_rx.recv_timeout(OUTCOME_WAIT);
+        let worker_joined = if matches!(&worker_saved, Err(RecvTimeoutError::Timeout)) {
+            None
+        } else {
+            Some(writer.join().is_ok())
+        };
+        let key_joined = if matches!(&key_saved, Err(RecvTimeoutError::Timeout)) {
+            None
+        } else {
+            Some(key_writer.join().is_ok())
+        };
+
+        let final_cfg = config::load().expect("reload final config");
+        assert!(release_event.is_ok(), "a bounded release event is required");
+        assert!(release_sent.is_ok(), "stale worker writer must be released");
+        assert_eq!(worker_saved, Ok(true), "stale worker writer must save");
+        assert_eq!(key_saved, Ok(true), "key persistence must succeed");
+        assert_eq!(
+            worker_joined,
+            Some(true),
+            "worker writer must finish cleanly"
+        );
+        assert_eq!(key_joined, Some(true), "key writer must finish cleanly");
+        assert_eq!(
+            final_cfg.phala_api_key.as_deref(),
+            Some("test-key"),
+            "the worker writer must not overwrite the key"
+        );
+        assert_eq!(
+            final_cfg
+                .networks
+                .get("mainnet")
+                .expect("mainnet entry")
+                .workers[0]
+                .node_secret,
+            "new-secret"
+        );
+        assert_eq!(
+            release_event,
+            Ok(TestConfigLockEvent::LockAttempt),
+            "persist_key must attempt the shared config lock before completion"
+        );
     }
 
     async fn mock_auth_me(body: serde_json::Value, status: u16) -> MockServer {
