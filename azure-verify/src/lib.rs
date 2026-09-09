@@ -26,7 +26,6 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
 use crate::arm::{ArmDeploymentList, ArmScope, PagedRead};
-use crate::binding::assert_deployment_bindings;
 use crate::checks::{
     assert_account_binding, assert_no_capture_children, assert_no_diagnostic_capture,
     assess_streaming_configuration, log_streaming_assessment, retain_observable_deployments,
@@ -343,14 +342,10 @@ impl AzureVerifier {
         let token = self.fetch_entra_token(config).await?;
         let account = self.fetch_arm_account(config, &endpoint, &token).await?;
         assert_account_binding(config.provider, &endpoint, &account)?;
-        let read = self.fetch_arm_deployments(config, &endpoint, &token).await;
-        assert_deployment_bindings(config.provider, &read.items)?;
-        if let Some(failure) = read.failure {
-            return Err(failure);
-        }
+        self.verify_arm_deployment_pages(config, &endpoint, &token)
+            .await?;
         tracing::debug!(
             provider = config.provider.label(),
-            deployment_count = read.items.len(),
             "periodic Azure deployment binding verification passed",
         );
         Ok(())
@@ -999,6 +994,79 @@ mod tests {
                 classify_verification_error(&error),
                 VerificationFailureKind::Definitive
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn binding_poll_rejects_observed_mismatch_before_reading_another_page() {
+        let empty = serde_json::json!({"value": []});
+        let server = foundry_arm(empty.clone(), ok_json(empty)).await;
+        override_deployments(
+            &server,
+            serde_json::json!({
+                "value": [{"name":"claude-opus-4-6","properties":{"model":{
+                    "format":"Anthropic","name":"claude-haiku-4-5"
+                }}}],
+                "nextLink":format!("{}/page-2", server.uri())
+            }),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/page-2"))
+            .respond_with(throttled().set_delay(std::time::Duration::from_secs(5)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            verifier_for(&server).verify_deployment_bindings(&foundry_target()),
+        )
+        .await
+        .expect("an observed mismatch must not wait for another ARM page")
+        .expect_err("binding mismatch");
+        assert!(error.to_string().contains("claude-opus-4-6"));
+        assert_eq!(
+            classify_verification_error(&error),
+            VerificationFailureKind::Definitive
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_poll_checks_the_final_page_of_an_honest_prefix() {
+        for model in ["claude-opus-4-6", "claude-haiku-4-5"] {
+            let empty = serde_json::json!({"value": []});
+            let server = foundry_arm(empty.clone(), ok_json(empty)).await;
+            override_deployments(
+                &server,
+                serde_json::json!({
+                    "value": [{"name":"claude-sonnet-4-6","properties":{"model":{
+                        "format":"Anthropic","name":"claude-sonnet-4-6"
+                    }}}],
+                    "nextLink":format!("{}/page-2", server.uri())
+                }),
+            )
+            .await;
+            Mock::given(method("GET"))
+                .and(path("/page-2"))
+                .respond_with(ok_json(serde_json::json!({
+                    "value": [{"name":"claude-opus-4-6","properties":{"model":{
+                        "format":"Anthropic","name":model
+                    }}}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = verifier_for(&server)
+                .verify_deployment_bindings(&foundry_target())
+                .await;
+            if model == "claude-opus-4-6" {
+                result.expect("every page has honest identities");
+            } else {
+                assert_eq!(
+                    classify_verification_error(&result.expect_err("final page mismatch")),
+                    VerificationFailureKind::Definitive
+                );
+            }
         }
     }
 

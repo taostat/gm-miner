@@ -11,9 +11,10 @@ catalog. It distinguishes transport capability from registry admission:
 * Direct Anthropic/OpenAI supply additionally requires verified key slots enforced
   inside the miner runtime.
 * Azure OpenAI chat completions and Microsoft Foundry Messages forward request
-  bodies unchanged through Envoy. They require the image feature
-  `upstream-model-hop` and registry capability `upstream-model-echo` before
-  registration or declaration. Azure Responses is unqualified because its echo
+  bodies unchanged through Envoy. Cloud registration, recovery and declaration
+  require registry capability `upstream-model-echo`; `gmcli deploy` also checks
+  the approved image for `upstream-model-hop`. Declarations leave per-worker
+  eligibility to the registry. Azure Responses is unqualified because its echo
   is the deployment name; Bedrock inference is disabled inside the image until
   its transport has an authoritative model echo. A known model id or a
   successful HTTP probe is not sufficient.

@@ -56,7 +56,10 @@ The streaming check uses the same scoped Entra credentials and ARM API version a
 - List deployments: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/deployments?api-version=2026-05-01`
 - Read each distinct referenced RAI policy: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/raiPolicies/{raiPolicyName}?api-version=2026-05-01`
 
-For Azure OpenAI, the verifier reads `value[].properties.raiPolicyName` from non-Anthropic-format deployments, then reads `properties.mode` from each referenced RAI policy. Streaming is considered enabled only when the mode is `Asynchronous_filter` or `Deferred`. The same deployment-list read checks the identity of every catalog-named deployment. An empty account passes the binding check. Foundry has no ARM streaming-policy check.
+For Azure OpenAI, the verifier reads `value[].properties.raiPolicyName` from non-Anthropic-format deployments, then reads `properties.mode` from each referenced RAI policy. Streaming is considered enabled only when the mode is `Asynchronous_filter` or `Deferred`. The same deployment-list read checks the identity of every catalog-named deployment.
+The deployment-only poll checks each page before requesting the next, so a known
+binding violation cannot be delayed by a later stalled page. Doctor retains the
+full audit to collect findings across all readable pages. An empty account passes the binding check. Foundry has no ARM streaming-policy check.
 
 For Azure OpenAI's non-Anthropic-format deployments, asynchronous content filtering (streaming-safe, no completion buffering) is required and enforced as gm policy. A synchronous or buffering policy fails the startup gate and continuous verification; there is no operator override.
 

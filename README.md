@@ -271,8 +271,9 @@ payout: a 10% discount means you keep 90% of each per-Mtok dollar.
 Fan one discount across the whole catalog. Bulk declaration checks the registry's
 `upstream-model-echo` capability, retains direct/API-key providers, and explicitly skips
 cloud-backed entries because the bulk wire request has no per-deployment binding. A single cloud
-declaration can proceed only after that capability check and an approved image advertises
-`upstream-model-hop`. The canonical model id also names the deployment; the
+declaration requires that capability check. `gmcli deploy` separately checks the approved
+image for `upstream-model-hop`; per-worker offer admission belongs to the registry.
+The canonical model id also names the deployment; the
 registry contract has no separate deployment-name field:
 
 ```sh
@@ -297,8 +298,8 @@ gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-
 `--discount-pct` accepts a value in `[0, 99.90]` with up to two decimal places (e.g. `10.5`).
 `0` means at retail; `99.90` is the cap (keeps per-request revenue strictly positive).
 Use the registry-owned source model for every admitted route; do not override it with a deployment
-name. After both admission checks, a qualified cloud offer is declared exactly like its direct
-counterpart. Azure Responses and Bedrock remain unqualified; legacy Bedrock ids remain
+name. After the capability check, a cloud offer is declared exactly like its direct
+counterpart; the registry decides whether each worker is eligible. Azure Responses and Bedrock remain unqualified; legacy Bedrock ids remain
 representable for audit and transport diagnostics.
 
 Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price

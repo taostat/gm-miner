@@ -1481,7 +1481,7 @@ static_resources:
               trusted_ca:
                 filename: /etc/ssl/certs/ca-certificates.crt
               # Azure serves wildcard DNS SANs. Match the configured Azure suffix;
-              # attestd ARM binding and exact SAN pin keep resource scope.
+              # ARM binds the configured host to the account; this matcher checks its suffix.
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:

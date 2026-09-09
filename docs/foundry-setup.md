@@ -251,9 +251,10 @@ honestly named catalog deployment, printing the echoed `model` against its name.
 gmcli deploy
 ```
 
-The CLI refuses Foundry registration or declaration when the registry does not
-advertise `upstream-model-echo` or the selected image lacks
-`upstream-model-hop`. Do not use `--upstream-model`: declare a Foundry offer
+The CLI requires registry capability `upstream-model-echo` for Foundry registration,
+recovery and declaration. `gmcli deploy` also requires the selected approved image
+to advertise `upstream-model-hop`. A declaration does not repeat that image check;
+the registry decides per-worker eligibility. Do not use `--upstream-model`: declare a Foundry offer
 exactly like the direct product, for example:
 
 ```sh

@@ -38,8 +38,9 @@ impl AzureDeployment {
         if format != provider.model_format() || model != self.name {
             bail!(
                 "{} deployment '{}' has ARM model.format '{format}' and model.name '{model}'; \
-                 expected format '{}' and exact model name '{}'. Delete and recreate the \
-                 deployment with that model; this catalog-named mismatch takes the worker offline",
+                 expected format '{}' and exact model name '{}'. Correct the deployment \
+                 identity; see docs/foundry-setup.md for Foundry replacement instructions. \
+                 This catalog-named mismatch takes the worker offline",
                 provider.label(),
                 self.name,
                 provider.model_format(),

@@ -297,6 +297,7 @@ pub(crate) fn cmd_set_api_keys(
     update: ProviderKeys,
 ) -> Result<()> {
     validate_update(&update)?;
+    // Re-read and merge under the lock so a concurrent deploy save is not lost.
     let lines = config::with_config_lock(|| {
         let mut cfg = config::load()
             .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;

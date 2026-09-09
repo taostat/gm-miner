@@ -796,18 +796,9 @@ pub(crate) async fn fetch_hotkey(client: &mut RegistryClient) -> Result<String> 
 /// worker #1 (`POST /miners/register`), then refreshes the worker record
 /// with the returned `worker_id`.
 pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> Result<()> {
-    // register-image re-registers worker #1 via `POST /miners/register`
-    // (which refreshes the miner's oldest worker). The CLI's first worker
-    // record is worker #1, so a tracked CVM that is *not* that record is a
-    // worker-add worker; routing it through `/miners/register` would
-    // overwrite worker #1's endpoint/secret and corrupt the local mapping.
-    // Reject it and point the operator at `worker add` instead.
-    //
-    // Reuse the locally-tracked worker record for this CVM: its secret keeps
-    // the registry's stored copy in sync with what the deployed envoy
-    // enforces, and its `app_name` preserves the operator's original
-    // `--app-name`. A worker not tracked locally has neither — the registry
-    // then leaves any stored secret untouched.
+    // Only the oldest live worker can use /miners/register; otherwise recovery
+    // would overwrite another worker's endpoint and secret. Resolve its role
+    // from the registry and reuse the tracked CVM's secret and name.
     let network = cfg.active_network().to_owned();
     // Scope the same Phala key deploy would use (env or saved config key) onto
     // register-image's `phala cvms get`, so a recovery run works off the key
@@ -826,22 +817,10 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
         require_registry_model_echo_capability(&mut client, "recovery").await?;
     }
 
-    // register-image is a hidden re-registration path (debug / registry
-    // resync), not the guided deploy: a check-only preflight with an install
-    // hint, never the interactive install offer `deploy` uses via
-    // `ensure_dependency(&PHALA, ...)`.
+    // Recovery must not block on an interactive dependency-install prompt.
     preflight_phala_cli()?;
 
-    let out = gm_miner_cli::deploy::phala_command(phala_key.as_deref())
-        .args(["cvms", "get", app_id, "--json"])
-        .output()
-        .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
-    if !out.status.success() {
-        bail!(
-            "phala cvms get {app_id} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
+    let out = registered_cvm_detail(app_id, phala_key.as_deref())?;
 
     let hashes = parse_phala_cvm_detail(out.status.success(), &out.stdout)
         .context("read deployed worker hashes from phala cvms get")?
@@ -854,11 +833,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
             )
         })?;
 
-    // The registry requires a non-empty `endpoint` on every registration —
-    // read it from the same CVM-detail document already fetched above,
-    // then rewrite it to the dstack TLS-passthrough (`s`-suffix) form so
-    // the registered URL is the one on which the miner's RA-TLS
-    // certificate is actually presented.
+    // Register the TLS-passthrough endpoint so callers receive the TEE's certificate.
     let endpoint = parse_phala_cvm_endpoint(out.status.success(), &out.stdout)
         .context("read deployed worker endpoint from phala cvms get")?
         .ok_or_else(|| {
@@ -872,11 +847,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
     let endpoint = to_ratls_passthrough_endpoint(&endpoint)
         .context("derive the RA-TLS passthrough endpoint for registration")?;
 
-    // A register-image with no tracked secret re-registers worker #1 in
-    // place and leaves the registry's stored secret untouched (omitted from
-    // the body); a known secret is re-sent. The registry's
-    // `/miners/register` only accepts bare lowercase hex hashes, so
-    // normalize before POST.
+    // The registry requires bare lowercase hex hashes.
     let compose_hash = normalize_hash(&hashes.compose_sha256);
     let os_image_hash = normalize_hash(&hashes.os_image_hash);
     let worker_id = post_register_image(
@@ -886,11 +857,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
             os_image_hash: &os_image_hash,
             endpoint: &endpoint,
             node_secret: node_secret.as_deref(),
-            // register-image re-registers an already-existing worker. Reuse
-            // the backends recorded at deploy time so a recovery or resync
-            // preserves the worker's provenance instead of relabeling it from
-            // whatever global config is current later. If no local record
-            // exists, current config is only a best-effort fallback.
+            // Reuse deployment-time provenance; current global config may describe another worker.
             backends: register_backends.as_ref(),
             provider_slots: provider_slots.as_ref(),
             // A register-image resync re-asserts the image, not the terms; the
@@ -900,11 +867,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
     )
     .await?;
 
-    // Refresh the worker record in place under the same `app_name` a later
-    // `deploy` would pass, so the records reconcile instead of duplicating.
-    // Prefer the locally-tracked name (the original `--app-name`); for a
-    // legacy/untracked config fall back to the CVM's own `name` from `phala
-    // cvms get`, and only as a last resort to the `app_id`.
+    // Preserve the original deploy name so later saves update this record in place.
     let cvm_name = parse_phala_cvm_name(out.status.success(), &out.stdout)
         .context("read deployed worker name from phala cvms get")?;
     let app_name = existing_app_name
@@ -927,6 +890,20 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
 
     println!("  worker_id : {worker_id}");
     Ok(())
+}
+
+fn registered_cvm_detail(app_id: &str, phala_key: Option<&str>) -> Result<std::process::Output> {
+    let out = gm_miner_cli::deploy::phala_command(phala_key)
+        .args(["cvms", "get", app_id, "--json"])
+        .output()
+        .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
+    if !out.status.success() {
+        bail!(
+            "phala cvms get {app_id} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out)
 }
 
 /// The backends `register-image` re-sends for a CVM: the recorded map for a
