@@ -32,24 +32,21 @@ sleep 0.3
 if [[ "${FAIL_READY}" == 1 ]]; then exit 23; fi
 touch "${MARKERS}/ready"
 for ((attempt = 0; attempt < 100; attempt++)); do
-  if [[ -e "${MARKERS}/gm-cloud-hop" && -e "${MARKERS}/envoy" ]]; then exit 23; fi
+  if [[ -e "${MARKERS}/envoy" ]]; then exit 23; fi
   sleep 0.1
 done
 exit 24
 "#,
     );
-    for service in ["gm-cloud-hop", "envoy"] {
-        executable(
-            &bin.join(service),
-            r#"#!/bin/bash
-if [[ "${1:-}" == "--validate-config" ]]; then exit 0; fi
+    executable(
+        &bin.join("envoy"),
+        r#"#!/bin/bash
 if [[ ! -e "${MARKERS}/ready" ]]; then touch "${MARKERS}/early"; fi
 touch "${MARKERS}/${0##*/}"
 trap 'touch "${MARKERS}/${0##*/}-stopped"; exit 0' TERM
 while true; do sleep 0.1; done
 "#,
-        );
-    }
+    );
     let output = entrypoint_command(root, temp.path())
         .env("FAIL_READY", if fail_before_ready { "1" } else { "0" })
         .output()
@@ -62,19 +59,17 @@ while true; do sleep 0.1; done
         !temp.path().join("early").exists(),
         "data plane started before readiness"
     );
-    for service in ["gm-cloud-hop", "envoy"] {
-        assert_eq!(
-            temp.path().join(service).exists(),
-            !fail_before_ready,
-            "{service}: {}",
-            String::from_utf8_lossy(&output.stderr)
+    assert_eq!(
+        temp.path().join("envoy").exists(),
+        !fail_before_ready,
+        "envoy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !fail_before_ready {
+        assert!(
+            temp.path().join("envoy-stopped").exists(),
+            "envoy must die with attestd"
         );
-        if !fail_before_ready {
-            assert!(
-                temp.path().join(format!("{service}-stopped")).exists(),
-                "{service} must die with attestd"
-            );
-        }
     }
 }
 
@@ -95,8 +90,7 @@ fn entrypoint_command(root: &Path, markers: &Path) -> Command {
         .env("GM_NODE_SECRET", "test-node-secret-0001")
         .env("OPENAI_UPSTREAM", "azure")
         .env("AZURE_OPENAI_ENDPOINT", "https://acct.openai.azure.com")
-        .env("AZURE_OPENAI_API_KEY", "azure-key")
-        .env("AZURE_OPENAI_DEPLOYMENTS", "gpt-5.5=azure-gpt55");
+        .env("AZURE_OPENAI_API_KEY", "azure-key");
     command
 }
 
@@ -137,16 +131,13 @@ echo "$$" > "${MARKERS}/attestd-pid"
 while true; do sleep 0.1; done
 "#,
     );
-    for service in ["gm-cloud-hop", "envoy"] {
-        executable(
-            &bin.join(service),
-            r#"#!/bin/bash
-if [[ "${1:-}" == "--validate-config" ]]; then exit 0; fi
+    executable(
+        &bin.join("envoy"),
+        r#"#!/bin/bash
 touch "${MARKERS}/early"
 exit 0
 "#,
-        );
-    }
+    );
     let mut child = entrypoint_command(root, temp.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -319,11 +319,6 @@ mod tests {
         TargetState {
             config: AzureVerifyConfig {
                 provider: AzureProvider::Foundry,
-                deployment_map: gm_cloud_hop::parse_deployment_map(
-                    gm_cloud_hop::CloudProvider::Foundry,
-                    "claude-sonnet-4-6=foundry-sonnet",
-                )
-                .expect("test deployment map"),
                 endpoint: "https://acct.services.ai.azure.com".to_owned(),
                 tenant_id: "tenant".to_owned(),
                 subscription_id: "subscription".to_owned(),
@@ -337,7 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round4_staleness_survives_fast_transient_polls() {
+    async fn staleness_survives_fast_transient_polls() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429))
@@ -485,7 +480,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("{account_path}/deployments")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "value": []
+                "value": [{"name":"claude-sonnet-4-6","properties":{"model":{"format":"Anthropic","name":"claude-haiku-4-5"}}}]
             })))
             .mount(&server)
             .await;
@@ -565,7 +560,7 @@ mod tests {
                 .await;
         }
         Mock::given(method("GET")).and(path(format!("{base}/deployments"))).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"value":[{
-                "name":"foundry-sonnet","properties":{"model":{"format":"Anthropic","name":"claude-sonnet-4-6","version":"1"}}
+                "name":"claude-sonnet-4-6","properties":{"model":{"format":"Anthropic","name":"claude-sonnet-4-6","version":"1"}}
             }]}))).mount(server).await;
     }
 
@@ -617,7 +612,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round5_boot_age_survives_a_later_targets_slow_sweep() {
+    async fn catalog_named_model_drift_after_boot_stops_the_periodic_verifier() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token":"token"})),
+            )
+            .mount(&server)
+            .await;
+        mount_boot_account(&server, "acct", 0).await;
+        let verifier =
+            AzureVerifier::with_endpoints(reqwest::Client::new(), server.uri(), server.uri());
+        let config = state().config;
+        let boot = verifier
+            .verify_target_with_timestamp(&config)
+            .await
+            .expect("honest boot");
+        Mock::given(method("GET"))
+            .and(path("/subscriptions/subscription/resourceGroups/resource-group/providers/Microsoft.CognitiveServices/accounts/acct/deployments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"value":[{
+                "name":"claude-sonnet-4-6","properties":{"model":{"format":"Anthropic","name":"claude-haiku-4-5"}}
+            }]})))
+            .with_priority(1)
+            .mount(&server).await;
+        let (tx, rx) = oneshot::channel();
+        let settings = PeriodicAzureVerifySettings {
+            interval: Duration::from_secs(30),
+            deployment_interval: Duration::from_millis(100),
+            transient_failure_limit: 3,
+        };
+        let task = tokio::spawn(run_periodic_azure_verification_with_verifier(
+            verifier,
+            vec![AzureVerifiedTarget::new(config, boot)],
+            settings,
+            tx,
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
+        task.abort();
+        let reason = result
+            .expect("poll must detect drift")
+            .expect("fatal signal");
+        assert!(reason.contains("definitive"), "{reason}");
+        assert!(reason.contains("claude-sonnet-4-6"), "{reason}");
+        assert!(reason.contains("claude-haiku-4-5"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn boot_age_survives_a_later_targets_slow_sweep() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(

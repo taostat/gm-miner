@@ -1,7 +1,6 @@
 # Serving Claude through Microsoft Foundry
 
-This guide sets up an Azure AI Foundry resource and the measured Foundry model
-hop. It does **not** by itself make Foundry a routable or registry-admissible
+This guide sets up an Azure AI Foundry resource for the miner. It does **not** by itself make Foundry a routable or registry-admissible
 source: an HTTP-successful Foundry probe is transport capability, not
 authoritative model admission. Cloud registration, recovery, and declaration
 also require a registry that advertises `upstream-model-echo`; the deployed
@@ -9,7 +8,7 @@ image must advertise `upstream-model-hop`. Azure OpenAI chat completions uses
 the same gates, while Azure Responses and Bedrock remain unqualified.
 
 The rest of this guide prepares the Azure resource, endpoint, credentials, and
-deployment map. It covers the Azure side — the resource, the connections and
+canonical deployment names. It covers the Azure side — the resource, the connections and
 settings that must not exist on it, the read-only service principal, and the
 deployment name — then the `gmcli` command that consumes the result.
 
@@ -21,7 +20,8 @@ comes back as native Anthropic SSE events.
 
 Before serving, `attestd` verifies from ARM that the Foundry account carries no
 owner-capture controls, and it repeats that check while the miner runs. If a
-check fails, the container does not serve — no Envoy, no RA-TLS, no traffic.
+startup check fails, the container does not serve. During operation, a definitive
+violation stops serving; transient errors have a bounded tolerance window.
 What those checks are, and what they deliberately do not cover, is in
 [`AZURE_VERIFY_NOTES.md`](../AZURE_VERIFY_NOTES.md). This guide is the operator
 procedure for satisfying them.
@@ -44,8 +44,8 @@ connection on the account or on one of its projects as a capture sink and fails
 closed. The miner will refuse to boot while it exists — after you have already
 paid for a CVM.
 
-Delete it before you deploy (step 3 below). Deleting it makes verification pass;
-nothing else about the resource has to change.
+Delete it before you deploy (step 3 below). This clears the connection finding;
+the other checks below must also pass.
 
 ## 1. Create the resource — it must be `kind=AIServices`
 
@@ -81,9 +81,9 @@ the miner needs is:
 https://<resource>.services.ai.azure.com
 ```
 
-`gmcli set-api-keys` and `attestd` both accept only the `.services.ai.azure.com`
-suffix for the Foundry endpoint, so an ARM-copied hostname is rejected up front
-rather than at boot.
+`gmcli doctor`, `gmcli deploy`, and `attestd` accept only the
+`.services.ai.azure.com` suffix for the Foundry endpoint. `set-api-keys` stores
+the supplied values; run doctor to catch an ARM-copied hostname before deployment.
 
 ## 3. Delete the Application Insights connection
 
@@ -171,22 +171,47 @@ These credentials are separate from the `AZURE_*` variables used by the Azure
 OpenAI upstream on purpose — a worker may hold the two accounts in different
 tenants, subscriptions or resource groups.
 
-## 6. Find the deployment name
+## 6. Create a deployment with the canonical gm model name
 
-Foundry routes on the **deployment** name, not on the canonical Anthropic model
-id. The deployment name defaults to the model id in the portal but does not have
-to match it, so read it back rather than assuming:
+**Name the deployment exactly the canonical gm model id**, for example
+`claude-opus-4-6`. Foundry routes by deployment name, so the gateway's `model`
+value reaches Azure unchanged. The image enumerates deployments through ARM and
+requires every name in its Foundry catalog to have `properties.model.format:
+Anthropic` and `properties.model.name` equal to that deployment name, exact ASCII.
+A catalog-named mismatch refuses boot or takes the worker offline when the
+60-second poll observes it. Non-catalog names are ignored by the binding check.
+A missing deployment is handled by the registry's per-offer probe and the gateway;
+it does not take attestd offline.
+
+As of September 2026, Anthropic deployments require `modelProviderData` containing
+`organizationName`, `countryCode`, and lowercase `industry`. Only
+`api-version=2025-10-01-preview` accepts this creation property; the verifier's ARM
+read API remains separate. Microsoft's [Claude starter kit](https://github.com/Azure-Samples/claude)
+uses these fields. Supply your actual organization details:
+
+```sh
+az rest --method put \
+  --url "https://management.azure.com<ACCOUNT_ID>/deployments/claude-opus-4-6?api-version=2025-10-01-preview" \
+  --body '{
+    "sku": {"name": "GlobalStandard", "capacity": 25},
+    "properties": {
+      "model": {"format": "Anthropic", "name": "claude-opus-4-6", "version": "1"},
+      "modelProviderData": {
+        "organizationName": "<your organization>",
+        "countryCode": "GB",
+        "industry": "technology"
+      }
+    }
+  }'
+```
+
+Azure cannot re-point a deployment to another model in place. Delete and recreate
+it with the correct model and name. Read back the resulting identities:
 
 ```sh
 az cognitiveservices account deployment list -n <ACCOUNT> -g <RG> \
-  --query "[].{deployment:name, model:properties.model.name, format:properties.model.format}" -o table
+  --query "[].{name:name, format:properties.model.format, model:properties.model.name, version:properties.model.version}" -o table
 ```
-
-The `deployment` column is the upstream identity for the hop. Add one
-`canonical=deployment` entry for each model you intend to serve; entries are
-separated with semicolons. The canonical id must be a known Foundry catalog
-model, and the deployment name is data only: it cannot select an endpoint,
-host, path, redirect, or proxy.
 
 ## 7. Configure gmcli
 
@@ -202,21 +227,13 @@ gmcli set-api-keys \
   --azure-foundry-subscription-id <subscription> \
   --azure-foundry-resource-group <rg> \
   --azure-foundry-client-id <appId> \
-  --azure-foundry-client-secret <password> \
-  --foundry-deployments 'claude-sonnet-4-6=<deployment-name>'
+  --azure-foundry-client-secret <password>
 ```
 
-All eight fields are required together: `gmcli` rejects a partial Foundry group
-rather than deploying something that will fail its boot gate or start an
-unmapped hop. Add more entries as
-`canonical=deployment;canonical=deployment`. The values are baked into the
-miner container at deploy time and stay inside the TEE. The Foundry API key is
-single-slot — semicolon-separated multi-key lists are not accepted for it.
-
-The measured hop rewrites only the top-level request `model` member before the
-existing Envoy Foundry egress cluster. It preserves the rest of the request and
-passes the upstream response through unchanged. It is enabled only for the
-native Foundry Messages surface.
+All seven endpoint/key/ARM fields are required together. The values are supplied
+inside the encrypted CVM environment. The Foundry API key is single-slot;
+semicolon-separated multi-key lists are rejected. Envoy forwards the request body
+unchanged and uses the existing TLS host, SNI and SAN policy.
 
 Run `gmcli doctor` before spending a deploy on it. Doctor does not merely check
 that the group is complete: it runs the *same* owner-capture sweep `attestd` runs
@@ -224,7 +241,9 @@ at boot — the `gm-azure-verify` crate, one implementation, so the two cannot
 disagree — against your account and every project on it. If a connection,
 capability host or diagnostic setting is still attached, doctor names it and
 prints the `az` command that clears it, here rather than after you have paid for
-a CVM that crashloops.
+a CVM that crashloops. It also lists every ARM deployment with name, format, model
+and version, flags each catalog-named mismatch, and sends one 1-token request per
+honestly named catalog deployment, printing the echoed `model` against its name.
 
 ## 8. Deploy and validate transport
 
@@ -232,9 +251,10 @@ a CVM that crashloops.
 gmcli deploy
 ```
 
-The CLI refuses Foundry registration or declaration when the registry does not
-advertise `upstream-model-echo` or the selected image lacks
-`upstream-model-hop`. Do not use `--upstream-model`: declare a Foundry offer
+The CLI requires registry capability `upstream-model-echo` for Foundry registration,
+recovery and declaration. `gmcli deploy` also requires the selected approved image
+to advertise `upstream-model-hop`. A declaration does not repeat that image check;
+the registry decides per-worker eligibility. Do not use `--upstream-model`: declare a Foundry offer
 exactly like the direct product, for example:
 
 ```sh
@@ -242,8 +262,9 @@ gmcli declare-product --provider anthropic \
   --model claude-sonnet-4-6 --discount-pct 5
 ```
 
-The deployment name stays in the measured image map; it is never the registry
-offer's model id.
+The deployment name, request `model` and offer model id are the same canonical id.
+The in-TEE ARM binding and the gateway's per-response echo check provide the model
+identity checks; the registry/gateway contract is unchanged.
 
 If the account still has a connection, a capability host or a diagnostic setting
 on it, the CVM starts, the boot gate fails, the container exits non-zero, and the
@@ -261,19 +282,18 @@ curl https://<resource>.services.ai.azure.com/anthropic/v1/messages \
   -H "x-api-key: <foundry-api-key>" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
-  -d '{"model":"<deployment-name>","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"claude-opus-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Adding `"stream": true` returns native Anthropic SSE events. A 404 here almost
-always means the `model` field carries the canonical model id rather than the
-deployment name.
+Adding `"stream": true` returns native Anthropic SSE events. For a 404, check
+that a deployment with that canonical name exists on the account.
 
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
 | Miner boots, exits non-zero, restarts in a loop right after deploy | A connection, capability host or diagnostic setting on the account or a project. The container log names it; clear it (steps 3–4) and restart. `gmcli doctor` finds the same thing without a deploy |
-| `gmcli set-api-keys` rejects the endpoint | The endpoint must end in `.services.ai.azure.com`. The `cognitiveservices.azure.com` host ARM reports is not the Foundry passthrough (step 2) |
+| Doctor or deploy rejects the endpoint | The endpoint must end in `.services.ai.azure.com`. The `cognitiveservices.azure.com` host ARM reports is not the Foundry passthrough (step 2) |
 | Verification fails on account kind | The resource is `kind=OpenAI` (classic Azure OpenAI), not `kind=AIServices`. Create a Foundry resource (step 1) |
 | ARM read fails at boot | The service principal cannot see the account. Confirm the `Reader` assignment is scoped to `<ACCOUNT_ID>` and the tenant/subscription/resource-group fields match it (step 5) |
-| Upstream 404s on a model gm lists | The deployment map is missing the canonical model or names a deployment that does not exist; verify `--foundry-deployments canonical=deployment` and run `gmcli doctor` (steps 6 and 8) |
+| Upstream 404s on a model gm lists | Create a deployment named exactly the canonical gm model id serving that same model, then run `gmcli doctor` (steps 6 and 8) |

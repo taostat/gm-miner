@@ -17,7 +17,7 @@ use crate::commands::deploy::{
     cmd_deploy_subcommand, default_deploy_flags, deploy_args_from_flags, WorkerRegistration,
 };
 use crate::commands::hotkey::cmd_register_hotkey;
-use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
+use crate::commands::keys::cmd_set_api_keys;
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::products::{cmd_declare_products, DeclareOutcome};
 
@@ -408,45 +408,7 @@ fn wizard_provider_keys(
         title,
         &command,
         assume_yes,
-        cmd_set_api_keys(
-            explicit_network,
-            keys.anthropic,
-            keys.anthropic_upstream,
-            keys.bedrock_region,
-            keys.bedrock_api_key,
-            // The wizard prompts for direct provider keys only; cloud backends
-            // (Bedrock, Foundry, Azure OpenAI) are configured with the explicit
-            // `set-api-keys` flags. Carry through whatever is already stored.
-            FoundryArgs {
-                endpoint: keys.azure_foundry_endpoint,
-                api_key: keys.azure_foundry_api_key,
-                tenant_id: keys.azure_foundry_tenant_id,
-                subscription_id: keys.azure_foundry_subscription_id,
-                resource_group: keys.azure_foundry_resource_group,
-                client_id: keys.azure_foundry_client_id,
-                client_secret: keys.azure_foundry_client_secret,
-                deployments: keys.azure_foundry_deployments,
-            },
-            keys.openai,
-            keys.openai_upstream,
-            keys.azure_openai_endpoint,
-            keys.azure_openai_api_key,
-            keys.azure_tenant_id,
-            keys.azure_subscription_id,
-            keys.azure_resource_group,
-            keys.azure_client_id,
-            keys.azure_client_secret,
-            keys.azure_openai_deployments,
-            keys.google,
-            keys.chutes,
-            keys.zai,
-            keys.moonshot,
-            keys.deepinfra,
-            keys.kubetee,
-            keys.engy,
-            keys.moonmath,
-            keys.near,
-        )
+        cmd_set_api_keys(explicit_network, keys)
     )
 }
 
@@ -481,7 +443,6 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         azure_foundry_resource_group: None,
         azure_foundry_client_id: None,
         azure_foundry_client_secret: None,
-        azure_foundry_deployments: None,
         openai: prompt_line("OpenAI API key (blank to skip):", assume_yes)?,
         openai_upstream: None,
         azure_openai_endpoint: None,
@@ -491,7 +452,6 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         azure_resource_group: None,
         azure_client_id: None,
         azure_client_secret: None,
-        azure_openai_deployments: None,
         google: prompt_line("Google API key (blank to skip):", assume_yes)?,
         chutes: prompt_line("Chutes API key (blank to skip):", assume_yes)?,
         zai: prompt_line("Z.ai API key (blank to skip):", assume_yes)?,
@@ -517,9 +477,6 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     if keys.bedrock_api_key.is_some() {
         cmd.push_str(" --bedrock-region <region> --bedrock-api-key <key>");
     }
-    if keys.azure_foundry_deployments.is_some() {
-        cmd.push_str(" --foundry-deployments <map>");
-    }
     if keys.openai.is_some() {
         cmd.push_str(" --openai <key>");
     }
@@ -528,9 +485,6 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     }
     if keys.azure_openai_api_key.is_some() {
         cmd.push_str(" --azure-openai-endpoint <url> --azure-openai-api-key <key>");
-    }
-    if keys.azure_openai_deployments.is_some() {
-        cmd.push_str(" --azure-deployments <map>");
     }
     if keys.google.is_some() {
         cmd.push_str(" --google <key>");

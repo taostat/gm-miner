@@ -362,6 +362,30 @@ impl AzureVerifier {
             .await
     }
 
+    pub(crate) async fn verify_arm_deployment_pages(
+        &self,
+        config: &AzureVerifyConfig,
+        endpoint: &AzureEndpoint,
+        token: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/deployments?api-version={ARM_API_VERSION}",
+            self.account_url(config, endpoint)
+        );
+        let read = self
+            .fetch_paged_checked::<ArmDeploymentList>(
+                url,
+                token,
+                "Azure deployment bindings",
+                |items| crate::binding::assert_deployment_bindings(config.provider, items),
+            )
+            .await;
+        match read.failure {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn fetch_arm_rai_policy(
         &self,
         config: &AzureVerifyConfig,
@@ -390,9 +414,20 @@ impl AzureVerifier {
     /// `AzureAudit::findings_outrank`, where a finding outranks it.
     async fn fetch_paged<P: ArmPage>(
         &self,
+        url: String,
+        token: &str,
+        label: &'static str,
+    ) -> PagedRead<P::Item> {
+        self.fetch_paged_checked::<P>(url, token, label, |_| Ok(()))
+            .await
+    }
+
+    async fn fetch_paged_checked<P: ArmPage>(
+        &self,
         mut url: String,
         token: &str,
         label: &'static str,
+        check: impl Fn(&[P::Item]) -> Result<()>,
     ) -> PagedRead<P::Item> {
         let mut items = Vec::new();
         for _ in 0..MAX_ARM_PAGES {
@@ -401,7 +436,13 @@ impl AzureVerifier {
                 Err(err) => return PagedRead::truncated(items, err),
             };
             let (value, next_link) = page.into_parts();
+            // A binding violation must stop serving before a later page can stall.
+            // Audits use an unchecked reader so doctor can still enumerate findings.
+            let outcome = check(&value);
             items.extend(value);
+            if let Err(error) = outcome {
+                return PagedRead::truncated(items, error);
+            }
             let Some(next_link) = next_link else {
                 return PagedRead::complete(items);
             };

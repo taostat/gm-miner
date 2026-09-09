@@ -1,8 +1,8 @@
 //! Cloud model-ID compatibility and transport-selection helpers.
 //!
-//! Cloud adapters now carry their canonical-to-deployment data through the
-//! measured image hop, but the separate registry/gateway response-echo check
-//! still owns routing admission. Keep these helpers together so diagnostics
+//! Cloud deployments use canonical model ids verified by the in-TEE ARM binding;
+//! the registry/gateway response-echo check owns routing admission.
+//! Keep these helpers together so diagnostics
 //! and bulk-declaration guidance do not confuse transport capability with the
 //! feature-fenced model identity check.
 
@@ -187,7 +187,7 @@ pub async fn declaration_policy(
 
     let mut has_unknown_provenance = false;
     let mut has_cloud_provenance = false;
-    let mut has_hop_image = false;
+    let mut has_binding_image = false;
 
     for live_worker in &live_workers {
         let image = live_worker.image_compose_hash.as_deref().and_then(|hash| {
@@ -199,7 +199,7 @@ pub async fn declaration_policy(
             has_unknown_provenance = true;
             continue;
         };
-        has_hop_image |= image.model_hop_capable();
+        has_binding_image |= image.cloud_binding_capable();
 
         let Some(local_worker) = local_workers
             .iter()
@@ -214,9 +214,9 @@ pub async fn declaration_policy(
     if has_cloud_provenance || has_unknown_provenance {
         return CloudDeclarationPolicy::FENCED;
     }
-    if has_hop_image {
-        // A direct worker on the hop image needs the model-echo fence, but it
-        // remains direct supply and must not disappear from a bulk set.
+    if has_binding_image {
+        // The image's model-echo fence does not change a direct worker's supply,
+        // so it must not remove that worker from bulk declarations.
         return CloudDeclarationPolicy::FENCED_BUT_DIRECT;
     }
     CloudDeclarationPolicy::DIRECT

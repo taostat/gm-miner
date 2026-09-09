@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["attestd", "azure-verify", "cli", "cloud-hop"]
+members = ["attestd", "azure-verify", "cli"]
 
 [workspace.package]
-version = "0.4.16-dev"
+version = "0.4.17-dev"
 edition = "2021"
 # 1.88 is the floor of the locked dependency tree: the dstack-sdk ->
 # alloy chain (pulled in by the attestd crate) requires rustc 1.88+
@@ -42,12 +42,15 @@ rustls = { version = "0.23.43", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 x509-parser = "0.18.1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+# dstack-sdk's locked Alloy macros pull proc-macro-error2 2.0.1, which emits
+# future-incompatibility E0365 on proc_macro re-export. Keep this dependency
+# graph for the attestation SDK; changing it requires separate SDK validation.
+# No lint is suppressed: the current fmt, clippy and test gates remain enforced.
 dstack-sdk = "0.1"
 # Reads the install receipt dist's shell installer writes, so it tracks the
 # cargo-dist family that builds the releases it updates from.
 axoupdater = "0.10"
 gm-azure-verify = { path = "azure-verify" }
-gm-cloud-hop = { path = "cloud-hop" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

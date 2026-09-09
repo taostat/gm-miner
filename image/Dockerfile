@@ -33,7 +33,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY cli/Cargo.toml ./cli/
 COPY attestd/Cargo.toml ./attestd/
 COPY azure-verify/Cargo.toml ./azure-verify/
-COPY cloud-hop/Cargo.toml ./cloud-hop/
 
 ## Copy dstack assets required by include_str! at compile time.
 COPY dstack/ ./dstack/
@@ -42,38 +41,32 @@ COPY dstack/ ./dstack/
 ## ships a lib and three bins (gm-miner-attestd, gm-miner-ratls, and the
 ## fail-closed NEAR verification proxy), so the
 ## dummy tree needs an entry file for each declared target.
-RUN mkdir -p cli/src attestd/src/bin azure-verify/src cloud-hop/src \
+RUN mkdir -p cli/src attestd/src/bin azure-verify/src \
   && echo "fn main() {}" > cli/src/main.rs \
   && echo "fn main() {}" > attestd/src/main.rs \
   && echo "fn main() {}" > attestd/src/bin/ratls.rs \
   && echo "fn main() {}" > attestd/src/bin/near_verify_proxy.rs \
   && echo "" > attestd/src/lib.rs \
   && echo "" > azure-verify/src/lib.rs \
-  && echo "" > cloud-hop/src/lib.rs \
-  && echo "fn main() {}" > cloud-hop/src/main.rs \
   && cargo build --release --workspace 2>/dev/null || true \
-  && rm -rf cli/src attestd/src azure-verify/src cloud-hop/src
+  && rm -rf cli/src attestd/src azure-verify/src
 
 ## Copy real sources.
 COPY cli/ ./cli/
 COPY attestd/ ./attestd/
 COPY azure-verify/ ./azure-verify/
-COPY cloud-hop/ ./cloud-hop/
 
 ## Build the workspace. Touch the entry points to invalidate the dummy
 ## build cache so the real sources compile.
 RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
     attestd/src/bin/ratls.rs attestd/src/bin/near_verify_proxy.rs \
-    azure-verify/src/lib.rs cloud-hop/src/lib.rs cloud-hop/src/main.rs \
+    azure-verify/src/lib.rs \
   && cargo build --release --workspace \
   && strip target/release/gmcli target/release/gm-miner-attestd \
-    target/release/gm-miner-ratls target/release/gm-near-verify-proxy \
-    target/release/gm-cloud-hop
+    target/release/gm-miner-ratls target/release/gm-near-verify-proxy
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
-## Envoy 1.32.x pinned by digest.
-## Update the pin via: docker manifest inspect envoyproxy/envoy:v1.32-latest
-## Current digest as of 2026-05-17:
+## Pin the base by digest so a mutable tag cannot change the attested runtime.
 FROM envoyproxy/envoy:v1.38-latest@sha256:4e3c734cbe9892a3513c97cf3974ff73cfef5d784f5cceed9ea758a2b80e0c31
 
 ## ca-certificates is already present in the envoy base image; nothing
@@ -85,9 +78,7 @@ FROM envoyproxy/envoy:v1.38-latest@sha256:4e3c734cbe9892a3513c97cf3974ff73cfef5d
 ARG GM_IMAGE_VERSION=dev
 ENV GM_IMAGE_VERSION=${GM_IMAGE_VERSION}
 
-## Copy the operator-side CLI binary. The CLI is included in the image
-## for one-shot ops tasks (config dump, key rotation) executed via
-## `docker run --entrypoint gmcli ...`.
+## start.sh depends on gmcli slot-env to derive key slots inside the TEE.
 COPY --from=builder /build/target/release/gmcli /usr/local/bin/gmcli
 
 ## Copy the attestation server. start.sh launches it alongside envoy;
@@ -101,10 +92,6 @@ COPY --from=builder /build/target/release/gm-miner-ratls /usr/local/bin/gm-miner
 ## Copy the NEAR verifier. It attests and forwards each NEAR inference over
 ## one exact TLS connection; Envoy never has a direct NEAR origin route.
 COPY --from=builder /build/target/release/gm-near-verify-proxy /usr/local/bin/gm-near-verify-proxy
-
-## Copy the measured cloud model hop. start.sh launches it only after the
-## Azure owner-capture gate, and supervises it with attestd and Envoy.
-COPY --from=builder /build/target/release/gm-cloud-hop /usr/local/bin/gm-cloud-hop
 
 ## Copy Envoy config.
 COPY image/envoy.yaml /etc/envoy/envoy.yaml

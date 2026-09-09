@@ -88,7 +88,7 @@ evidence is a separate GM runbook concern.
 ### Cloud transport variants and admission
 
 The image retains three cloud transports. Azure OpenAI chat completions and
-Foundry Messages pass through a measured model hop. Azure Responses is
+Foundry Messages forward request bodies unchanged through Envoy. Azure Responses is
 explicitly rejected because its echo is the deployment name. Bedrock inference is
 disabled: requests return 421 with a slot header and 400 without one. Selecting one per worker does
 **not** make every model on that provider a registry-admissible route, and a
@@ -97,19 +97,28 @@ successful upstream probe is not evidence of admission:
 | Buyer product | Route | Selector |
 |---|---|---|
 | `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — inference disabled; 421 with a slot header, 400 without one |
-| `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` plus `--foundry-deployments canonical=deployment;...` (see [foundry-setup.md](foundry-setup.md)) — qualified measured transport |
-| `openai/*` | Azure OpenAI chat completions | `--openai-upstream azure` plus `--azure-deployments canonical=deployment;...` — qualified measured transport; `/v1/responses` is rejected |
+| `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) — qualified measured transport |
+| `openai/*` | Azure OpenAI chat completions | `--openai-upstream azure` — qualified measured transport; `/v1/responses` is rejected |
 
-Same idea, different mechanism — selectors and maps are set once per worker.
-The map format is `canonical=deployment;canonical=deployment`; its values are
-data only and do not choose hosts, paths, redirects, or proxy settings. Use
-direct/API-key providers for ordinary declarations when a cloud binding is not
-configured. The CLI requires both the image feature `upstream-model-hop` and
-registry capability `upstream-model-echo` before cloud registration, recovery,
-or declaration; it refuses legacy registries. Declare a qualified cloud route
-with the same canonical `provider/model` as a direct route; do not send the
-deployment name with the offer. Direct Anthropic/OpenAI routes still
-require verified key slots enforced inside the miner runtime.
+Name each Azure or Foundry deployment exactly the canonical gm model id. The
+image verifies through ARM that a deployment named X in the adapter's catalog
+serves model X, with exact ASCII names and format `OpenAI` for Azure OpenAI or
+`Anthropic` for Foundry. A catalog-named violation blocks boot and takes a running
+worker offline when observed by the 60-second poll. Non-catalog names are ignored
+by this binding check; missing deployments are handled by registry per-offer probes
+and the gateway. The gateway still checks each response's model echo.
+
+[Foundry setup](foundry-setup.md) gives the deployment creation prerequisites,
+creation API version, and replacement procedure. These operator actions are
+separate from the verifier's ARM reads.
+
+The CLI retains the `upstream-model-hop` image feature check and the
+`upstream-model-echo` registry capability fence. Declare qualified cloud routes
+with the same canonical `provider/model` as direct routes. `gmcli doctor` lists
+ARM name, format, model and version, flags catalog-named violations, then sends
+one 1-token request per honestly named catalog deployment and prints its model echo.
+Direct Anthropic/OpenAI routes still require verified key slots enforced inside
+the miner runtime.
 
 ## One lottery entry per worker
 
@@ -267,8 +276,8 @@ reading anything into its count.
 
 Note that the current `declare-products` fan-out checks `upstream-model-echo`
 but skips cloud-backed entries because its bulk request has no per-deployment
-binding. Use `declare-product` for one qualified cloud route; the deployment map
-remains inside the measured image and is not part of the declaration.
+binding. Use `declare-product` for one qualified cloud route. Its canonical gm model id
+also names the Azure deployment; the declaration has no separate deployment field.
 
 To withdraw a route later, `gmcli undeclare-product --provider engy --model
 glm-5.2`. The registry keeps the row for audit and re-declaring re-offers it.

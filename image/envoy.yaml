@@ -1,4 +1,4 @@
-## gm miner Envoy configuration — six provider routes plus an
+## gm miner Envoy configuration — provider routes plus an
 ## optional benchmark route.
 ##
 ## Routes match on the `x-gm-provider` header set by the gateway and
@@ -37,8 +37,7 @@
 ## Prometheus metrics: the `metrics` listener on :9902 below surfaces
 ## `/stats/prometheus` (and only that path) to external scrapers, gated
 ## on `x-gm-node-key`. The full admin interface stays loopback-only.
-## See that listener's own comment for the rationale. This replaces the
-## deleted capability sidecar's `/metrics` endpoint.
+## See that listener's own comment for the rationale.
 ##
 ## Load shedding: under saturation the data plane sheds load with an
 ## HTTP 429 rather than by resetting connections. The HTTP local
@@ -385,22 +384,27 @@ static_resources:
                                   numerator: 0
                                   denominator: HUNDRED
 
-                        ## gm:anthropic-cloud-hop-route-begin
-                        ## ── Foundry qualified Messages surface ─────────────
-                        ##  The hop is reached only after the node-secret Lua
-                        ##  filter. It rewrites the model, then the loopback
-                        ##  Envoy egress listener below applies Foundry's
-                        ##  fixed path, host, auth, SNI, and SAN policy.
+                        ## gm:anthropic-foundry-route-begin
                         - match:
                             path: "/v1/messages"
                             headers:
-                              - name: "x-gm-provider"
+                              - name: x-gm-provider
                                 string_match:
                                   exact: "anthropic"
                           route:
-                            cluster: cloud_hop
+                            cluster: anthropic
+                            host_rewrite_literal: __GM_ANTHROPIC_HOST__
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/messages$"
+                              substitution: "/anthropic/v1/messages"
                             timeout: 1800s
                           request_headers_to_remove:
+                            - authorization
+                            - x-api-key
+                            - api-key
+                            - x-goog-api-key
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
@@ -409,10 +413,14 @@ static_resources:
                             - x-gm-upstream-slot
                           request_headers_to_add:
                             - header:
-                                key: x-gm-cloud-hop-provider
-                                value: "foundry"
+                                key: x-api-key
+                                value: "%ENVIRONMENT(GM_ANTHROPIC_KEY_SLOT_1)%"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
-                        ## gm:anthropic-cloud-hop-route-end
+                            - header:
+                                key: anthropic-version
+                                value: "2023-06-01"
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                        ## gm:anthropic-foundry-route-end
                         ## gm:anthropic-bedrock-reject-route-begin
                         ## ── Bedrock unqualified-surface fence ───────────────
                         ##  Bedrock has no authoritative model echo in this
@@ -442,14 +450,10 @@ static_resources:
                         ## gm:anthropic-bedrock-reject-route-end
                         ## gm:anthropic-direct-route-begin
                         ## ── Anthropic ───────────────────────────────────────
-                        ##  Enabled only when ANTHROPIC_API_KEY is set.
-                        ##  The route matches any path beginning with /v1/ that
-                        ##  was tagged with x-gm-product: anthropic/* by the
-                        ##  gateway. The header x-gm-provider is set by the
-                        ##  gateway; we use it as the route discriminator so
-                        ##  Envoy's static config can separate providers while
-                        ##  the template engine strips the route block entirely
-                        ##  when the key is absent.
+                        ##  Keep the direct route when its key is absent so
+                        ##  registry probes can observe the upstream auth failure.
+                        ##  Cloud selectors exclude it to prevent fallback around
+                        ##  their restricted inference surfaces.
                         - match:
                             prefix: "/"
                             headers:
@@ -459,13 +463,6 @@ static_resources:
                           route:
                             cluster: anthropic
                             host_rewrite_literal: __GM_ANTHROPIC_HOST__
-                            ## gm:anthropic-path-rewrite-begin
-                            regex_rewrite:
-                              pattern:
-                                google_re2: {}
-                                regex: "^/v1/messages$"
-                              substitution: "/anthropic/v1/messages"
-                            ## gm:anthropic-path-rewrite-end
                             ##  Total request/response duration cap. Raised to 1800s so a
                             ##  long single-item reasoning stream — o3, kimi-k3 or a
                             ##  Qwen-thinking model on a hard item flows reasoning tokens
@@ -504,33 +501,33 @@ static_resources:
                             - x-gm-provider
                             - x-gm-upstream-slot
                           request_headers_to_add:
-                            ## gm:anthropic-static-auth-begin
-                            - header:
-                                key: __GM_ANTHROPIC_AUTH_HEADER__
-                                value: "__GM_ANTHROPIC_AUTH_VALUE__"
-                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
-                            ## gm:anthropic-static-auth-end
                             - header:
                                 key: anthropic-version
                                 value: "2023-06-01"
                               append_action: __GM_ANTHROPIC_VERSION_APPEND_ACTION__
 
                         ## gm:anthropic-direct-route-end
-                        ## gm:openai-cloud-hop-route-begin
-                        ## ── Azure OpenAI qualified chat surface ─────────────
-                        ##  Chat completions is qualified by the 2026-09-09
-                        ##  dated-model echo. Azure Responses is deliberately
-                        ##  rejected below: its echo is the deployment name.
+                        ## gm:openai-azure-route-begin
                         - match:
                             path: "/v1/chat/completions"
                             headers:
-                              - name: "x-gm-provider"
+                              - name: x-gm-provider
                                 string_match:
                                   exact: "openai"
                           route:
-                            cluster: cloud_hop
+                            cluster: openai
+                            host_rewrite_literal: __GM_OPENAI_HOST__
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/chat/completions$"
+                              substitution: "/openai/v1/chat/completions"
                             timeout: 1800s
                           request_headers_to_remove:
+                            - authorization
+                            - x-api-key
+                            - api-key
+                            - x-goog-api-key
                             - x-gm-request-id
                             - x-gm-gateway-sig
                             - x-gm-product
@@ -539,17 +536,17 @@ static_resources:
                             - x-gm-upstream-slot
                           request_headers_to_add:
                             - header:
-                                key: x-gm-cloud-hop-provider
-                                value: "azure-openai"
+                                key: api-key
+                                value: "%ENVIRONMENT(GM_OPENAI_KEY_SLOT_1)%"
                               append_action: OVERWRITE_IF_EXISTS_OR_ADD
-                        ## gm:openai-cloud-hop-route-end
+                        ## gm:openai-azure-route-end
                         ## gm:openai-azure-responses-reject-begin
                         ## ── Azure OpenAI Responses qualification fence ─────
                         ##  The live response.created/non-streaming echo is the
                         ##  deployment name (`gm-echo-test`), not the model.
                         ##  Keep this explicit JSON 400 before the generic
                         ##  OpenAI route so an Azure Responses request cannot
-                        ##  silently bypass the measured hop.
+                        ##  reach an unqualified response surface.
                         - match:
                             path: "/v1/responses"
                             headers:
@@ -584,20 +581,6 @@ static_resources:
                           route:
                             cluster: openai
                             host_rewrite_literal: __GM_OPENAI_HOST__
-                            ## gm:openai-path-rewrite-begin
-                            ##  Azure OpenAI serves its OpenAI-compatible
-                            ##  chat-completions surface under /openai/v1, so
-                            ##  the inbound /v1/chat/completions path is
-                            ##  rewritten to its /openai/v1 form. Direct
-                            ##  api.openai.com serves both under /v1, so the
-                            ##  rewrite is dropped entirely for `direct` via
-                            ##  OPENAI_PATH_REWRITE.
-                            regex_rewrite:
-                              pattern:
-                                google_re2: {}
-                                regex: "^/v1/chat/completions$"
-                              substitution: "/openai/v1/chat/completions"
-                            ## gm:openai-path-rewrite-end
                             timeout: 1800s
                             retry_policy:
                               retry_on: "reset,connect-failure,refused-stream,5xx"
@@ -609,13 +592,6 @@ static_resources:
                             - x-gm-node-key
                             - x-gm-provider
                             - x-gm-upstream-slot
-                          ## gm:openai-static-auth-begin
-                          request_headers_to_add:
-                            - header:
-                                key: __GM_OPENAI_AUTH_HEADER__
-                                value: "__GM_OPENAI_AUTH_VALUE__"
-                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
-                          ## gm:openai-static-auth-end
 
                         ## gm:openai-direct-route-end
                         ## ── Chutes ──────────────────────────────────────────
@@ -916,7 +892,7 @@ static_resources:
                   ##  `start.sh` substitutes the `__GM_NODE_SECRET__`
                   ##  placeholder below with the value of the
                   ##  `GM_NODE_SECRET` env var at container start, then
-                  ##  execs envoy against the rendered config. The secret
+                  ##  launches envoy against the rendered config. The secret
                   ##  is a config literal at runtime. Provider keys are
                   ##  different: start.sh fans them out into per-slot
                   ##  process env vars and renders only slot ids + env var
@@ -933,14 +909,13 @@ static_resources:
                           local slot_config = {
                             anthropic = {
                               cloud = __GM_ANTHROPIC_CLOUD__,
-                              cloud_hop = __GM_ANTHROPIC_CLOUD_HOP__,
+                              disabled = __GM_ANTHROPIC_BEDROCK_UNQUALIFIED__,
                               direct_env = "ANTHROPIC_API_KEY",
                               default_env = __GM_ANTHROPIC_DEFAULT_SLOT_ENV__,
                               slots = __GM_ANTHROPIC_SLOT_MAP__,
                             },
                             openai = {
                               cloud = __GM_OPENAI_CLOUD__,
-                              cloud_hop = __GM_OPENAI_CLOUD_HOP__,
                               direct_env = "OPENAI_API_KEY",
                               default_env = __GM_OPENAI_DEFAULT_SLOT_ENV__,
                               slots = __GM_OPENAI_SLOT_MAP__,
@@ -1031,6 +1006,23 @@ static_resources:
                             headers:remove("api-key")
                           end
 
+                          local function strip_internal_headers(headers, provider)
+                            -- Envoy forbids header mutation during iteration. Keep the
+                            -- route discriminator until route actions remove it, and
+                            -- NEAR's validated selector until its loopback verifier.
+                            local names = {}
+                            for name in pairs(headers) do
+                              if name:sub(1, 5) == "x-gm-"
+                                and name ~= "x-gm-provider"
+                                and not (provider == "near" and name == "x-gm-upstream-model") then
+                                names[#names + 1] = name
+                              end
+                            end
+                            for _, name in ipairs(names) do
+                              headers:remove(name)
+                            end
+                          end
+
                           local function getenv(name)
                             if os == nil or os.getenv == nil then
                               return nil
@@ -1080,10 +1072,7 @@ static_resources:
                               return true
                             end
 
-                            -- A cloud adapter that is not routed through the
-                            -- measured hop (currently Bedrock) remains direct
-                            -- and must reject all registry slot headers.
-                            if cfg.cloud and not cfg.cloud_hop then
+                            if cfg.disabled then
                               if requested ~= nil then
                                 slot_unavailable(handle, requested)
                               else
@@ -1094,10 +1083,7 @@ static_resources:
                               end
                               return false
                             end
-                            -- A qualified adapter is reached only through the
-                            -- hop route and may accept its one authenticated
-                            -- cloud slot there.
-                            if cfg.cloud and cfg.cloud_hop then
+                            if cfg.cloud then
                               if requested == nil then
                                 slot_unavailable(handle, "")
                                 return false
@@ -1107,9 +1093,6 @@ static_resources:
                                 slot_unavailable(handle, requested)
                                 return false
                               end
-                              -- Cloud egress auth is added by the internal
-                              -- listener after the hop has rewritten the
-                              -- request. No direct key is selected here.
                               return true
                             end
                             local env_name = nil
@@ -1163,7 +1146,7 @@ static_resources:
                                 return
                               end
                             end
-                            -- Route actions remove gm metadata before the
+                            -- Header cleanup removes gm metadata before the
                             -- upstream request leaves the CVM. Only after the
                             -- node key has authenticated the caller, snapshot
                             -- the three non-secret correlation values into
@@ -1206,6 +1189,7 @@ static_resources:
                             if not select_upstream_slot(handle, headers, provider) then
                               return
                             end
+                            strip_internal_headers(headers, provider)
                           end
                   ## ── Graceful load shedding ──────────────────────────
                   ##  The miner's saturation signal. Without it a miner
@@ -1272,110 +1256,6 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
-    ## gm:cloud-hop-listener-begin
-    ## ── Measured cloud-hop egress listener ────────────────────────────
-    ##  Loopback only. The Rust hop sends the already model-translated
-    ##  request here; this listener is the only route that can reach the
-    ##  existing TLS egress clusters for qualified cloud adapters.
-    - name: cloud_hop_egress
-      address:
-        socket_address:
-          address: 127.0.0.1
-          port_value: 8084
-      filter_chains:
-        - filters:
-            - name: envoy.filters.network.http_connection_manager
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-                stat_prefix: cloud_hop_egress_http
-                stream_idle_timeout: 1800s
-                route_config:
-                  name: cloud_hop_egress_routes
-                  virtual_hosts:
-                    - name: cloud_hop_egress
-                      domains: ["*"]
-                      routes:
-                        - match:
-                            path: "/v1/chat/completions"
-                            headers:
-                              - name: x-gm-cloud-hop-provider
-                                string_match:
-                                  exact: "azure-openai"
-                          route:
-                            cluster: openai
-                            host_rewrite_literal: __GM_OPENAI_HOST__
-                            regex_rewrite:
-                              pattern:
-                                google_re2: {}
-                                regex: "^/v1/chat/completions$"
-                              substitution: "/openai/v1/chat/completions"
-                            timeout: 1800s
-                          request_headers_to_remove:
-                            - authorization
-                            - x-api-key
-                            - api-key
-                            - x-goog-api-key
-                            - x-gm-cloud-hop-provider
-                            - x-gm-request-id
-                            - x-gm-gateway-sig
-                            - x-gm-product
-                            - x-gm-node-key
-                            - x-gm-provider
-                            - x-gm-upstream-slot
-                          request_headers_to_add:
-                            - header:
-                                key: api-key
-                                value: "%ENVIRONMENT(GM_OPENAI_KEY_SLOT_1)%"
-                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
-                        - match:
-                            path: "/v1/messages"
-                            headers:
-                              - name: x-gm-cloud-hop-provider
-                                string_match:
-                                  exact: "foundry"
-                          route:
-                            cluster: anthropic
-                            host_rewrite_literal: __GM_ANTHROPIC_HOST__
-                            regex_rewrite:
-                              pattern:
-                                google_re2: {}
-                                regex: "^/v1/messages$"
-                              substitution: "/anthropic/v1/messages"
-                            timeout: 1800s
-                          request_headers_to_remove:
-                            - authorization
-                            - x-api-key
-                            - api-key
-                            - x-goog-api-key
-                            - x-gm-cloud-hop-provider
-                            - x-gm-request-id
-                            - x-gm-gateway-sig
-                            - x-gm-product
-                            - x-gm-node-key
-                            - x-gm-provider
-                            - x-gm-upstream-slot
-                          request_headers_to_add:
-                            - header:
-                                key: x-api-key
-                                value: "%ENVIRONMENT(GM_ANTHROPIC_KEY_SLOT_1)%"
-                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
-                            - header:
-                                key: anthropic-version
-                                value: "2023-06-01"
-                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
-                        - match:
-                            prefix: "/"
-                          direct_response:
-                            status: 404
-                            body:
-                              inline_string: '{"error":"cloud hop egress surface is not enabled"}'
-                          request_headers_to_remove:
-                            - x-gm-cloud-hop-provider
-                http_filters:
-                  - name: envoy.filters.http.router
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-    ## gm:cloud-hop-listener-end
     ## ── Prometheus metrics listener ──────────────────────────────────
     ##  Surfaces ONLY `/stats/prometheus` to the outside. The full Envoy
     ##  admin interface on :9901 (loopback) also serves `/quitquitquit`,
@@ -1525,24 +1405,6 @@ static_resources:
                       address: 127.0.0.1
                       port_value: 8082
 
-    ## gm:cloud-hop-cluster-begin
-    ## ── Measured cloud model hop ──────────────────────────────────────
-    ##  The hop is a loopback HTTP/1.1 process. It has no cloud TLS client;
-    ##  Envoy's existing `anthropic` and `openai` clusters remain the only
-    ##  restricted egress paths and retain their host/SNI/SAN configuration.
-    - name: cloud_hop
-      type: STATIC
-      connect_timeout: 5s
-      load_assignment:
-        cluster_name: cloud_hop
-        endpoints:
-          - lb_endpoints:
-              - endpoint:
-                  address:
-                    socket_address:
-                      address: 127.0.0.1
-                      port_value: 8083
-    ## gm:cloud-hop-cluster-end
     ## ── Anthropic ─────────────────────────────────────────────────────
     - name: anthropic
       type: LOGICAL_DNS
@@ -1615,7 +1477,7 @@ static_resources:
               trusted_ca:
                 filename: /etc/ssl/certs/ca-certificates.crt
               # Azure serves wildcard DNS SANs. Match the configured Azure suffix;
-              # attestd ARM binding and exact SAN pin keep resource scope.
+              # ARM binds the configured host to the account; this matcher checks its suffix.
               match_typed_subject_alt_names:
                 - san_type: DNS
                   matcher:

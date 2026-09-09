@@ -7,6 +7,137 @@ use gm_miner_cli::{
     network::Network,
 };
 
+#[derive(clap::Args)]
+pub(crate) struct SetApiKeysArgs {
+    /// Anthropic API key (sk-ant-...).
+    #[arg(long)]
+    anthropic: Option<String>,
+
+    /// Anthropic transport selector: direct, bedrock, or foundry.
+    /// Foundry uses the ARM-verified model binding; cloud operations also require
+    /// the registry capability `upstream-model-echo`. Bedrock remains a
+    /// disabled inference transport in this image.
+    #[arg(long)]
+    anthropic_upstream: Option<String>,
+
+    /// AWS Bedrock region for `ANTHROPIC_UPSTREAM=bedrock`.
+    #[arg(long)]
+    bedrock_region: Option<String>,
+
+    /// AWS Bedrock API key for `ANTHROPIC_UPSTREAM=bedrock`.
+    #[arg(long)]
+    bedrock_api_key: Option<String>,
+
+    /// Microsoft Foundry (Claude on Azure) settings.
+    #[command(flatten)]
+    foundry: FoundryArgs,
+
+    /// `OpenAI` API key (sk-...).
+    #[arg(long)]
+    openai: Option<String>,
+
+    /// `OpenAI` transport selector: direct or azure. Azure uses the
+    /// ARM-verified model binding; offers still require feature admission.
+    #[arg(long)]
+    openai_upstream: Option<String>,
+
+    /// Azure `OpenAI` HTTPS endpoint URL for `OPENAI_UPSTREAM=azure`.
+    #[arg(long)]
+    azure_openai_endpoint: Option<String>,
+
+    /// Azure `OpenAI` API key for `OPENAI_UPSTREAM=azure`.
+    #[arg(long)]
+    azure_openai_api_key: Option<String>,
+
+    /// Azure tenant ID for ARM verification when `OPENAI_UPSTREAM=azure`.
+    #[arg(long)]
+    azure_tenant_id: Option<String>,
+
+    /// Azure subscription ID for ARM verification when `OPENAI_UPSTREAM=azure`.
+    #[arg(long)]
+    azure_subscription_id: Option<String>,
+
+    /// Azure resource group for ARM verification when `OPENAI_UPSTREAM=azure`.
+    #[arg(long)]
+    azure_resource_group: Option<String>,
+
+    /// Azure client ID for ARM verification when `OPENAI_UPSTREAM=azure`.
+    #[arg(long)]
+    azure_client_id: Option<String>,
+
+    /// Azure client secret for ARM verification when `OPENAI_UPSTREAM=azure`.
+    #[arg(long)]
+    azure_client_secret: Option<String>,
+
+    /// Google API key.
+    #[arg(long)]
+    google: Option<String>,
+
+    /// Chutes API key (cpk_...).
+    #[arg(long)]
+    chutes: Option<String>,
+
+    /// Z.ai API key.
+    #[arg(long)]
+    zai: Option<String>,
+
+    /// Moonshot API key.
+    #[arg(long)]
+    moonshot: Option<String>,
+
+    /// `DeepInfra` API key.
+    #[arg(long)]
+    deepinfra: Option<String>,
+
+    /// `KubeTEE` API key.
+    #[arg(long)]
+    kubetee: Option<String>,
+
+    /// Engy API key.
+    #[arg(long)]
+    engy: Option<String>,
+
+    /// Moonmath ZRO API key (sk-...).
+    #[arg(long)]
+    moonmath: Option<String>,
+
+    /// NEAR AI Cloud API key.
+    #[arg(long)]
+    near: Option<String>,
+}
+
+impl SetApiKeysArgs {
+    pub(crate) fn run(self, network: Option<Network>) -> Result<()> {
+        let mut update = ProviderKeys {
+            anthropic: self.anthropic,
+            anthropic_upstream: self.anthropic_upstream,
+            bedrock_region: self.bedrock_region,
+            bedrock_api_key: self.bedrock_api_key,
+            openai: self.openai,
+            openai_upstream: self.openai_upstream,
+            azure_openai_endpoint: self.azure_openai_endpoint,
+            azure_openai_api_key: self.azure_openai_api_key,
+            azure_tenant_id: self.azure_tenant_id,
+            azure_subscription_id: self.azure_subscription_id,
+            azure_resource_group: self.azure_resource_group,
+            azure_client_id: self.azure_client_id,
+            azure_client_secret: self.azure_client_secret,
+            google: self.google,
+            chutes: self.chutes,
+            zai: self.zai,
+            moonshot: self.moonshot,
+            deepinfra: self.deepinfra,
+            kubetee: self.kubetee,
+            engy: self.engy,
+            moonmath: self.moonmath,
+            near: self.near,
+            ..ProviderKeys::default()
+        };
+        self.foundry.merge_into(&mut update);
+        cmd_set_api_keys(network, update)
+    }
+}
+
 /// Validate a key value passed to `set-api-keys`: reject empty / whitespace-only
 /// strings with an actionable error rather than silently storing them.
 fn validate_key(name: &str, value: &str) -> Result<()> {
@@ -30,14 +161,10 @@ fn validate_selector(name: &str, value: &str, allowed: &[&str]) -> Result<()> {
 /// The `ANTHROPIC_UPSTREAM=foundry` transport flag group: the Claude-on-Azure
 /// data-plane endpoint and key, plus the read-only Entra service principal
 /// `attestd` uses to verify the Foundry account carries no owner-capture
-/// controls. The deployment map is data-only; registry/gateway admission and
-/// echo verification are a separate image-feature gate. Grouped so
-/// the eight settings travel as one argument instead of widening an already-long
-/// handler signature.
+/// controls and verifies catalog-named deployment identities through ARM.
 #[derive(Debug, Default, clap::Args)]
 pub(crate) struct FoundryArgs {
     /// Microsoft Foundry transport endpoint for `ANTHROPIC_UPSTREAM=foundry`
-    /// (not currently registry-admissible)
     /// (`https://<resource>.services.ai.azure.com`).
     #[arg(long = "azure-foundry-endpoint")]
     pub(crate) endpoint: Option<String>,
@@ -65,42 +192,9 @@ pub(crate) struct FoundryArgs {
     /// Azure client secret for Foundry ARM verification.
     #[arg(long = "azure-foundry-client-secret")]
     pub(crate) client_secret: Option<String>,
-
-    /// Canonical-to-deployment map for qualified Foundry Messages models,
-    /// formatted as `canonical=deployment;canonical=deployment`.
-    #[arg(long = "foundry-deployments")]
-    pub(crate) deployments: Option<String>,
 }
 
 impl FoundryArgs {
-    fn validate(&self) -> Result<()> {
-        for (name, value) in [
-            ("azure-foundry-endpoint", self.endpoint.as_deref()),
-            ("azure-foundry-api-key", self.api_key.as_deref()),
-            ("azure-foundry-tenant-id", self.tenant_id.as_deref()),
-            (
-                "azure-foundry-subscription-id",
-                self.subscription_id.as_deref(),
-            ),
-            (
-                "azure-foundry-resource-group",
-                self.resource_group.as_deref(),
-            ),
-            ("azure-foundry-client-id", self.client_id.as_deref()),
-            ("azure-foundry-client-secret", self.client_secret.as_deref()),
-            ("foundry-deployments", self.deployments.as_deref()),
-        ] {
-            if let Some(value) = value {
-                validate_key(name, value)?;
-            }
-        }
-        if let Some(value) = self.deployments.as_deref() {
-            gm_cloud_hop::parse_deployment_map(gm_cloud_hop::CloudProvider::Foundry, value)
-                .context("validate --foundry-deployments")?;
-        }
-        Ok(())
-    }
-
     fn merge_into(self, keys: &mut ProviderKeys) {
         if let Some(v) = self.endpoint {
             keys.azure_foundry_endpoint = Some(v);
@@ -122,9 +216,6 @@ impl FoundryArgs {
         }
         if let Some(v) = self.client_secret {
             keys.azure_foundry_client_secret = Some(v);
-        }
-        if let Some(v) = self.deployments {
-            keys.azure_foundry_deployments = Some(v);
         }
     }
 }
@@ -165,7 +256,6 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
             keys.azure_foundry_resource_group.as_ref(),
             keys.azure_foundry_client_id.as_ref(),
             keys.azure_foundry_client_secret.as_ref(),
-            keys.azure_foundry_deployments.as_ref(),
         ],
     );
     group("openai", &[keys.openai.as_ref()]);
@@ -179,7 +269,6 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
             keys.azure_resource_group.as_ref(),
             keys.azure_client_id.as_ref(),
             keys.azure_client_secret.as_ref(),
-            keys.azure_openai_deployments.as_ref(),
         ],
     );
     group("google", &[keys.google.as_ref()]);
@@ -203,209 +292,26 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
     lines
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "single CLI command handler validates, persists, and reports all provider settings"
-)]
 pub(crate) fn cmd_set_api_keys(
     explicit_network: Option<Network>,
-    anthropic: Option<String>,
-    anthropic_upstream: Option<String>,
-    bedrock_region: Option<String>,
-    bedrock_api_key: Option<String>,
-    foundry: FoundryArgs,
-    openai: Option<String>,
-    openai_upstream: Option<String>,
-    azure_openai_endpoint: Option<String>,
-    azure_openai_api_key: Option<String>,
-    azure_tenant_id: Option<String>,
-    azure_subscription_id: Option<String>,
-    azure_resource_group: Option<String>,
-    azure_client_id: Option<String>,
-    azure_client_secret: Option<String>,
-    azure_deployments: Option<String>,
-    google: Option<String>,
-    chutes: Option<String>,
-    zai: Option<String>,
-    moonshot: Option<String>,
-    deepinfra: Option<String>,
-    kubetee: Option<String>,
-    engy: Option<String>,
-    moonmath: Option<String>,
-    near: Option<String>,
+    update: ProviderKeys,
 ) -> Result<()> {
-    // Reject empty values up front so they don't pass the deploy preflight.
-    if let Some(ref k) = anthropic {
-        validate_key("anthropic", k)?;
-    }
-    if let Some(ref v) = anthropic_upstream {
-        validate_selector("anthropic-upstream", v, &["direct", "bedrock", "foundry"])?;
-    }
-    foundry.validate()?;
-    if let Some(ref v) = bedrock_region {
-        validate_key("bedrock-region", v)?;
-    }
-    if let Some(ref k) = bedrock_api_key {
-        validate_key("bedrock-api-key", k)?;
-    }
-    if let Some(ref k) = openai {
-        validate_key("openai", k)?;
-    }
-    if let Some(ref v) = openai_upstream {
-        validate_selector("openai-upstream", v, &["direct", "azure"])?;
-    }
-    if let Some(ref v) = azure_openai_endpoint {
-        validate_key("azure-openai-endpoint", v)?;
-    }
-    if let Some(ref k) = azure_openai_api_key {
-        validate_key("azure-openai-api-key", k)?;
-    }
-    if let Some(ref v) = azure_tenant_id {
-        validate_key("azure-tenant-id", v)?;
-    }
-    if let Some(ref v) = azure_subscription_id {
-        validate_key("azure-subscription-id", v)?;
-    }
-    if let Some(ref v) = azure_resource_group {
-        validate_key("azure-resource-group", v)?;
-    }
-    if let Some(ref v) = azure_client_id {
-        validate_key("azure-client-id", v)?;
-    }
-    if let Some(ref v) = azure_client_secret {
-        validate_key("azure-client-secret", v)?;
-    }
-    if let Some(ref v) = azure_deployments {
-        validate_key("azure-deployments", v)?;
-        gm_cloud_hop::parse_deployment_map(gm_cloud_hop::CloudProvider::AzureOpenAi, v)
-            .context("validate --azure-deployments")?;
-    }
-    if let Some(ref k) = google {
-        validate_key("google", k)?;
-    }
-    if let Some(ref k) = chutes {
-        validate_key("chutes", k)?;
-    }
-    if let Some(ref k) = zai {
-        validate_key("zai", k)?;
-    }
-    if let Some(ref k) = moonshot {
-        validate_key("moonshot", k)?;
-    }
-    if let Some(ref k) = deepinfra {
-        validate_key("deepinfra", k)?;
-    }
-    if let Some(ref k) = engy {
-        validate_key("engy", k)?;
-    }
-    if let Some(ref k) = kubetee {
-        validate_key("kubetee", k)?;
-    }
-    if let Some(ref k) = moonmath {
-        validate_key("moonmath", k)?;
-    }
-    if let Some(ref k) = near {
-        validate_key("near", k)?;
-    }
-
-    // Load → mutate → save under the lock so a concurrent `deploy` save can't
-    // be clobbered, and re-read fresh inside the lock so we merge onto the
-    // latest on-disk state rather than a snapshot taken before the lock.
+    validate_update(&update)?;
+    // Re-read and merge under the lock so a concurrent deploy save is not lost.
     let lines = config::with_config_lock(|| {
         let mut cfg = config::load()
             .context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
-
-        // Provider keys are network-independent, but an explicit --network here
-        // is still the user's sticky selection — persist it so the promise holds
-        // even when set-api-keys is the command that carries the flag.
         if let Some(network) = explicit_network {
             cfg.set_network(network);
         }
-
         let keys = cfg.provider_keys.get_or_insert_with(ProviderKeys::default);
-        if let Some(k) = anthropic {
-            keys.anthropic = Some(k);
-        }
-        if let Some(v) = anthropic_upstream {
-            keys.anthropic_upstream = Some(v);
-        }
-        if let Some(v) = bedrock_region {
-            keys.bedrock_region = Some(v);
-        }
-        if let Some(k) = bedrock_api_key {
-            keys.bedrock_api_key = Some(k);
-        }
-        foundry.merge_into(keys);
-        if let Some(k) = openai {
-            keys.openai = Some(k);
-        }
-        if let Some(v) = openai_upstream {
-            keys.openai_upstream = Some(v);
-        }
-        if let Some(v) = azure_openai_endpoint {
-            keys.azure_openai_endpoint = Some(v);
-        }
-        if let Some(k) = azure_openai_api_key {
-            keys.azure_openai_api_key = Some(k);
-        }
-        if let Some(v) = azure_tenant_id {
-            keys.azure_tenant_id = Some(v);
-        }
-        if let Some(v) = azure_subscription_id {
-            keys.azure_subscription_id = Some(v);
-        }
-        if let Some(v) = azure_resource_group {
-            keys.azure_resource_group = Some(v);
-        }
-        if let Some(v) = azure_client_id {
-            keys.azure_client_id = Some(v);
-        }
-        if let Some(v) = azure_client_secret {
-            keys.azure_client_secret = Some(v);
-        }
-        if let Some(v) = azure_deployments {
-            keys.azure_openai_deployments = Some(v);
-        }
-        if let Some(k) = google {
-            keys.google = Some(k);
-        }
-        if let Some(k) = chutes {
-            keys.chutes = Some(k);
-        }
-        if let Some(k) = zai {
-            keys.zai = Some(k);
-        }
-        if let Some(k) = moonshot {
-            keys.moonshot = Some(k);
-        }
-        if let Some(k) = deepinfra {
-            keys.deepinfra = Some(k);
-        }
-        if let Some(k) = engy {
-            keys.engy = Some(k);
-        }
-        if let Some(k) = kubetee {
-            keys.kubetee = Some(k);
-        }
-        if let Some(k) = moonmath {
-            keys.moonmath = Some(k);
-        }
-        if let Some(k) = near {
-            keys.near = Some(k);
-        }
-        keys.canonicalize_deployment_maps()?;
+        merge_update(keys, update);
         let lines = summary_lines(keys);
-
         config::save(&cfg).context("save config")?;
         Ok(lines)
     })?;
-
-    // Report what is now configured — never print a key's value.
     if lines.is_empty() {
-        println!(
-            "No keys stored (pass a provider key or a cloud deployment map such as \
-             --foundry-deployments or --azure-deployments to set one)."
-        );
+        println!("No keys stored (pass a provider key to set one).");
     } else {
         println!("Provider keys updated.");
         for line in &lines {
@@ -414,6 +320,145 @@ pub(crate) fn cmd_set_api_keys(
         println!("\nNext: gmcli deploy --image-repo ghcr.io/<owner>/gm-miner");
     }
     Ok(())
+}
+
+fn validate_update(keys: &ProviderKeys) -> Result<()> {
+    for (name, value) in [
+        (
+            "azure-foundry-endpoint",
+            keys.azure_foundry_endpoint.as_deref(),
+        ),
+        (
+            "azure-foundry-api-key",
+            keys.azure_foundry_api_key.as_deref(),
+        ),
+        (
+            "azure-foundry-tenant-id",
+            keys.azure_foundry_tenant_id.as_deref(),
+        ),
+        (
+            "azure-foundry-subscription-id",
+            keys.azure_foundry_subscription_id.as_deref(),
+        ),
+        (
+            "azure-foundry-resource-group",
+            keys.azure_foundry_resource_group.as_deref(),
+        ),
+        (
+            "azure-foundry-client-id",
+            keys.azure_foundry_client_id.as_deref(),
+        ),
+        (
+            "azure-foundry-client-secret",
+            keys.azure_foundry_client_secret.as_deref(),
+        ),
+        ("anthropic", keys.anthropic.as_deref()),
+        ("bedrock-region", keys.bedrock_region.as_deref()),
+        ("bedrock-api-key", keys.bedrock_api_key.as_deref()),
+        ("openai", keys.openai.as_deref()),
+        (
+            "azure-openai-endpoint",
+            keys.azure_openai_endpoint.as_deref(),
+        ),
+        ("azure-openai-api-key", keys.azure_openai_api_key.as_deref()),
+        ("azure-tenant-id", keys.azure_tenant_id.as_deref()),
+        (
+            "azure-subscription-id",
+            keys.azure_subscription_id.as_deref(),
+        ),
+        ("azure-resource-group", keys.azure_resource_group.as_deref()),
+        ("azure-client-id", keys.azure_client_id.as_deref()),
+        ("azure-client-secret", keys.azure_client_secret.as_deref()),
+        ("google", keys.google.as_deref()),
+        ("chutes", keys.chutes.as_deref()),
+        ("zai", keys.zai.as_deref()),
+        ("moonshot", keys.moonshot.as_deref()),
+        ("deepinfra", keys.deepinfra.as_deref()),
+        ("kubetee", keys.kubetee.as_deref()),
+        ("engy", keys.engy.as_deref()),
+        ("moonmath", keys.moonmath.as_deref()),
+        ("near", keys.near.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_key(name, value)?;
+        }
+    }
+    if let Some(value) = keys.anthropic_upstream.as_deref() {
+        validate_selector(
+            "anthropic-upstream",
+            value,
+            &["direct", "bedrock", "foundry"],
+        )?;
+    }
+    if let Some(value) = keys.openai_upstream.as_deref() {
+        validate_selector("openai-upstream", value, &["direct", "azure"])?;
+    }
+    Ok(())
+}
+
+fn merge_update(keys: &mut ProviderKeys, update: ProviderKeys) {
+    for (target, value) in [
+        (&mut keys.anthropic, update.anthropic),
+        (&mut keys.anthropic_upstream, update.anthropic_upstream),
+        (&mut keys.bedrock_region, update.bedrock_region),
+        (&mut keys.bedrock_api_key, update.bedrock_api_key),
+        (&mut keys.openai, update.openai),
+        (&mut keys.openai_upstream, update.openai_upstream),
+        (
+            &mut keys.azure_openai_endpoint,
+            update.azure_openai_endpoint,
+        ),
+        (&mut keys.azure_openai_api_key, update.azure_openai_api_key),
+        (&mut keys.azure_tenant_id, update.azure_tenant_id),
+        (
+            &mut keys.azure_subscription_id,
+            update.azure_subscription_id,
+        ),
+        (&mut keys.azure_resource_group, update.azure_resource_group),
+        (&mut keys.azure_client_id, update.azure_client_id),
+        (&mut keys.azure_client_secret, update.azure_client_secret),
+        (&mut keys.google, update.google),
+        (&mut keys.chutes, update.chutes),
+        (&mut keys.zai, update.zai),
+        (&mut keys.moonshot, update.moonshot),
+        (&mut keys.deepinfra, update.deepinfra),
+        (&mut keys.kubetee, update.kubetee),
+        (&mut keys.engy, update.engy),
+        (&mut keys.moonmath, update.moonmath),
+        (&mut keys.near, update.near),
+        (
+            &mut keys.azure_foundry_endpoint,
+            update.azure_foundry_endpoint,
+        ),
+        (
+            &mut keys.azure_foundry_api_key,
+            update.azure_foundry_api_key,
+        ),
+        (
+            &mut keys.azure_foundry_tenant_id,
+            update.azure_foundry_tenant_id,
+        ),
+        (
+            &mut keys.azure_foundry_subscription_id,
+            update.azure_foundry_subscription_id,
+        ),
+        (
+            &mut keys.azure_foundry_resource_group,
+            update.azure_foundry_resource_group,
+        ),
+        (
+            &mut keys.azure_foundry_client_id,
+            update.azure_foundry_client_id,
+        ),
+        (
+            &mut keys.azure_foundry_client_secret,
+            update.azure_foundry_client_secret,
+        ),
+    ] {
+        if value.is_some() {
+            *target = value;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -431,7 +476,6 @@ mod tests {
             azure_foundry_resource_group: Some("rg".to_owned()),
             azure_foundry_client_id: Some("client".to_owned()),
             azure_foundry_client_secret: Some("secret".to_owned()),
-            azure_foundry_deployments: Some("claude-sonnet-4-6=foundry-sonnet".to_owned()),
             ..ProviderKeys::default()
         }
     }
