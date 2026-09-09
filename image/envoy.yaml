@@ -450,14 +450,10 @@ static_resources:
                         ## gm:anthropic-bedrock-reject-route-end
                         ## gm:anthropic-direct-route-begin
                         ## ── Anthropic ───────────────────────────────────────
-                        ##  Enabled only when ANTHROPIC_API_KEY is set.
-                        ##  The route matches any path beginning with /v1/ that
-                        ##  was tagged with x-gm-product: anthropic/* by the
-                        ##  gateway. The header x-gm-provider is set by the
-                        ##  gateway; we use it as the route discriminator so
-                        ##  Envoy's static config can separate providers while
-                        ##  the template engine strips the route block entirely
-                        ##  when the key is absent.
+                        ##  Keep the direct route when its key is absent so
+                        ##  registry probes can observe the upstream auth failure.
+                        ##  Cloud selectors exclude it to prevent fallback around
+                        ##  their restricted inference surfaces.
                         - match:
                             prefix: "/"
                             headers:
@@ -1150,7 +1146,7 @@ static_resources:
                                 return
                               end
                             end
-                            -- Route actions remove gm metadata before the
+                            -- Header cleanup removes gm metadata before the
                             -- upstream request leaves the CVM. Only after the
                             -- node key has authenticated the caller, snapshot
                             -- the three non-secret correlation values into

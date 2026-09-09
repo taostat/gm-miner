@@ -62,7 +62,7 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// not values, so every miner produces the same `compose_hash`. The order
 /// matches `render_env_file`: Anthropic direct/Bedrock/Foundry, `OpenAI`
 /// direct/Azure, Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, Engy,
-/// Moonmath and the node secret.
+/// Moonmath, NEAR and the node secret.
 /// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
 /// gm image is public and those vars do not appear in `allowed_envs`.
 const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
@@ -237,9 +237,8 @@ mod tests {
     /// and `APPROVED_BASELINE_ALLOWED_ENVS`.
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
         "81e5f2b7544840f5394dd76940a6cf75558a4e822e7992670972af9cca695377";
-    /// Candidate hash for this branch's measured compose. It is deliberately
-    /// separate from the approved baseline: the baseline proves historical
-    /// reproducibility while this pin makes candidate drift visible.
+    /// Keep the candidate pin separate: deterministic rendering does not confer
+    /// registry approval, and template changes must not move the approved anchor.
     const CANDIDATE_TESTNET_COMPOSE_HASH: &str =
         "6d41a82c6c49def6e6e84b182fe9d89e60621da21482c74543b2e1d8630210f2";
 
@@ -321,10 +320,8 @@ mod tests {
         );
     }
 
-    /// The measured object must carry the security flags Phala Cloud sets —
-    /// the content PR #70's deploy-and-read could not derive. Missing any of
-    /// them moves the hash, so assert they are present and true/false as
-    /// pinned.
+    /// Missing a Phala Cloud security flag changes the measured hash even when
+    /// the inner compose YAML is identical.
     #[test]
     fn app_compose_carries_the_security_flags() {
         let compose =
