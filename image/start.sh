@@ -2,8 +2,7 @@
 # gm miner container entrypoint.
 #
 # Startup runs the required one-shot gates, then launches the required
-# co-located
-# long-running processes:
+# co-located long-running processes:
 #
 #   0. gm-miner-attestd --verify-azure-once (one-shot, Azure only) —
 #      verifies the configured Azure OpenAI account owner-capture
@@ -24,7 +23,7 @@
 #      registry's x-gm-provider capability probes, and forwards
 #      /attestation/info to the attestation server.
 #
-# Disabled-route handling: envoy's static config carries all six
+# Disabled-route handling: envoy's static config carries all direct
 # provider clusters. Routes match on `x-gm-provider`. When the
 # corresponding env var is absent envoy injects an empty key and the
 # upstream returns 401; the registry's probe surfaces that as a
@@ -173,14 +172,14 @@ require_host_suffix() {
   exit 1
 }
 
-## Cloud backend keys are single-slot in this release: a ';'-separated value
+## Cloud backend keys are single-slot: a ';'-separated value
 ## would advertise slots the registry never probes.
 require_single_slot() {
   local name="$1"
   local value="$2"
   local upstream="$3"
   if [[ "${value}" == *";"* ]]; then
-    log "error: ${name} cannot contain ';' when ${upstream}; cloud backends are single-slot in this release"
+    log "error: ${name} cannot contain ';' when ${upstream}; cloud backends are single-slot"
     exit 1
   fi
 }
@@ -905,7 +904,7 @@ wait 2>/dev/null || true
 # unless-stopped` policy recreates the stack. A supervised process
 # exiting *at all* — even with a clean status 0 (a graceful or
 # self-initiated shutdown) — leaves the miner missing one of its required
-# required services, which is a failure. The exit code is only a
+# services, which is a failure. The exit code is only a
 # diagnostic detail: surface it when it is non-zero, otherwise exit 1
 # so a status-0 child exit is still treated as a container failure.
 if [[ "${FIRST_EXIT_STATUS}" -ne 0 ]]; then

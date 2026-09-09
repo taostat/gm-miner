@@ -108,10 +108,9 @@ worker offline when observed by the 60-second poll. Non-catalog names are ignore
 by this binding check; missing deployments are handled by registry per-offer probes
 and the gateway. The gateway still checks each response's model echo.
 
-Azure Anthropic deployment creation requires `modelProviderData` (`organizationName`,
-`countryCode`, lowercase `industry`); as of September 2026 only
-`api-version=2025-10-01-preview` accepts it. Azure cannot re-point a deployment in
-place: delete and recreate it. [Foundry setup](foundry-setup.md) gives the command.
+[Foundry setup](foundry-setup.md) gives the deployment creation prerequisites,
+creation API version, and replacement procedure. These operator actions are
+separate from the verifier's ARM reads.
 
 The CLI retains the `upstream-model-hop` image feature check and the
 `upstream-model-echo` registry capability fence. Declare qualified cloud routes

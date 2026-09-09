@@ -429,8 +429,8 @@ async fn resolve_bulk_policies(
 
 /// Remove only products whose resolved policy says a bulk request cannot
 /// establish safe direct supply. Bulk requests intentionally omit
-/// `upstream_model`; a known-direct worker remains eligible even when its hop
-/// image requires the registry compatibility fence.
+/// `upstream_model`; a known-direct worker remains eligible even when its image
+/// requires the registry compatibility fence.
 fn skip_cloud_bulk_targets(
     client: &RegistryClient,
     policies: &BTreeMap<String, CloudDeclarationPolicy>,
@@ -1031,15 +1031,15 @@ mod tests {
             .await;
     }
 
-    async fn mount_live_hop_worker(server: &MockServer) {
+    async fn mount_live_binding_worker(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/miners/5Grw.../workers"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "workers": [{
-                    "worker_id": "worker-hop",
+                    "worker_id": "worker-binding",
                     "endpoint": "https://worker.example",
                     "status": "active",
-                    "image_compose_hash": "hop-compose",
+                    "image_compose_hash": "binding-compose",
                     "last_attestation_at": null,
                     "supported_models": {},
                     "provider_slot_status": {}
@@ -1143,12 +1143,12 @@ mod tests {
     async fn direct_selector_with_no_local_workers_still_fences_live_supply() {
         let server = MockServer::start().await;
         mount_me(&server, serde_json::json!([])).await;
-        mount_live_hop_worker(&server).await;
+        mount_live_binding_worker(&server).await;
         Mock::given(method("GET"))
             .and(path("/image-versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "versions": [{
-                    "compose_hash": "hop-compose",
+                    "compose_hash": "binding-compose",
                     "os_image_hash": "os",
                     "status": "supported",
                     "notes": null,
@@ -1212,13 +1212,13 @@ mod tests {
     async fn known_direct_worker_on_cloud_binding_image_stays_in_bulk_supply() {
         let server = MockServer::start().await;
         mount_me(&server, serde_json::json!([])).await;
-        mount_live_hop_worker(&server).await;
+        mount_live_binding_worker(&server).await;
         mount_model_echo_capability(&server).await;
         Mock::given(method("GET"))
             .and(path("/image-versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "versions": [{
-                    "compose_hash": "hop-compose",
+                    "compose_hash": "binding-compose",
                     "os_image_hash": "os",
                     "status": "supported",
                     "notes": null,
@@ -1260,7 +1260,7 @@ mod tests {
 
         let mut config = config_for(&server);
         config.active_entry_mut().workers.push(WorkerRecord {
-            worker_id: "worker-hop".to_owned(),
+            worker_id: "worker-binding".to_owned(),
             backends: Some(std::collections::BTreeMap::new()),
             ..Default::default()
         });

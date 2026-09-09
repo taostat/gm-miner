@@ -1,4 +1,4 @@
-## gm miner Envoy configuration — six provider routes plus an
+## gm miner Envoy configuration — provider routes plus an
 ## optional benchmark route.
 ##
 ## Routes match on the `x-gm-provider` header set by the gateway and
@@ -37,8 +37,7 @@
 ## Prometheus metrics: the `metrics` listener on :9902 below surfaces
 ## `/stats/prometheus` (and only that path) to external scrapers, gated
 ## on `x-gm-node-key`. The full admin interface stays loopback-only.
-## See that listener's own comment for the rationale. This replaces the
-## deleted capability sidecar's `/metrics` endpoint.
+## See that listener's own comment for the rationale.
 ##
 ## Load shedding: under saturation the data plane sheds load with an
 ## HTTP 429 rather than by resetting connections. The HTTP local
@@ -897,7 +896,7 @@ static_resources:
                   ##  `start.sh` substitutes the `__GM_NODE_SECRET__`
                   ##  placeholder below with the value of the
                   ##  `GM_NODE_SECRET` env var at container start, then
-                  ##  execs envoy against the rendered config. The secret
+                  ##  launches envoy against the rendered config. The secret
                   ##  is a config literal at runtime. Provider keys are
                   ##  different: start.sh fans them out into per-slot
                   ##  process env vars and renders only slot ids + env var
@@ -1012,6 +1011,9 @@ static_resources:
                           end
 
                           local function strip_internal_headers(headers, provider)
+                            -- Envoy forbids header mutation during iteration. Keep the
+                            -- route discriminator until route actions remove it, and
+                            -- NEAR's validated selector until its loopback verifier.
                             local names = {}
                             for name in pairs(headers) do
                               if name:sub(1, 5) == "x-gm-"

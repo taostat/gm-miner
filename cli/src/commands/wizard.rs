@@ -17,7 +17,7 @@ use crate::commands::deploy::{
     cmd_deploy_subcommand, default_deploy_flags, deploy_args_from_flags, WorkerRegistration,
 };
 use crate::commands::hotkey::cmd_register_hotkey;
-use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
+use crate::commands::keys::cmd_set_api_keys;
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::products::{cmd_declare_products, DeclareOutcome};
 
@@ -408,43 +408,7 @@ fn wizard_provider_keys(
         title,
         &command,
         assume_yes,
-        cmd_set_api_keys(
-            explicit_network,
-            keys.anthropic,
-            keys.anthropic_upstream,
-            keys.bedrock_region,
-            keys.bedrock_api_key,
-            // The wizard prompts for direct provider keys only; cloud backends
-            // (Bedrock, Foundry, Azure OpenAI) are configured with the explicit
-            // `set-api-keys` flags. Carry through whatever is already stored.
-            FoundryArgs {
-                endpoint: keys.azure_foundry_endpoint,
-                api_key: keys.azure_foundry_api_key,
-                tenant_id: keys.azure_foundry_tenant_id,
-                subscription_id: keys.azure_foundry_subscription_id,
-                resource_group: keys.azure_foundry_resource_group,
-                client_id: keys.azure_foundry_client_id,
-                client_secret: keys.azure_foundry_client_secret,
-            },
-            keys.openai,
-            keys.openai_upstream,
-            keys.azure_openai_endpoint,
-            keys.azure_openai_api_key,
-            keys.azure_tenant_id,
-            keys.azure_subscription_id,
-            keys.azure_resource_group,
-            keys.azure_client_id,
-            keys.azure_client_secret,
-            keys.google,
-            keys.chutes,
-            keys.zai,
-            keys.moonshot,
-            keys.deepinfra,
-            keys.kubetee,
-            keys.engy,
-            keys.moonmath,
-            keys.near,
-        )
+        cmd_set_api_keys(explicit_network, keys)
     )
 }
 

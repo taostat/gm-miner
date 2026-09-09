@@ -700,6 +700,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cloud_probe_url_uses_the_same_https_port_as_the_data_plane() {
+        let url = cloud_probe_url(
+            "https://acct.services.ai.azure.com:8443/old/path",
+            "/anthropic/v1/messages",
+        )
+        .expect("url");
+        assert_eq!(
+            url.as_str(),
+            "https://acct.services.ai.azure.com/anthropic/v1/messages"
+        );
+        assert_eq!(url.port_or_known_default(), Some(443));
+    }
+
     #[tokio::test]
     async fn cloud_identity_check_sends_one_canonical_probe_and_checks_echo() {
         let server = MockServer::start().await;

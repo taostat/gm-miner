@@ -1,8 +1,8 @@
 //! Cloud model-ID compatibility and transport-selection helpers.
 //!
-//! Cloud adapters now carry their canonical-to-deployment data through the
-//! measured image hop, but the separate registry/gateway response-echo check
-//! still owns routing admission. Keep these helpers together so diagnostics
+//! Cloud deployments use canonical model ids verified by the in-TEE ARM binding;
+//! the registry/gateway response-echo check owns routing admission.
+//! Keep these helpers together so diagnostics
 //! and bulk-declaration guidance do not confuse transport capability with the
 //! feature-fenced model identity check.
 
@@ -215,8 +215,8 @@ pub async fn declaration_policy(
         return CloudDeclarationPolicy::FENCED;
     }
     if has_binding_image {
-        // A direct worker on a cloud-binding-capable image needs the model-echo fence, but it
-        // remains direct supply and must not disappear from a bulk set.
+        // The image's model-echo fence does not change a direct worker's supply,
+        // so it must not remove that worker from bulk declarations.
         return CloudDeclarationPolicy::FENCED_BUT_DIRECT;
     }
     CloudDeclarationPolicy::DIRECT

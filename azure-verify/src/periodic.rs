@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round4_staleness_survives_fast_transient_polls() {
+    async fn staleness_survives_fast_transient_polls() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429))
@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round5_boot_age_survives_a_later_targets_slow_sweep() {
+    async fn boot_age_survives_a_later_targets_slow_sweep() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(

@@ -66,9 +66,7 @@ RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
     target/release/gm-miner-ratls target/release/gm-near-verify-proxy
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
-## Envoy 1.32.x pinned by digest.
-## Update the pin via: docker manifest inspect envoyproxy/envoy:v1.32-latest
-## Current digest as of 2026-05-17:
+## Pin the base by digest so a mutable tag cannot change the attested runtime.
 FROM envoyproxy/envoy:v1.38-latest@sha256:4e3c734cbe9892a3513c97cf3974ff73cfef5d784f5cceed9ea758a2b80e0c31
 
 ## ca-certificates is already present in the envoy base image; nothing
@@ -80,9 +78,7 @@ FROM envoyproxy/envoy:v1.38-latest@sha256:4e3c734cbe9892a3513c97cf3974ff73cfef5d
 ARG GM_IMAGE_VERSION=dev
 ENV GM_IMAGE_VERSION=${GM_IMAGE_VERSION}
 
-## Copy the operator-side CLI binary. The CLI is included in the image
-## for one-shot ops tasks (config dump, key rotation) executed via
-## `docker run --entrypoint gmcli ...`.
+## start.sh depends on gmcli slot-env to derive key slots inside the TEE.
 COPY --from=builder /build/target/release/gmcli /usr/local/bin/gmcli
 
 ## Copy the attestation server. start.sh launches it alongside envoy;

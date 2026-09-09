@@ -13,6 +13,115 @@
 
 use gm_miner_cli::config::{Config, ProviderKeys};
 
+fn run_keys(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_gmcli"))
+        .env_clear()
+        .env("GMCLI_CONFIG_DIR", dir)
+        .args(["--testnet", "set-api-keys"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cli_persists_every_key_group_and_preserves_omitted_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let fields = [
+        ("anthropic", "anthropic-key"),
+        ("anthropic-upstream", "foundry"),
+        ("bedrock-region", "us-east-1"),
+        ("bedrock-api-key", "bedrock-key"),
+        (
+            "azure-foundry-endpoint",
+            "https://foundry.services.ai.azure.com",
+        ),
+        ("azure-foundry-api-key", "foundry-key"),
+        ("azure-foundry-tenant-id", "foundry-tenant"),
+        ("azure-foundry-subscription-id", "foundry-sub"),
+        ("azure-foundry-resource-group", "foundry-rg"),
+        ("azure-foundry-client-id", "foundry-client"),
+        ("azure-foundry-client-secret", "foundry-secret"),
+        ("openai", "openai-key"),
+        ("openai-upstream", "azure"),
+        ("azure-openai-endpoint", "https://openai.openai.azure.com"),
+        ("azure-openai-api-key", "azure-key"),
+        ("azure-tenant-id", "azure-tenant"),
+        ("azure-subscription-id", "azure-sub"),
+        ("azure-resource-group", "azure-rg"),
+        ("azure-client-id", "azure-client"),
+        ("azure-client-secret", "azure-secret"),
+        ("google", "google-key"),
+        ("chutes", "chutes-key"),
+        ("zai", "zai-key"),
+        ("moonshot", "moonshot-key"),
+        ("deepinfra", "deepinfra-key"),
+        ("kubetee", "kubetee-key"),
+        ("engy", "engy-key"),
+        ("moonmath", "moonmath-key"),
+        ("near", "near-key"),
+    ];
+    let args = fields
+        .iter()
+        .flat_map(|(flag, value)| [format!("--{flag}"), (*value).to_owned()])
+        .collect::<Vec<_>>();
+    let output = run_keys(
+        dir.path(),
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config_path = dir.path().join("config.json");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    for (flag, value) in fields {
+        assert_eq!(
+            saved["provider_keys"][flag.replace('-', "_")],
+            value,
+            "{flag}"
+        );
+        if !flag.ends_with("upstream") {
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains(value),
+                "{flag} value was printed"
+            );
+        }
+    }
+    let updated = run_keys(dir.path(), &["--openai", "replacement-key"]);
+    assert!(updated.status.success());
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+    let mut expected = saved;
+    expected["provider_keys"]["openai"] = "replacement-key".into();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn cli_rejects_invalid_updates_before_writing_any_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(run_keys(dir.path(), &["--openai", "first-key"])
+        .status
+        .success());
+    let config_path = dir.path().join("config.json");
+    let original = std::fs::read(&config_path).unwrap();
+    for args in [
+        vec!["--azure-foundry-client-secret", " ", "--openai", ""],
+        vec![
+            "--openai-upstream",
+            "invalid",
+            "--openai",
+            "replacement-key",
+        ],
+    ] {
+        let output = run_keys(dir.path(), &args);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(args[0]));
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+    }
+}
+
 /// Simulate the `cmd_set_api_keys` merge logic, working on in-memory `Config`
 /// values.  No filesystem I/O needed for most tests; the file-mode test
 /// uses a tempdir directly.

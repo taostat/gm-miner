@@ -20,7 +20,7 @@ handles the full operator lifecycle from your laptop.
 | Path | Description |
 |---|---|
 | `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, optional NEAR verifier, and Envoy data plane. |
-| `cli/` | `gmcli` CLI (Rust + clap). Login via Taostats device-code OAuth; register image; declare products + prices; check status. Runs operator-side from a laptop, not inside the TEE. |
+| `cli/` | `gmcli` CLI (Rust + clap). Operator commands handle login, image registration, products, and prices. The image also uses its hidden `slot-env` command to derive upstream key slots inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
 
@@ -222,12 +222,9 @@ gmcli set-api-keys \
   --azure-foundry-client-secret <password>
 ```
 
-As of September 2026, Azure Anthropic deployment creation requires `modelProviderData`
-with `organizationName`, `countryCode`, and lowercase `industry`; only
-`api-version=2025-10-01-preview` accepts it. A deployment cannot be re-pointed in place:
-delete and recreate it. See [Foundry setup](docs/foundry-setup.md) for the creation command
-and the capture controls to clear, including the Application Insights connection Azure
-attaches to portal-created Foundry resources.
+See [Foundry setup](docs/foundry-setup.md) for deployment creation prerequisites,
+the creation API version, replacement procedure, and capture controls to clear.
+The verifier reads ARM identities; it does not create or replace deployments.
 
 Run `gmcli doctor` before deploying. It lists the bound account's ARM deployments
 (name, format, model, version), flags every catalog-named mismatch, and sends one

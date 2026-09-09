@@ -611,10 +611,11 @@ pub(crate) async fn cmd_deploy(
         cfg,
         args,
         registration,
-        keys,
-        approved,
-        &versions,
-        worker_backends,
+        WorkerRecordInput {
+            keys,
+            slot_capable: image_is_slot_capable(args, approved, &versions),
+            backends: worker_backends,
+        },
     )?;
     let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
     println!("Resolved miner image: {}", target.image_ref);
@@ -666,9 +667,12 @@ async fn deploy_preflight<'a>(
     args: &DeployArgs,
     registration: &WorkerRegistration,
 ) -> Result<&'a gm_miner_cli::config::ProviderKeys> {
+    // Refuse unusable registry auth before any irreversible CVM work.
     client.preflight_auth().await?;
     reject_secondary_worker_deploy(cfg, client, registration, &args.app_name).await?;
+    // Phala cannot reuse a CVM name; detect collisions before paying for an image build.
     preflight_cvm_name(phala, &args.app_name)?;
+    // Only first-worker registration accepts terms, before any provider key is read.
     if *registration == WorkerRegistration::First {
         ensure_terms_accepted(cfg, args)?;
     }
@@ -683,22 +687,25 @@ async fn deploy_preflight<'a>(
     Ok(keys)
 }
 
+struct WorkerRecordInput<'a> {
+    keys: &'a gm_miner_cli::config::ProviderKeys,
+    slot_capable: bool,
+    backends: std::collections::BTreeMap<String, String>,
+}
+
 fn prepare_worker_record(
     cfg: &Config,
     args: &DeployArgs,
     registration: &WorkerRegistration,
-    keys: &gm_miner_cli::config::ProviderKeys,
-    approved: &ImageVersion,
-    versions: &[ImageVersion],
-    backends: std::collections::BTreeMap<String, String>,
+    input: WorkerRecordInput<'_>,
 ) -> Result<WorkerRecord> {
     let is_first = *registration == WorkerRegistration::First;
     let (node_secret, freshly_generated) =
         node_secret::for_worker(cfg.active_network_entry(), &args.app_name, is_first)?;
-    let provider_slots = if image_is_slot_capable(args, approved, versions) {
-        slots::provider_slots_for_keys(keys, &node_secret)?
+    let provider_slots = if input.slot_capable {
+        slots::provider_slots_for_keys(input.keys, &node_secret)?
     } else {
-        slots::reject_multikey_for_legacy_image(keys)?;
+        slots::reject_multikey_for_legacy_image(input.keys)?;
         std::collections::BTreeMap::new()
     };
     let record = WorkerRecord {
@@ -706,7 +713,7 @@ fn prepare_worker_record(
         app_id: String::new(),
         app_name: args.app_name.clone(),
         node_secret,
-        backends: Some(backends),
+        backends: Some(input.backends),
         provider_slots: (!provider_slots.is_empty()).then_some(provider_slots),
         provisional_secondary: !is_first,
     };

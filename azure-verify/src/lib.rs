@@ -330,8 +330,9 @@ impl AzureVerifier {
 
     /// Poll only the deployment binding between full owner-capture sweeps.
     ///
-    /// This intentionally performs one ARM deployment-list read per target;
-    /// capture settings remain on the slower full sweep. A catalog-named
+    /// Deployment evidence must remain bound to its account, so each poll also
+    /// checks the account binding. Child capture settings stay on the full sweep.
+    /// The deployment list may span several ARM pages. A catalog-named
     /// deployment serving another model stops the data plane when observed.
     ///
     /// # Errors

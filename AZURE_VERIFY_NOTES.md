@@ -49,16 +49,16 @@ The gate fails closed if:
   offline. Non-catalog names are ignored by this binding check. A missing
   deployment is not attestd's concern: registry per-offer probes and the gateway
   handle the upstream 404. `version` is retained as observed ARM evidence.
-- For Azure OpenAI, any deployment on the account references a Responsible AI policy whose `properties.mode` is not `Asynchronous_filter` or legacy `Deferred`. `Blocking`, `Default`, an absent mode, or a deployment with no `properties.raiPolicyName` is treated as synchronous buffering and always fails verification.
+- For Azure OpenAI, a non-Anthropic-format deployment references a Responsible AI policy whose `properties.mode` is not `Asynchronous_filter` or legacy `Deferred`. `Blocking`, `Default`, an absent mode, or a deployment with no `properties.raiPolicyName` is treated as synchronous buffering and fails verification. Anthropic-format deployments are excluded because Azure's RAI filter does not govern them.
 
 The streaming check uses the same scoped Entra credentials and ARM API version as the account binding check:
 
 - List deployments: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/deployments?api-version=2026-05-01`
 - Read each distinct referenced RAI policy: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/raiPolicies/{raiPolicyName}?api-version=2026-05-01`
 
-The verifier reads `value[].properties.raiPolicyName` from the deployment list, then reads `properties.mode` from each referenced RAI policy. Streaming is considered enabled only when the mode is `Asynchronous_filter` or `Deferred`. The verifier checks all deployments on the account so the attestation covers whatever the gateway may route to. The same list read checks the identity of every catalog-named deployment. An empty account passes the binding check.
+For Azure OpenAI, the verifier reads `value[].properties.raiPolicyName` from non-Anthropic-format deployments, then reads `properties.mode` from each referenced RAI policy. Streaming is considered enabled only when the mode is `Asynchronous_filter` or `Deferred`. The same deployment-list read checks the identity of every catalog-named deployment. An empty account passes the binding check. Foundry has no ARM streaming-policy check.
 
-Asynchronous content filtering (streaming-safe, no completion buffering) is required and enforced as gm policy. Any synchronous or buffering deployment fails the startup gate and continuous verification; there is no operator override.
+For Azure OpenAI's non-Anthropic-format deployments, asynchronous content filtering (streaming-safe, no completion buffering) is required and enforced as gm policy. A synchronous or buffering policy fails the startup gate and continuous verification; there is no operator override.
 
 The account's diagnostic-settings list must be empty. Presence of any setting fails the gate — enabled or not, whatever its categories, whatever its destination. There is no allowlist of "safe" categories: a disabled setting can be enabled between two polls, and a sink using a destination field this verifier does not model would otherwise pass. See the Security boundary section for the operator migration note.
 
@@ -181,12 +181,9 @@ and the gateway. `gmcli doctor` lists name, format, model and version for the bo
 account, flags every catalog-named violation, and sends one 1-token request per
 honestly named catalog deployment, printing its echoed `model` against its name.
 
-Azure Anthropic deployment creation requires `modelProviderData` containing
-`organizationName`, `countryCode` and lowercase `industry`. As of September 2026,
-only `api-version=2025-10-01-preview` accepts that property. A deployment cannot
-be re-pointed in place; delete and recreate it. Microsoft's
-[Claude starter kit](https://github.com/Azure-Samples/claude) uses these fields.
-This creation API is separate from the verifier's ARM read API.
+Deployment creation prerequisites, the creation API version, and the replacement
+procedure are documented in [Foundry setup](docs/foundry-setup.md). These operator
+actions are separate from the verifier's ARM read API.
 
 The model security checks are the in-TEE ARM binding and the gateway's
 per-response model echo comparison. Cloud registration, recovery and declaration

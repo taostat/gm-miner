@@ -215,7 +215,24 @@ fn cloud_config(provider: &str) -> String {
     rendered
 }
 
-fn assert_cloud_route(provider: &str, path: &str, egress: &str, host: &str, auth: &str, env: &str) {
+struct CloudRoute<'a> {
+    provider: &'a str,
+    path: &'a str,
+    egress: &'a str,
+    host: &'a str,
+    auth: &'a str,
+    env: &'a str,
+}
+
+fn assert_cloud_route(expected: &CloudRoute<'_>) {
+    let CloudRoute {
+        provider,
+        path,
+        egress,
+        host,
+        auth,
+        env,
+    } = *expected;
     let rendered = cloud_config(provider);
     let parsed = config(&rendered);
     let selected = route(&parsed, provider, path);
@@ -270,26 +287,26 @@ fn assert_cloud_route(provider: &str, path: &str, egress: &str, host: &str, auth
 
 #[test]
 fn azure_chat_forwards_to_tls_cluster_after_executing_slot_and_auth_guards() {
-    assert_cloud_route(
-        "openai",
-        "/v1/chat/completions",
-        "/openai/v1/chat/completions",
-        "gm-resource.openai.azure.com",
-        "api-key",
-        "GM_OPENAI_KEY_SLOT_1",
-    );
+    assert_cloud_route(&CloudRoute {
+        provider: "openai",
+        path: "/v1/chat/completions",
+        egress: "/openai/v1/chat/completions",
+        host: "gm-resource.openai.azure.com",
+        auth: "api-key",
+        env: "GM_OPENAI_KEY_SLOT_1",
+    });
 }
 
 #[test]
 fn foundry_messages_forwards_to_tls_cluster_after_executing_slot_and_auth_guards() {
-    assert_cloud_route(
-        "anthropic",
-        "/v1/messages",
-        "/anthropic/v1/messages",
-        "gm-resource.services.ai.azure.com",
-        "x-api-key",
-        "GM_ANTHROPIC_KEY_SLOT_1",
-    );
+    assert_cloud_route(&CloudRoute {
+        provider: "anthropic",
+        path: "/v1/messages",
+        egress: "/anthropic/v1/messages",
+        host: "gm-resource.services.ai.azure.com",
+        auth: "x-api-key",
+        env: "GM_ANTHROPIC_KEY_SLOT_1",
+    });
 }
 
 #[test]
@@ -576,6 +593,99 @@ fn near_only_passes_approved_source_models_to_the_local_verifier() {
         );
     }
 }
+
+#[test]
+fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("GOOGLE_API_KEY", "google-key"),
+        ("NEAR_API_KEY", "near-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    for provider in [
+        "anthropic",
+        "openai",
+        "gemini",
+        "chutes",
+        "zai",
+        "moonshot",
+        "deepinfra",
+        "kubetee",
+        "engy",
+        "moonmath",
+        "near",
+        "benchmark",
+    ] {
+        for path in ["/v1/chat/completions?trace=1", "/v1/models"] {
+            let lua = run_request(
+                &rendered,
+                &[
+                    (":path", path),
+                    ("x-gm-provider", provider),
+                    ("x-gm-node-key", "test-node-secret-0001"),
+                    ("x-gm-upstream-model", "Qwen/Qwen3.8-27B"),
+                    ("x-gm-private", "private"),
+                    ("x-gm-request-id", "request-123"),
+                    ("anthropic-beta", "caller-beta"),
+                ],
+                &[
+                    ("GM_GEMINI_KEY_SLOT_1", "google-key"),
+                    ("GM_NEAR_KEY_SLOT_1", "near-key"),
+                ],
+            );
+            assert_eq!(
+                lua.globals()
+                    .get::<Option<String>>("response_status")
+                    .expect("status"),
+                None
+            );
+            let headers = lua
+                .globals()
+                .get::<mlua::Table>("input_headers")
+                .expect("headers");
+            let routed_provider = headers.get::<String>("x-gm-provider").expect("provider");
+            let routed_path = headers.get::<String>(":path").expect("path");
+            assert_eq!(routed_provider, provider);
+            assert_eq!(routed_path, path);
+            let selected = route(&parsed, &routed_provider, &routed_path);
+            assert_eq!(
+                selected["route"]["cluster"],
+                if provider == "near" {
+                    "near_verify_proxy"
+                } else {
+                    provider
+                }
+            );
+            assert!(selected["request_headers_to_remove"]
+                .as_array()
+                .expect("removed headers")
+                .contains(&json!("x-gm-provider")));
+            let near_model = provider == "near" && path != "/v1/models";
+            assert_eq!(
+                headers
+                    .get::<Option<String>>("x-gm-upstream-model")
+                    .expect("model"),
+                near_model.then(|| "Qwen/Qwen3.8-27B".to_owned())
+            );
+            for pair in headers.pairs::<String, String>() {
+                let (name, _) = pair.expect("header");
+                assert!(
+                    !name.starts_with("x-gm-")
+                        || name == "x-gm-provider"
+                        || (near_model && name == "x-gm-upstream-model"),
+                    "{provider} leaked {name}"
+                );
+            }
+            assert_eq!(
+                headers
+                    .get::<String>("anthropic-beta")
+                    .expect("native header"),
+                "caller-beta"
+            );
+        }
+    }
+}
+
 #[test]
 fn node_secret_carrying_lua_breakout_is_rejected_before_render() {
     // A node secret with a quote would close the `local expected = "..."` Lua

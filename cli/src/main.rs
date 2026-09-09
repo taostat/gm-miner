@@ -755,6 +755,15 @@ impl DispatchContext {
     async fn client(&self) -> Result<RegistryClient> {
         Ok(RegistryClient::new(self.authenticated_config().await?))
     }
+
+    async fn deploy(&self, flags: DeployFlags) -> Result<()> {
+        cmd_deploy_subcommand(
+            self.authenticated_config().await?,
+            deploy_args_from_flags(flags),
+            WorkerRegistration::First,
+        )
+        .await
+    }
 }
 
 async fn dispatch(cli: Cli) -> Result<()> {
@@ -770,14 +779,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cmd_moon();
             Ok(())
         }
-        Command::Deploy { flags } => {
-            cmd_deploy_subcommand(
-                context.authenticated_config().await?,
-                deploy_args_from_flags(*flags),
-                WorkerRegistration::First,
-            )
-            .await
-        }
+        Command::Deploy { flags } => context.deploy(*flags).await,
         Command::Worker { command } => {
             dispatch_worker(command, context.network, context.api_url).await
         }
@@ -790,6 +792,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             buyer_api_key,
             gateway_url,
         } => {
+            // Let the handler reject mainnet before checking optional buyer credentials.
             cmd_image_canary(
                 context.config()?.resolved_network(),
                 gateway_url.as_deref(),
@@ -807,12 +810,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cmd_register_image_subcommand(context.authenticated_config().await?, &app_id).await
         }
         Command::PublishImageVersion { flags } => {
+            // This endpoint uses an admin key; OAuth must not block it.
             cmd_publish_image_version(&context.config()?, *flags).await
         }
         Command::SlotEnv { provider, env_var } => cmd_slot_env(&provider, &env_var),
         Command::ListProducts | Command::Status => cmd_status(&mut context.client().await?).await,
         Command::Pricing => cmd_pricing(&mut context.client().await?).await,
         Command::Sources => cmd_sources(&mut context.client().await?).await,
+        // Upgrades must work with expired tokens or a damaged config.
         Command::Update => cmd_update().await,
         Command::Earnings { yes } => cmd_earnings(&context.config()?, yes),
         Command::DeclareProduct {
@@ -845,12 +850,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             yes,
         )
         .await
+        // A declined standalone command succeeds; only the wizard needs its outcome.
         .map(|_| ()),
         Command::UndeclareProduct { provider, model } => {
             cmd_undeclare_product(&mut context.client().await?, &provider, &model).await
         }
         Command::UndeclareProducts {
             provider,
+            // Clap enforces exactly one scope; provider=None already represents --all.
             all: _all,
         } => cmd_undeclare_products(&mut context.client().await?, provider.as_ref()).await,
     }

@@ -28,7 +28,7 @@ impl AzureDeployment {
     ///
     /// # Errors
     /// A catalog-named deployment must serve exactly that model in its adapter's
-    /// format. Azure cannot change the model in place; delete and recreate it.
+    /// format; any mismatch is a definitive verification failure.
     pub fn verify_binding(&self, provider: AzureProvider) -> Result<bool> {
         if !provider.catalog_ids().contains(&self.name.as_str()) {
             return Ok(false);

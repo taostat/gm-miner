@@ -20,7 +20,8 @@ comes back as native Anthropic SSE events.
 
 Before serving, `attestd` verifies from ARM that the Foundry account carries no
 owner-capture controls, and it repeats that check while the miner runs. If a
-check fails, the container does not serve — no Envoy, no RA-TLS, no traffic.
+startup check fails, the container does not serve. During operation, a definitive
+violation stops serving; transient errors have a bounded tolerance window.
 What those checks are, and what they deliberately do not cover, is in
 [`AZURE_VERIFY_NOTES.md`](../AZURE_VERIFY_NOTES.md). This guide is the operator
 procedure for satisfying them.
@@ -43,8 +44,8 @@ connection on the account or on one of its projects as a capture sink and fails
 closed. The miner will refuse to boot while it exists — after you have already
 paid for a CVM.
 
-Delete it before you deploy (step 3 below). Deleting it makes verification pass;
-nothing else about the resource has to change.
+Delete it before you deploy (step 3 below). This clears the connection finding;
+the other checks below must also pass.
 
 ## 1. Create the resource — it must be `kind=AIServices`
 
@@ -80,9 +81,9 @@ the miner needs is:
 https://<resource>.services.ai.azure.com
 ```
 
-`gmcli set-api-keys` and `attestd` both accept only the `.services.ai.azure.com`
-suffix for the Foundry endpoint, so an ARM-copied hostname is rejected up front
-rather than at boot.
+`gmcli doctor`, `gmcli deploy`, and `attestd` accept only the
+`.services.ai.azure.com` suffix for the Foundry endpoint. `set-api-keys` stores
+the supplied values; run doctor to catch an ARM-copied hostname before deployment.
 
 ## 3. Delete the Application Insights connection
 
@@ -283,15 +284,15 @@ curl https://<resource>.services.ai.azure.com/anthropic/v1/messages \
   -d '{"model":"claude-opus-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Adding `"stream": true` returns native Anthropic SSE events. A 404 here almost
-often means that no deployment with that canonical name exists on the account.
+Adding `"stream": true` returns native Anthropic SSE events. For a 404, check
+that a deployment with that canonical name exists on the account.
 
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
 | Miner boots, exits non-zero, restarts in a loop right after deploy | A connection, capability host or diagnostic setting on the account or a project. The container log names it; clear it (steps 3–4) and restart. `gmcli doctor` finds the same thing without a deploy |
-| `gmcli set-api-keys` rejects the endpoint | The endpoint must end in `.services.ai.azure.com`. The `cognitiveservices.azure.com` host ARM reports is not the Foundry passthrough (step 2) |
+| Doctor or deploy rejects the endpoint | The endpoint must end in `.services.ai.azure.com`. The `cognitiveservices.azure.com` host ARM reports is not the Foundry passthrough (step 2) |
 | Verification fails on account kind | The resource is `kind=OpenAI` (classic Azure OpenAI), not `kind=AIServices`. Create a Foundry resource (step 1) |
 | ARM read fails at boot | The service principal cannot see the account. Confirm the `Reader` assignment is scoped to `<ACCOUNT_ID>` and the tenant/subscription/resource-group fields match it (step 5) |
 | Upstream 404s on a model gm lists | Create a deployment named exactly the canonical gm model id serving that same model, then run `gmcli doctor` (steps 6 and 8) |

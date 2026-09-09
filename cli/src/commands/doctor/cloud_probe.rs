@@ -88,6 +88,12 @@ fn echo_matches(deployment: &str, echo: &str) -> bool {
 
 pub(super) fn cloud_probe_url(endpoint: &str, path: &str) -> Result<reqwest::Url> {
     let mut url = reqwest::Url::parse(endpoint).context("parse endpoint URL")?;
+    // start.sh selects the endpoint's host but always connects over HTTPS on 443.
+    // Preserve explicit HTTP ports for local diagnostic fixtures.
+    if url.scheme() == "https" {
+        url.set_port(None)
+            .map_err(|()| anyhow::anyhow!("cloud endpoint cannot use an HTTPS port"))?;
+    }
     url.set_path(path);
     url.set_query(None);
     url.set_fragment(None);

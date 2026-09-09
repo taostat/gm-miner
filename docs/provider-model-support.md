@@ -31,10 +31,9 @@ registry contract remain unchanged.
 violation and sends one 1-token probe per honestly named catalog deployment,
 printing the echoed `model` against its name. Offers use canonical `provider/model`.
 
-As of September 2026, Azure Anthropic deployments require `modelProviderData`
-(`organizationName`, `countryCode`, lowercase `industry`), accepted only with
-`api-version=2025-10-01-preview`. A deployment cannot be re-pointed in place;
-delete and recreate it. See [Foundry setup](foundry-setup.md).
+See [Foundry setup](foundry-setup.md) for deployment creation prerequisites,
+the creation API version, and the replacement procedure. The verifier reads
+deployment identities; it does not create or replace deployments.
 
 The backticked `provider/model` is the pair to pass to
 `gmcli declare-product` for a direct route. See

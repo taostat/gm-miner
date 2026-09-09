@@ -41,7 +41,7 @@ pub(crate) struct SetApiKeysArgs {
     #[arg(long)]
     openai_upstream: Option<String>,
 
-    /// Azure `OpenAI` endpoint URL or host for `OPENAI_UPSTREAM=azure`.
+    /// Azure `OpenAI` HTTPS endpoint URL for `OPENAI_UPSTREAM=azure`.
     #[arg(long)]
     azure_openai_endpoint: Option<String>,
 
@@ -108,32 +108,33 @@ pub(crate) struct SetApiKeysArgs {
 
 impl SetApiKeysArgs {
     pub(crate) fn run(self, network: Option<Network>) -> Result<()> {
-        cmd_set_api_keys(
-            network,
-            self.anthropic,
-            self.anthropic_upstream,
-            self.bedrock_region,
-            self.bedrock_api_key,
-            self.foundry,
-            self.openai,
-            self.openai_upstream,
-            self.azure_openai_endpoint,
-            self.azure_openai_api_key,
-            self.azure_tenant_id,
-            self.azure_subscription_id,
-            self.azure_resource_group,
-            self.azure_client_id,
-            self.azure_client_secret,
-            self.google,
-            self.chutes,
-            self.zai,
-            self.moonshot,
-            self.deepinfra,
-            self.kubetee,
-            self.engy,
-            self.moonmath,
-            self.near,
-        )
+        let mut update = ProviderKeys {
+            anthropic: self.anthropic,
+            anthropic_upstream: self.anthropic_upstream,
+            bedrock_region: self.bedrock_region,
+            bedrock_api_key: self.bedrock_api_key,
+            openai: self.openai,
+            openai_upstream: self.openai_upstream,
+            azure_openai_endpoint: self.azure_openai_endpoint,
+            azure_openai_api_key: self.azure_openai_api_key,
+            azure_tenant_id: self.azure_tenant_id,
+            azure_subscription_id: self.azure_subscription_id,
+            azure_resource_group: self.azure_resource_group,
+            azure_client_id: self.azure_client_id,
+            azure_client_secret: self.azure_client_secret,
+            google: self.google,
+            chutes: self.chutes,
+            zai: self.zai,
+            moonshot: self.moonshot,
+            deepinfra: self.deepinfra,
+            kubetee: self.kubetee,
+            engy: self.engy,
+            moonmath: self.moonmath,
+            near: self.near,
+            ..ProviderKeys::default()
+        };
+        self.foundry.merge_into(&mut update);
+        cmd_set_api_keys(network, update)
     }
 }
 
@@ -194,29 +195,6 @@ pub(crate) struct FoundryArgs {
 }
 
 impl FoundryArgs {
-    fn validate(&self) -> Result<()> {
-        for (name, value) in [
-            ("azure-foundry-endpoint", self.endpoint.as_deref()),
-            ("azure-foundry-api-key", self.api_key.as_deref()),
-            ("azure-foundry-tenant-id", self.tenant_id.as_deref()),
-            (
-                "azure-foundry-subscription-id",
-                self.subscription_id.as_deref(),
-            ),
-            (
-                "azure-foundry-resource-group",
-                self.resource_group.as_deref(),
-            ),
-            ("azure-foundry-client-id", self.client_id.as_deref()),
-            ("azure-foundry-client-secret", self.client_secret.as_deref()),
-        ] {
-            if let Some(value) = value {
-                validate_key(name, value)?;
-            }
-        }
-        Ok(())
-    }
-
     fn merge_into(self, keys: &mut ProviderKeys) {
         if let Some(v) = self.endpoint {
             keys.azure_foundry_endpoint = Some(v);
@@ -316,57 +294,8 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
 
 pub(crate) fn cmd_set_api_keys(
     explicit_network: Option<Network>,
-    anthropic: Option<String>,
-    anthropic_upstream: Option<String>,
-    bedrock_region: Option<String>,
-    bedrock_api_key: Option<String>,
-    foundry: FoundryArgs,
-    openai: Option<String>,
-    openai_upstream: Option<String>,
-    azure_openai_endpoint: Option<String>,
-    azure_openai_api_key: Option<String>,
-    azure_tenant_id: Option<String>,
-    azure_subscription_id: Option<String>,
-    azure_resource_group: Option<String>,
-    azure_client_id: Option<String>,
-    azure_client_secret: Option<String>,
-    google: Option<String>,
-    chutes: Option<String>,
-    zai: Option<String>,
-    moonshot: Option<String>,
-    deepinfra: Option<String>,
-    kubetee: Option<String>,
-    engy: Option<String>,
-    moonmath: Option<String>,
-    near: Option<String>,
+    update: ProviderKeys,
 ) -> Result<()> {
-    foundry.validate()?;
-    let mut update = ProviderKeys {
-        anthropic,
-        anthropic_upstream,
-        bedrock_region,
-        bedrock_api_key,
-        openai,
-        openai_upstream,
-        azure_openai_endpoint,
-        azure_openai_api_key,
-        azure_tenant_id,
-        azure_subscription_id,
-        azure_resource_group,
-        azure_client_id,
-        azure_client_secret,
-        google,
-        chutes,
-        zai,
-        moonshot,
-        deepinfra,
-        kubetee,
-        engy,
-        moonmath,
-        near,
-        ..ProviderKeys::default()
-    };
-    foundry.merge_into(&mut update);
     validate_update(&update)?;
     let lines = config::with_config_lock(|| {
         let mut cfg = config::load()
@@ -394,6 +323,34 @@ pub(crate) fn cmd_set_api_keys(
 
 fn validate_update(keys: &ProviderKeys) -> Result<()> {
     for (name, value) in [
+        (
+            "azure-foundry-endpoint",
+            keys.azure_foundry_endpoint.as_deref(),
+        ),
+        (
+            "azure-foundry-api-key",
+            keys.azure_foundry_api_key.as_deref(),
+        ),
+        (
+            "azure-foundry-tenant-id",
+            keys.azure_foundry_tenant_id.as_deref(),
+        ),
+        (
+            "azure-foundry-subscription-id",
+            keys.azure_foundry_subscription_id.as_deref(),
+        ),
+        (
+            "azure-foundry-resource-group",
+            keys.azure_foundry_resource_group.as_deref(),
+        ),
+        (
+            "azure-foundry-client-id",
+            keys.azure_foundry_client_id.as_deref(),
+        ),
+        (
+            "azure-foundry-client-secret",
+            keys.azure_foundry_client_secret.as_deref(),
+        ),
         ("anthropic", keys.anthropic.as_deref()),
         ("bedrock-region", keys.bedrock_region.as_deref()),
         ("bedrock-api-key", keys.bedrock_api_key.as_deref()),
