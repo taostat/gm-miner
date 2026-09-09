@@ -40,20 +40,29 @@ The gate fails closed if:
 - `properties.endpoint` does not use the same host as the configured Azure endpoint, including the configured allowed suffix.
 - `properties.raiMonitorConfig` is non-null.
 - `properties.userOwnedStorage` is non-null and non-empty.
-- Any deployment on the account references a Responsible AI policy whose `properties.mode` is not `Asynchronous_filter` or legacy `Deferred`. `Blocking`, `Default`, an absent mode, or a deployment with no `properties.raiPolicyName` is treated as synchronous buffering and always fails verification.
+- Every entry in the measured deployment map must be present on the bound
+  account's ARM deployment list. Azure OpenAI entries must have
+  `properties.model.format: OpenAI`; Foundry entries must have
+  `properties.model.format: Anthropic`; and `properties.model.name` must equal
+  the mapped canonical id exactly, with ASCII, case-sensitive comparison. A
+  missing deployment, wrong format, or different model name is definitive: it
+  rejects boot and stops the periodic verifier. `version` is read and retained
+  as ARM evidence (for example, `gpt-5` reports `2025-08-07` and
+  `claude-opus-4-6` reports `1`).
+- For Azure OpenAI, any deployment on the account references a Responsible AI policy whose `properties.mode` is not `Asynchronous_filter` or legacy `Deferred`. `Blocking`, `Default`, an absent mode, or a deployment with no `properties.raiPolicyName` is treated as synchronous buffering and always fails verification.
 
 The streaming check uses the same scoped Entra credentials and ARM API version as the account binding check:
 
-- List deployments: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/deployments?api-version=2024-10-01`
-- Read each distinct referenced RAI policy: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/raiPolicies/{raiPolicyName}?api-version=2024-10-01`
+- List deployments: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/deployments?api-version=2026-05-01`
+- Read each distinct referenced RAI policy: `GET https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{name}/raiPolicies/{raiPolicyName}?api-version=2026-05-01`
 
-The verifier reads `value[].properties.raiPolicyName` from the deployment list, then reads `properties.mode` from each referenced RAI policy. Streaming is considered enabled only when the mode is `Asynchronous_filter` or `Deferred`. The verifier checks all deployments on the account so the attestation covers whatever the gateway may route to. If the account has zero deployments, the streaming check passes and logs that there are no deployments to check; model availability is gated elsewhere.
+The verifier reads `value[].properties.raiPolicyName` from the deployment list, then reads `properties.mode` from each referenced RAI policy. Streaming is considered enabled only when the mode is `Asynchronous_filter` or `Deferred`. The verifier checks all deployments on the account so the attestation covers whatever the gateway may route to. The same list read enforces the measured canonical-to-deployment binding for every configured entry; if the account has zero deployments, the binding gate fails whenever the map is non-empty.
 
 Asynchronous content filtering (streaming-safe, no completion buffering) is required and enforced as gm policy. Any synchronous or buffering deployment fails the startup gate and continuous verification; there is no operator override.
 
 The account's diagnostic-settings list must be empty. Presence of any setting fails the gate — enabled or not, whatever its categories, whatever its destination. There is no allowlist of "safe" categories: a disabled setting can be enabled between two polls, and a sink using a destination field this verifier does not model would otherwise pass. See the Security boundary section for the operator migration note.
 
-After the startup gate passes and the listener binds, `attestd` re-runs the same Azure owner-capture verification periodically, including the deployment streaming-mode check. The default re-verification interval is 900 seconds; values below 60 seconds are clamped to 60 seconds. Transient verification errors such as Azure management/login network errors, timeouts, HTTP 408/429/5xx responses, or response decode failures are tolerated for 3 consecutive checks by default. A definitive verification failure, such as `raiMonitorConfig` becoming non-null, endpoint binding changing, account kind changing, async filtering being disabled, or other policy mismatch, stops `attestd` immediately with a non-zero exit so the container restarts and the boot-time gate blocks serving.
+After the startup gate passes and the listener binds, `attestd` re-runs the full Azure owner-capture verification every 900 seconds by default and polls the ARM deployment list for model binding every 60 seconds. Values below 60 seconds are clamped to 60 seconds for the full sweep. Transient verification errors such as Azure management/login network errors, timeouts, HTTP 408/429/5xx responses, or response decode failures are tolerated for 3 consecutive checks by default. A definitive verification failure, such as a deployment disappearing, changing format or model name, `raiMonitorConfig` becoming non-null, endpoint binding changing, account kind changing, or async filtering being disabled, stops `attestd` immediately with a non-zero exit so the container restarts and the boot-time gate blocks serving.
 
 Envoy validates the Azure OpenAI and Foundry upstreams against the system CA bundle with their configured DNS SAN suffix rules. Bedrock is tighter: its SAN is matched exactly against the constructed `bedrock-mantle.<region>.api.aws` host. Root pinning was dropped because it is out of scope for the operator threat model — a miner operator cannot obtain a valid cert for a Microsoft-owned hostname regardless of the trusted-root set — and a pinned bundle would fail closed if Microsoft rotates its Azure PKI. Direct `api.openai.com` uses the same system CA bundle and exact SAN pin approach.
 
@@ -64,7 +73,7 @@ Azure miners must provide:
 - `OPENAI_UPSTREAM=azure`
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_DEPLOYMENTS=canonical=deployment;...`
+- `AZURE_OPENAI_DEPLOYMENTS=canonical=deployment;...` (each entry is ARM-bound to an exact `OpenAI` model name)
 - `AZURE_TENANT_ID`
 - `AZURE_SUBSCRIPTION_ID`
 - `AZURE_RESOURCE_GROUP`
@@ -77,7 +86,7 @@ Azure deployments must use a content-filter RAI policy configured for asynchrono
 
 ## Security boundary
 
-The owner-capture checks enforce that the Azure OpenAI account is bound to the configured endpoint by ARM identity, has no secondary storage or monitoring sinks attached (`userOwnedStorage`, `raiMonitorConfig`), and that every deployment uses asynchronous content filtering so completions are never buffered server-side before delivery. These checks run at container startup and repeat every 15 minutes; a policy violation detected after startup terminates `attestd` and restarts the container.
+The owner-capture checks enforce that the Azure account is bound to the configured endpoint by ARM identity, every configured deployment is present and exactly bound to its canonical model class/name, has no secondary storage or monitoring sinks attached (`userOwnedStorage`, `raiMonitorConfig`), and, for Azure OpenAI, uses asynchronous content filtering so completions are never buffered server-side before delivery. These checks run at container startup; the full sweep repeats every 15 minutes and deployment binding is polled every minute. A policy violation detected after startup terminates `attestd` and restarts the container.
 
 Network operators on the path between the miner CVM and Azure observe only TLS-encrypted ciphertext. Prompt content stays confidential end-to-end through Envoy: the RA-TLS data plane is terminated inside the TEE, and the Azure OpenAI and Foundry upstream connections are validated against the system CA bundle with their configured DNS SAN suffix rules. Bedrock is tighter: its SAN is matched exactly against the constructed `bedrock-mantle.<region>.api.aws` host. The ARM account binding checks verify that the Azure endpoint belongs to the miner's own resource, not a third-party account.
 
@@ -153,7 +162,7 @@ read. The connection gate above is what neutralizes it.
 ### Required miner configuration
 
 `ANTHROPIC_UPSTREAM=foundry`, `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_API_KEY`,
-`AZURE_FOUNDRY_DEPLOYMENTS=canonical=deployment;...`,
+`AZURE_FOUNDRY_DEPLOYMENTS=canonical=deployment;...` (each entry is ARM-bound to an exact `Anthropic` model name),
 plus a read-only Entra service principal for ARM: `AZURE_FOUNDRY_TENANT_ID`,
 `AZURE_FOUNDRY_SUBSCRIPTION_ID`, `AZURE_FOUNDRY_RESOURCE_GROUP`,
 `AZURE_FOUNDRY_CLIENT_ID`, `AZURE_FOUNDRY_CLIENT_SECRET`. These are separate from
@@ -168,6 +177,13 @@ declaration require the image feature `upstream-model-hop` and the registry
 capability `upstream-model-echo`. Azure OpenAI chat completions and Foundry
 Messages are qualified by their model echo; Azure Responses is rejected because
 its echo is the deployment name, and Bedrock remains unqualified.
+
+Foundry deployment binding is part of the same boot and continuous gate. ARM
+must report the mapped deployment with `properties.model.format: Anthropic` and
+an exact, case-sensitive `properties.model.name` equal to the canonical Claude
+id. A repointed deployment, fine-tune, model router, or missing deployment is
+not an inference-probe question and is a definitive failure. `gmcli doctor`
+uses this same verifier and comparison before a CVM is paid for.
 
 The operator procedure for satisfying these checks — which resource kind to
 create, the `az` calls that list and clear the connections, capability hosts and

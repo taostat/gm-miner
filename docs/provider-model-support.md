@@ -14,8 +14,9 @@ catalog. It distinguishes transport capability from registry admission:
   canonical-to-deployment hop in the image. They require the image feature
   `upstream-model-hop` and registry capability `upstream-model-echo` before
   registration or declaration. Azure Responses is unqualified because its echo
-  is the deployment name; Bedrock is direct and unqualified. A known model id or
-  a successful HTTP probe is not sufficient.
+  is the deployment name; Bedrock inference is disabled inside the image until
+  its transport has an authoritative model echo. A known model id or a
+  successful HTTP probe is not sufficient.
 
 For Azure OpenAI, configure `--azure-deployments
 canonical=deployment;canonical=deployment`. For Foundry, configure
@@ -27,10 +28,13 @@ model beside the canonical id. Once the image feature and registry capability
 are admitted, cloud offers are declared with the same canonical
 `provider/model` as direct offers.
 
-Fine-tune and other model-class qualification is not decidable inside the image
-from the provider echo alone. It remains a documented registry/gateway residual:
-the echo rule must attest that the returned model belongs to the declared
-catalog class before admitting an offer.
+The measured image also binds every mapped deployment to ARM before it serves.
+Azure OpenAI mappings require an ARM deployment with `model.format: OpenAI` and
+an exact, case-sensitive `model.name` equal to the canonical catalog id;
+Foundry mappings require `model.format: Anthropic` and the same exact name
+comparison. A missing, repointed, fine-tuned, or model-router deployment is a
+definitive boot and continuous-verification failure. `gmcli doctor` runs the
+same ARM comparison before a CVM is paid for.
 
 The backticked `provider/model` is the pair to pass to
 `gmcli declare-product` for a direct route. See

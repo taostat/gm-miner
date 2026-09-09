@@ -43,6 +43,7 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+gm-cloud-hop = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

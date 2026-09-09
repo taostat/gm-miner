@@ -6,7 +6,7 @@ use anyhow::{bail, Context as _, Result};
 
 use gm_miner_cli::{
     client::{RegistryClient, UPSTREAM_MODEL_ECHO_CAPABILITY},
-    cloud_policy::configured_cloud_backend,
+    cloud_policy::{cloud_fence_required_for_provider, configured_cloud_backend},
     dependency::confirm,
     pricing::{
         effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
@@ -51,7 +51,9 @@ pub(crate) async fn cmd_declare_product(
     discount_bp: u32,
     args: DeclareArgs<'_>,
 ) -> Result<()> {
-    if let Some(backend) = configured_cloud_backend(&client.config, provider.as_str()) {
+    if cloud_fence_required_for_provider(&client.config, provider.as_str()) {
+        let backend = configured_cloud_backend(&client.config, provider.as_str())
+            .unwrap_or("recorded/unknown");
         client
             .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
             .await
@@ -386,12 +388,14 @@ async fn require_cloud_bulk_capability(
     client: &mut RegistryClient,
     targets: &[&Product],
 ) -> Result<()> {
-    let Some(backend) = targets
+    let Some(product) = targets
         .iter()
-        .find_map(|product| configured_cloud_backend(&client.config, &product.provider))
+        .find(|product| cloud_fence_required_for_provider(&client.config, &product.provider))
     else {
         return Ok(());
     };
+    let backend =
+        configured_cloud_backend(&client.config, &product.provider).unwrap_or("recorded/unknown");
     client
         .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
         .await
@@ -409,9 +413,11 @@ async fn require_cloud_bulk_capability(
 fn skip_cloud_bulk_targets(client: &RegistryClient, targets: &mut Vec<&Product>) -> Result<usize> {
     let mut skipped_cloud: Vec<(String, String, String)> = Vec::new();
     targets.retain(|product| {
-        let Some(backend) = configured_cloud_backend(&client.config, &product.provider) else {
+        if !cloud_fence_required_for_provider(&client.config, &product.provider) {
             return true;
-        };
+        }
+        let backend = configured_cloud_backend(&client.config, &product.provider)
+            .unwrap_or("recorded/unknown");
         skipped_cloud.push((
             product.provider.clone(),
             product.model.clone(),
@@ -894,7 +900,7 @@ fn ineligible_detail_lines(products: &[ProductOfferStatus]) -> Vec<String> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use gm_miner_cli::config::{Config, NetworkEntry, ProviderKeys, TokenEntry};
+    use gm_miner_cli::config::{Config, NetworkEntry, ProviderKeys, TokenEntry, WorkerRecord};
     use gm_miner_cli::network::Network;
     use wiremock::{
         matchers::{body_json, method, path},
@@ -1083,6 +1089,36 @@ mod tests {
         )
         .await
         .expect_err("a registry without the capability must refuse cloud offers");
+        assert!(error.to_string().contains("upstream-model-echo"));
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_cloud_worker_fences_single_declaration_after_direct_switch() {
+        let server = MockServer::start().await;
+        let mut config = config_for(&server);
+        config.provider_keys = Some(ProviderKeys {
+            openai_upstream: Some("direct".to_owned()),
+            ..Default::default()
+        });
+        config.active_entry_mut().workers.push(WorkerRecord {
+            backends: Some(std::collections::BTreeMap::from([(
+                "openai".to_owned(),
+                "azure".to_owned(),
+            )])),
+            ..Default::default()
+        });
+        let mut client = RegistryClient::new(config);
+
+        let error = cmd_declare_product(
+            &mut client,
+            &Provider::OpenAI,
+            "gpt-5.5",
+            500,
+            DeclareArgs::default(),
+        )
+        .await
+        .expect_err("recorded cloud provenance must survive a direct selector switch");
         assert!(error.to_string().contains("upstream-model-echo"));
         assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
     }
@@ -1510,7 +1546,14 @@ mod tests {
 
         let mut client = RegistryClient::new(config_for(&server));
         client.config.provider_keys = Some(ProviderKeys {
-            anthropic_upstream: Some("bedrock".to_owned()),
+            anthropic_upstream: Some("direct".to_owned()),
+            ..Default::default()
+        });
+        client.config.active_entry_mut().workers.push(WorkerRecord {
+            backends: Some(std::collections::BTreeMap::from([(
+                "anthropic".to_owned(),
+                "bedrock".to_owned(),
+            )])),
             ..Default::default()
         });
         let error = cmd_declare_products(&mut client, None, 500, true)

@@ -24,9 +24,9 @@ use tokio::sync::oneshot;
 
 use crate::arm::{ArmDeploymentList, ArmScope, PagedRead};
 use crate::checks::{
-    assert_account_binding, assert_no_capture_children, assert_no_diagnostic_capture,
-    assess_streaming_configuration, log_streaming_assessment, retain_observable_deployments,
-    split_azure_governed_deployments, AI_SERVICES_KIND,
+    assert_account_binding, assert_deployment_bindings, assert_no_capture_children,
+    assert_no_diagnostic_capture, assess_streaming_configuration, log_streaming_assessment,
+    retain_observable_deployments, split_azure_governed_deployments, AI_SERVICES_KIND,
 };
 use crate::config::{configured_targets_from_env, PeriodicAzureVerifySettings};
 use crate::endpoint::{parse_azure_endpoint, AzureEndpoint};
@@ -219,6 +219,39 @@ impl AzureVerifier {
         Ok(())
     }
 
+    /// Poll only the deployment binding between full owner-capture sweeps.
+    ///
+    /// This intentionally performs one ARM deployment-list read per target;
+    /// capture settings remain on the slower full sweep, while a repointed or
+    /// deleted deployment stops the data plane within the one-minute poll
+    /// interval.
+    ///
+    /// # Errors
+    /// Returns a definitive binding error or the transport error that prevented
+    /// the deployment list from being read.
+    pub async fn verify_deployment_bindings(&self, config: &AzureVerifyConfig) -> Result<()> {
+        let endpoint = parse_azure_endpoint(config.provider, &config.endpoint)?;
+        let token = self.fetch_entra_token(config).await?;
+        let account = self.fetch_arm_account(config, &endpoint, &token).await?;
+        assert_account_binding(config.provider, &endpoint, &account)?;
+        let read = self.fetch_arm_deployments(config, &endpoint, &token).await;
+        assert_deployment_bindings(
+            config.provider,
+            &config.deployment_map,
+            &read.items,
+            read.failure.is_none(),
+        )?;
+        if let Some(failure) = read.failure {
+            return Err(failure);
+        }
+        tracing::debug!(
+            provider = config.provider.label(),
+            deployment_count = read.items.len(),
+            "periodic Azure deployment binding verification passed",
+        );
+        Ok(())
+    }
+
     /// Run every owner-capture check against one configured Azure account and
     /// collect what failed, rather than stopping at the first violation.
     ///
@@ -286,13 +319,24 @@ impl AzureVerifier {
         self.audit_capture_surfaces(&sweep, &resource_id, has_child_collections, audit)
             .await?;
 
+        let deployment_read = self.fetch_arm_deployments(config, endpoint, &token).await;
+        audit.record(assert_deployment_bindings(
+            config.provider,
+            &config.deployment_map,
+            &deployment_read.items,
+            deployment_read.failure.is_none(),
+        ));
+
         // Only Azure OpenAI has an ARM-observable streaming control. Azure's RAI
         // content filter is not in Claude's inference path on Foundry, so there is
         // no `raiPolicyName` mode to read there and the verifier never consults one
         // (Microsoft's own Claude templates do set `raiPolicyName`, and it is inert
         // — reading it would prove nothing either way).
         if config.provider == AzureProvider::OpenAi {
-            self.audit_async_filter_configuration(&sweep, audit).await?;
+            self.audit_async_filter_configuration(&sweep, deployment_read, audit)
+                .await?;
+        } else if let Some(failure) = deployment_read.failure {
+            return Err(failure);
         }
         Ok(())
     }
@@ -414,6 +458,7 @@ impl AzureVerifier {
     async fn audit_async_filter_configuration(
         &self,
         sweep: &Sweep<'_>,
+        read: PagedRead<crate::arm::ArmDeployment>,
         audit: &mut AzureAudit,
     ) -> Result<()> {
         let config = sweep.config;
@@ -423,7 +468,6 @@ impl AzureVerifier {
         // Whatever page of deployments we got is still evidence: a deployment
         // with no `raiPolicyName` is a violation on sight, and it does not stop
         // being one because a later page throttled.
-        let read = self.fetch_arm_deployments(config, endpoint, token).await;
         let mut failure = read.failure;
         let (mut deployments, skipped) = split_azure_governed_deployments(ArmDeploymentList {
             value: read.items,
@@ -551,6 +595,11 @@ mod tests {
     fn foundry_target() -> AzureVerifyConfig {
         AzureVerifyConfig {
             provider: AzureProvider::Foundry,
+            deployment_map: gm_cloud_hop::parse_deployment_map(
+                gm_cloud_hop::CloudProvider::Foundry,
+                "claude-sonnet-4-6=foundry-sonnet",
+            )
+            .expect("foundry map"),
             endpoint: "https://acct.services.ai.azure.com".to_owned(),
             tenant_id: "tenant".to_owned(),
             subscription_id: "sub".to_owned(),
@@ -563,8 +612,17 @@ mod tests {
     fn openai_target() -> AzureVerifyConfig {
         AzureVerifyConfig {
             provider: AzureProvider::OpenAi,
+            deployment_map: gm_cloud_hop::parse_deployment_map(
+                gm_cloud_hop::CloudProvider::AzureOpenAi,
+                "gpt-5.5=gpt-5",
+            )
+            .expect("Azure OpenAI map"),
             endpoint: "https://acct.openai.azure.com".to_owned(),
-            ..foundry_target()
+            tenant_id: "tenant".to_owned(),
+            subscription_id: "sub".to_owned(),
+            resource_group: "rg".to_owned(),
+            client_id: "client".to_owned(),
+            client_secret: "secret".to_owned(),
         }
     }
 
@@ -645,6 +703,23 @@ mod tests {
             &server,
             &format!("{ACCOUNT_PATH}/capabilityHosts"),
             capability_hosts,
+        )
+        .await;
+        mount_get(
+            &server,
+            &format!("{ACCOUNT_PATH}/deployments"),
+            ok_json(serde_json::json!({
+                "value": [{
+                    "name": "foundry-sonnet",
+                    "properties": {
+                        "model": {
+                            "format": "Anthropic",
+                            "name": "claude-sonnet-4-6",
+                            "version": "1"
+                        }
+                    }
+                }]
+            })),
         )
         .await;
         server
@@ -781,7 +856,9 @@ mod tests {
         .await;
         let page_1 = page_1_of_2(
             &server,
-            &serde_json::json!([{"name": "gpt-5", "properties": {"model": {"format": "OpenAI"}}}]),
+            &serde_json::json!([{"name": "gpt-5", "properties": {"model": {
+                "format": "OpenAI", "name": "gpt-5.5", "version": "2025-08-07"
+            }}}]),
         );
         mount_get(&server, &format!("{ACCOUNT_PATH}/deployments"), page_1).await;
         mount_get(&server, "/page-2", throttled()).await;
@@ -819,9 +896,11 @@ mod tests {
             &server,
             &format!("{ACCOUNT_PATH}/deployments"),
             ok_json(serde_json::json!({"value": [
-                {"name": "unfiltered", "properties": {"model": {"format": "OpenAI"}}},
+                {"name": "unfiltered", "properties": {"model": {
+                    "format": "OpenAI", "name": "gpt-5.5", "version": "2025-08-07"
+                }}},
                 {"name": "gpt-5", "properties": {
-                    "model": {"format": "OpenAI"},
+                    "model": {"format": "OpenAI", "name": "gpt-5.5", "version": "2025-08-07"},
                     "raiPolicyName": "some-policy"
                 }}
             ]})),

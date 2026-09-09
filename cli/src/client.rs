@@ -142,6 +142,30 @@ pub const CAPABILITIES_FIELD: &str = "capabilities";
 /// Registry-side admission capability for model-echo-backed cloud bindings.
 pub const UPSTREAM_MODEL_ECHO_CAPABILITY: &str = "upstream-model-echo";
 
+/// Validate the registry capability payload and report whether it contains the
+/// requested capability. Every array member must be a string: accepting a
+/// mixed JSON array would make a malformed response look like an authoritative
+/// capability list.
+///
+/// # Errors
+/// Returns an error when the capability field is missing or any array member
+/// is not a string.
+pub fn capability_is_advertised(payload: &Value, capability: &str) -> Result<bool> {
+    let Some(values) = payload.get(CAPABILITIES_FIELD).and_then(Value::as_array) else {
+        bail!("registry capability response is missing JSON field '{CAPABILITIES_FIELD}'");
+    };
+    let mut advertised = false;
+    for value in values {
+        let Some(value) = value.as_str() else {
+            bail!(
+                "registry capability response field '{CAPABILITIES_FIELD}' contains a non-string entry"
+            );
+        };
+        advertised |= value == capability;
+    }
+    Ok(advertised)
+}
+
 pub struct RegistryClient {
     pub config: Config,
     client: Client,
@@ -318,15 +342,11 @@ impl RegistryClient {
         let payload: Value = serde_json::from_str(&body).with_context(|| {
             format!("registry capability response from {CAPABILITIES_PATH} is not valid JSON")
         })?;
-        let Some(values) = payload.get(CAPABILITIES_FIELD).and_then(Value::as_array) else {
-            bail!(
-                "registry does not advertise capability '{capability}': response is missing JSON field '{CAPABILITIES_FIELD}'"
-            );
-        };
-        if !values
-            .iter()
-            .any(|value| value.as_str() == Some(capability))
-        {
+        if !capability_is_advertised(&payload, capability).with_context(|| {
+            format!(
+                "registry does not advertise capability '{capability}': malformed capability response"
+            )
+        })? {
             bail!("registry does not advertise capability '{capability}' in {CAPABILITIES_PATH}");
         }
         Ok(())
@@ -461,6 +481,38 @@ mod tests {
                 .expect_err("missing capability must be a hard fence");
             assert!(error.to_string().contains("does not advertise capability"));
         }
+    }
+
+    #[tokio::test]
+    async fn registry_capability_gate_rejects_mixed_type_lists() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path(CAPABILITIES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "capabilities": [UPSTREAM_MODEL_ECHO_CAPABILITY, 7]
+            })))
+            .mount(&server)
+            .await;
+        let config = Config {
+            active_network: Some("testnet".to_owned()),
+            networks: std::collections::HashMap::from([(
+                "testnet".to_owned(),
+                NetworkEntry {
+                    api_url: Some(server.uri()),
+                    tokens: Some(TokenEntry {
+                        access_token: Some("test-token".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let error = RegistryClient::new(config)
+            .require_capability(UPSTREAM_MODEL_ECHO_CAPABILITY)
+            .await
+            .expect_err("a mixed capability list must be a hard fence");
+        assert!(error.to_string().contains("malformed"), "{error:#}");
     }
 
     /// Starts a bare HTTPS listener on `127.0.0.1` presenting a freshly

@@ -6,7 +6,7 @@
 //! and bulk-declaration guidance do not confuse transport capability with the
 //! feature-fenced model identity check.
 
-use crate::config::Config;
+use crate::config::{Config, WorkerRecord};
 
 /// The only Bedrock model-ID tuple currently covered by registry normalization.
 /// This does not authorize the worker's cloud transport.
@@ -71,6 +71,80 @@ pub fn configured_cloud_backend(config: &Config, provider: &str) -> Option<&'sta
         ("openai", Some("azure")) => Some("azure"),
         _ => None,
     }
+}
+
+/// Whether one recorded worker requires the cloud capability fence for a
+/// provider-specific declaration.
+///
+/// `None` is deliberately treated as unknown provenance, not as direct
+/// provenance. Older records and records written by a different CLI version
+/// may omit the map, so allowing them through would recreate the selector
+/// bypass this fence is meant to close.
+#[must_use]
+pub fn recorded_worker_requires_cloud_fence(record: &WorkerRecord, provider: &str) -> bool {
+    record
+        .backends
+        .as_ref()
+        .is_none_or(|backends| backends.contains_key(provider))
+}
+
+/// Whether declarations for `provider` must use the registry's cloud-model
+/// capability fence.
+///
+/// The decision is the union of the current selectors and every locally
+/// recorded worker's provenance. A worker with unknown provenance is treated
+/// as cloud-backed conservatively.
+#[must_use]
+pub fn cloud_fence_required_for_provider(config: &Config, provider: &str) -> bool {
+    configured_cloud_backend(config, provider).is_some()
+        || config
+            .active_network_entry()
+            .into_iter()
+            .flat_map(|network| network.workers.iter())
+            .any(|worker| recorded_worker_requires_cloud_fence(worker, provider))
+}
+
+/// Whether registering or re-registering the named worker must pass the
+/// registry's cloud-model capability fence.
+#[must_use]
+pub fn cloud_fence_required_for_worker(
+    config: &Config,
+    app_name: &str,
+    current_backends: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    config
+        .provider_keys
+        .as_ref()
+        .is_some_and(|keys| !keys.worker_backends().is_empty())
+        || !current_backends.is_empty()
+        || config
+            .active_network_entry()
+            .and_then(|network| network.worker_by_app_name(app_name))
+            .is_some_and(|worker| {
+                worker
+                    .backends
+                    .as_ref()
+                    .is_none_or(|backends| !backends.is_empty())
+            })
+}
+
+/// Whether `register-image` recovery must pass the cloud-model capability
+/// fence. An untracked worker has unknown provenance and is therefore fenced.
+#[must_use]
+pub fn cloud_fence_required_for_image_recovery(
+    config: &Config,
+    record: Option<&WorkerRecord>,
+) -> bool {
+    config
+        .provider_keys
+        .as_ref()
+        .is_some_and(|keys| !keys.worker_backends().is_empty())
+        || record.is_none_or(|worker| {
+            worker
+                .backends
+                .as_ref()
+                .is_none_or(|backends| !backends.is_empty())
+        })
 }
 
 #[cfg(test)]
@@ -198,5 +272,147 @@ mod tests {
         };
         assert_eq!(configured_cloud_backend(&config, "anthropic"), None);
         assert_eq!(configured_cloud_backend(&config, "openai"), None);
+    }
+
+    #[test]
+    fn declaration_fence_unions_selectors_recorded_and_unknown_provenance() {
+        let config = Config {
+            provider_keys: Some(ProviderKeys {
+                anthropic_upstream: Some("direct".to_owned()),
+                ..Default::default()
+            }),
+            networks: HashMap::from([(
+                "mainnet".to_owned(),
+                NetworkEntry {
+                    workers: vec![
+                        WorkerRecord {
+                            backends: Some(BTreeMap::from([(
+                                "openai".to_owned(),
+                                "azure".to_owned(),
+                            )])),
+                            ..Default::default()
+                        },
+                        WorkerRecord::default(),
+                    ],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert!(cloud_fence_required_for_provider(&config, "anthropic"));
+        assert!(cloud_fence_required_for_provider(&config, "openai"));
+    }
+
+    #[test]
+    fn known_direct_worker_and_direct_selector_are_not_cloud() {
+        let config = Config {
+            active_network: Some("mainnet".to_owned()),
+            provider_keys: Some(ProviderKeys {
+                anthropic_upstream: Some("direct".to_owned()),
+                ..Default::default()
+            }),
+            networks: HashMap::from([(
+                "mainnet".to_owned(),
+                NetworkEntry {
+                    workers: vec![WorkerRecord {
+                        backends: Some(BTreeMap::new()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(!cloud_fence_required_for_provider(&config, "anthropic"));
+        assert!(!cloud_fence_required_for_worker(
+            &config,
+            "worker",
+            &BTreeMap::new()
+        ));
+    }
+
+    #[test]
+    fn worker_registration_fence_covers_recorded_cloud_and_unknown_sources() {
+        let recorded_cloud = WorkerRecord {
+            app_name: "cloud".to_owned(),
+            backends: Some(BTreeMap::from([("openai".to_owned(), "azure".to_owned())])),
+            ..Default::default()
+        };
+        let unknown = WorkerRecord {
+            app_name: "unknown".to_owned(),
+            ..Default::default()
+        };
+        let config = Config {
+            active_network: Some("mainnet".to_owned()),
+            networks: HashMap::from([(
+                "mainnet".to_owned(),
+                NetworkEntry {
+                    workers: vec![recorded_cloud, unknown],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(cloud_fence_required_for_worker(
+            &config,
+            "cloud",
+            &BTreeMap::new()
+        ));
+        assert!(cloud_fence_required_for_worker(
+            &config,
+            "unknown",
+            &BTreeMap::new()
+        ));
+        assert!(cloud_fence_required_for_worker(
+            &config,
+            "new",
+            &BTreeMap::from([("anthropic".to_owned(), "foundry".to_owned())])
+        ));
+    }
+
+    #[test]
+    fn worker_registration_fence_includes_current_cloud_selector() {
+        let config = Config {
+            provider_keys: Some(ProviderKeys {
+                openai_upstream: Some("azure".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cloud_fence_required_for_worker(
+            &config,
+            "new",
+            &BTreeMap::new()
+        ));
+    }
+
+    #[test]
+    fn image_recovery_fences_unknown_record_and_current_cloud_selector() {
+        let direct = Config {
+            provider_keys: Some(ProviderKeys::default()),
+            ..Default::default()
+        };
+        let known_direct = WorkerRecord {
+            backends: Some(BTreeMap::new()),
+            ..Default::default()
+        };
+        assert!(cloud_fence_required_for_image_recovery(&direct, None));
+        assert!(!cloud_fence_required_for_image_recovery(
+            &direct,
+            Some(&known_direct)
+        ));
+
+        let cloud = Config {
+            provider_keys: Some(ProviderKeys {
+                openai_upstream: Some("azure".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cloud_fence_required_for_image_recovery(
+            &cloud,
+            Some(&known_direct)
+        ));
     }
 }

@@ -201,6 +201,7 @@ fn azure_targets(keys: &ProviderKeys) -> Vec<AzureVerifyConfig> {
         targets.extend(azure_target(
             AzureProvider::Foundry,
             keys.azure_foundry_endpoint.as_deref(),
+            keys.azure_foundry_deployments.as_deref(),
             [
                 keys.azure_foundry_tenant_id.as_deref(),
                 keys.azure_foundry_subscription_id.as_deref(),
@@ -214,6 +215,7 @@ fn azure_targets(keys: &ProviderKeys) -> Vec<AzureVerifyConfig> {
         targets.extend(azure_target(
             AzureProvider::OpenAi,
             keys.azure_openai_endpoint.as_deref(),
+            keys.azure_openai_deployments.as_deref(),
             [
                 keys.azure_tenant_id.as_deref(),
                 keys.azure_subscription_id.as_deref(),
@@ -237,11 +239,17 @@ fn azure_targets(keys: &ProviderKeys) -> Vec<AzureVerifyConfig> {
 fn azure_target(
     provider: AzureProvider,
     endpoint: Option<&str>,
+    raw_map: Option<&str>,
     arm: [Option<&str>; 5],
 ) -> Option<AzureVerifyConfig> {
     let [tenant_id, subscription_id, resource_group, client_id, client_secret] = arm;
+    let map_provider = match provider {
+        AzureProvider::OpenAi => gm_cloud_hop::CloudProvider::AzureOpenAi,
+        AzureProvider::Foundry => gm_cloud_hop::CloudProvider::Foundry,
+    };
     Some(AzureVerifyConfig {
         provider,
+        deployment_map: parse_deployment_map(map_provider, raw_map?).ok()?,
         endpoint: configured(endpoint)?,
         tenant_id: configured(tenant_id)?,
         subscription_id: configured(subscription_id)?,
@@ -714,6 +722,7 @@ mod tests {
         provider_keys_check, Status,
     };
     use gm_azure_verify::{AzureProvider, AzureVerifier, AzureVerifyConfig};
+    use gm_cloud_hop::parse_deployment_map;
     use gm_miner_cli::config::{Config, ProviderKeys};
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path};
@@ -986,6 +995,11 @@ mod tests {
     fn foundry_target() -> AzureVerifyConfig {
         AzureVerifyConfig {
             provider: AzureProvider::Foundry,
+            deployment_map: parse_deployment_map(
+                gm_cloud_hop::CloudProvider::Foundry,
+                "claude-sonnet-4-6=foundry-sonnet",
+            )
+            .expect("foundry map"),
             endpoint: "https://acct.services.ai.azure.com".to_owned(),
             tenant_id: "tenant".to_owned(),
             subscription_id: "sub".to_owned(),
@@ -1061,6 +1075,23 @@ mod tests {
             &server,
             &format!("{ACCOUNT_PATH}/projects/p1/connections"),
             project_connections,
+        )
+        .await;
+        mount_get(
+            &server,
+            &format!("{ACCOUNT_PATH}/deployments"),
+            json!({
+                "value": [{
+                    "name": "foundry-sonnet",
+                    "properties": {
+                        "model": {
+                            "format": "Anthropic",
+                            "name": "claude-sonnet-4-6",
+                            "version": "1"
+                        }
+                    }
+                }]
+            }),
         )
         .await;
         server

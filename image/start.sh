@@ -248,6 +248,7 @@ ANTHROPIC_SAN_VALUE="${ANTHROPIC_HOST}"
 ANTHROPIC_STATIC_AUTH=0
 ANTHROPIC_CLOUD=0
 ANTHROPIC_CLOUD_HOP=0
+ANTHROPIC_BEDROCK_UNQUALIFIED=0
 CLOUD_HOP_ENABLED=0
 
 case "${ANTHROPIC_UPSTREAM}" in
@@ -282,11 +283,12 @@ case "${ANTHROPIC_UPSTREAM}" in
     ANTHROPIC_SAN_MATCH=exact
     # Bedrock's route constructs this exact Mantle hostname from the bounded
     # region; suffix matching would also admit unrelated *.api.aws certs.
-    # Bedrock remains a direct, unqualified route: it is marked as cloud
-    # provenance for the Lua slot fence, but it never enables the measured hop.
+    # Bedrock remains cloud provenance for the Lua fence, but inference is
+    # rejected inside the image because it has no qualified model echo.
     ANTHROPIC_SAN_VALUE="${ANTHROPIC_HOST}"
     ANTHROPIC_STATIC_AUTH=1
     ANTHROPIC_CLOUD=1
+    ANTHROPIC_BEDROCK_UNQUALIFIED=1
     ;;
   foundry)
     ## Microsoft Foundry serves Claude on an Anthropic-native passthrough:
@@ -615,6 +617,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_ANTHROPIC_STATIC_AUTH="${ANTHROPIC_STATIC_AUTH}" \
   GM_ANTHROPIC_CLOUD="$(lua_bool "${ANTHROPIC_CLOUD}")" \
   GM_ANTHROPIC_CLOUD_HOP="${ANTHROPIC_CLOUD_HOP}" \
+  GM_ANTHROPIC_BEDROCK_UNQUALIFIED="${ANTHROPIC_BEDROCK_UNQUALIFIED}" \
   GM_ANTHROPIC_SLOT_MAP="${GM_ANTHROPIC_SLOT_MAP}" \
   GM_ANTHROPIC_DEFAULT_SLOT_ENV="${GM_ANTHROPIC_DEFAULT_SLOT_ENV}" \
   GM_ANTHROPIC_SAN_MATCH="${ANTHROPIC_SAN_MATCH}" \
@@ -676,6 +679,7 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     anthropic_static_auth = (ENVIRON["GM_ANTHROPIC_STATIC_AUTH"] == "1")
     anthropic_cloud = ENVIRON["GM_ANTHROPIC_CLOUD"]
     anthropic_cloud_hop = (ENVIRON["GM_ANTHROPIC_CLOUD_HOP"] == "1")
+    anthropic_bedrock_unqualified = (ENVIRON["GM_ANTHROPIC_BEDROCK_UNQUALIFIED"] == "1")
     anthropic_slot_map = ENVIRON["GM_ANTHROPIC_SLOT_MAP"]
     anthropic_default_slot_env = ENVIRON["GM_ANTHROPIC_DEFAULT_SLOT_ENV"]
     anthropic_san_match = ENVIRON["GM_ANTHROPIC_SAN_MATCH"]
@@ -728,9 +732,12 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   /^[[:space:]]*## gm:anthropic-cloud-hop-route-begin[[:space:]]*$/ { in_anthropic_cloud_hop_route = 1; next }
   /^[[:space:]]*## gm:anthropic-cloud-hop-route-end[[:space:]]*$/   { in_anthropic_cloud_hop_route = 0; next }
   in_anthropic_cloud_hop_route && !anthropic_cloud_hop { next }
+  /^[[:space:]]*## gm:anthropic-bedrock-reject-route-begin[[:space:]]*$/ { in_anthropic_bedrock_reject_route = 1; next }
+  /^[[:space:]]*## gm:anthropic-bedrock-reject-route-end[[:space:]]*$/   { in_anthropic_bedrock_reject_route = 0; next }
+  in_anthropic_bedrock_reject_route && !anthropic_bedrock_unqualified { next }
   /^[[:space:]]*## gm:anthropic-direct-route-begin[[:space:]]*$/ { in_anthropic_direct_route = 1; next }
   /^[[:space:]]*## gm:anthropic-direct-route-end[[:space:]]*$/   { in_anthropic_direct_route = 0; next }
-  in_anthropic_direct_route && anthropic_cloud_hop { next }
+  in_anthropic_direct_route && (anthropic_cloud_hop || anthropic_bedrock_unqualified) { next }
   /^[[:space:]]*## gm:openai-path-rewrite-begin[[:space:]]*$/ { in_openai_path_rewrite = 1; next }
   /^[[:space:]]*## gm:openai-path-rewrite-end[[:space:]]*$/   { in_openai_path_rewrite = 0; next }
   in_openai_path_rewrite && !openai_path_rewrite { next }
@@ -818,7 +825,7 @@ else
 fi
 
 if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" ]]; then
-  log "anthropic route proxies to AWS Bedrock at https://${ANTHROPIC_HOST}:${ANTHROPIC_PORT}"
+  log "anthropic Bedrock inference is rejected as unqualified (configured host https://${ANTHROPIC_HOST}:${ANTHROPIC_PORT} is retained only for non-inference checks)"
 fi
 if [[ "${OPENAI_UPSTREAM}" == "azure" ]]; then
   log "openai route proxies to Azure OpenAI at https://${OPENAI_HOST}:${OPENAI_PORT}"

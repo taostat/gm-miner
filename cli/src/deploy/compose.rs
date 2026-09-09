@@ -29,6 +29,13 @@ const CLOUD_HOP_RUNTIME_ENVS: [&str; 5] = [
     "GM_CLOUD_HOP_MAX_CONCURRENCY",
     "GM_CLOUD_HOP_TIMEOUT_MS",
 ];
+const MIN_RUNTIME_LIMIT: u64 = 1;
+const MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BUFFERED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CONCURRENCY: u64 = 256;
+const MAX_TIMEOUT_MS: u64 = 3_600_000;
+const DEFAULT_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DEPLOYMENT_NAME_BYTES: u64 = 64;
 
 /// Placeholder substituted with the active network name (`testnet` /
 /// `mainnet`) at compose render time. A literal in the rendered compose,
@@ -183,10 +190,57 @@ where
     lines.push_str(node_secret);
     lines.push('\n');
 
-    for name in CLOUD_HOP_RUNTIME_ENVS {
+    let runtime_values = CLOUD_HOP_RUNTIME_ENVS
+        .iter()
+        .map(|name| {
+            let raw = runtime_value(name);
+            let (minimum, maximum) = match *name {
+                "GM_GATEWAY_MAX_REQUEST_BODY_BYTES" | "GM_CLOUD_HOP_MAX_REQUEST_BYTES" => {
+                    (MIN_RUNTIME_LIMIT, MAX_REQUEST_BYTES)
+                }
+                "GM_CLOUD_HOP_MAX_BUFFERED_BYTES" => (MIN_RUNTIME_LIMIT, MAX_BUFFERED_BYTES),
+                "GM_CLOUD_HOP_MAX_CONCURRENCY" => (MIN_RUNTIME_LIMIT, MAX_CONCURRENCY),
+                "GM_CLOUD_HOP_TIMEOUT_MS" => (MIN_RUNTIME_LIMIT, MAX_TIMEOUT_MS),
+                _ => bail!("unsupported runtime environment setting {name}"),
+            };
+            parse_runtime_limit(name, raw, minimum, maximum).map(|value| (*name, value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let effective_request_bytes = runtime_values
+        .iter()
+        .find(|(name, value)| *name == "GM_CLOUD_HOP_MAX_REQUEST_BYTES" && value.is_some())
+        .and_then(|(_, value)| value.as_deref())
+        .or_else(|| {
+            runtime_values
+                .iter()
+                .find(|(name, value)| {
+                    *name == "GM_GATEWAY_MAX_REQUEST_BODY_BYTES" && value.is_some()
+                })
+                .and_then(|(_, value)| value.as_deref())
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REQUEST_BYTES);
+    let required_buffered = effective_request_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(MAX_DEPLOYMENT_NAME_BYTES))
+        .context("compute the cloud hop aggregate buffer minimum")?;
+    if let Some(buffered) = runtime_values
+        .iter()
+        .find(|(name, _)| *name == "GM_CLOUD_HOP_MAX_BUFFERED_BYTES")
+        .and_then(|(_, value)| value.as_deref())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if buffered < required_buffered {
+            bail!(
+                "GM_CLOUD_HOP_MAX_BUFFERED_BYTES must be at least {required_buffered} \
+                 for a {effective_request_bytes}-byte request cap"
+            );
+        }
+    }
+    for (name, value) in runtime_values {
         lines.push_str(name);
         lines.push('=');
-        if let Some(value) = runtime_value(name) {
+        if let Some(value) = value {
             lines.push_str(&value);
         }
         lines.push('\n');
@@ -207,6 +261,30 @@ where
     }
 
     Ok(lines)
+}
+
+fn parse_runtime_limit(
+    name: &'static str,
+    raw: Option<String>,
+    minimum: u64,
+    maximum: u64,
+) -> Result<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("{name} must be a decimal integer");
+    }
+    let value = raw
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a decimal integer"))?;
+    if !(minimum..=maximum).contains(&value) {
+        bail!("{name} must be between {minimum} and {maximum}");
+    }
+    Ok(Some(value.to_string()))
 }
 
 /// Write the provider keys + node secret + registry credentials to
@@ -548,6 +626,48 @@ mod tests {
         assert!(body.contains("GM_CLOUD_HOP_MAX_BUFFERED_BYTES=262144\n"));
         assert!(body.contains("GM_CLOUD_HOP_MAX_CONCURRENCY=8\n"));
         assert!(body.contains("GM_CLOUD_HOP_TIMEOUT_MS=15000\n"));
+    }
+
+    #[test]
+    fn render_env_file_rejects_numeric_env_injection_and_noncanonical_values() {
+        let error =
+            render_env_file_with_runtime(&ProviderKeys::default(), "node-secret", None, |name| {
+                match name {
+                    "GM_CLOUD_HOP_TIMEOUT_MS" => {
+                        Some("500\nGM_NODE_SECRET=attacker-secret".to_owned())
+                    }
+                    _ => None,
+                }
+            })
+            .expect_err("numeric runtime settings must not accept newline injection");
+        assert!(
+            format!("{error:#}").contains("decimal integer"),
+            "{error:#}"
+        );
+
+        let body =
+            render_env_file_with_runtime(&ProviderKeys::default(), "node-secret", None, |name| {
+                match name {
+                    "GM_CLOUD_HOP_TIMEOUT_MS" => Some("000500".to_owned()),
+                    _ => None,
+                }
+            })
+            .expect("leading zeroes should render as canonical decimal");
+        assert!(body.contains("GM_CLOUD_HOP_TIMEOUT_MS=500\n"));
+        assert!(!body.contains("GM_CLOUD_HOP_TIMEOUT_MS=000500\n"));
+
+        let error =
+            render_env_file_with_runtime(&ProviderKeys::default(), "node-secret", None, |name| {
+                match name {
+                    "GM_CLOUD_HOP_TIMEOUT_MS" => Some("+500".to_owned()),
+                    _ => None,
+                }
+            })
+            .expect_err("numeric runtime settings must reject signs");
+        assert!(
+            format!("{error:#}").contains("decimal integer"),
+            "{error:#}"
+        );
     }
 
     /// When private-registry credentials are supplied, all three

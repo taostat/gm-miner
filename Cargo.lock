@@ -2333,6 +2333,7 @@ name = "gm-azure-verify"
 version = "0.4.15"
 dependencies = [
  "anyhow",
+ "gm-cloud-hop",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

@@ -14,7 +14,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "6d26ba055aab3eaf9f976c8505e35b65331e42cdbeb3777a2ba393f94915738a";
+    "cd3078d3dea62623a86790c24cbb7462abc3d05f116b6eb545f7b0ecfc19c9e4";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -567,9 +567,19 @@ fn bedrock_and_azure_render_cloud_upstreams() {
     assert!(rendered.contains("sni: bedrock-mantle.us-west-2.api.aws"));
     assert!(rendered.contains("exact: bedrock-mantle.us-west-2.api.aws"));
     assert!(!rendered.contains("suffix: .api.aws"));
-    assert!(rendered.contains("substitution: \"/anthropic/v1/messages\""));
-    assert!(rendered.contains("value: \"%ENVIRONMENT(BEDROCK_API_KEY)%\""));
-    assert!(rendered.contains("append_action: OVERWRITE_IF_EXISTS_OR_ADD"));
+    let ingress = rendered
+        .split_once("    - name: cloud_hop_egress")
+        .map_or(rendered.as_str(), |(ingress, _)| ingress);
+    assert!(
+        ingress.contains("status: 400")
+            && ingress.contains("AWS Bedrock is unqualified inside this image"),
+        "Bedrock inference must be rejected in the ingress route"
+    );
+    assert!(
+        !ingress.contains("host_rewrite_literal: bedrock-mantle.us-west-2.api.aws"),
+        "Bedrock must not have a direct ingress route to the Anthropic cluster"
+    );
+    assert!(!ingress.contains("%ENVIRONMENT(BEDROCK_API_KEY)%"));
     assert!(!rendered.contains("local function json_error"));
 
     assert!(rendered.contains("host_rewrite_literal: gm-resource.openai.azure.com"));
@@ -586,6 +596,23 @@ fn bedrock_and_azure_render_cloud_upstreams() {
     assert!(rendered.contains("key: x-gm-cloud-hop-provider"));
     assert!(rendered.contains("key: api-key"));
     assert!(rendered.contains("value: \"%ENVIRONMENT(GM_OPENAI_KEY_SLOT_1)%\""));
+}
+
+#[test]
+fn bedrock_inference_is_unqualified_with_or_without_a_slot() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "bedrock"),
+        ("BEDROCK_REGION", "us-west-2"),
+        ("BEDROCK_API_KEY", "bedrock-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert!(rendered.contains("AWS Bedrock is unqualified inside this image"));
+    assert!(
+        rendered.contains(
+            "if cfg.cloud and not cfg.cloud_hop then\n                              handle:respond"
+        ),
+        "slot and no-slot Bedrock requests must share the unqualified JSON 400"
+    );
 }
 
 #[test]
@@ -619,6 +646,7 @@ fn azure_openai_rewrites_only_qualified_chat_completions() {
             && egress.contains("substitution: \"/openai/v1/chat/completions\""),
         "Envoy's egress cluster must rewrite the qualified chat surface"
     );
+    assert!(egress.contains("stream_idle_timeout: 1800s"));
     assert!(!egress.contains("^/v1/(chat/completions|responses)$"));
     assert!(rendered.contains("gm_unqualified_surface"));
 }
@@ -779,8 +807,29 @@ fn cloud_backend_multikey_fails_fast() {
     assert!(!stderr.contains("bedrock-b"));
 }
 
+fn assert_rendered_cloud_slot_contract(rendered: &str) {
+    let lua = data_plane_lua(rendered).expect("data-plane Lua source");
+    assert!(lua.contains("cloud = true"), "cloud slot config is missing");
+    assert!(
+        lua.contains("cloud_hop = true"),
+        "hop slot config is missing"
+    );
+    assert!(
+        lua.contains("gm_slot_unavailable") && lua.contains("[\":status\"] = \"421\""),
+        "qualified slot rejection must remain a 421"
+    );
+    assert!(
+        lua.contains("missing or invalid x-gm-node-key"),
+        "the node-secret guard must remain before slot selection"
+    );
+}
+
 #[test]
-fn cloud_slot_guard_behaves_when_lua_is_available() {
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Lua integration fixture keeps the rendered behavior contract together"
+)]
+fn cloud_slot_guard_behaves_with_lua_or_a_render_contract() {
     let (status, _, stderr, rendered) = render_envoy([
         ("OPENAI_UPSTREAM", "azure"),
         (
@@ -792,7 +841,11 @@ fn cloud_slot_guard_behaves_when_lua_is_available() {
     ]);
     assert!(status.success(), "render failed: {stderr}");
     let Some(lua) = lua_interpreter() else {
-        eprintln!("skipping Lua slot behavior test: no lua or luajit in PATH");
+        assert_rendered_cloud_slot_contract(&rendered);
+        eprintln!(
+            "SKIPPED Lua execution: neither lua nor luajit is available; \
+             evaluated the rendered cloud-slot contract in Rust"
+        );
         return;
     };
     let source = data_plane_lua(&rendered).expect("data-plane Lua source");

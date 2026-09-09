@@ -10,7 +10,6 @@
 use std::{
     collections::BTreeMap,
     convert::Infallible,
-    future::Future,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -29,8 +28,9 @@ use hyper_util::rt::TokioIo;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
-    time::{timeout_at, Instant, Sleep},
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    task::AbortHandle,
+    time::{timeout_at, Instant},
 };
 
 /// The cloud adapters whose request surfaces are qualified for this hop.
@@ -77,6 +77,24 @@ impl CloudProvider {
             Self::Bedrock => BEDROCK_MODEL_IDS,
         }
     }
+
+    /// The ARM model class this adapter is allowed to serve.
+    #[must_use]
+    pub const fn model_class(self) -> CloudModelClass {
+        match self {
+            Self::AzureOpenAi => CloudModelClass::OpenAi,
+            Self::Foundry | Self::Bedrock => CloudModelClass::Anthropic,
+        }
+    }
+}
+
+/// The model publisher class asserted by ARM for a qualified deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudModelClass {
+    /// Azure `OpenAI` model format.
+    OpenAi,
+    /// Anthropic model format.
+    Anthropic,
 }
 
 /// A request surface in the cloud qualification matrix.
@@ -117,6 +135,7 @@ pub struct Qualification {
 struct QualificationRow {
     provider: CloudProvider,
     surface: CloudSurface,
+    model_class: CloudModelClass,
     streaming: bool,
     qualification: Qualification,
 }
@@ -124,7 +143,7 @@ struct QualificationRow {
 const QUALIFIED_MODEL_ECHO_REASON: &str =
     "2026-09-09 live echo identifies the upstream model (dated Azure model or Foundry model)";
 pub const AZURE_RESPONSES_UNQUALIFIED_REASON: &str =
-    "2026-09-09 live Azure Responses echo identifies the deployment name, not the upstream model; ARM-attested deployment binding is not shipped";
+    "2026-09-09 live Azure Responses echo identifies the deployment name, not the upstream model; this surface remains unqualified even with ARM-attested deployment binding";
 const BEDROCK_UNQUALIFIED_REASON: &str =
     "Bedrock is unqualified: no authoritative live model echo has been admitted";
 
@@ -134,6 +153,7 @@ const QUALIFICATION_MATRIX: &[QualificationRow] = &[
     QualificationRow {
         provider: CloudProvider::AzureOpenAi,
         surface: CloudSurface::AzureChatCompletions,
+        model_class: CloudModelClass::OpenAi,
         streaming: false,
         qualification: Qualification {
             qualified: true,
@@ -144,6 +164,7 @@ const QUALIFICATION_MATRIX: &[QualificationRow] = &[
     QualificationRow {
         provider: CloudProvider::AzureOpenAi,
         surface: CloudSurface::AzureChatCompletions,
+        model_class: CloudModelClass::OpenAi,
         streaming: true,
         qualification: Qualification {
             qualified: true,
@@ -154,6 +175,7 @@ const QUALIFICATION_MATRIX: &[QualificationRow] = &[
     QualificationRow {
         provider: CloudProvider::AzureOpenAi,
         surface: CloudSurface::AzureResponses,
+        model_class: CloudModelClass::OpenAi,
         streaming: false,
         qualification: Qualification {
             qualified: false,
@@ -164,6 +186,7 @@ const QUALIFICATION_MATRIX: &[QualificationRow] = &[
     QualificationRow {
         provider: CloudProvider::AzureOpenAi,
         surface: CloudSurface::AzureResponses,
+        model_class: CloudModelClass::OpenAi,
         streaming: true,
         qualification: Qualification {
             qualified: false,
@@ -174,6 +197,7 @@ const QUALIFICATION_MATRIX: &[QualificationRow] = &[
     QualificationRow {
         provider: CloudProvider::Foundry,
         surface: CloudSurface::FoundryMessages,
+        model_class: CloudModelClass::Anthropic,
         streaming: false,
         qualification: Qualification {
             qualified: true,
@@ -184,6 +208,7 @@ const QUALIFICATION_MATRIX: &[QualificationRow] = &[
     QualificationRow {
         provider: CloudProvider::Foundry,
         surface: CloudSurface::FoundryMessages,
+        model_class: CloudModelClass::Anthropic,
         streaming: true,
         qualification: Qualification {
             qualified: true,
@@ -194,6 +219,7 @@ const QUALIFICATION_MATRIX: &[QualificationRow] = &[
     QualificationRow {
         provider: CloudProvider::Bedrock,
         surface: CloudSurface::BedrockMessages,
+        model_class: CloudModelClass::Anthropic,
         streaming: false,
         qualification: Qualification {
             qualified: false,
@@ -204,6 +230,7 @@ const QUALIFICATION_MATRIX: &[QualificationRow] = &[
     QualificationRow {
         provider: CloudProvider::Bedrock,
         surface: CloudSurface::BedrockMessages,
+        model_class: CloudModelClass::Anthropic,
         streaming: true,
         qualification: Qualification {
             qualified: false,
@@ -222,7 +249,10 @@ pub fn qualification(
     QUALIFICATION_MATRIX
         .iter()
         .find(|row| {
-            row.provider == provider && row.surface == surface && row.streaming == streaming
+            row.provider == provider
+                && row.model_class == provider.model_class()
+                && row.surface == surface
+                && row.streaming == streaming
         })
         .map(|row| row.qualification)
 }
@@ -282,6 +312,7 @@ const DEFAULT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BUFFERED_BYTES: usize = 512 * 1024 * 1024;
+const REQUIRED_BUFFERED_EXTRA_BYTES: usize = MAX_DEPLOYMENT_NAME_BYTES;
 const DEFAULT_CONCURRENCY: usize = 16;
 const MAX_CONCURRENCY: usize = 256;
 const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
@@ -361,6 +392,8 @@ pub enum DeploymentMapError {
     CanonicalTooLong { entry: usize },
     #[error("canonical model '{canonical}' is not known for {provider}")]
     UnknownCanonical { provider: String, canonical: String },
+    #[error("canonical model '{canonical}' has no qualified {provider} adapter/surface row")]
+    UnqualifiedCanonical { provider: String, canonical: String },
     #[error("canonical model '{canonical}' is duplicated in the deployment map")]
     DuplicateCanonical { canonical: String },
     #[error(
@@ -435,6 +468,12 @@ pub fn parse_deployment_map(
                 canonical: canonical.to_owned(),
             });
         }
+        if !provider_has_qualified_surface(provider) {
+            return Err(DeploymentMapError::UnqualifiedCanonical {
+                provider: provider.to_string(),
+                canonical: canonical.to_owned(),
+            });
+        }
         if !valid_deployment_name(deployment) {
             return Err(DeploymentMapError::InvalidDeployment { entry });
         }
@@ -459,6 +498,14 @@ fn valid_deployment_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn provider_has_qualified_surface(provider: CloudProvider) -> bool {
+    QUALIFICATION_MATRIX.iter().any(|row| {
+        row.provider == provider
+            && row.model_class == provider.model_class()
+            && row.qualification.qualified
+    })
 }
 
 /// Construct the reviewed static Bedrock table for future use.
@@ -848,11 +895,12 @@ impl CloudHopConfig {
             MAX_REQUEST_BYTES,
             DEFAULT_REQUEST_BYTES,
         )?;
-        let default_buffered = DEFAULT_BUFFERED_BYTES.max(max_request_bytes);
+        let minimum_buffered = required_buffered_bytes(max_request_bytes);
+        let default_buffered = DEFAULT_BUFFERED_BYTES.max(minimum_buffered);
         let max_buffered_bytes = bounded_usize(
             "GM_CLOUD_HOP_MAX_BUFFERED_BYTES",
             std::env::var("GM_CLOUD_HOP_MAX_BUFFERED_BYTES").ok(),
-            max_request_bytes,
+            minimum_buffered,
             MAX_BUFFERED_BYTES,
             default_buffered,
         )?;
@@ -894,6 +942,12 @@ impl CloudHopConfig {
             CloudProvider::Bedrock => None,
         }
     }
+}
+
+fn required_buffered_bytes(max_request_bytes: usize) -> usize {
+    max_request_bytes
+        .saturating_mul(2)
+        .saturating_add(REQUIRED_BUFFERED_EXTRA_BYTES)
 }
 
 /// Environment configuration failure.
@@ -1002,8 +1056,8 @@ struct TimedResponseBody {
     request_permit: Option<OwnedSemaphorePermit>,
     buffer_permit: Option<OwnedSemaphorePermit>,
     deadline: Instant,
-    idle_sleep: Pin<Box<Sleep>>,
-    idle_timeout: Duration,
+    watchdog: Option<AbortHandle>,
+    upstream_connection: Option<AbortHandle>,
     finished: bool,
 }
 
@@ -1013,20 +1067,33 @@ impl TimedResponseBody {
         request_permit: OwnedSemaphorePermit,
         buffer_permit: Option<OwnedSemaphorePermit>,
         deadline: Instant,
+        cancellation: watch::Sender<bool>,
+        upstream_connection: AbortHandle,
     ) -> Self {
-        let idle_timeout = deadline.saturating_duration_since(Instant::now());
+        let watchdog = tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let _ = cancellation.send(true);
+        })
+        .abort_handle();
         Self {
             body,
             request_permit: Some(request_permit),
             buffer_permit,
             deadline,
-            idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
-            idle_timeout,
+            watchdog: Some(watchdog),
+            upstream_connection: Some(upstream_connection),
             finished: false,
         }
     }
 
-    fn release_permits(&mut self) {
+    fn finish(&mut self) {
+        self.finished = true;
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
+        }
+        if let Some(upstream_connection) = self.upstream_connection.take() {
+            upstream_connection.abort();
+        }
         self.request_permit.take();
         self.buffer_permit.take();
     }
@@ -1045,35 +1112,28 @@ impl hyper::body::Body for TimedResponseBody {
             return Poll::Ready(None);
         }
         if Instant::now() >= this.deadline {
-            this.finished = true;
-            this.release_permits();
-            return Poll::Ready(Some(Err(ResponseBodyError::Timeout)));
-        }
-        if this.idle_sleep.as_mut().poll(context).is_ready() {
-            this.finished = true;
-            this.release_permits();
+            this.finish();
             return Poll::Ready(Some(Err(ResponseBodyError::Timeout)));
         }
 
         match Pin::new(&mut this.body).poll_frame(context) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                this.finished = true;
-                this.release_permits();
+                this.finish();
                 Poll::Ready(None)
             }
-            Poll::Ready(Some(Ok(frame))) => {
-                this.idle_sleep
-                    .as_mut()
-                    .reset(Instant::now() + this.idle_timeout);
-                Poll::Ready(Some(Ok(frame)))
-            }
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
             Poll::Ready(Some(Err(error))) => {
-                this.finished = true;
-                this.release_permits();
+                this.finish();
                 Poll::Ready(Some(Err(ResponseBodyError::Upstream(error))))
             }
         }
+    }
+}
+
+impl Drop for TimedResponseBody {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -1104,6 +1164,16 @@ pub async fn serve_with_upstream(
     config: CloudHopConfig,
     upstream_addr: SocketAddr,
 ) -> Result<(), std::io::Error> {
+    let required_buffered = required_buffered_bytes(config.max_request_bytes);
+    if config.max_buffered_bytes < required_buffered {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "max_buffered_bytes must be at least {required_buffered} for a {}-byte request cap",
+                config.max_request_bytes
+            ),
+        ));
+    }
     let state = Arc::new(ProxyState {
         buffered: Arc::new(Semaphore::new(config.max_buffered_bytes)),
         requests: Arc::new(Semaphore::new(config.max_concurrency)),
@@ -1113,8 +1183,10 @@ pub async fn serve_with_upstream(
     loop {
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
+        let (cancellation, cancellation_rx) = watch::channel(false);
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, state).await {
+            if let Err(error) = serve_connection(stream, state, cancellation, cancellation_rx).await
+            {
                 tracing::warn!(error = %error, "cloud hop connection ended");
             }
         });
@@ -1128,16 +1200,37 @@ struct ProxyState {
     requests: Arc<Semaphore>,
 }
 
-async fn serve_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<(), hyper::Error> {
+async fn serve_connection(
+    stream: TcpStream,
+    state: Arc<ProxyState>,
+    cancellation: watch::Sender<bool>,
+    mut cancellation_rx: watch::Receiver<bool>,
+) -> Result<(), hyper::Error> {
     let io = TokioIo::new(stream);
     let service = service_fn(move |request| {
         let state = Arc::clone(&state);
-        async move { Ok::<_, Infallible>(handle_request(request, state).await) }
+        let cancellation = cancellation.clone();
+        async move { Ok::<_, Infallible>(handle_request(request, state, cancellation).await) }
     });
-    hyper::server::conn::http1::Builder::new()
+    let connection = hyper::server::conn::http1::Builder::new()
         .keep_alive(true)
-        .serve_connection(io, service)
-        .await
+        .serve_connection(io, service);
+    tokio::select! {
+        result = connection => result,
+        result = wait_for_cancellation(&mut cancellation_rx) => {
+            let _ = result;
+            Ok(())
+        }
+    }
+}
+
+async fn wait_for_cancellation(
+    cancellation: &mut watch::Receiver<bool>,
+) -> Result<(), watch::error::RecvError> {
+    while !*cancellation.borrow() {
+        cancellation.changed().await?;
+    }
+    Ok(())
 }
 
 #[expect(
@@ -1147,6 +1240,7 @@ async fn serve_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<(
 async fn handle_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
+    cancellation: watch::Sender<bool>,
 ) -> Response<ResponseBody> {
     let deadline = Instant::now() + state.config.timeout;
     let Some(selector) = request
@@ -1175,11 +1269,15 @@ async fn handle_request(
     if request.method() != Method::POST {
         return json_error(StatusCode::NOT_FOUND, "cloud hop surface is not enabled");
     }
-    if selector == CloudProvider::AzureOpenAi && request.uri().path() == "/v1/responses" {
-        return json_error(StatusCode::BAD_REQUEST, AZURE_RESPONSES_UNQUALIFIED_REASON);
-    }
-    if !supported_surface(selector, request.uri().path()) {
+    let Some(surface) = surface_for_path(selector, request.uri().path()) else {
         return json_error(StatusCode::NOT_FOUND, "cloud hop surface is not enabled");
+    };
+    let Some(non_streaming) = qualification(selector, surface, false) else {
+        return json_error(StatusCode::NOT_FOUND, "cloud hop surface is not enabled");
+    };
+    let streaming = qualification(selector, surface, true).unwrap_or(non_streaming);
+    if !non_streaming.qualified || !streaming.qualified {
+        return json_error(StatusCode::BAD_REQUEST, non_streaming.reason);
     }
     if usize::try_from(request.body().size_hint().lower())
         .is_ok_and(|size| size > state.config.max_request_bytes)
@@ -1288,7 +1386,14 @@ async fn handle_request(
     };
 
     match forward_request(parts, rewritten, selector, state, deadline).await {
-        Ok(response) => box_response(response, request_permit, buffer_permit, deadline),
+        Ok(forwarded) => box_response(
+            forwarded.response,
+            request_permit,
+            buffer_permit,
+            deadline,
+            cancellation,
+            forwarded.connection_abort,
+        ),
         Err(error) => {
             tracing::warn!(error = %error, "cloud hop upstream forwarding failed");
             json_error(
@@ -1304,8 +1409,16 @@ async fn read_request_body(
     max_request_bytes: usize,
     buffered: Arc<Semaphore>,
 ) -> Result<(Bytes, Option<OwnedSemaphorePermit>), ReadBodyError> {
-    let mut bytes = Vec::new();
-    let mut permit: Option<OwnedSemaphorePermit> = None;
+    let permit = Some(
+        buffered
+            .try_acquire_many_owned(
+                max_request_bytes
+                    .try_into()
+                    .map_err(|_| ReadBodyError::AggregateLimit)?,
+            )
+            .map_err(|_| ReadBodyError::AggregateLimit)?,
+    );
+    let mut bytes = Vec::with_capacity(max_request_bytes);
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(ReadBodyError::Body)?;
         if let Ok(data) = frame.into_data() {
@@ -1316,28 +1429,7 @@ async fn read_request_body(
             if next_len > max_request_bytes {
                 return Err(ReadBodyError::TooLarge);
             }
-            let frame_permit = if data.is_empty() {
-                None
-            } else {
-                Some(
-                    buffered
-                        .clone()
-                        .try_acquire_many_owned(
-                            data.len()
-                                .try_into()
-                                .map_err(|_| ReadBodyError::AggregateLimit)?,
-                        )
-                        .map_err(|_| ReadBodyError::AggregateLimit)?,
-                )
-            };
             bytes.extend_from_slice(&data);
-            if let Some(frame_permit) = frame_permit {
-                if let Some(existing) = permit.as_mut() {
-                    existing.merge(frame_permit);
-                } else {
-                    permit = Some(frame_permit);
-                }
-            }
         } else {
             return Err(ReadBodyError::Trailers);
         }
@@ -1357,11 +1449,21 @@ enum ReadBodyError {
     Trailers,
 }
 
-fn supported_surface(provider: CloudProvider, path: &str) -> bool {
+fn surface_for_path(provider: CloudProvider, path: &str) -> Option<CloudSurface> {
     match provider {
-        CloudProvider::AzureOpenAi => path == "/v1/chat/completions",
-        CloudProvider::Foundry => path == "/v1/messages",
-        CloudProvider::Bedrock => false,
+        CloudProvider::AzureOpenAi if path == CloudSurface::AzureChatCompletions.path() => {
+            Some(CloudSurface::AzureChatCompletions)
+        }
+        CloudProvider::AzureOpenAi if path == CloudSurface::AzureResponses.path() => {
+            Some(CloudSurface::AzureResponses)
+        }
+        CloudProvider::Foundry if path == CloudSurface::FoundryMessages.path() => {
+            Some(CloudSurface::FoundryMessages)
+        }
+        CloudProvider::Bedrock if path == CloudSurface::BedrockMessages.path() => {
+            Some(CloudSurface::BedrockMessages)
+        }
+        _ => None,
     }
 }
 
@@ -1371,7 +1473,7 @@ async fn forward_request(
     selector: CloudProvider,
     state: Arc<ProxyState>,
     deadline: Instant,
-) -> Result<Response<Incoming>, ForwardError> {
+) -> Result<ForwardedResponse, ForwardError> {
     let headers_to_remove = parts
         .headers
         .keys()
@@ -1405,15 +1507,31 @@ async fn forward_request(
         .await
         .map_err(|_| ForwardError::Timeout)?
         .map_err(ForwardError::Http)?;
-    tokio::spawn(async move {
+    let connection_task = tokio::spawn(async move {
         if let Err(error) = connection.await {
             tracing::debug!(error = %error, "cloud hop egress connection ended");
         }
     });
-    timeout_at(deadline, sender.send_request(request))
-        .await
-        .map_err(|_| ForwardError::Timeout)?
-        .map_err(ForwardError::Http)
+    let connection_abort = connection_task.abort_handle();
+    match timeout_at(deadline, sender.send_request(request)).await {
+        Ok(Ok(response)) => Ok(ForwardedResponse {
+            response,
+            connection_abort,
+        }),
+        Ok(Err(error)) => {
+            connection_task.abort();
+            Err(ForwardError::Http(error))
+        }
+        Err(_) => {
+            connection_task.abort();
+            Err(ForwardError::Timeout)
+        }
+    }
+}
+
+struct ForwardedResponse {
+    response: Response<Incoming>,
+    connection_abort: AbortHandle,
 }
 
 fn box_response(
@@ -1421,9 +1539,18 @@ fn box_response(
     request_permit: OwnedSemaphorePermit,
     buffer_permit: Option<OwnedSemaphorePermit>,
     deadline: Instant,
+    cancellation: watch::Sender<bool>,
+    upstream_connection: AbortHandle,
 ) -> Response<ResponseBody> {
     let (parts, body) = response.into_parts();
-    let body = TimedResponseBody::new(body, request_permit, buffer_permit, deadline);
+    let body = TimedResponseBody::new(
+        body,
+        request_permit,
+        buffer_permit,
+        deadline,
+        cancellation,
+        upstream_connection,
+    );
     let body = BoxBody::new(body);
     Response::from_parts(parts, body)
 }
@@ -1542,6 +1669,27 @@ mod tests {
         }
     }
 
+    struct FloodingBody {
+        remaining: usize,
+        chunk: Bytes,
+    }
+
+    impl hyper::body::Body for FloodingBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.remaining == 0 {
+                return Poll::Pending;
+            }
+            self.remaining -= 1;
+            Poll::Ready(Some(Ok(Frame::data(self.chunk.clone()))))
+        }
+    }
+
     fn quick_test_body() -> BoxBody<Bytes, Infallible> {
         Full::new(Bytes::from_static(b"ok"))
             .map_err(|never: Infallible| match never {})
@@ -1581,10 +1729,24 @@ mod tests {
         max_concurrency: usize,
         timeout: Duration,
     ) -> CloudHopConfig {
+        test_config_with_request(
+            1024 * 1024,
+            max_buffered_bytes.max(required_buffered_bytes(1024 * 1024)),
+            max_concurrency,
+            timeout,
+        )
+    }
+
+    fn test_config_with_request(
+        max_request_bytes: usize,
+        max_buffered_bytes: usize,
+        max_concurrency: usize,
+        timeout: Duration,
+    ) -> CloudHopConfig {
         CloudHopConfig {
             azure_openai: Some(azure_map()),
             foundry: Some(foundry_map()),
-            max_request_bytes: 1024 * 1024,
+            max_request_bytes,
             max_buffered_bytes,
             max_concurrency,
             timeout,
@@ -1595,6 +1757,7 @@ mod tests {
     enum FirstResponse {
         Stalled,
         ChunkThenPending,
+        Flooding,
     }
 
     fn spawn_counted_upstream(
@@ -1627,6 +1790,10 @@ mod tests {
                                         FirstResponse::ChunkThenPending => {
                                             BoxBody::new(FirstChunkThenPending { sent: false })
                                         }
+                                        FirstResponse::Flooding => BoxBody::new(FloodingBody {
+                                            remaining: 2048,
+                                            chunk: Bytes::from(vec![b'x'; 16 * 1024]),
+                                        }),
                                     }
                                 } else {
                                     quick_test_body()
@@ -1832,6 +1999,21 @@ mod tests {
         assert_eq!(request_cap_value(None, Some(" ".to_owned())), None);
     }
 
+    #[tokio::test]
+    async fn serving_rejects_an_aggregate_budget_below_the_peak_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
+        let config = test_config_with_request(1024, 1024, 1, Duration::from_secs(1));
+        let error = serve_with_upstream(
+            listener,
+            config,
+            "127.0.0.1:1".parse().expect("unused upstream address"),
+        )
+        .await
+        .expect_err("an invalid aggregate budget must fail before serving");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("max_buffered_bytes"));
+    }
+
     #[test]
     fn rewrite_storage_capacity_covers_the_original_and_new_buffers() {
         let body = br#"{"model":"gpt-5.5"}"#;
@@ -1932,16 +2114,29 @@ mod tests {
             .await
             .expect("upstream bind");
         let upstream_addr = upstream_listener.local_addr().expect("upstream address");
+        let (forwarded_tx, forwarded_rx) = oneshot::channel();
+        let forwarded_tx = Arc::new(Mutex::new(Some(forwarded_tx)));
         tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.expect("upstream accept");
             let io = TokioIo::new(stream);
-            let service = service_fn(|request: Request<Incoming>| async move {
-                let _ = request
-                    .into_body()
-                    .collect()
-                    .await
-                    .expect("fragmented request body");
-                Ok::<_, Infallible>(Response::new(quick_test_body()))
+            let service = service_fn(move |request: Request<Incoming>| {
+                let forwarded_tx = Arc::clone(&forwarded_tx);
+                async move {
+                    let body = request
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("fragmented request body")
+                        .to_bytes();
+                    if let Some(forwarded_tx) = forwarded_tx
+                        .lock()
+                        .expect("forwarded body sender lock")
+                        .take()
+                    {
+                        forwarded_tx.send(body).expect("forwarded body receiver");
+                    }
+                    Ok::<_, Infallible>(Response::new(quick_test_body()))
+                }
             });
             server_http1::Builder::new()
                 .serve_connection(io, service)
@@ -1949,23 +2144,27 @@ mod tests {
                 .expect("upstream serve");
         });
 
-        let original = Bytes::from_static(br#"{"model":"gpt-5.5"}"#);
+        let original = Bytes::from(
+            format!(r#"{{"model":"gpt-5.5","padding":"{}"}}"#, "x".repeat(4096)).into_bytes(),
+        );
         let rewrite_storage = rewrite_capacity(&original, &azure_map()).expect("rewrite size");
+        let aggregate_budget = required_buffered_bytes(original.len());
+        assert!(original.len() + rewrite_storage <= aggregate_budget);
         let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
         let hop_addr = hop_listener.local_addr().expect("hop address");
         tokio::spawn(serve_with_upstream(
             hop_listener,
-            test_config(original.len() + rewrite_storage, 1, Duration::from_secs(5)),
+            test_config_with_request(original.len(), aggregate_budget, 1, Duration::from_secs(5)),
             upstream_addr,
         ));
 
-        let split = 3;
-        let mut response = send_hop_request(
-            hop_addr,
-            vec![original.slice(..split), original.slice(split..)],
-        )
-        .await
-        .expect("hop response");
+        let chunks = original
+            .iter()
+            .map(|byte| Bytes::copy_from_slice(std::slice::from_ref(byte)))
+            .collect();
+        let mut response = send_hop_request(hop_addr, chunks)
+            .await
+            .expect("hop response");
         assert_eq!(response.status(), StatusCode::OK);
         let response_body = response
             .body_mut()
@@ -1974,6 +2173,12 @@ mod tests {
             .expect("response body")
             .to_bytes();
         assert_eq!(response_body, Bytes::from_static(b"ok"));
+        assert_eq!(
+            forwarded_rx.await.expect("forwarded body"),
+            Bytes::from(
+                format!(r#"{{"model":"my-gpt55","padding":"{}"}}"#, "x".repeat(4096)).into_bytes(),
+            )
+        );
     }
 
     #[tokio::test]
@@ -2028,12 +2233,63 @@ mod tests {
             .await
             .expect("upstream bind");
         let (upstream_addr, upstream_task) =
+            spawn_counted_upstream(upstream_listener, FirstResponse::Flooding);
+        let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
+        let hop_addr = hop_listener.local_addr().expect("hop address");
+        tokio::spawn(serve_with_upstream(
+            hop_listener,
+            test_config(2 * 1024 * 1024, 1, Duration::from_millis(100)),
+            upstream_addr,
+        ));
+
+        let first = send_hop_request(
+            hop_addr,
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        )
+        .await
+        .expect("first hop response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let mut second_task = tokio::spawn(send_hop_request(
+            hop_addr,
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second_task)
+                .await
+                .is_err(),
+            "a non-reading consumer should not be admitted before the deadline"
+        );
+        second_task.abort();
+        let _ = second_task.await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut second = send_hop_request(
+            hop_addr,
+            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
+        )
+        .await
+        .expect("deadline must release a non-reading response");
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = second
+            .body_mut()
+            .collect()
+            .await
+            .expect("second response body");
+        drop(first);
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_after_progress_times_out_at_the_absolute_deadline() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let (upstream_addr, upstream_task) =
             spawn_counted_upstream(upstream_listener, FirstResponse::ChunkThenPending);
         let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
         let hop_addr = hop_listener.local_addr().expect("hop address");
         tokio::spawn(serve_with_upstream(
             hop_listener,
-            test_config(2 * 1024 * 1024, 1, Duration::from_secs(5)),
+            test_config(2 * 1024 * 1024, 1, Duration::from_millis(100)),
             upstream_addr,
         ));
 
@@ -2055,28 +2311,15 @@ mod tests {
                 .expect("first response frame data"),
             Bytes::from_static(b"first")
         );
-
-        let mut second_task = tokio::spawn(send_hop_request(
-            hop_addr,
-            vec![Bytes::from_static(br#"{"model":"gpt-5.5"}"#)],
-        ));
+        let started = Instant::now();
+        let timed_out = tokio::time::timeout(Duration::from_secs(1), first.body_mut().frame())
+            .await
+            .expect("response timeout task");
+        assert!(matches!(timed_out, Some(Err(_))));
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut second_task)
-                .await
-                .is_err(),
-            "a slow consumer must retain the only request permit"
+            started.elapsed() < Duration::from_millis(500),
+            "absolute deadline was not enforced after progress"
         );
-        drop(first);
-        let mut second = second_task
-            .await
-            .expect("second request task")
-            .expect("second response");
-        assert_eq!(second.status(), StatusCode::OK);
-        let _ = second
-            .body_mut()
-            .collect()
-            .await
-            .expect("second response body");
         upstream_task.abort();
     }
 
@@ -2196,7 +2439,7 @@ mod tests {
             azure_openai: Some(azure_map()),
             foundry: Some(foundry_map()),
             max_request_bytes: 1024 * 1024,
-            max_buffered_bytes: 2 * 1024 * 1024,
+            max_buffered_bytes: required_buffered_bytes(1024 * 1024),
             max_concurrency: 2,
             timeout: Duration::from_secs(5),
         };

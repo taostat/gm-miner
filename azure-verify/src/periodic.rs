@@ -36,61 +36,108 @@ pub(crate) async fn run_periodic_azure_verification(
         }
     };
 
+    let mut full_sweep = tokio::time::interval(settings.interval);
+    let mut deployment_poll = tokio::time::interval(settings.deployment_interval);
+    // Do not run an extra immediate sweep: boot already performed the full
+    // gate, and the first periodic events should occur at their configured
+    // intervals.
+    full_sweep.tick().await;
+    deployment_poll.tick().await;
+
     loop {
-        tokio::time::sleep(settings.interval).await;
-        for state in &mut states {
-            let provider = state.config.provider.label();
-            match verifier.verify_target(&state.config).await {
-                Ok(()) => {
-                    if state.transient_failures > 0 {
-                        tracing::info!(
-                            provider,
-                            recovered_after = state.transient_failures,
-                            "periodic Azure owner-capture verification recovered",
-                        );
-                        state.transient_failures = 0;
-                    }
-                }
-                Err(err) => match classify_verification_error(&err) {
-                    VerificationFailureKind::Definitive => {
-                        let reason = format!(
-                            "definitive {provider} owner-capture verification failure: {err:#}"
-                        );
-                        tracing::error!(
-                            provider,
-                            error = %err,
-                            "periodic Azure owner-capture verification failed definitively",
-                        );
+        tokio::select! {
+            _ = full_sweep.tick() => {
+                for state in &mut states {
+                    let result = verifier.verify_target(&state.config).await;
+                    if let Some(reason) = record_result(
+                        state,
+                        result,
+                        "owner-capture verification",
+                        settings.transient_failure_limit,
+                    ) {
                         let _ = fatal_shutdown.send(reason);
                         return;
                     }
-                    VerificationFailureKind::Transient => {
-                        state.transient_failures = state.transient_failures.saturating_add(1);
-                        if state.transient_failures >= settings.transient_failure_limit {
-                            let reason = format!(
-                                "{provider} owner-capture verification had {} consecutive transient failures (limit {}): {err:#}",
-                                state.transient_failures, settings.transient_failure_limit
-                            );
-                            tracing::error!(
-                                provider,
-                                error = %err,
-                                transient_failures = state.transient_failures,
-                                transient_failure_limit = settings.transient_failure_limit,
-                                "periodic Azure owner-capture verification exceeded transient failure tolerance",
-                            );
-                            let _ = fatal_shutdown.send(reason);
-                            return;
-                        }
-                        tracing::warn!(
-                            provider,
-                            error = %err,
-                            transient_failures = state.transient_failures,
-                            transient_failure_limit = settings.transient_failure_limit,
-                            "periodic Azure owner-capture verification hit a transient error",
-                        );
+                }
+            }
+            _ = deployment_poll.tick() => {
+                for state in &mut states {
+                    let result = verifier.verify_deployment_bindings(&state.config).await;
+                    if let Some(reason) = record_result(
+                        state,
+                        result,
+                        "deployment binding verification",
+                        settings.transient_failure_limit,
+                    ) {
+                        let _ = fatal_shutdown.send(reason);
+                        return;
                     }
-                },
+                }
             }
         }
+    }
+}
+
+fn record_result(
+    state: &mut TargetState,
+    result: anyhow::Result<()>,
+    operation: &str,
+    transient_failure_limit: u32,
+) -> Option<String> {
+    let provider = state.config.provider.label();
+    match result {
+        Ok(()) => {
+            if state.transient_failures > 0 {
+                tracing::info!(
+                    provider,
+                    operation,
+                    recovered_after = state.transient_failures,
+                    "periodic Azure verification recovered",
+                );
+                state.transient_failures = 0;
+            }
+            None
+        }
+        Err(err) => match classify_verification_error(&err) {
+            VerificationFailureKind::Definitive => {
+                tracing::error!(
+                    provider,
+                    operation,
+                    error = %err,
+                    "periodic Azure verification failed definitively",
+                );
+                Some(format!(
+                    "definitive {provider} {operation} failure: {err:#}"
+                ))
+            }
+            VerificationFailureKind::Transient => {
+                state.transient_failures = state.transient_failures.saturating_add(1);
+                if state.transient_failures >= transient_failure_limit {
+                    tracing::error!(
+                        provider,
+                        operation,
+                        error = %err,
+                        transient_failures = state.transient_failures,
+                        transient_failure_limit,
+                        "periodic Azure verification exceeded transient failure tolerance",
+                    );
+                    Some(format!(
+                        "{provider} {operation} had {} consecutive transient failures \
+                         (limit {transient_failure_limit}): {err:#}",
+                        state.transient_failures,
+                    ))
+                } else {
+                    tracing::warn!(
+                        provider,
+                        operation,
+                        error = %err,
+                        transient_failures = state.transient_failures,
+                        transient_failure_limit,
+                        "periodic Azure verification hit a transient error",
+                    );
+                    None
+                }
+            }
+        },
     }
 }
