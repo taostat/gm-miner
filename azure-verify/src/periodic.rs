@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use crate::AzureVerifiedTarget;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
 
 use crate::arm::AzureVerifier;
 use crate::config::{AzureVerifyConfig, PeriodicAzureVerifySettings};
@@ -48,7 +50,7 @@ impl VerificationOperation {
 const DEPLOYMENT_STALE_INTERVALS: u32 = 2;
 
 pub(crate) async fn run_periodic_azure_verification(
-    targets: Vec<AzureVerifyConfig>,
+    targets: Vec<AzureVerifiedTarget>,
     settings: PeriodicAzureVerifySettings,
     fatal_shutdown: oneshot::Sender<String>,
 ) {
@@ -68,7 +70,7 @@ pub(crate) async fn run_periodic_azure_verification(
 
 async fn run_periodic_azure_verification_with_verifier(
     verifier: AzureVerifier,
-    targets: Vec<AzureVerifyConfig>,
+    targets: Vec<AzureVerifiedTarget>,
     settings: PeriodicAzureVerifySettings,
     fatal_shutdown: oneshot::Sender<String>,
 ) {
@@ -78,7 +80,8 @@ async fn run_periodic_azure_verification_with_verifier(
 
     let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
     let mut tasks = Vec::with_capacity(targets.len().saturating_mul(2));
-    for config in targets {
+    for target in targets {
+        let config = target.config;
         let capture_tx = failure_tx.clone();
         let capture_verifier = verifier.clone();
         let capture_settings = settings;
@@ -94,6 +97,7 @@ async fn run_periodic_azure_verification_with_verifier(
             run_deployment_binding_loop(
                 deployment_verifier,
                 deployment_config,
+                target.binding_verified_at,
                 deployment_settings,
                 deployment_tx,
             )
@@ -141,13 +145,16 @@ async fn run_capture_audit_loop(
 async fn run_deployment_binding_loop(
     verifier: AzureVerifier,
     config: AzureVerifyConfig,
+    binding_verified_at: watch::Sender<Instant>,
     settings: PeriodicAzureVerifySettings,
     failure_tx: mpsc::UnboundedSender<String>,
 ) {
     let mut state = TargetState::new(config);
-    let mut interval = tokio::time::interval(settings.deployment_interval);
+    let mut interval = tokio::time::interval_at(
+        *binding_verified_at.borrow() + settings.deployment_interval,
+        settings.deployment_interval,
+    );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    interval.tick().await;
     let cycle_timeout = settings
         .deployment_interval
         .checked_mul(DEPLOYMENT_STALE_INTERVALS)
@@ -155,12 +162,13 @@ async fn run_deployment_binding_loop(
     // The boot gate verified this target before this loop was spawned. Keep
     // the target's staleness deadline anchored to that successful verification
     // rather than starting a fresh timeout for every poll attempt.
-    let mut stale_deadline = tokio::time::Instant::now() + cycle_timeout;
+    let mut stale_deadline = *binding_verified_at.borrow() + cycle_timeout;
 
     loop {
-        if tokio::time::timeout_at(stale_deadline, interval.tick())
-            .await
-            .is_err()
+        if Instant::now() >= stale_deadline
+            || tokio::time::timeout_at(stale_deadline, interval.tick())
+                .await
+                .is_err()
         {
             let _ = failure_tx.send(stale_failure_message());
             return;
@@ -195,7 +203,9 @@ async fn run_deployment_binding_loop(
             return;
         }
         if successful {
-            stale_deadline = tokio::time::Instant::now() + cycle_timeout;
+            let verified_at = Instant::now();
+            binding_verified_at.send_replace(verified_at);
+            stale_deadline = verified_at + cycle_timeout;
         }
     }
 }
@@ -344,6 +354,7 @@ mod tests {
         let task = tokio::spawn(run_deployment_binding_loop(
             verifier,
             state().config,
+            watch::channel(Instant::now()).0,
             settings,
             tx,
         ));
@@ -356,7 +367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round4_staleness_interrupts_a_stalled_deployment_read() {
+    async fn stalled_read_expires_at_last_success_with_controlled_time() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tenant/oauth2/v2.0/token"))
@@ -379,24 +390,14 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        let reading = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify = reading.clone();
         Mock::given(method("GET"))
             .and(path(format!("{account_path}/deployments")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(500))
-                    .set_body_json(serde_json::json!({
-                        "value": [{
-                            "name": "foundry-sonnet",
-                            "properties": {
-                                "model": {
-                                    "format": "Anthropic",
-                                    "name": "claude-sonnet-4-6",
-                                    "version": "1"
-                                }
-                            }
-                        }]
-                    })),
-            )
+            .respond_with(move |_: &wiremock::Request| {
+                notify.notify_one();
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(5))
+            })
             .mount(&server)
             .await;
 
@@ -408,16 +409,33 @@ mod tests {
             deployment_interval: Duration::from_millis(100),
             transient_failure_limit: 3,
         };
+        let last_success = Instant::now();
         let task = tokio::spawn(run_deployment_binding_loop(
             verifier,
             state().config,
+            watch::channel(last_success).0,
             settings,
             tx,
         ));
-        let result = tokio::time::timeout(Duration::from_millis(350), rx.recv())
-            .await
-            .expect("stalled deployment read must not outlive the stale deadline")
-            .expect("stale deployment read must report a failure");
+        reading.notified().await;
+        tokio::time::pause();
+        let remaining = (last_success + Duration::from_millis(200)) - Instant::now();
+        tokio::time::advance(
+            remaining
+                .checked_sub(Duration::from_millis(1))
+                .expect("ARM read began before stale deadline"),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must not expire before last-success deadline"
+        );
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        let result = rx
+            .try_recv()
+            .expect("must expire at last-success deadline, not per-attempt deadline");
         task.abort();
         assert!(result.contains("became stale"), "{result}");
     }
@@ -482,7 +500,7 @@ mod tests {
         };
         let task = tokio::spawn(run_periodic_azure_verification_with_verifier(
             verifier,
-            vec![state().config],
+            vec![AzureVerifiedTarget::new(state().config, Instant::now())],
             settings,
             fatal_tx,
         ));
@@ -521,5 +539,146 @@ mod tests {
             3,
         )
         .is_some());
+    }
+    async fn mount_boot_account(server: &MockServer, account: &str, delay: u64) {
+        let base = format!("/subscriptions/subscription/resourceGroups/resource-group/providers/Microsoft.CognitiveServices/accounts/{account}");
+        Mock::given(method("GET")).and(path(base.clone())).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":base, "kind":"AIServices", "properties":{"customSubDomainName":account,"endpoint":format!("https://{account}.services.ai.azure.com/")}
+            }))).mount(server).await;
+        for collection in [
+            "projects",
+            "connections",
+            "capabilityHosts",
+            "providers/Microsoft.Insights/diagnosticSettings",
+        ] {
+            let response =
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"value":[]}));
+            let response = if collection == "projects" {
+                response.set_delay(Duration::from_millis(delay))
+            } else {
+                response
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("{base}/{collection}")))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET")).and(path(format!("{base}/deployments"))).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"value":[{
+                "name":"foundry-sonnet","properties":{"model":{"format":"Anthropic","name":"claude-sonnet-4-6","version":"1"}}
+            }]}))).mount(server).await;
+    }
+
+    #[tokio::test]
+    async fn aged_boot_binding_is_polled_before_its_inherited_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "token"})),
+            )
+            .mount(&server)
+            .await;
+        mount_boot_account(&server, "acct", 0).await;
+        let verifier =
+            AzureVerifier::with_endpoints(reqwest::Client::new(), server.uri(), server.uri());
+        let boot = Instant::now()
+            .checked_sub(Duration::from_millis(1500))
+            .expect("boot timestamp");
+        let target = AzureVerifiedTarget::new(state().config, boot);
+        let mut updates = target.binding_verified_at.subscribe();
+        let settings = PeriodicAzureVerifySettings {
+            interval: Duration::from_secs(30),
+            deployment_interval: Duration::from_secs(1),
+            transient_failure_limit: 3,
+        };
+        let readiness = crate::AzureBindingReadiness {
+            targets: vec![target.clone()],
+            window: settings.deployment_interval * 2,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_deployment_binding_loop(
+            verifier,
+            target.config,
+            target.binding_verified_at,
+            settings,
+            tx,
+        ));
+        tokio::time::timeout(Duration::from_millis(500), updates.changed())
+            .await
+            .expect("successful poll must publish its timestamp")
+            .expect("poll remains alive");
+        assert!(*updates.borrow() > boot);
+        assert!(readiness.is_fresh());
+        task.abort();
+        tokio::time::pause();
+        tokio::time::advance(settings.deployment_interval * 2).await;
+        assert!(!readiness.is_fresh());
+    }
+
+    #[tokio::test]
+    async fn round5_boot_age_survives_a_later_targets_slow_sweep() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token":"token"})),
+            )
+            .mount(&server)
+            .await;
+        mount_boot_account(&server, "acct", 0).await;
+        mount_boot_account(&server, "acct2", 300).await;
+        let verifier =
+            AzureVerifier::with_endpoints(reqwest::Client::new(), server.uri(), server.uri());
+        let first = state().config;
+        let mut second = first.clone();
+        second.endpoint = "https://acct2.services.ai.azure.com".to_owned();
+        // Same sequential boot-gate control flow as verify_azure_config_from_env.
+        let last_success = verifier
+            .verify_target_with_timestamp(&first)
+            .await
+            .expect("first boot binding");
+        verifier
+            .verify_target(&second)
+            .await
+            .expect("valid fixture");
+        assert!(last_success.elapsed() > Duration::from_millis(200));
+        let settings = PeriodicAzureVerifySettings {
+            interval: Duration::from_secs(30),
+            deployment_interval: Duration::from_millis(100),
+            transient_failure_limit: 3,
+        };
+        let mut targets = vec![AzureVerifiedTarget::new(first.clone(), last_success)];
+        crate::refresh_expired_bindings(&verifier, &mut targets, settings)
+            .await
+            .expect("earlier target must be refreshed after later sweep");
+        assert!(*targets[0].binding_verified_at.borrow() > last_success);
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let mut expired = vec![AzureVerifiedTarget::new(first.clone(), last_success)];
+        assert!(
+            crate::refresh_expired_bindings(&verifier, &mut expired, settings)
+                .await
+                .is_err(),
+            "unverifiable expired boot evidence must prevent startup"
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_deployment_binding_loop(
+            verifier,
+            first,
+            watch::channel(last_success).0,
+            PeriodicAzureVerifySettings {
+                interval: Duration::from_secs(30),
+                deployment_interval: Duration::from_millis(100),
+                transient_failure_limit: 3,
+            },
+            tx,
+        ));
+        let result = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        task.abort();
+        assert!(matches!(result, Ok(Some(_))), "boot verification is already older than two intervals, but starting the loop granted another stale window");
     }
 }

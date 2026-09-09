@@ -2823,4 +2823,61 @@ mod tests {
         assert_eq!(second, Bytes::from_static(b"second"));
         assert!(response.body_mut().frame().await.is_none());
     }
+    #[tokio::test]
+    async fn round5_cancel_before_headers_releases_transport_storage() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("valid cancellation fixture");
+        let addr = listener.local_addr().expect("valid cancellation fixture");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("valid cancellation fixture");
+            accepted_tx.send(()).expect("valid cancellation fixture");
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let size = 16 * 1024 * 1024;
+        let buffered = Arc::new(Semaphore::new(size));
+        let permit = buffered
+            .clone()
+            .acquire_many_owned(u32::try_from(size).expect("fixture fits u32"))
+            .await
+            .expect("valid cancellation fixture");
+        let body = BufferedBytes::new(Bytes::from(vec![b'x'; size]), Some(permit));
+        let state = Arc::new(ProxyState {
+            config: test_config_with_request(size, size * 2 + 64, 1, Duration::from_millis(100)),
+            upstream_addr: addr,
+            buffered: buffered.clone(),
+            requests: Arc::new(Semaphore::new(1)),
+        });
+        let (parts, ()) = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .body(())
+            .expect("valid cancellation fixture")
+            .into_parts();
+        let task = tokio::spawn(forward_request(
+            parts,
+            body,
+            CloudProvider::AzureOpenAi,
+            state,
+            Instant::now() + Duration::from_millis(100),
+        ));
+        accepted_rx.await.expect("valid cancellation fixture");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            buffered.available_permits(),
+            0,
+            "transport must still own the incomplete upload"
+        );
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let available = buffered.available_permits();
+        upstream.abort();
+        assert_eq!(
+            available, size,
+            "cancelled pre-header forwarding must free transport storage by its deadline"
+        );
+    }
 }

@@ -883,9 +883,25 @@ log "starting attestation server on ${ATTESTD_BIND_ADDR}"
 gm-miner-attestd &
 ATTESTD_PID=$!
 
+# The one-shot check predates certificate provisioning. Wait for the serving
+# verifier to refresh that evidence and start its success-anchored pollers.
+if [[ "${CLOUD_HOP_ENABLED}" -eq 1 ]]; then
+  until gm-miner-attestd --check-ready >/dev/null 2>&1; do
+    if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
+      wait "${ATTESTD_PID}" || true
+      log "error: attestation server exited before Azure readiness"
+      if [[ -n "${NEAR_PROXY_PID}" ]]; then
+        kill -TERM "${NEAR_PROXY_PID}" 2>/dev/null || true
+      fi
+      exit 1
+    fi
+    sleep 0.1
+  done
+fi
+
 # ── Launch the measured cloud hop ──────────────────────────────────────
-# This happens after the one-shot Azure gate above. It binds loopback only;
-# the internal Envoy listener is the hop's sole egress and owns the cloud TLS
+# The serving Azure verifier reports fresh bindings before this loopback-only
+# hop starts. The internal Envoy listener is the hop's sole egress and owns the cloud TLS
 # connection. The supervisor below treats an exit exactly like attestd/envoy.
 CLOUD_HOP_PID=""
 if [[ "${CLOUD_HOP_ENABLED}" -eq 1 ]]; then

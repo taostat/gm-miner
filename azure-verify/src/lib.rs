@@ -20,7 +20,8 @@ mod periodic;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Result};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
+use tokio::time::Instant;
 
 use crate::arm::{ArmDeploymentList, ArmScope, PagedRead};
 use crate::checks::{
@@ -80,6 +81,44 @@ pub struct AzureAudit {
     pub swept_completely: bool,
     /// One message per violation, each ending in the fix.
     pub findings: Vec<String>,
+    /// The instant at which the complete deployment binding was successfully
+    /// checked. The full audit may perform slower policy reads afterwards, so
+    /// this must be captured at the binding check rather than at audit return.
+    binding_verified_at: Option<Instant>,
+}
+
+/// A target that passed the boot gate, including the binding timestamp that
+/// the periodic deployment poll must use as its staleness anchor.
+#[derive(Debug, Clone)]
+pub struct AzureVerifiedTarget {
+    config: AzureVerifyConfig,
+    binding_verified_at: watch::Sender<Instant>,
+}
+
+impl AzureVerifiedTarget {
+    fn new(config: AzureVerifyConfig, verified_at: Instant) -> Self {
+        Self {
+            config,
+            binding_verified_at: watch::channel(verified_at).0,
+        }
+    }
+}
+
+/// Live deployment freshness, including delays between boot and listener startup.
+#[derive(Clone)]
+pub struct AzureBindingReadiness {
+    targets: Vec<AzureVerifiedTarget>,
+    window: std::time::Duration,
+}
+
+impl AzureBindingReadiness {
+    /// True only while every target's last successful binding is fresh.
+    #[must_use]
+    pub fn is_fresh(&self) -> bool {
+        self.targets
+            .iter()
+            .all(|target| Instant::now() < *target.binding_verified_at.borrow() + self.window)
+    }
 }
 
 impl AzureAudit {
@@ -91,6 +130,7 @@ impl AzureAudit {
             projects_swept: 0,
             swept_completely: true,
             findings: Vec::new(),
+            binding_verified_at: None,
         }
     }
 
@@ -155,17 +195,21 @@ impl AzureAudit {
 /// Returns an error when any required env var is missing, an endpoint is not an
 /// allowed Azure host, ARM cannot be queried, or any configured account is not
 /// bound to its TLS destination with every observable capture surface off.
-pub async fn verify_azure_config_from_env() -> Result<()> {
+pub async fn verify_azure_config_from_env() -> Result<Vec<AzureVerifiedTarget>> {
     let targets = configured_targets_from_env()?;
     if targets.is_empty() {
         tracing::info!("no Azure-backed upstream configured; nothing to verify");
-        return Ok(());
+        return Ok(Vec::new());
     }
     let verifier = AzureVerifier::new()?;
+    let mut verified_targets = Vec::with_capacity(targets.len());
     for target in &targets {
-        verifier.verify_target(target).await?;
+        verified_targets.push(AzureVerifiedTarget::new(
+            target.clone(),
+            verifier.verify_target_with_timestamp(target).await?,
+        ));
     }
-    Ok(())
+    Ok(verified_targets)
 }
 
 /// Start periodic owner-capture verification for every configured Azure target.
@@ -177,25 +221,65 @@ pub async fn verify_azure_config_from_env() -> Result<()> {
 /// # Errors
 /// Returns an error if verifier env is invalid or periodic settings cannot be
 /// parsed.
-pub fn spawn_periodic_azure_verification_from_env(
+pub async fn spawn_periodic_azure_verification_from_env(
     fatal_shutdown: oneshot::Sender<String>,
-) -> Result<Option<tokio::task::JoinHandle<()>>> {
-    let targets = configured_targets_from_env()?;
-    if targets.is_empty() {
-        return Ok(None);
+    mut verified_targets: Vec<AzureVerifiedTarget>,
+) -> Result<(Option<tokio::task::JoinHandle<()>>, AzureBindingReadiness)> {
+    if verified_targets.is_empty() {
+        return Ok((
+            None,
+            AzureBindingReadiness {
+                targets: Vec::new(),
+                window: std::time::Duration::ZERO,
+            },
+        ));
     }
     let settings = PeriodicAzureVerifySettings::from_env()?;
+    refresh_expired_bindings(&AzureVerifier::new()?, &mut verified_targets, settings).await?;
+    let readiness = AzureBindingReadiness {
+        targets: verified_targets.clone(),
+        window: settings.deployment_interval.saturating_mul(2),
+    };
     tracing::info!(
         interval_secs = settings.interval.as_secs(),
         transient_failure_limit = settings.transient_failure_limit,
-        targets = targets.len(),
+        targets = verified_targets.len(),
         "starting periodic Azure owner-capture verification",
     );
-    Ok(Some(tokio::spawn(run_periodic_azure_verification(
-        targets,
-        settings,
-        fatal_shutdown,
-    ))))
+    Ok((
+        Some(tokio::spawn(run_periodic_azure_verification(
+            verified_targets,
+            settings,
+            fatal_shutdown,
+        ))),
+        readiness,
+    ))
+}
+
+/// Refresh expired boot observations while the data plane is still disabled.
+/// Rechecking the whole set also catches targets that age during a refresh.
+async fn refresh_expired_bindings(
+    verifier: &AzureVerifier,
+    targets: &mut [AzureVerifiedTarget],
+    settings: PeriodicAzureVerifySettings,
+) -> Result<()> {
+    let window = settings.deployment_interval.saturating_mul(2);
+    let deadline = Instant::now() + window;
+    loop {
+        let Some(target) = targets
+            .iter_mut()
+            .find(|target| Instant::now() >= *target.binding_verified_at.borrow() + window)
+        else {
+            return Ok(());
+        };
+        tokio::time::timeout_at(
+            deadline,
+            verifier.verify_deployment_bindings(&target.config),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("boot deployment binding refresh timed out"))??;
+        target.binding_verified_at.send_replace(Instant::now());
+    }
 }
 
 impl AzureVerifier {
@@ -205,18 +289,36 @@ impl AzureVerifier {
     /// Returns an error when ARM cannot be reached or read, or when the account
     /// is not bound to its endpoint with every capture surface off.
     pub async fn verify_target(&self, config: &AzureVerifyConfig) -> Result<()> {
+        self.verify_target_with_timestamp(config).await.map(|_| ())
+    }
+
+    /// Run the boot gate and return the instant at which its deployment binding
+    /// check passed. Later audit reads do not move this timestamp forward.
+    ///
+    /// # Errors
+    /// Returns the same capture or transport failures as `verify_target`.
+    pub async fn verify_target_with_timestamp(
+        &self,
+        config: &AzureVerifyConfig,
+    ) -> Result<Instant> {
         let audit = self.audit_target(config).await?;
         let provider = audit.provider.label();
         let host = audit.host.clone();
         let resource_id = audit.resource_id.clone().unwrap_or_default();
+        let binding_verified_at = audit.binding_verified_at;
         audit.into_result()?;
+        let binding_verified_at = binding_verified_at.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Azure owner-capture verification passed without a deployment binding timestamp"
+            )
+        })?;
         tracing::info!(
             provider,
             azure_host = %host,
             resource_id = %resource_id,
             "Azure owner-capture verification passed",
         );
-        Ok(())
+        Ok(binding_verified_at)
     }
 
     /// Poll only the deployment binding between full owner-capture sweeps.
@@ -320,12 +422,16 @@ impl AzureVerifier {
             .await?;
 
         let deployment_read = self.fetch_arm_deployments(config, endpoint, &token).await;
-        audit.record(assert_deployment_bindings(
+        let deployment_binding = assert_deployment_bindings(
             config.provider,
             &config.deployment_map,
             &deployment_read.items,
             deployment_read.failure.is_none(),
-        ));
+        );
+        if deployment_read.failure.is_none() && deployment_binding.is_ok() {
+            audit.binding_verified_at = Some(Instant::now());
+        }
+        audit.record(deployment_binding);
 
         // Only Azure OpenAI has an ARM-observable streaming control. Azure's RAI
         // content filter is not in Claude's inference path on Foundry, so there is
@@ -624,6 +730,75 @@ mod tests {
             client_id: "client".to_owned(),
             client_secret: "secret".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn boot_binding_timestamp_is_before_post_binding_policy_audit() {
+        let server = MockServer::start().await;
+        mount_token(&server).await;
+        mount_account(&server, "OpenAI").await;
+        mount_get(
+            &server,
+            &format!("{ACCOUNT_PATH}{DIAGNOSTICS}"),
+            ok_json(serde_json::json!({"value": []})),
+        )
+        .await;
+        mount_get(
+            &server,
+            &format!("{ACCOUNT_PATH}/deployments"),
+            ok_json(serde_json::json!({
+                "value": [{
+                    "name": "gpt-5",
+                    "properties": {
+                        "model": {
+                            "format": "OpenAI",
+                            "name": "gpt-5.5",
+                            "version": "2025-08-07"
+                        },
+                        "raiPolicyName": "async-policy"
+                    }
+                }]
+            })),
+        )
+        .await;
+        mount_get(
+            &server,
+            &format!("{ACCOUNT_PATH}/raiPolicies/async-policy"),
+            ok_json(serde_json::json!({"properties": {"mode": "Asynchronous_filter"}}))
+                .set_delay(std::time::Duration::from_millis(100)),
+        )
+        .await;
+
+        let verified_at = verifier_for(&server)
+            .verify_target_with_timestamp(&openai_target())
+            .await
+            .expect("clean OpenAI target must pass");
+        assert!(
+            verified_at.elapsed() >= std::time::Duration::from_millis(80),
+            "binding timestamp must precede the slower post-binding policy audit"
+        );
+        let mut targets = vec![AzureVerifiedTarget::new(openai_target(), verified_at)];
+        let settings = PeriodicAzureVerifySettings {
+            interval: std::time::Duration::from_secs(30),
+            deployment_interval: std::time::Duration::from_millis(40),
+            transient_failure_limit: 3,
+        };
+        let readiness = AzureBindingReadiness {
+            targets: targets.clone(),
+            window: settings.deployment_interval * 2,
+        };
+        assert!(!readiness.is_fresh());
+        refresh_expired_bindings(&verifier_for(&server), &mut targets, settings)
+            .await
+            .expect("refresh expired binding before readiness");
+        assert!(readiness.is_fresh());
+        assert!(*targets[0].binding_verified_at.borrow() > verified_at);
+        tokio::time::pause();
+        tokio::time::advance(settings.deployment_interval * 2).await;
+        assert!(
+            !readiness.is_fresh(),
+            "startup delays must not extend readiness"
+        );
     }
 
     async fn mount_get(server: &MockServer, at: &str, response: ResponseTemplate) {

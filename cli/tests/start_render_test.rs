@@ -5,12 +5,12 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::OnceLock,
 };
 
+use mlua::Lua;
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
@@ -112,17 +112,6 @@ where
     )
 }
 
-fn lua_interpreter() -> Option<String> {
-    ["lua", "luajit"].into_iter().find_map(|candidate| {
-        Command::new(candidate)
-            .arg("-v")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|_| candidate.to_owned())
-    })
-}
-
 fn data_plane_lua(rendered: &str) -> Option<String> {
     let (_, rendered) = rendered.split_once("default_source_code:\n")?;
     let (_, source) = rendered.split_once("inline_string: |\n")?;
@@ -138,6 +127,13 @@ fn data_plane_lua(rendered: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+fn execute_lua(source: &str) {
+    Lua::new()
+        .load(source)
+        .exec()
+        .expect("embedded Lua behavior fixture must pass");
 }
 
 #[test]
@@ -616,103 +612,26 @@ fn bedrock_inference_render_contract_is_structural() {
 }
 
 #[test]
-fn bedrock_slot_guard_behaves_with_lua_or_uses_structural_check() {
+fn bedrock_slot_guard_executes_lua() {
     let (status, _, stderr, rendered) = render_envoy([
         ("ANTHROPIC_UPSTREAM", "bedrock"),
         ("BEDROCK_REGION", "us-west-2"),
         ("BEDROCK_API_KEY", "bedrock-key"),
     ]);
     assert!(status.success(), "render failed: {stderr}");
-    let Some(lua) = lua_interpreter() else {
-        let source = data_plane_lua(&rendered).expect("data-plane Lua source");
-        assert!(
-            source.contains("if requested ~= nil then")
-                && source.contains("slot_unavailable(handle, requested)"),
-            "Bedrock's supplied-slot branch must use the 421 structural contract"
-        );
-        assert!(
-            source.contains("AWS Bedrock is unqualified inside this image"),
-            "Bedrock's no-slot branch must remain the unqualified-surface rejection"
-        );
-        eprintln!(
-            "SKIPPED Lua execution: neither lua nor luajit is available; this is a structural check only"
-        );
-        return;
-    };
-
     let source = data_plane_lua(&rendered).expect("data-plane Lua source");
-    let mut script = source;
-    script.push_str(
-        r#"
-local function make_headers(values)
-  local headers = {values = values}
-  function headers:get(name)
-    return self.values[name]
-  end
-  function headers:remove(name)
-    self.values[name] = nil
-  end
-  function headers:add(name, value)
-    self.values[name] = value
-  end
-  return headers
-end
-
-local function run(slot)
-  local values = {
-    [":path"] = "/v1/messages",
-    ["x-gm-provider"] = "anthropic",
-    ["x-gm-node-key"] = "test-node-secret-0001",
-  }
-  if slot ~= nil then values["x-gm-upstream-slot"] = slot end
-  local headers = make_headers(values)
-  local metadata = {}
-  function metadata:set(_, _, _) end
-  local stream_info = {}
-  function stream_info:dynamicMetadata() return metadata end
-  local status = nil
-  local body = nil
-  local handle = {}
-  function handle:headers() return headers end
-  function handle:streamInfo() return stream_info end
-  function handle:respond(response_headers, response_body)
-    status = response_headers[":status"]
-    body = response_body
-  end
-  envoy_on_request(handle)
-  return status, body
-end
-
-local status, body = run(nil)
-assert(status == "400", "Bedrock without a slot must remain unqualified")
-assert(body:find("gm_unqualified_surface", 1, true) ~= nil, "no-slot body must name the unqualified surface")
-status, body = run("bedrock-slot")
-assert(status == "421", "any supplied Bedrock slot must be unavailable")
-assert(body:find("gm_slot_unavailable", 1, true) ~= nil, "supplied-slot body must use the slot contract")
-assert(body:find("bedrock-slot", 1, true) ~= nil, "421 must name the supplied slot")
-"#,
-    );
-    let mut child = Command::new(lua)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start Bedrock Lua behavior fixture");
-    child
-        .stdin
-        .take()
-        .expect("Lua stdin")
-        .write_all(script.as_bytes())
-        .expect("write Bedrock Lua behavior fixture");
-    let output = child
-        .wait_with_output()
-        .expect("wait for Bedrock Lua behavior fixture");
     assert!(
-        output.status.success(),
-        "Bedrock slot behavior failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        source.contains("if requested ~= nil then")
+            && source.contains("slot_unavailable(handle, requested)"),
+        "Bedrock's supplied-slot branch must use the 421 structural contract"
     );
+    assert!(
+        source.contains("AWS Bedrock is unqualified inside this image"),
+        "Bedrock's no-slot branch must remain the unqualified-surface rejection"
+    );
+    let mut script = source;
+    script.push_str(include_str!("fixtures/bedrock_slot_guard.lua"));
+    execute_lua(&script);
 }
 
 #[test]
@@ -924,12 +843,38 @@ fn assert_rendered_cloud_slot_contract(rendered: &str) {
     );
 }
 
+fn execute_cloud_slot_fixture(rendered: &str, provider: &str, request_path: &str, slot_env: &str) {
+    let source = data_plane_lua(rendered).expect("data-plane Lua source");
+    let mut script = source;
+    script.push_str(include_str!("fixtures/cloud_slot_guard.lua"));
+    let current_key = if provider == "openai" {
+        "azure-key"
+    } else {
+        "foundry-key"
+    };
+    let script = script
+        .replace(
+            "__EXPECTED_SLOT__",
+            &gm_miner_cli::slots::derive_slot_id(provider, current_key, "test-node-secret-0001")
+                .expect("current HMAC slot"),
+        )
+        .replace(
+            "__OLD_SLOT__",
+            &gm_miner_cli::slots::derive_slot_id(
+                provider,
+                "retired-cloud-key",
+                "test-node-secret-0001",
+            )
+            .expect("old HMAC slot"),
+        )
+        .replace("__SLOT_ENV__", slot_env)
+        .replace("__PROVIDER__", provider)
+        .replace("__REQUEST_PATH__", request_path);
+    execute_lua(&script);
+}
+
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the Lua integration fixture keeps executable and structural contracts together"
-)]
-fn cloud_slot_guard_behaves_with_lua_or_uses_structural_check() {
+fn cloud_slot_guard_executes_lua_and_keeps_structural_coverage() {
     let (status, _, stderr, rendered) = render_envoy([
         ("OPENAI_UPSTREAM", "azure"),
         (
@@ -940,101 +885,36 @@ fn cloud_slot_guard_behaves_with_lua_or_uses_structural_check() {
         ("AZURE_OPENAI_DEPLOYMENTS", "gpt-5.5=azure-gpt55"),
     ]);
     assert!(status.success(), "render failed: {stderr}");
-    let Some(lua) = lua_interpreter() else {
-        assert_rendered_cloud_slot_contract(&rendered);
-        eprintln!(
-            "SKIPPED Lua execution: neither lua nor luajit is available; \
-             this is a structural check only"
-        );
-        return;
-    };
-    let source = data_plane_lua(&rendered).expect("data-plane Lua source");
-    let mut script = source;
-    script.push_str(
-        r#"
-local original_getenv = os.getenv
-os.getenv = function(name)
-  if name == "GM_OPENAI_KEY_SLOT_1" then
-    return "test-azure-key"
-  end
-  return original_getenv(name)
-end
-
-local valid_slot = nil
-for slot_id, _ in pairs(slot_config.openai.slots) do
-  valid_slot = slot_id
-  break
-end
-assert(valid_slot ~= nil, "the qualified Azure cloud slot must be rendered")
-
-local function make_headers(values)
-  local headers = {values = values}
-  function headers:get(name)
-    return self.values[name]
-  end
-  function headers:remove(name)
-    self.values[name] = nil
-  end
-  function headers:add(name, value)
-    self.values[name] = value
-  end
-  return headers
-end
-
-local function run(node_key, slot)
-  local values = {
-    [":path"] = "/v1/chat/completions",
-    ["x-gm-provider"] = "openai",
-  }
-  if node_key ~= nil then values["x-gm-node-key"] = node_key end
-  if slot ~= nil then values["x-gm-upstream-slot"] = slot end
-  local headers = make_headers(values)
-  local metadata = {}
-  function metadata:set(_, _) end
-  local stream_info = {}
-  function stream_info:dynamicMetadata() return metadata end
-  local status = nil
-  local body = nil
-  local handle = {}
-  function handle:headers() return headers end
-  function handle:streamInfo() return stream_info end
-  function handle:respond(response_headers, response_body)
-    status = response_headers[":status"]
-    body = response_body
-  end
-  envoy_on_request(handle)
-  return status, body
-end
-
-local status = run("test-node-secret-0001", valid_slot)
-assert(status == nil, "authenticated qualified slot must proceed")
-status = run(nil, valid_slot)
-assert(status == "401", "missing node key must be rejected")
-status, body = run("test-node-secret-0001", "wrong-slot")
-assert(status == "421", "wrong cloud slot must be rejected")
-assert(body:find("wrong-slot", 1, true) ~= nil, "421 must name the wrong slot")
-"#,
+    assert_rendered_cloud_slot_contract(&rendered);
+    execute_cloud_slot_fixture(
+        &rendered,
+        "openai",
+        "/v1/chat/completions",
+        "GM_OPENAI_KEY_SLOT_1",
     );
-    let mut child = Command::new(lua)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start Lua behavior fixture");
-    child
-        .stdin
-        .take()
-        .expect("Lua stdin")
-        .write_all(script.as_bytes())
-        .expect("write Lua behavior fixture");
-    let output = child
-        .wait_with_output()
-        .expect("wait for Lua behavior fixture");
-    assert!(
-        output.status.success(),
-        "Lua slot behavior failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+}
+
+#[test]
+fn foundry_slot_guard_executes_lua() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("ANTHROPIC_UPSTREAM", "foundry"),
+        (
+            "AZURE_FOUNDRY_ENDPOINT",
+            "https://gm-resource.services.ai.azure.com/",
+        ),
+        ("AZURE_FOUNDRY_API_KEY", "foundry-key"),
+        (
+            "AZURE_FOUNDRY_DEPLOYMENTS",
+            "claude-sonnet-4-6=gm-echo-test",
+        ),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert_rendered_cloud_slot_contract(&rendered);
+    execute_cloud_slot_fixture(
+        &rendered,
+        "anthropic",
+        "/v1/messages",
+        "GM_ANTHROPIC_KEY_SLOT_1",
     );
 }
 

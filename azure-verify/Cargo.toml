@@ -46,5 +46,5 @@ anyhow = { workspace = true }
 gm-cloud-hop = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
