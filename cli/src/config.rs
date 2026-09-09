@@ -547,6 +547,11 @@ impl ProviderKeys {
     pub fn validate_upstreams(&self) -> Result<()> {
         crate::slots::validate_cloud_backend_single_keys(self)?;
         self.validate_deployment_maps()?;
+        self.validate_anthropic_upstream()?;
+        self.validate_openai_upstream()
+    }
+
+    fn validate_anthropic_upstream(&self) -> Result<()> {
         match self.anthropic_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
             "bedrock" => {
@@ -607,6 +612,10 @@ impl ProviderKeys {
                 )
             }
         }
+        Ok(())
+    }
+
+    fn validate_openai_upstream(&self) -> Result<()> {
         match self.openai_upstream.as_deref().unwrap_or("direct") {
             "direct" => {}
             "azure" => {

@@ -47,19 +47,24 @@ fn env_selects_azure() -> bool {
     selected("OPENAI_UPSTREAM", "azure") || selected("ANTHROPIC_UPSTREAM", "foundry")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Log to stderr, not stdout: the container entrypoint (start.sh)
-    // also logs to stderr, so a single stream keeps attestd's and the
-    // entrypoint's lines correctly interleaved in `phala cvms logs`,
-    // and an anyhow fatal-error printout (also stderr) lands in order.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+fn main() -> Result<()> {
+    run_with_runtime(run())
+}
+
+fn run_with_runtime(future: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(future);
+    // DNS uses blocking tasks that cancellation cannot stop. Once the server
+    // exits, main must return so PID 1 can stop the data plane without waiting
+    // for a stalled resolver thread to finish.
+    runtime.shutdown_background();
+    result
+}
+
+async fn run() -> Result<()> {
+    init_logging();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args == ["--check-ready"] {
@@ -151,6 +156,20 @@ async fn main() -> Result<()> {
     serve_attestation(listener, app, azure_shutdown_rx).await
 }
 
+fn init_logging() {
+    // Log to stderr, not stdout: the container entrypoint (start.sh)
+    // also logs to stderr, so a single stream keeps attestd's and the
+    // entrypoint's lines correctly interleaved in `phala cvms logs`,
+    // and an anyhow fatal-error printout (also stderr) lands in order.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+}
+
 async fn check_readiness(addr: &str) -> Result<()> {
     let response = reqwest::Client::builder()
         .no_proxy()
@@ -192,7 +211,7 @@ async fn serve_attestation(
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "local server regression fixtures")]
 mod tests {
-    use super::{check_readiness, serve_attestation};
+    use super::{check_readiness, run_with_runtime, serve_attestation};
     use axum::{routing::get, Router};
     use std::{sync::Arc, time::Duration};
     use tokio::{
@@ -258,5 +277,39 @@ mod tests {
             .expect_err("fatal shutdown")
             .to_string()
             .contains("stale binding"));
+    }
+
+    #[test]
+    fn fatal_verification_exits_with_a_pending_blocking_task() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = run_with_runtime(async move {
+                let (entered_tx, entered_rx) = oneshot::channel();
+                tokio::task::spawn_blocking(move || {
+                    entered_tx.send(()).expect("blocking task entered");
+                    release_rx.recv().expect("release blocking task");
+                });
+                entered_rx.await.expect("blocking task running");
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let (fatal_tx, fatal_rx) = oneshot::channel();
+                fatal_tx
+                    .send("stale binding".to_owned())
+                    .expect("fatal reason");
+                started_tx.send(()).expect("fatal ready");
+                serve_attestation(listener, Router::new(), Some(fatal_rx)).await
+            });
+            finished_tx.send(result).expect("runtime result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fixture startup");
+        let result = finished_rx.recv_timeout(Duration::from_millis(200));
+        release_tx.send(()).expect("unblock fixture for cleanup");
+        thread.join().expect("runtime thread");
+        assert!(result
+            .expect("fatal shutdown must not wait for a blocking DNS task")
+            .is_err());
     }
 }

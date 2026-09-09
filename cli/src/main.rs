@@ -175,7 +175,7 @@ enum Command {
         /// Anthropic transport selector: direct, bedrock, or foundry.
         /// Foundry uses the measured model hop; cloud operations also require
         /// the registry capability `upstream-model-echo`. Bedrock remains a
-        /// direct, unqualified transport.
+        /// disabled inference transport in this image.
         #[arg(long)]
         anthropic_upstream: Option<String>,
 
@@ -500,7 +500,7 @@ enum Command {
     /// and asks you to confirm the discount once for the whole batch.
     #[command(after_help = "Examples:\n  \
         gmcli declare-products --discount-pct 5            # direct/API-key catalog entries\n  \
-        gmcli declare-products --provider openai --discount-pct 10  # direct + admitted Azure")]
+        gmcli declare-products --provider openai --discount-pct 10  # direct only; use declare-product for Azure")]
     DeclareProducts {
         /// Optional provider filter. When set, only products from this
         /// provider are declared. Omit to fan out over the whole catalog.

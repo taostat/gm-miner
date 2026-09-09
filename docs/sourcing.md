@@ -89,14 +89,14 @@ evidence is a separate GM runbook concern.
 
 The image retains three cloud transports. Azure OpenAI chat completions and
 Foundry Messages pass through a measured model hop. Azure Responses is
-explicitly rejected because its echo is the deployment name, while Bedrock stays
-on its direct, unqualified transport and rejects slot headers. Selecting one per worker does
+explicitly rejected because its echo is the deployment name. Bedrock inference is
+disabled: requests return 421 with a slot header and 400 without one. Selecting one per worker does
 **not** make every model on that provider a registry-admissible route, and a
 successful upstream probe is not evidence of admission:
 
 | Buyer product | Route | Selector |
 |---|---|---|
-| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — direct legacy transport only; unqualified and no slot headers |
+| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — inference disabled; 421 with a slot header, 400 without one |
 | `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` plus `--foundry-deployments canonical=deployment;...` (see [foundry-setup.md](foundry-setup.md)) — qualified measured transport |
 | `openai/*` | Azure OpenAI chat completions | `--openai-upstream azure` plus `--azure-deployments canonical=deployment;...` — qualified measured transport; `/v1/responses` is rejected |
 

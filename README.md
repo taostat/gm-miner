@@ -13,7 +13,7 @@ behind the existing Anthropic/OpenAI routes) and your own funded
 admission: Azure OpenAI chat completions and Foundry Messages are qualified only when the
 image's `upstream-model-hop` feature and the registry's `upstream-model-echo` capability are
 both present. Azure Responses is unqualified because its echo is the deployment name, and
-Bedrock remains a direct, unqualified transport with slot headers rejected. Direct
+Bedrock inference is disabled: requests return 421 with a slot header and 400 without one. Direct
 Anthropic/OpenAI routes use verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 
@@ -180,13 +180,13 @@ matrix](docs/provider-model-support.md) for the provider-side setup.
 The image contains cloud transport adapters for Bedrock, Azure OpenAI and Foundry. Azure OpenAI
 chat completions and Foundry Messages use the measured in-image model hop. Azure Responses is
 rejected with a JSON 400 because its echo identifies the deployment name, not the upstream
-model. Bedrock remains on its direct transport and rejects every slot header; it is not routed
-through the hop. Cloud registration, recovery, and declaration additionally require the registry
+model. Bedrock inference is disabled: requests with a slot header return 421 and requests
+without one return 400. Cloud registration, recovery, and declaration additionally require the registry
 capability `upstream-model-echo`; deployment also requires the approved image feature
 `upstream-model-hop`.
 
-For Bedrock transport testing, select the adapter and provide the region and API key.
-This does not make the worker routable:
+Bedrock settings remain available for legacy configuration. This image rejects Bedrock
+inference until its model echo is qualified:
 
 ```sh
 gmcli set-api-keys \

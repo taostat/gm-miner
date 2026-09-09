@@ -858,6 +858,30 @@ log "minting data-plane RA-TLS certificate via dstack get_tls_key"
 gm-miner-ratls
 log "RA-TLS certificate ready"
 
+# Install the trap before starting children: Azure readiness can take time,
+# and PID 1 must forward termination even while the data plane is disabled.
+NEAR_PROXY_PID=""
+ATTESTD_PID=""
+CLOUD_HOP_PID=""
+ENVOY_PID=""
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
+shutdown() {
+  log "received signal — shutting down"
+  local -a pids=()
+  local pid
+  for pid in "${ENVOY_PID}" "${ATTESTD_PID}" "${NEAR_PROXY_PID}" "${CLOUD_HOP_PID}"; do
+    if [[ -n "${pid}" ]]; then
+      pids+=("${pid}")
+    fi
+  done
+  if [[ "${#pids[@]}" -gt 0 ]]; then
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    wait "${pids[@]}" 2>/dev/null || true
+  fi
+  exit 1
+}
+trap shutdown TERM INT
+
 # ── Launch the NEAR attestation proxy ─────────────────────────────────
 # NEAR routes exist only when a key is configured. The long-running proxy
 # verifies each inference over the exact TLS connection it forwards on and
@@ -865,7 +889,6 @@ log "RA-TLS certificate ready"
 # startup dependency: one unavailable model must not take unrelated models
 # or providers out of service. Process supervision below remains the proxy
 # readiness gate; if the proxy itself exits, the whole container exits.
-NEAR_PROXY_PID=""
 if [[ -n "${NEAR_API_KEY:-}" ]]; then
   log "starting NEAR verification proxy on 127.0.0.1:8082"
   gm-near-verify-proxy &
@@ -903,7 +926,6 @@ fi
 # The serving Azure verifier reports fresh bindings before this loopback-only
 # hop starts. The internal Envoy listener is the hop's sole egress and owns the cloud TLS
 # connection. The supervisor below treats an exit exactly like attestd/envoy.
-CLOUD_HOP_PID=""
 if [[ "${CLOUD_HOP_ENABLED}" -eq 1 ]]; then
   log "starting measured cloud hop on 127.0.0.1:8083"
   "${GM_CLOUD_HOP_BIN:-gm-cloud-hop}" &
@@ -920,20 +942,6 @@ envoy \
   --log-level warn \
   --drain-time-s 10 &
 ENVOY_PID=$!
-
-# shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
-shutdown() {
-  log "received signal — shutting down"
-  local -a pids=("${ENVOY_PID}" "${ATTESTD_PID}")
-  if [[ -n "${NEAR_PROXY_PID}" ]]; then
-    pids+=("${NEAR_PROXY_PID}")
-  fi
-  if [[ -n "${CLOUD_HOP_PID}" ]]; then
-    pids+=("${CLOUD_HOP_PID}")
-  fi
-  kill -TERM "${pids[@]}" 2>/dev/null || true
-}
-trap shutdown TERM INT
 
 # ── Supervise all serving processes ───────────────────────────────────
 # `jobs -pr` lists only children still running. Poll it from this main shell

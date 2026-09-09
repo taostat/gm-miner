@@ -189,34 +189,6 @@ pub fn validate_cloud_backend_single_keys(keys: &ProviderKeys) -> Result<()> {
     Ok(())
 }
 
-/// Reject semicolon-separated direct keys when a cloud backend is
-/// selected: backend workers are single-slot in this release, so extra
-/// keys would be advertised nowhere and used never.
-///
-/// # Errors
-/// Returns an error naming the offending env var when any ACTIVE
-/// direct-provider key holds multiple segments.
-pub fn reject_multikey_for_cloud_backend(
-    keys: &ProviderKeys,
-    backends: &BTreeMap<String, String>,
-) -> Result<()> {
-    for (var, value) in active_direct_keys(keys) {
-        if has_semicolon(value) {
-            let adapters = backends
-                .values()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join("/");
-            bail!(
-                "{var} holds multiple keys but the {adapters} cloud backend is selected;                  cloud-backend workers are single-slot in this release — drop the extra                  keys or the cloud backend"
-            );
-        }
-    }
-    Ok(())
-}
-
 /// Reject semicolon-separated direct keys when the deploy target image
 /// cannot fan them out.
 ///

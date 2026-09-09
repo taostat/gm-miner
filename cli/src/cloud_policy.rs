@@ -121,22 +121,6 @@ pub fn recorded_worker_requires_cloud_fence(record: &WorkerRecord, provider: &st
         .is_none_or(|backends| backends.contains_key(provider))
 }
 
-/// Whether declarations for `provider` must use the registry's cloud-model
-/// capability fence.
-///
-/// The decision is the union of the current selectors and every locally
-/// recorded worker's provenance. A worker with unknown provenance is treated
-/// as cloud-backed conservatively.
-#[must_use]
-pub fn cloud_fence_required_for_provider(config: &Config, provider: &str) -> bool {
-    configured_cloud_backend(config, provider).is_some()
-        || config
-            .active_network_entry()
-            .into_iter()
-            .flat_map(|network| network.workers.iter())
-            .any(|worker| recorded_worker_requires_cloud_fence(worker, provider))
-}
-
 /// Resolve the live worker/image provenance needed before treating a
 /// declaration as direct-only.
 ///
@@ -152,19 +136,7 @@ pub async fn declaration_policy(
     if !matches!(provider, "anthropic" | "openai") {
         return CloudDeclarationPolicy::DIRECT;
     }
-    if configured_cloud_backend(&client.config, provider).is_some()
-        || client
-            .config
-            .active_network_entry()
-            .into_iter()
-            .flat_map(|network| network.workers.iter())
-            .any(|worker| {
-                worker
-                    .backends
-                    .as_ref()
-                    .is_some_and(|backends| backends.contains_key(provider))
-            })
-    {
+    if has_explicit_cloud_provenance(&client.config, provider) {
         return CloudDeclarationPolicy::FENCED;
     }
 
@@ -236,11 +208,7 @@ pub async fn declaration_policy(
             has_unknown_provenance = true;
             continue;
         };
-        let Some(backends) = local_worker.backends.as_ref() else {
-            has_unknown_provenance = true;
-            continue;
-        };
-        has_cloud_provenance |= backends.contains_key(provider);
+        has_cloud_provenance |= recorded_worker_requires_cloud_fence(local_worker, provider);
     }
 
     if has_cloud_provenance || has_unknown_provenance {
@@ -252,6 +220,20 @@ pub async fn declaration_policy(
         return CloudDeclarationPolicy::FENCED_BUT_DIRECT;
     }
     CloudDeclarationPolicy::DIRECT
+}
+
+fn has_explicit_cloud_provenance(config: &Config, provider: &str) -> bool {
+    configured_cloud_backend(config, provider).is_some()
+        || config
+            .active_network_entry()
+            .into_iter()
+            .flat_map(|network| network.workers.iter())
+            .any(|worker| {
+                worker
+                    .backends
+                    .as_ref()
+                    .is_some_and(|backends| backends.contains_key(provider))
+            })
 }
 
 /// Fetch the registry's live workers. A missing miner row means no worker has
@@ -453,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn declaration_fence_unions_selectors_recorded_and_unknown_provenance() {
+    fn recorded_worker_fence_includes_unknown_provenance() {
         let config = Config {
             provider_keys: Some(ProviderKeys {
                 anthropic_upstream: Some("direct".to_owned()),
@@ -478,8 +460,17 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(cloud_fence_required_for_provider(&config, "anthropic"));
-        assert!(cloud_fence_required_for_provider(&config, "openai"));
+        let workers = &config.networks["mainnet"].workers;
+        assert!(!recorded_worker_requires_cloud_fence(
+            &workers[0],
+            "anthropic"
+        ));
+        assert!(recorded_worker_requires_cloud_fence(&workers[0], "openai"));
+        assert!(recorded_worker_requires_cloud_fence(
+            &workers[1],
+            "anthropic"
+        ));
+        assert!(recorded_worker_requires_cloud_fence(&workers[1], "openai"));
     }
 
     #[test]
@@ -502,7 +493,6 @@ mod tests {
             )]),
             ..Default::default()
         };
-        assert!(!cloud_fence_required_for_provider(&config, "anthropic"));
         assert!(!cloud_fence_required_for_worker(
             &config,
             "worker",

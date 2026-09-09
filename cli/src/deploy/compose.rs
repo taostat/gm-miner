@@ -73,10 +73,6 @@ pub fn render_env_file(
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the env-file order is kept beside the canonical provider field list"
-)]
 fn render_env_file_with_runtime<F>(
     env_vars: &ProviderKeys,
     node_secret: &str,
@@ -86,26 +82,32 @@ fn render_env_file_with_runtime<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    let foundry_deployments = env_vars
-        .azure_foundry_deployments
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            gm_cloud_hop::parse_deployment_map(gm_cloud_hop::CloudProvider::Foundry, value)
-                .map(|map| map.canonical_string())
-                .with_context(|| "validate AZURE_FOUNDRY_DEPLOYMENTS")
-        })
-        .transpose()?;
-    let azure_openai_deployments = env_vars
-        .azure_openai_deployments
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            gm_cloud_hop::parse_deployment_map(gm_cloud_hop::CloudProvider::AzureOpenAi, value)
-                .map(|map| map.canonical_string())
-                .with_context(|| "validate AZURE_OPENAI_DEPLOYMENTS")
-        })
-        .transpose()?;
+    let mut keys = env_vars.clone();
+    keys.canonicalize_deployment_maps()?;
+    let mut lines = render_provider_envs(&keys);
+    lines.push_str("GM_NODE_SECRET=");
+    lines.push_str(node_secret);
+    lines.push('\n');
+    lines.push_str(&render_runtime_envs(runtime_value)?);
+
+    // Private-registry pull credentials, consumed by the CVM's pre-launch
+    // script (`docker login` before pulling the private miner image).
+    if let Some(creds) = registry_creds {
+        lines.push_str("DSTACK_DOCKER_REGISTRY=");
+        lines.push_str(&creds.registry);
+        lines.push('\n');
+        lines.push_str("DSTACK_DOCKER_USERNAME=");
+        lines.push_str(&creds.username);
+        lines.push('\n');
+        lines.push_str("DSTACK_DOCKER_PASSWORD=");
+        lines.push_str(&creds.password);
+        lines.push('\n');
+    }
+
+    Ok(lines)
+}
+
+fn render_provider_envs(env_vars: &ProviderKeys) -> String {
     let mut lines = String::new();
     for (name, value) in [
         ("ANTHROPIC_API_KEY", env_vars.anthropic.as_deref()),
@@ -140,7 +142,13 @@ where
             "AZURE_FOUNDRY_CLIENT_SECRET",
             env_vars.azure_foundry_client_secret.as_deref(),
         ),
-        ("AZURE_FOUNDRY_DEPLOYMENTS", foundry_deployments.as_deref()),
+        (
+            "AZURE_FOUNDRY_DEPLOYMENTS",
+            env_vars
+                .azure_foundry_deployments
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
+        ),
         ("OPENAI_API_KEY", env_vars.openai.as_deref()),
         ("OPENAI_UPSTREAM", env_vars.openai_upstream.as_deref()),
         (
@@ -167,7 +175,10 @@ where
         ),
         (
             "AZURE_OPENAI_DEPLOYMENTS",
-            azure_openai_deployments.as_deref(),
+            env_vars
+                .azure_openai_deployments
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
         ),
         ("GOOGLE_API_KEY", env_vars.google.as_deref()),
         ("CHUTES_API_KEY", env_vars.chutes.as_deref()),
@@ -184,12 +195,11 @@ where
         lines.push_str(value.unwrap_or(""));
         lines.push('\n');
     }
-    // The node secret envoy enforces as the x-gm-node-key header. Always
-    // written: `cmd_deploy` resolves it before this call.
-    lines.push_str("GM_NODE_SECRET=");
-    lines.push_str(node_secret);
-    lines.push('\n');
+    lines
+}
 
+fn render_runtime_envs(runtime_value: impl Fn(&str) -> Option<String>) -> Result<String> {
+    let mut lines = String::new();
     let runtime_values = CLOUD_HOP_RUNTIME_ENVS
         .iter()
         .map(|name| {
@@ -243,20 +253,6 @@ where
         if let Some(value) = value {
             lines.push_str(&value);
         }
-        lines.push('\n');
-    }
-
-    // Private-registry pull credentials, consumed by the CVM's pre-launch
-    // script (`docker login` before pulling the private miner image).
-    if let Some(creds) = registry_creds {
-        lines.push_str("DSTACK_DOCKER_REGISTRY=");
-        lines.push_str(&creds.registry);
-        lines.push('\n');
-        lines.push_str("DSTACK_DOCKER_USERNAME=");
-        lines.push_str(&creds.username);
-        lines.push('\n');
-        lines.push_str("DSTACK_DOCKER_PASSWORD=");
-        lines.push_str(&creds.password);
         lines.push('\n');
     }
 

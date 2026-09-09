@@ -40,9 +40,7 @@ pub enum CloudProvider {
     AzureOpenAi,
     /// Microsoft Foundry Anthropic Messages.
     Foundry,
-    /// AWS Bedrock Mantle. Kept in the type and static table for a reviewed
-    /// future enablement, but disabled below until its response echo is live-
-    /// observed.
+    /// AWS Bedrock Mantle, rejected until its response echo is qualified.
     Bedrock,
 }
 
@@ -288,19 +286,8 @@ pub const FOUNDRY_MODEL_IDS: &[&str] = &[
     "claude-sonnet-5",
 ];
 
-/// Canonical IDs represented by the reviewed static Mantle table.
+/// Legacy Bedrock canonical IDs, retained for configuration diagnostics only.
 pub const BEDROCK_MODEL_IDS: &[&str] = &["claude-sonnet-4-6"];
-
-/// The reviewed Mantle table. It is intentionally unreachable from Envoy
-/// while [`BEDROCK_HOP_ENABLED`] is false: enable only after a live Bedrock
-/// response proves that the upstream echo identifies the underlying model.
-pub const BEDROCK_MANTLE_DEPLOYMENTS: &[(&str, &str)] =
-    &[("claude-sonnet-4-6", "anthropic.claude-sonnet-4-6-v1")];
-
-/// Build-time safety fence for Bedrock. Do not flip this until the Mantle
-/// response `model` echo has been observed on the exact routed surface and
-/// added to the qualified echo evidence.
-pub const BEDROCK_HOP_ENABLED: bool = false;
 
 const MAX_MAP_BYTES: usize = 4096;
 const MAX_MAP_ENTRIES: usize = 64;
@@ -508,18 +495,6 @@ fn provider_has_qualified_surface(provider: CloudProvider) -> bool {
     })
 }
 
-/// Construct the reviewed static Bedrock table for future use.
-#[must_use]
-pub fn bedrock_deployment_map() -> DeploymentMap {
-    DeploymentMap {
-        provider: CloudProvider::Bedrock,
-        entries: BEDROCK_MANTLE_DEPLOYMENTS
-            .iter()
-            .map(|(canonical, deployment)| ((*canonical).to_owned(), (*deployment).to_owned()))
-            .collect(),
-    }
-}
-
 /// Model-identity error returned before an upstream request is made.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RewriteError {
@@ -539,8 +514,6 @@ pub enum RewriteError {
     UnmappedModel,
     #[error("cloud hop is disabled for this provider")]
     DisabledProvider,
-    #[error("cloud hop does not support this HTTP surface")]
-    UnsupportedSurface,
 }
 
 /// Replace only the raw top-level `model` value and leave every other body
@@ -557,7 +530,7 @@ pub fn rewrite_model_bytes(
     body: &[u8],
     map: &DeploymentMap,
 ) -> Result<Vec<u8>, RewriteError> {
-    if provider == CloudProvider::Bedrock && !BEDROCK_HOP_ENABLED {
+    if provider == CloudProvider::Bedrock {
         return Err(RewriteError::DisabledProvider);
     }
     if map.provider != provider {
@@ -1380,189 +1353,204 @@ async fn wait_for_cancellation(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the request lifecycle keeps admission, rewrite, and streaming ownership together"
-)]
+struct RequestRejection {
+    status: StatusCode,
+    message: String,
+}
+
+impl RequestRejection {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn aggregate_limit() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cloud hop aggregate buffering limit reached",
+        )
+    }
+}
+
+impl From<RewriteError> for RequestRejection {
+    fn from(error: RewriteError) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, error.to_string())
+    }
+}
+
 async fn handle_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
     cancellation: watch::Sender<bool>,
 ) -> Response<ResponseBody> {
+    match proxy_request(request, state, cancellation).await {
+        Ok(response) => response,
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn proxy_request(
+    request: Request<Incoming>,
+    state: Arc<ProxyState>,
+    cancellation: watch::Sender<bool>,
+) -> Result<Response<ResponseBody>, RequestRejection> {
     let deadline = Instant::now() + state.config.timeout;
-    let Some(selector) = request
+    let (selector, map) = request_map(&request, &state.config)?;
+    let request_permit = timeout_at(deadline, Arc::clone(&state.requests).acquire_owned())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or_else(|| {
+            RequestRejection::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cloud hop concurrency limit timed out",
+            )
+        })?;
+    let (parts, request_body) = request.into_parts();
+    let body = buffered_request(request_body, &state, deadline).await?;
+    let rewritten = rewrite_buffered_request(selector, body.as_ref(), map, &state.buffered)?;
+    drop(body);
+    let forwarded = forward_request(parts, rewritten, selector, state, deadline)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "cloud hop upstream forwarding failed");
+            RequestRejection::new(
+                StatusCode::BAD_GATEWAY,
+                "cloud hop upstream forwarding failed",
+            )
+        })?;
+    Ok(box_response(
+        forwarded.response,
+        request_permit,
+        deadline,
+        cancellation,
+        forwarded.connection_abort,
+    ))
+}
+
+fn request_map<'a>(
+    request: &Request<Incoming>,
+    config: &'a CloudHopConfig,
+) -> Result<(CloudProvider, &'a DeploymentMap), RequestRejection> {
+    let selector = request
         .headers()
         .get("x-gm-cloud-hop-provider")
         .and_then(|value| value.to_str().ok())
         .and_then(CloudProvider::from_selector)
-    else {
-        return json_error(
-            StatusCode::NOT_FOUND,
-            "cloud hop selector missing or invalid",
-        );
-    };
-    if selector == CloudProvider::Bedrock && !BEDROCK_HOP_ENABLED {
-        return json_error(
+        .ok_or_else(|| {
+            RequestRejection::new(
+                StatusCode::NOT_FOUND,
+                "cloud hop selector missing or invalid",
+            )
+        })?;
+    if selector == CloudProvider::Bedrock {
+        return Err(RequestRejection::new(
             StatusCode::NOT_FOUND,
             "cloud hop is disabled for this provider",
-        );
+        ));
     }
-    let Some(map) = state.config.map_for(selector) else {
-        return json_error(
+    let map = config.map_for(selector).ok_or_else(|| {
+        RequestRejection::new(
             StatusCode::NOT_FOUND,
             "cloud hop is not configured for this provider",
-        );
-    };
+        )
+    })?;
     if request.method() != Method::POST {
-        return json_error(StatusCode::NOT_FOUND, "cloud hop surface is not enabled");
+        return Err(RequestRejection::new(
+            StatusCode::NOT_FOUND,
+            "cloud hop surface is not enabled",
+        ));
     }
-    let Some(surface) = surface_for_path(selector, request.uri().path()) else {
-        return json_error(StatusCode::NOT_FOUND, "cloud hop surface is not enabled");
-    };
-    let Some(non_streaming) = qualification(selector, surface, false) else {
-        return json_error(StatusCode::NOT_FOUND, "cloud hop surface is not enabled");
-    };
-    let streaming = qualification(selector, surface, true).unwrap_or(non_streaming);
-    if !non_streaming.qualified || !streaming.qualified {
-        return json_error(StatusCode::BAD_REQUEST, non_streaming.reason);
-    }
-    if usize::try_from(request.body().size_hint().lower())
-        .is_ok_and(|size| size > state.config.max_request_bytes)
-    {
-        return json_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "cloud hop request body is too large",
-        );
-    }
-    if let Some(value) = request.headers().get(CONTENT_LENGTH) {
-        if value
-            .to_str()
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .is_some_and(|size| size > state.config.max_request_bytes)
-        {
-            return json_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "cloud hop request body is too large",
-            );
+    let surface = surface_for_path(selector, request.uri().path()).ok_or_else(|| {
+        RequestRejection::new(StatusCode::NOT_FOUND, "cloud hop surface is not enabled")
+    })?;
+    for streaming in [false, true] {
+        let row = qualification(selector, surface, streaming).ok_or_else(|| {
+            RequestRejection::new(StatusCode::NOT_FOUND, "cloud hop surface is not enabled")
+        })?;
+        if !row.qualified {
+            return Err(RequestRejection::new(StatusCode::BAD_REQUEST, row.reason));
         }
     }
+    let declared_length = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.parse::<usize>().ok());
+    if usize::try_from(request.body().size_hint().lower())
+        .is_ok_and(|size| size > config.max_request_bytes)
+        || declared_length.is_some_and(|size| size > config.max_request_bytes)
+    {
+        return Err(RequestRejection::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "cloud hop request body is too large",
+        ));
+    }
+    Ok((selector, map))
+}
 
-    let Ok(Ok(request_permit)) =
-        timeout_at(deadline, Arc::clone(&state.requests).acquire_owned()).await
-    else {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cloud hop concurrency limit timed out",
-        );
-    };
-    let (parts, request_body) = request.into_parts();
-    let body = match timeout_at(
+async fn buffered_request(
+    body: Incoming,
+    state: &ProxyState,
+    deadline: Instant,
+) -> Result<BufferedBytes, RequestRejection> {
+    match timeout_at(
         deadline,
         read_request_body(
-            request_body,
+            body,
             state.config.max_request_bytes,
             Arc::clone(&state.buffered),
         ),
     )
     .await
     {
-        Ok(Ok(result)) => result,
-        Ok(Err(ReadBodyError::TooLarge)) => {
-            return json_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "cloud hop request body is too large",
-            )
-        }
-        Ok(Err(ReadBodyError::AggregateLimit)) => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "cloud hop aggregate buffering limit reached",
-            )
-        }
-        Ok(Err(ReadBodyError::Trailers)) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "cloud hop request trailers are not supported",
-            )
-        }
-        Ok(Err(ReadBodyError::Body(_))) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "cloud hop request body stream failed",
-            )
-        }
-        Err(_) => {
-            return json_error(
-                StatusCode::REQUEST_TIMEOUT,
-                "cloud hop request body timed out",
-            )
-        }
-    };
-    let rewrite_capacity = match rewrite_capacity(body.as_ref(), map) {
-        Ok(capacity) => capacity,
-        Err(error) => {
-            let message = error.to_string();
-            return json_error(StatusCode::BAD_REQUEST, &message);
-        }
-    };
-    let Ok(rewrite_capacity_units) = u32::try_from(rewrite_capacity) else {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cloud hop aggregate buffering limit reached",
-        );
-    };
-    let Ok(mut rewrite_permit) =
-        Arc::clone(&state.buffered).try_acquire_many_owned(rewrite_capacity_units)
-    else {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cloud hop aggregate buffering limit reached",
-        );
-    };
-    let rewritten = match rewrite_model_bytes(selector, body.as_ref(), map) {
-        Ok(body) => body,
-        Err(error) => {
-            let message = error.to_string();
-            return json_error(StatusCode::BAD_REQUEST, &message);
-        }
-    };
-    let rewrite_extra = rewritten.capacity().saturating_sub(rewrite_capacity);
-    if rewrite_extra > 0 {
-        let Some(extra_permit) = u32::try_from(rewrite_extra).ok().and_then(|extra| {
-            Arc::clone(&state.buffered)
-                .try_acquire_many_owned(extra)
-                .ok()
-        }) else {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "cloud hop aggregate buffering limit reached",
-            );
-        };
-        rewrite_permit.merge(extra_permit);
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(ReadBodyError::TooLarge)) => Err(RequestRejection::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "cloud hop request body is too large",
+        )),
+        Ok(Err(ReadBodyError::AggregateLimit)) => Err(RequestRejection::aggregate_limit()),
+        Ok(Err(ReadBodyError::Trailers)) => Err(RequestRejection::new(
+            StatusCode::BAD_REQUEST,
+            "cloud hop request trailers are not supported",
+        )),
+        Ok(Err(ReadBodyError::Body(_))) => Err(RequestRejection::new(
+            StatusCode::BAD_REQUEST,
+            "cloud hop request body stream failed",
+        )),
+        Err(_) => Err(RequestRejection::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "cloud hop request body timed out",
+        )),
     }
-    // Bind the rewritten allocation's reservation to the bytes sent through
-    // hyper. The transport can hold those bytes after this function returns,
-    // so the reservation must follow that ownership rather than the response.
-    let rewritten = BufferedBytes::new(Bytes::from(rewritten), Some(rewrite_permit));
-    drop(body);
+}
 
-    match forward_request(parts, rewritten, selector, state, deadline).await {
-        Ok(forwarded) => box_response(
-            forwarded.response,
-            request_permit,
-            deadline,
-            cancellation,
-            forwarded.connection_abort,
-        ),
-        Err(error) => {
-            tracing::warn!(error = %error, "cloud hop upstream forwarding failed");
-            json_error(
-                StatusCode::BAD_GATEWAY,
-                "cloud hop upstream forwarding failed",
-            )
-        }
+fn rewrite_buffered_request(
+    selector: CloudProvider,
+    body: &[u8],
+    map: &DeploymentMap,
+    buffered: &Arc<Semaphore>,
+) -> Result<BufferedBytes, RequestRejection> {
+    let capacity = rewrite_capacity(body, map)?;
+    let units = u32::try_from(capacity).map_err(|_| RequestRejection::aggregate_limit())?;
+    let mut permit = Arc::clone(buffered)
+        .try_acquire_many_owned(units)
+        .map_err(|_| RequestRejection::aggregate_limit())?;
+    let rewritten = rewrite_model_bytes(selector, body, map)?;
+    let extra = rewritten.capacity().saturating_sub(capacity);
+    if extra > 0 {
+        let units = u32::try_from(extra).map_err(|_| RequestRejection::aggregate_limit())?;
+        permit.merge(
+            Arc::clone(buffered)
+                .try_acquire_many_owned(units)
+                .map_err(|_| RequestRejection::aggregate_limit())?,
+        );
     }
+    // Hyper can retain upload frames after the response arrives. The storage
+    // reservation must follow those bytes rather than the response lifetime.
+    Ok(BufferedBytes::new(Bytes::from(rewritten), Some(permit)))
 }
 
 async fn read_request_body(
@@ -1648,7 +1636,7 @@ fn reserve_buffer_capacity(
         .clone()
         .try_acquire_many_owned(requested_u32)
         .map_err(|_| ReadBodyError::AggregateLimit)?;
-    bytes.reserve_exact(requested);
+    bytes.reserve_exact(required - bytes.len());
     let actual = bytes.capacity().saturating_sub(before);
     if actual > requested {
         let extra = actual - requested;
@@ -1684,21 +1672,18 @@ enum ReadBodyError {
 }
 
 fn surface_for_path(provider: CloudProvider, path: &str) -> Option<CloudSurface> {
-    match provider {
-        CloudProvider::AzureOpenAi if path == CloudSurface::AzureChatCompletions.path() => {
-            Some(CloudSurface::AzureChatCompletions)
-        }
-        CloudProvider::AzureOpenAi if path == CloudSurface::AzureResponses.path() => {
-            Some(CloudSurface::AzureResponses)
-        }
-        CloudProvider::Foundry if path == CloudSurface::FoundryMessages.path() => {
-            Some(CloudSurface::FoundryMessages)
-        }
-        CloudProvider::Bedrock if path == CloudSurface::BedrockMessages.path() => {
-            Some(CloudSurface::BedrockMessages)
-        }
-        _ => None,
-    }
+    let surfaces: &[CloudSurface] = match provider {
+        CloudProvider::AzureOpenAi => &[
+            CloudSurface::AzureChatCompletions,
+            CloudSurface::AzureResponses,
+        ],
+        CloudProvider::Foundry => &[CloudSurface::FoundryMessages],
+        CloudProvider::Bedrock => &[CloudSurface::BedrockMessages],
+    };
+    surfaces
+        .iter()
+        .copied()
+        .find(|surface| surface.path() == path)
 }
 
 async fn forward_request(
@@ -1832,9 +1817,8 @@ fn full_body(body: Bytes) -> ResponseBody {
 
 #[cfg(test)]
 #[expect(
-    clippy::assertions_on_constants,
     clippy::expect_used,
-    reason = "tests intentionally panic on unexpected values and assert safety constants"
+    reason = "tests intentionally panic on unexpected values"
 )]
 mod tests {
     use super::*;
@@ -1941,14 +1925,24 @@ mod tests {
         path: &str,
         chunks: Vec<Bytes>,
     ) -> Result<Response<Incoming>, hyper::Error> {
+        send_selected_hop_request(hop_addr, Method::POST, path, "azure-openai", chunks).await
+    }
+
+    async fn send_selected_hop_request(
+        hop_addr: SocketAddr,
+        method: Method,
+        path: &str,
+        selector: &str,
+        chunks: Vec<Bytes>,
+    ) -> Result<Response<Incoming>, hyper::Error> {
         let stream = TcpStream::connect(hop_addr).await.expect("hop connect");
         let io = TokioIo::new(stream);
         let (mut sender, connection) = http1::handshake(io).await.expect("hop handshake");
         tokio::spawn(connection);
         let request = Request::builder()
-            .method(Method::POST)
+            .method(method)
             .uri(path)
-            .header("x-gm-cloud-hop-provider", "azure-openai")
+            .header("x-gm-cloud-hop-provider", selector)
             .header(CONTENT_TYPE, "application/json")
             .body(ChunkBody {
                 chunks: chunks.into_iter().collect(),
@@ -2219,6 +2213,201 @@ mod tests {
         assert!(body.contains(AZURE_RESPONSES_UNQUALIFIED_REASON));
     }
 
+    const REJECTED_HOP_REQUESTS: &[(Method, &str, &str, &str, StatusCode)] = &[
+        (
+            Method::GET,
+            "/v1/models",
+            "azure-openai",
+            "{}",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/v1/responses",
+            "azure-openai",
+            "{}",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            "invalid",
+            "{}",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            "foundry",
+            "{}",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/v1/messages",
+            "bedrock",
+            "{}",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/v1/messages/count_tokens",
+            "foundry",
+            "{}",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            "azure-openai",
+            "{",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            "azure-openai",
+            "{}",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            "azure-openai",
+            r#"{"model":3}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            "azure-openai",
+            r#"{"model":"gpt-cheap"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            "azure-openai",
+            r#"{"model":"gpt-5.5","model":"gpt-5.6"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+
+    #[tokio::test]
+    async fn request_admission_rejects_invalid_inputs_without_egress() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("upstream");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let hop = TcpListener::bind("127.0.0.1:0").await.expect("hop");
+        let hop_addr = hop.local_addr().expect("hop address");
+        let task = tokio::spawn(serve_with_upstream(
+            hop,
+            test_config_with_request(64, required_buffered_bytes(64), 1, Duration::from_secs(5)),
+            upstream_addr,
+        ));
+        for &(ref method, path, selector, body, status) in REJECTED_HOP_REQUESTS {
+            let response = send_selected_hop_request(
+                hop_addr,
+                method.clone(),
+                path,
+                selector,
+                vec![Bytes::from_static(body.as_bytes())],
+            )
+            .await
+            .expect("hop response");
+            assert_eq!(response.status(), status, "{selector} {path} {body}");
+        }
+        let oversized = vec![
+            Bytes::from_static(br#"{"model":"gpt-5.5","padding":""#),
+            Bytes::from(vec![b'x'; 64]),
+            Bytes::from_static(br#""}"#),
+        ];
+        let response = send_hop_request(hop_addr, oversized)
+            .await
+            .expect("oversized response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), upstream.accept())
+                .await
+                .is_err(),
+            "rejected requests must never connect to egress"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn foundry_rewrites_only_the_request_and_preserves_a_mismatched_echo() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("upstream");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let raw_response =
+            Bytes::from_static(br#"{ "model" : "cheap-model", "value":1.2300e+03 }"#);
+        let response_copy = raw_response.clone();
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let observed_tx = Arc::new(Mutex::new(Some(observed_tx)));
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.expect("egress connection");
+            let service = service_fn(move |request: Request<Incoming>| {
+                let tx = observed_tx
+                    .lock()
+                    .expect("sender")
+                    .take()
+                    .expect("one request");
+                let response = response_copy.clone();
+                async move {
+                    tx.send(
+                        request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("upload")
+                            .to_bytes(),
+                    )
+                    .expect("observation");
+                    Ok::<_, Infallible>(Response::new(Full::new(response)))
+                }
+            });
+            let _ = server_http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let hop = TcpListener::bind("127.0.0.1:0").await.expect("hop");
+        let hop_addr = hop.local_addr().expect("hop address");
+        let task = tokio::spawn(serve_with_upstream(
+            hop,
+            test_config(3 * 1024 * 1024, 1, Duration::from_secs(5)),
+            upstream_addr,
+        ));
+        let request = Bytes::from_static(
+            br#"{ "model":"claude-sonnet-4-6", "n":1.2300e+03, "nested":{"model":"leave-me"} }"#,
+        );
+        let response = send_selected_hop_request(
+            hop_addr,
+            Method::POST,
+            "/v1/messages",
+            "foundry",
+            vec![request],
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("response body")
+                .to_bytes(),
+            raw_response
+        );
+        assert_eq!(
+            observed_rx.await.expect("rewritten request"),
+            Bytes::from_static(
+                br#"{ "model":"gm-echo-test", "n":1.2300e+03, "nested":{"model":"leave-me"} }"#
+            )
+        );
+        task.abort();
+        upstream_task.abort();
+    }
+
     #[test]
     fn gateway_body_cap_is_used_only_when_hop_cap_is_absent() {
         assert_eq!(
@@ -2254,6 +2443,29 @@ mod tests {
             rewrite_capacity(body, &azure_map()),
             Ok(body.len() + "my-gpt55".len())
         );
+    }
+
+    #[test]
+    fn buffer_growth_accounts_for_existing_spare_capacity() {
+        let buffered = Arc::new(Semaphore::new(100));
+        let mut bytes = Vec::with_capacity(10);
+        bytes.extend_from_slice(b"12345");
+        let mut permit = Some(
+            buffered
+                .clone()
+                .try_acquire_many_owned(10)
+                .expect("initial storage"),
+        );
+        reserve_buffer_capacity(&mut bytes, &mut permit, 15, &buffered).expect("grow buffer");
+        assert!(
+            bytes.capacity() >= 15,
+            "extension must not allocate beyond its reservation"
+        );
+        bytes.extend_from_slice(b"6789012345");
+        assert_eq!(100 - buffered.available_permits(), bytes.capacity());
+        drop(bytes);
+        drop(permit);
+        assert_eq!(buffered.available_permits(), 100);
     }
 
     #[test]
@@ -2342,13 +2554,8 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_table_is_present_but_hop_is_disabled() {
-        let map = bedrock_deployment_map();
-        assert_eq!(
-            map.get("claude-sonnet-4-6"),
-            Some("anthropic.claude-sonnet-4-6-v1")
-        );
-        assert!(!BEDROCK_HOP_ENABLED);
+    fn bedrock_rewrite_is_disabled() {
+        let map = foundry_map();
         assert_eq!(
             rewrite_model_bytes(
                 CloudProvider::Bedrock,
@@ -2706,10 +2913,6 @@ mod tests {
         upstream_task.abort();
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the passthrough test keeps request, response, and lifecycle assertions together"
-    )]
     #[tokio::test]
     async fn response_status_headers_and_stream_frames_pass_through() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
@@ -2728,22 +2931,7 @@ mod tests {
                     let body = body.collect().await.expect("forwarded body").to_bytes();
                     if let Some(observed_tx) = observed_tx {
                         observed_tx
-                            .send((
-                                parts.uri.path().to_owned(),
-                                parts
-                                    .headers
-                                    .get("x-gm-cloud-hop-provider")
-                                    .and_then(|value| value.to_str().ok())
-                                    .map(str::to_owned),
-                                parts.headers.contains_key("x-gm-node-key"),
-                                parts.headers.contains_key("x-gm-upstream-slot"),
-                                parts
-                                    .headers
-                                    .get(CONTENT_LENGTH)
-                                    .and_then(|value| value.to_str().ok())
-                                    .map(str::to_owned),
-                                body,
-                            ))
+                            .send(Request::from_parts(parts, body))
                             .expect("observation receiver");
                     }
                     Ok::<_, Infallible>(
@@ -2768,14 +2956,11 @@ mod tests {
 
         let hop_listener = TcpListener::bind("127.0.0.1:0").await.expect("hop bind");
         let hop_addr = hop_listener.local_addr().expect("hop address");
-        let config = CloudHopConfig {
-            azure_openai: Some(azure_map()),
-            foundry: Some(foundry_map()),
-            max_request_bytes: 1024 * 1024,
-            max_buffered_bytes: required_buffered_bytes(1024 * 1024),
-            max_concurrency: 2,
-            timeout: Duration::from_secs(5),
-        };
+        let config = test_config(
+            required_buffered_bytes(1024 * 1024),
+            2,
+            Duration::from_secs(5),
+        );
         tokio::spawn(serve_with_upstream(hop_listener, config, upstream_addr));
 
         let stream = TcpStream::connect(hop_addr).await.expect("hop connect");
@@ -2793,14 +2978,19 @@ mod tests {
             .body(Full::new(Bytes::from_static(br#"{"model":"gpt-5.5"}"#)))
             .expect("request");
         let mut response = sender.send_request(request).await.expect("hop response");
-        let (path, provider, has_node_key, has_slot, content_length, body) =
-            observed_rx.await.expect("forwarded request observation");
-        assert_eq!(path, "/v1/chat/completions");
-        assert_eq!(provider.as_deref(), Some("azure-openai"));
-        assert!(!has_node_key);
-        assert!(!has_slot);
-        assert_eq!(content_length.as_deref(), Some("20"));
-        assert_eq!(body, Bytes::from_static(br#"{"model":"my-gpt55"}"#));
+        let forwarded = observed_rx.await.expect("forwarded request observation");
+        assert_eq!(forwarded.uri().path(), "/v1/chat/completions");
+        assert_eq!(
+            forwarded.headers()["x-gm-cloud-hop-provider"],
+            "azure-openai"
+        );
+        assert!(!forwarded.headers().contains_key("x-gm-node-key"));
+        assert!(!forwarded.headers().contains_key("x-gm-upstream-slot"));
+        assert_eq!(forwarded.headers()[CONTENT_LENGTH], "20");
+        assert_eq!(
+            forwarded.body(),
+            &Bytes::from_static(br#"{"model":"my-gpt55"}"#)
+        );
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()["x-upstream-marker"], "preserve-me");
         let first = response
