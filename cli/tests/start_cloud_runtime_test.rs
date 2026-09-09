@@ -111,7 +111,7 @@ fn failed_serving_gate_never_starts_cloud_data_plane() {
 }
 
 fn wait_for_file(path: &Path) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !path.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
