@@ -621,6 +621,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const FLUX_KLEIN_MODEL: &str = "black-forest-labs/FLUX.2-klein-4B";
+    const FLUX_KLEIN_HOST: &str = "flux2-klein.completions.near.ai";
+
     fn attestation(nonce: [u8; 32], spki: [u8; 32], model: &str) -> NearAttestation {
         let signing_key = [7_u8; 32];
         let app_compose = serde_json::json!({"docker_compose_file": "services: {}"}).to_string();
@@ -682,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn every_qualified_near_chat_target_is_closed_listed() {
+    fn every_qualified_near_target_is_closed_listed() {
         let actual = TARGETS
             .iter()
             .map(|target| (target.model, target.host))
@@ -699,8 +702,44 @@ mod tests {
                 ),
                 ("google/gemma-4-31B-it", "gemma-4-31b.completions.near.ai"),
                 ("Qwen/Qwen3.8-27B", "qwen3-8-27b.completions.near.ai"),
+                (FLUX_KLEIN_MODEL, FLUX_KLEIN_HOST),
             ]
         );
+    }
+
+    #[test]
+    fn flux_klein_image_target_is_closed_listed() {
+        assert_eq!(
+            target_for_model(FLUX_KLEIN_MODEL),
+            Some(NearTarget {
+                model: FLUX_KLEIN_MODEL,
+                host: FLUX_KLEIN_HOST,
+            })
+        );
+    }
+
+    #[test]
+    fn attested_identity_for_the_image_target_passes() {
+        let nonce = [1_u8; 32];
+        let spki = [2_u8; 32];
+        let target = target_for_model(FLUX_KLEIN_MODEL);
+        assert!(
+            target.is_some(),
+            "FLUX.2 klein must be a compiled NEAR target"
+        );
+        let attestation = attestation(nonce, spki, FLUX_KLEIN_MODEL);
+        let (report_data, mr_config_id) = fields(&attestation, nonce, spki);
+        verify_identity(
+            &attestation,
+            target.unwrap(),
+            &nonce,
+            &spki,
+            AttestedFields {
+                report_data: &report_data,
+                mr_config_id: &mr_config_id,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -798,14 +837,98 @@ mod tests {
             (Method::GET, "/v1/chat/completions"),
             (Method::POST, "/v1/models"),
             (Method::POST, "/attacker"),
+            (Method::GET, "/v1/images/generations"),
+            (Method::POST, "/v1/images/edits"),
+            (Method::POST, "/v1/images/variations"),
+            (Method::POST, "/v1/images"),
         ] {
             let request = Request::builder()
-                .method(method)
+                .method(&method)
                 .uri(path)
                 .body(Body::empty())
                 .unwrap();
-            assert!(validate_request(&request).is_err());
+            assert!(
+                validate_request(&request).is_err(),
+                "{method} {path} must be rejected"
+            );
         }
+    }
+
+    #[test]
+    fn images_generations_post_is_accepted_by_the_verifier() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/generations")
+            .body(Body::empty())
+            .unwrap();
+        validate_request(&request).unwrap();
+    }
+
+    fn images_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "model": FLUX_KLEIN_MODEL,
+            "prompt": "a lighthouse at dusk",
+            "n": 1,
+            "size": "1024x1024",
+            "response_format": "b64_json",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn images_request_is_forwarded_unread_to_the_flux_host() {
+        let body = images_body();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/generations")
+            .header(SELECTOR_HEADER, FLUX_KLEIN_MODEL)
+            .header("content-type", "application/json")
+            .header(CONNECTION, "keep-alive")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let target = target_for_model(FLUX_KLEIN_MODEL);
+        assert!(
+            target.is_some(),
+            "FLUX.2 klein must be a compiled NEAR target"
+        );
+        let upstream = upstream_request(request, target.unwrap()).unwrap();
+        assert_eq!(upstream.method(), Method::POST);
+        assert_eq!(upstream.uri().path(), "/v1/images/generations");
+        assert_eq!(upstream.headers()[HOST], FLUX_KLEIN_HOST);
+        assert!(!upstream.headers().contains_key(SELECTOR_HEADER));
+        assert!(!upstream.headers().contains_key(CONNECTION));
+        assert_eq!(upstream.headers()["content-type"], "application/json");
+        let forwarded = upstream.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(forwarded.as_ref(), body.as_slice());
+    }
+
+    #[tokio::test]
+    async fn images_path_reaches_selector_validation_before_any_network() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = NearVerifier::new().unwrap();
+        let unknown = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/generations")
+            .header(SELECTOR_HEADER, "attacker/model")
+            .body(Body::from(images_body()))
+            .unwrap();
+        let error = verifier.forward(unknown).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported NEAR model selector"),
+            "images POST must pass path validation and fail on the selector, got: {error:#}"
+        );
+        let missing = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/generations")
+            .body(Body::from(images_body()))
+            .unwrap();
+        let error = verifier.forward(missing).await.unwrap_err();
+        assert!(
+            error.to_string().contains("missing NEAR model selector"),
+            "got: {error:#}"
+        );
     }
 
     fn nras_response(result: &Value) -> Value {

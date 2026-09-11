@@ -137,4 +137,22 @@ mod tests {
             .to_vec();
         assert_eq!(catalog["data"], serde_json::Value::Array(expected));
     }
+
+    #[tokio::test]
+    async fn local_capability_catalog_lists_the_flux_klein_image_model() {
+        let Json(catalog) = models().await;
+        let ids = catalog["data"]
+            .as_array()
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|model| model["id"].as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            ids.contains(&"black-forest-labs/FLUX.2-klein-4B"),
+            "registry capability walk must see the image model, got: {ids:?}"
+        );
+    }
 }
