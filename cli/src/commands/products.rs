@@ -1422,6 +1422,7 @@ mod tests {
             status: "active".to_owned(),
             retail_price: serde_json::from_value(retail(500_000_000, 3_000_000_000))
                 .expect("decode image retail"),
+            capabilities: None,
         };
         let products = [image];
         let targets = filter_catalog(&products, Some(&Provider::Gemini));

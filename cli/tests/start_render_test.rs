@@ -85,7 +85,14 @@ fn route<'a>(config: &'a Value, provider: &str, path: &str) -> &'a Value {
             let path_matches = target["path"].as_str() == Some(bare)
                 || target["prefix"]
                     .as_str()
-                    .is_some_and(|prefix| bare.starts_with(prefix));
+                    .is_some_and(|prefix| bare.starts_with(prefix))
+                || target["safe_regex"]["regex"]
+                    .as_str()
+                    .is_some_and(|pattern| {
+                        regex::Regex::new(pattern)
+                            .expect("route regex")
+                            .is_match(bare)
+                    });
             path_matches
                 && target["headers"].as_array().is_none_or(|headers| {
                     headers.iter().all(|header| {
@@ -590,6 +597,84 @@ fn near_only_passes_approved_source_models_to_the_local_verifier() {
                 .get::<Option<String>>("response_status")
                 .expect("status"),
             (model == "unapproved-source").then(|| "400".to_owned())
+        );
+    }
+}
+
+const FLUX_KLEIN_MODEL: &str = "black-forest-labs/FLUX.2-klein-4B";
+
+#[test]
+fn near_images_generations_routes_through_the_measured_verifier() {
+    let (status, _, stderr, rendered) = render_envoy([("NEAR_API_KEY", "near-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    let images = route(&parsed, "near", "/v1/images/generations");
+    assert_eq!(images["route"]["cluster"], "near_verify_proxy");
+    assert!(images["route"].get("host_rewrite_literal").is_none());
+    assert!(images["route"].get("regex_rewrite").is_none());
+    let chat = route(&parsed, "near", "/v1/chat/completions");
+    assert_eq!(images["route"]["timeout"], chat["route"]["timeout"]);
+    assert_eq!(
+        images["request_headers_to_remove"],
+        chat["request_headers_to_remove"]
+    );
+    assert_ne!(
+        route(&parsed, "near", "/v1/images/edits")["route"]["cluster"],
+        "near_verify_proxy",
+        "only the two closed-list inference paths reach the verifier"
+    );
+}
+
+#[test]
+fn near_images_gate_admits_flux_klein_and_still_rejects_unknown_models() {
+    let (status, _, stderr, rendered) = render_envoy([("NEAR_API_KEY", "near-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    for (model, expected_status) in [
+        (FLUX_KLEIN_MODEL, None),
+        ("unapproved-source", Some("400".to_owned())),
+    ] {
+        let lua = run_request(
+            &rendered,
+            &[
+                (":path", "/v1/images/generations"),
+                ("x-gm-provider", "near"),
+                ("x-gm-node-key", "test-node-secret-0001"),
+                ("x-gm-upstream-model", model),
+                ("x-gm-request-id", "request-123"),
+                ("authorization", "caller-secret"),
+            ],
+            &[("GM_NEAR_KEY_SLOT_1", "near-key")],
+        );
+        assert_eq!(
+            lua.globals()
+                .get::<Option<String>>("response_status")
+                .expect("status"),
+            expected_status,
+            "{model} on the images path"
+        );
+        if expected_status.is_some() {
+            continue;
+        }
+        let headers = lua
+            .globals()
+            .get::<mlua::Table>("input_headers")
+            .expect("headers");
+        assert_eq!(
+            headers
+                .get::<Option<String>>("x-gm-upstream-model")
+                .expect("selector"),
+            Some(FLUX_KLEIN_MODEL.to_owned()),
+            "the validated selector must survive to the loopback verifier"
+        );
+        assert_eq!(
+            headers.get::<String>("authorization").expect("auth"),
+            "Bearer near-key"
+        );
+        assert_eq!(
+            headers
+                .get::<Option<String>>("x-gm-request-id")
+                .expect("internal header"),
+            None
         );
     }
 }

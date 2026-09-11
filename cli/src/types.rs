@@ -22,12 +22,6 @@ use strum::EnumIter;
 pub const GEMINI_IMAGE_MODELS: [&str; 2] =
     ["gemini-3.1-flash-lite-image", "gemini-3.1-flash-image"];
 
-/// Whether a provider/model pair is one of the Gemini image products.
-#[must_use]
-pub fn is_gemini_image_model(provider: &str, model: &str) -> bool {
-    provider == "gemini" && GEMINI_IMAGE_MODELS.contains(&model)
-}
-
 /// Provider identifier — must match the canonical enum in product.json.
 ///
 /// `Benchmark` exists so a serde decode of any payload that mentions the
@@ -139,6 +133,41 @@ pub struct Product {
     pub model: String,
     pub status: String,
     pub retail_price: RetailPrice,
+    #[serde(default)]
+    pub capabilities: Option<ProductCapabilities>,
+}
+
+impl Product {
+    /// The registry's capability block is the only signal that a product
+    /// generates images; model names are not.
+    #[must_use]
+    pub fn generates_images(&self) -> bool {
+        self.capabilities
+            .as_ref()
+            .is_some_and(ProductCapabilities::generates_images)
+    }
+}
+
+/// The subset of `GET /products` `capabilities` the CLI reads. `api` is a
+/// string, not an enum, so a registry that adds an api this build predates
+/// still decodes the whole catalog.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProductCapabilities {
+    #[serde(default)]
+    pub image_generation: bool,
+    #[serde(default)]
+    pub api: Option<String>,
+}
+
+impl ProductCapabilities {
+    #[must_use]
+    pub fn generates_images(&self) -> bool {
+        self.image_generation
+            || matches!(
+                self.api.as_deref(),
+                Some("gemini_generate_content" | "openai_images")
+            )
+    }
 }
 
 /// Per-product retail price block returned by `GET /products`. The CLI

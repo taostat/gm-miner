@@ -822,7 +822,9 @@ static_resources:
                             - x-gm-provider
                             - x-gm-upstream-slot
                         - match:
-                            path: "/v1/chat/completions"
+                            safe_regex:
+                              google_re2: {}
+                              regex: "^/v1/(chat/completions|images/generations)$"
                             headers:
                               - name: "x-gm-provider"
                                 string_match:
@@ -1178,7 +1180,8 @@ static_resources:
                                 and model ~= "z-ai/glm-5.2"
                                 and model ~= "deepseek-ai/DeepSeek-V4-Flash"
                                 and model ~= "google/gemma-4-31B-it"
-                                and model ~= "Qwen/Qwen3.8-27B" then
+                                and model ~= "Qwen/Qwen3.8-27B"
+                                and model ~= "black-forest-labs/FLUX.2-klein-4B" then
                                 handle:respond(
                                   {[":status"] = "400",
                                    ["content-type"] = "application/json"},

@@ -985,6 +985,7 @@ mod tests {
                     ..Default::default()
                 },
             },
+            capabilities: None,
         }
     }
 

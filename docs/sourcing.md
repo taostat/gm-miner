@@ -63,6 +63,8 @@ explains the table and how to set each upstream up.
 | `deepseek/deepseek-v4-flash-0731-tee` | `near/deepseek-ai/DeepSeek-V4-Flash` | `dsv4-flash.completions.near.ai` | `--near` |
 | `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
 | `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
+| `bfl/flux.2-klein-4b` | `near/black-forest-labs/FLUX.2-klein-4B` | `flux2-klein.completions.near.ai` | `--near` |
+| `bfl/flux.2-klein-4b` | `deepinfra/black-forest-labs/FLUX-2-klein-4b` | `api.deepinfra.com` | `--deepinfra` |
 
 Source pairs that differ from their buyer are absent from the public catalog:
 they are dispatch targets, not products a buyer can request by name. The
@@ -242,7 +244,9 @@ requests nonce-bound evidence on that connection, validates the Intel TDX quote,
 the exact model id, the live TLS public-key fingerprint, the compose measurement
 binding, and NVIDIA's GPU verdict, and only then forwards inference on that same
 connection. A missing, stale, substituted, malformed, or failed verdict returns
-an error; there is no direct-origin or unattested fallback route.
+an error; there is no direct-origin or unattested fallback route. The same
+checks cover `POST /v1/images/generations` for
+`near/black-forest-labs/FLUX.2-klein-4B`; the verifier never reads the body.
 
 The registry's `GET /v1/models` capability check is answered locally from that
 same compiled allowlist. It does not contact an unattested catalog endpoint;

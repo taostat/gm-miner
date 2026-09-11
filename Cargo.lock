@@ -2402,6 +2402,7 @@ dependencies = [
  "open",
  "percent-encoding",
  "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "rustls",
  "serde",

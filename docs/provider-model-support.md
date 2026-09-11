@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-09-10**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-09-11**. This is a miner setup matrix, not a buyer product
 catalog. It distinguishes transport capability from registry admission:
 
 * A direct/API-key source is declarable when the registry publishes the route
@@ -57,6 +57,7 @@ authority for which explicit routes that registry has published.
 | `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`); Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`) |
 | `DeepSeek V4.1 Flash` | KubeTEE: `kubetee/deepseek/deepseek-v4.1-flash` (`--kubetee`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash` (`--deepinfra`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`); NEAR confidential inference: `near/deepseek-ai/DeepSeek-V4-Flash` (`--near`) |
+| `FLUX.2 klein 4B` | NEAR confidential inference: `near/black-forest-labs/FLUX.2-klein-4B` (`--near`); DeepInfra: `deepinfra/black-forest-labs/FLUX-2-klein-4b` (`--deepinfra`) |
 | `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`); NEAR confidential inference: `near/google/gemma-4-31B-it` (`--near`) |
 | `Gemini 3.1 Flash Lite Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-lite-image` (`--google`) |
 | `Gemini 3.1 Flash Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-image` (`--google`) |
@@ -93,6 +94,9 @@ authority for which explicit routes that registry has published.
 | `Qwen3.8 27B TEE` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
 | `Qwen3.8-Flash-Next` | KubeTEE: `kubetee/qwen/qwen3.8-flash-next` (`--kubetee`) |
 
+`FLUX.2 klein 4B` uses the OpenAI images shape, `POST /v1/images/generations`
+with `response_format: "b64_json"`, forwarded unchanged to either upstream.
+
 The two Gemini image SKUs use the native
 `POST /v1beta/models/{model}:generateContent` request shape. Envoy forwards
 that path and body unchanged to Google's Gemini API; there is no Interactions
@@ -113,6 +117,6 @@ validator, finalizer, and dashboard evidence belongs to a separate GM
 runbook check. It never prints its prompt, generated image, or either key.
 See [`image-canary.md`](image-canary.md).
 
-`gmcli check-streaming` also skips these native image SKUs because its
-streaming check targets the OpenAI-compatible SSE surface; it never sends an
-image-generation probe.
+`gmcli check-streaming` skips every offered product whose registry catalog
+entry publishes image generation because its streaming check targets the
+OpenAI-compatible SSE surface; it never sends an image-generation probe.

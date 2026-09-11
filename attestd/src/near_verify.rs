@@ -38,37 +38,51 @@ const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(120);
 const NRAS_TIMEOUT: Duration = Duration::from_secs(60);
 const NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 const ATTESTATION_ATTEMPTS: usize = 3;
+const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+const IMAGES_GENERATIONS: &str = "/v1/images/generations";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NearTarget {
     pub model: &'static str,
     pub host: &'static str,
+    pub path: &'static str,
 }
 
-pub const TARGETS: [NearTarget; 6] = [
+pub const TARGETS: [NearTarget; 7] = [
     NearTarget {
         model: "zai-org/GLM-5.1-FP8",
         host: "glm-5-1.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "Qwen/Qwen3.6-27B-FP8",
         host: "qwen3-6-27b.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "z-ai/glm-5.2",
         host: "glm-5-2-long.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "deepseek-ai/DeepSeek-V4-Flash",
         host: "dsv4-flash.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "google/gemma-4-31B-it",
         host: "gemma-4-31b.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "Qwen/Qwen3.8-27B",
         host: "qwen3-8-27b.completions.near.ai",
+        path: CHAT_COMPLETIONS,
+    },
+    NearTarget {
+        model: "black-forest-labs/FLUX.2-klein-4B",
+        host: "flux2-klein.completions.near.ai",
+        path: IMAGES_GENERATIONS,
     },
 ];
 
@@ -223,7 +237,6 @@ impl NearVerifier {
     /// Returns an error for unsupported requests or any attestation/upstream
     /// failure. No inference is sent when attestation fails.
     pub async fn forward(&self, request: Request<Body>) -> Result<Response<Body>> {
-        validate_request(&request)?;
         let selector = request
             .headers()
             .get(SELECTOR_HEADER)
@@ -231,6 +244,7 @@ impl NearVerifier {
             .to_str()
             .context("NEAR model selector is not valid ASCII")?;
         let target = target_for_model(selector).context("unsupported NEAR model selector")?;
+        validate_request(&request, target)?;
         let (mut sender, connection, _, _) = self.connect_and_attest(target).await?;
 
         let upstream_request = upstream_request(request, target)?;
@@ -463,9 +477,17 @@ fn verify_nras_response(response: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_request(request: &Request<Body>) -> Result<()> {
-    if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
-        bail!("NEAR proxy accepts only POST /v1/chat/completions");
+// Runs before the attested connect: a selector on the wrong path must not spend
+// a TDX quote and an NRAS round-trip only to be refused at forwarding time.
+fn validate_request(request: &Request<Body>, target: NearTarget) -> Result<()> {
+    let path = request.uri().path();
+    if request.method() != Method::POST || path != target.path {
+        bail!(
+            "{} is served only at POST {}, not {} {path}",
+            target.model,
+            target.path,
+            request.method()
+        );
     }
     Ok(())
 }
@@ -477,10 +499,10 @@ fn upstream_request(mut request: Request<Body>, target: NearTarget) -> Result<Re
         HOST,
         target.host.parse().context("encode NEAR Host header")?,
     );
-    let path = request.uri().path_and_query().map_or(
-        "/v1/chat/completions",
-        axum::http::uri::PathAndQuery::as_str,
-    );
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or(target.path, axum::http::uri::PathAndQuery::as_str);
     *request.uri_mut() = path.parse().context("encode NEAR upstream URI")?;
     Ok(request)
 }
@@ -621,6 +643,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const FLUX_KLEIN_MODEL: &str = "black-forest-labs/FLUX.2-klein-4B";
+    const FLUX_KLEIN_HOST: &str = "flux2-klein.completions.near.ai";
+
     fn attestation(nonce: [u8; 32], spki: [u8; 32], model: &str) -> NearAttestation {
         let signing_key = [7_u8; 32];
         let app_compose = serde_json::json!({"docker_compose_file": "services: {}"}).to_string();
@@ -682,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn every_qualified_near_chat_target_is_closed_listed() {
+    fn every_qualified_near_target_is_closed_listed() {
         let actual = TARGETS
             .iter()
             .map(|target| (target.model, target.host))
@@ -699,6 +724,7 @@ mod tests {
                 ),
                 ("google/gemma-4-31B-it", "gemma-4-31b.completions.near.ai"),
                 ("Qwen/Qwen3.8-27B", "qwen3-8-27b.completions.near.ai"),
+                (FLUX_KLEIN_MODEL, FLUX_KLEIN_HOST),
             ]
         );
     }
@@ -794,18 +820,86 @@ mod tests {
 
     #[test]
     fn any_other_path_or_method_is_rejected() {
+        let flux = target_for_model(FLUX_KLEIN_MODEL).unwrap();
         for (method, path) in [
             (Method::GET, "/v1/chat/completions"),
             (Method::POST, "/v1/models"),
             (Method::POST, "/attacker"),
+            (Method::GET, "/v1/images/generations"),
+            (Method::POST, "/v1/images/edits"),
+            (Method::POST, "/v1/images/variations"),
+            (Method::POST, "/v1/images"),
         ] {
+            for target in [TARGETS[0], flux] {
+                let request = Request::builder()
+                    .method(&method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap();
+                assert!(
+                    validate_request(&request, target).is_err(),
+                    "{method} {path} must be rejected for {}",
+                    target.model
+                );
+            }
+        }
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/generations")
+            .body(Body::empty())
+            .unwrap();
+        validate_request(&request, flux).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_selector_on_the_wrong_path_is_refused_before_any_connection() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = NearVerifier::new().unwrap();
+        let flux = target_for_model(FLUX_KLEIN_MODEL).unwrap();
+        for (path, target) in [(IMAGES_GENERATIONS, TARGETS[0]), (CHAT_COMPLETIONS, flux)] {
             let request = Request::builder()
-                .method(method)
+                .method(Method::POST)
                 .uri(path)
+                .header(SELECTOR_HEADER, target.model)
                 .body(Body::empty())
                 .unwrap();
-            assert!(validate_request(&request).is_err());
+            let error = format!("{:#}", verifier.forward(request).await.unwrap_err());
+            assert!(
+                error.contains(target.path) && !error.contains("attest"),
+                "{} on {path} must be refused without an attested connection, got: {error}",
+                target.model
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn images_request_is_forwarded_unread_to_the_flux_host() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": FLUX_KLEIN_MODEL,
+            "prompt": "a lighthouse at dusk",
+            "n": 1,
+            "size": "1024x1024",
+            "response_format": "b64_json",
+        }))
+        .unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/generations")
+            .header(SELECTOR_HEADER, FLUX_KLEIN_MODEL)
+            .header("content-type", "application/json")
+            .header(CONNECTION, "keep-alive")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let target = target_for_model(FLUX_KLEIN_MODEL).unwrap();
+        let upstream = upstream_request(request, target).unwrap();
+        assert_eq!(upstream.method(), Method::POST);
+        assert_eq!(upstream.uri().path(), "/v1/images/generations");
+        assert_eq!(upstream.headers()[HOST], FLUX_KLEIN_HOST);
+        assert!(!upstream.headers().contains_key(SELECTOR_HEADER));
+        assert!(!upstream.headers().contains_key(CONNECTION));
+        assert_eq!(upstream.headers()["content-type"], "application/json");
+        let forwarded = upstream.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(forwarded.as_ref(), body.as_slice());
     }
 
     fn nras_response(result: &Value) -> Value {
