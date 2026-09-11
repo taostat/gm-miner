@@ -63,6 +63,8 @@ explains the table and how to set each upstream up.
 | `deepseek/deepseek-v4-flash-0731-tee` | `near/deepseek-ai/DeepSeek-V4-Flash` | `dsv4-flash.completions.near.ai` | `--near` |
 | `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
 | `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
+| `bfl/flux.2-klein-4b` | `near/black-forest-labs/FLUX.2-klein-4B` | `flux2-klein.completions.near.ai` | `--near` |
+| `bfl/flux.2-klein-4b` | `deepinfra/black-forest-labs/FLUX-2-klein-4b` | `api.deepinfra.com` | `--deepinfra` |
 
 Source pairs that differ from their buyer are absent from the public catalog:
 they are dispatch targets, not products a buyer can request by name. The
@@ -220,6 +222,7 @@ gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4.1-Flash --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.6-35B-A3B --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.8-27B --discount-pct 5
+gmcli declare-product --provider deepinfra --model black-forest-labs/FLUX-2-klein-4b --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.3 --discount-pct 5
 gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
@@ -231,6 +234,7 @@ gmcli declare-product --provider near --model Qwen/Qwen3.6-27B-FP8 --discount-pc
 gmcli declare-product --provider near --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider near --model deepseek-ai/DeepSeek-V4-Flash --discount-pct 5
 gmcli declare-product --provider near --model google/gemma-4-31B-it --discount-pct 5
+gmcli declare-product --provider near --model black-forest-labs/FLUX.2-klein-4B --discount-pct 5
 ```
 
 ### NEAR attestation enforcement
@@ -243,6 +247,11 @@ the exact model id, the live TLS public-key fingerprint, the compose measurement
 binding, and NVIDIA's GPU verdict, and only then forwards inference on that same
 connection. A missing, stale, substituted, malformed, or failed verdict returns
 an error; there is no direct-origin or unattested fallback route.
+
+Image generation on NEAR (`near/black-forest-labs/FLUX.2-klein-4B`, OpenAI
+images shape at `POST /v1/images/generations`) goes through the same verifier
+with the same checks; the verifier never reads the request body, so the
+images request is forwarded unchanged on the attested connection.
 
 The registry's `GET /v1/models` capability check is answered locally from that
 same compiled allowlist. It does not contact an unattested catalog endpoint;

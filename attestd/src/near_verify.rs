@@ -38,6 +38,7 @@ const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(120);
 const NRAS_TIMEOUT: Duration = Duration::from_secs(60);
 const NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 const ATTESTATION_ATTEMPTS: usize = 3;
+const INFERENCE_PATHS: [&str; 2] = ["/v1/chat/completions", "/v1/images/generations"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NearTarget {
@@ -45,7 +46,7 @@ pub struct NearTarget {
     pub host: &'static str,
 }
 
-pub const TARGETS: [NearTarget; 6] = [
+pub const TARGETS: [NearTarget; 7] = [
     NearTarget {
         model: "zai-org/GLM-5.1-FP8",
         host: "glm-5-1.completions.near.ai",
@@ -69,6 +70,10 @@ pub const TARGETS: [NearTarget; 6] = [
     NearTarget {
         model: "Qwen/Qwen3.8-27B",
         host: "qwen3-8-27b.completions.near.ai",
+    },
+    NearTarget {
+        model: "black-forest-labs/FLUX.2-klein-4B",
+        host: "flux2-klein.completions.near.ai",
     },
 ];
 
@@ -464,8 +469,8 @@ fn verify_nras_response(response: &Value) -> Result<()> {
 }
 
 fn validate_request(request: &Request<Body>) -> Result<()> {
-    if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
-        bail!("NEAR proxy accepts only POST /v1/chat/completions");
+    if request.method() != Method::POST || !INFERENCE_PATHS.contains(&request.uri().path()) {
+        bail!("NEAR proxy accepts only POST /v1/chat/completions or POST /v1/images/generations");
     }
     Ok(())
 }
