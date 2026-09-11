@@ -222,7 +222,6 @@ gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4.1-Flash --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.6-35B-A3B --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.8-27B --discount-pct 5
-gmcli declare-product --provider deepinfra --model black-forest-labs/FLUX-2-klein-4b --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.3 --discount-pct 5
 gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
@@ -234,7 +233,6 @@ gmcli declare-product --provider near --model Qwen/Qwen3.6-27B-FP8 --discount-pc
 gmcli declare-product --provider near --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider near --model deepseek-ai/DeepSeek-V4-Flash --discount-pct 5
 gmcli declare-product --provider near --model google/gemma-4-31B-it --discount-pct 5
-gmcli declare-product --provider near --model black-forest-labs/FLUX.2-klein-4B --discount-pct 5
 ```
 
 ### NEAR attestation enforcement

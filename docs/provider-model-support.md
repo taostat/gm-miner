@@ -94,9 +94,8 @@ authority for which explicit routes that registry has published.
 | `Qwen3.8 27B TEE` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
 | `Qwen3.8-Flash-Next` | KubeTEE: `kubetee/qwen/qwen3.8-flash-next` (`--kubetee`) |
 
-`FLUX.2 klein 4B` uses the OpenAI images shape: `POST /v1/images/generations`
-with `response_format: "b64_json"`. The miner forwards that path and body
-unchanged to either upstream.
+`FLUX.2 klein 4B` uses the OpenAI images shape, `POST /v1/images/generations`
+with `response_format: "b64_json"`, forwarded unchanged to either upstream.
 
 The two Gemini image SKUs use the native
 `POST /v1beta/models/{model}:generateContent` request shape. Envoy forwards
@@ -119,7 +118,5 @@ runbook check. It never prints its prompt, generated image, or either key.
 See [`image-canary.md`](image-canary.md).
 
 `gmcli check-streaming` skips every offered product whose registry catalog
-entry publishes image generation (the Gemini pair, and `FLUX.2 klein 4B` on
-either upstream once its buyer row carries that capability), because its
-streaming check targets the OpenAI-compatible SSE surface; it never sends an
-image-generation probe. The miner carries no image model list of its own.
+entry publishes image generation because its streaming check targets the
+OpenAI-compatible SSE surface; it never sends an image-generation probe.
