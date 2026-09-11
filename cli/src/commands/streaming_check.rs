@@ -693,6 +693,12 @@ async fn fetch_routes(cfg: &Config) -> Vec<SourceProduct> {
 /// buyer product whose catalog capabilities publish image generation, and
 /// every source route that serves one. Source pairs are absent from
 /// `GET /products`, so the route is the only link to the capability block.
+///
+/// A registry outage yields an empty set and the probe still goes out, the
+/// same policy `catalog_outage_still_checks_every_declared_kubetee_route`
+/// pins: a text probe on an image product is a false FAIL line, never an
+/// image charge, while silencing every sourcing route would hide the outage
+/// the check exists to surface.
 fn image_probe_exclusions(
     catalog: &[Product],
     routes: &[SourceProduct],
