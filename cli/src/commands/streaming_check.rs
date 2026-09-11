@@ -11,7 +11,7 @@ use gm_miner_cli::{
     cloud_policy::normalize_bedrock_upstream_model,
     config::{Config, ProviderKeys, WorkerRecord},
     types::{
-        is_image_model, MinerStatus, ProductCatalogResponse, Provider, WorkerEntry,
+        MinerStatus, Product, ProductCatalogResponse, Provider, SourceProduct, WorkerEntry,
         WorkerListResponse,
     },
     workers::first_live_worker_id,
@@ -215,12 +215,15 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
     }
 
     let empty_declared = std::collections::HashMap::new();
-    let model_catalog = fetch_probe_models(
-        cfg,
+    let catalog = fetch_catalog(cfg).await;
+    let canonical = canonical_models(&catalog, &providers);
+    let routes = fetch_routes(cfg).await;
+    let excluded = image_probe_exclusions(&catalog, &routes);
+    let model_catalog = resolve_probe_models(
         &providers,
+        &canonical,
         declared.as_ref().unwrap_or(&empty_declared),
-    )
-    .await;
+    );
     for provider in providers {
         let Some(models) =
             models_for_target(target, &provider, model_catalog.models_for(&provider))
@@ -243,10 +246,13 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
             continue;
         }
         for selected in models {
-            if is_image_model(provider.as_str(), &selected.model.canonical) {
-                // Image SKUs are not OpenAI-compatible SSE models. Do not send
-                // a streaming probe to them: even a text-looking prompt could
-                // select image output and charge the miner's upstream account.
+            if excluded.contains(&(
+                provider.as_str().to_owned(),
+                selected.model.canonical.clone(),
+            )) {
+                // Image products are not OpenAI-compatible SSE models. Do not
+                // send a streaming probe to them: even a text-looking prompt
+                // could select image output and charge the miner's upstream.
                 println!(
                     "  [--] {provider}/{}: image-generation SKU skipped by streaming self-test (no image request sent)",
                     selected.model.canonical
@@ -602,16 +608,6 @@ impl ProbeModels {
 /// deepseek-v4-flash-0731), independent of buyer-catalog availability. If
 /// nothing is declared, [`fallback_model`] is used at print time. The check
 /// must never fail the deploy it advises on.
-async fn fetch_probe_models(
-    cfg: &Config,
-    providers: &[Provider],
-    declared: &std::collections::HashMap<(Provider, String), DeclaredOffer>,
-) -> ProbeModels {
-    let canonical = fetch_canonical_models(cfg, providers).await;
-
-    resolve_probe_models(providers, &canonical, declared)
-}
-
 fn resolve_probe_models(
     providers: &[Provider],
     canonical: &std::collections::HashMap<Provider, Vec<String>>,
@@ -648,39 +644,70 @@ fn resolve_probe_models(
     ProbeModels { models }
 }
 
-/// Public `GET /products` → the active canonical model per provider.
-async fn fetch_canonical_models(
-    cfg: &Config,
+/// Public `GET /products`; empty when unreachable so the check never fails the
+/// deploy it advises on.
+async fn fetch_catalog(cfg: &Config) -> Vec<Product> {
+    let url = format!("{}/products", cfg.api_url());
+    let Ok(client) = build_http_client() else {
+        return Vec::new();
+    };
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<ProductCatalogResponse>()
+            .await
+            .map(|catalog| catalog.products)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The active canonical model ids per provider.
+fn canonical_models(
+    catalog: &[Product],
     providers: &[Provider],
 ) -> std::collections::HashMap<Provider, Vec<String>> {
-    let url = format!("{}/products", cfg.api_url());
-    let catalog = match build_http_client() {
-        Ok(client) => match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                resp.json::<ProductCatalogResponse>().await.ok()
-            }
-            _ => None,
-        },
-        Err(_) => None,
-    };
-
     let mut models = std::collections::HashMap::new();
-    if let Some(catalog) = catalog {
-        for provider in providers {
-            let provider_models: Vec<_> = catalog
-                .products
-                .iter()
-                .filter(|product| {
-                    product.provider == provider.as_str() && product.status == "active"
-                })
-                .map(|product| product.model.clone())
-                .collect();
-            if !provider_models.is_empty() {
-                models.insert(provider.clone(), provider_models);
-            }
+    for provider in providers {
+        let provider_models: Vec<_> = catalog
+            .iter()
+            .filter(|product| product.provider == provider.as_str() && product.status == "active")
+            .map(|product| product.model.clone())
+            .collect();
+        if !provider_models.is_empty() {
+            models.insert(provider.clone(), provider_models);
         }
     }
     models
+}
+
+/// Authenticated sourcing routes; empty when unreachable, like the catalog.
+async fn fetch_routes(cfg: &Config) -> Vec<SourceProduct> {
+    let mut client = RegistryClient::new(cfg.clone());
+    match crate::commands::sources::fetch_sources(&mut client).await {
+        Ok(lookup) => lookup.routes().to_vec(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Declared `(provider, model)` pairs the text-only probe must skip: every
+/// buyer product whose catalog capabilities publish image generation, and
+/// every source route that serves one. Source pairs are absent from
+/// `GET /products`, so the route is the only link to the capability block.
+fn image_probe_exclusions(
+    catalog: &[Product],
+    routes: &[SourceProduct],
+) -> BTreeSet<(String, String)> {
+    let mut excluded: BTreeSet<_> = catalog
+        .iter()
+        .filter(|product| product.generates_images())
+        .map(|product| (product.provider.clone(), product.model.clone()))
+        .collect();
+    for route in routes {
+        if excluded.contains(&(route.buyer_provider.clone(), route.buyer_model.clone())) {
+            excluded.insert((route.provider.clone(), route.model.clone()));
+        }
+    }
+    excluded
 }
 
 #[derive(Debug, Clone)]
@@ -1187,17 +1214,22 @@ mod tests {
     }
 
     fn catalog_row(provider: &str, model: &str, capabilities: Value) -> Product {
-        serde_json::from_value(serde_json::json!({
+        let mut row = serde_json::json!({
             "provider": provider,
             "model": model,
             "status": "active",
             "retail_price": {"dimensions": {"input_per_mtok_ndollars": 1, "output_per_mtok_ndollars": 2}},
-            "capabilities": capabilities,
-        }))
-        .expect("catalog row")
+        });
+        row["capabilities"] = capabilities;
+        serde_json::from_value(row).expect("catalog row")
     }
 
-    fn route(provider: &str, model: &str, buyer_provider: &str, buyer_model: &str) -> SourceProduct {
+    fn route(
+        provider: &str,
+        model: &str,
+        buyer_provider: &str,
+        buyer_model: &str,
+    ) -> SourceProduct {
         serde_json::from_value(serde_json::json!({
             "provider": provider,
             "model": model,
@@ -1223,14 +1255,33 @@ mod tests {
                 "gemini-3.1-flash-image",
                 serde_json::json!({"api": "gemini_generate_content", "image_output": true}),
             ),
-            catalog_row("gemini", "gemini-3.1-flash", serde_json::json!({"image_input": true})),
+            catalog_row(
+                "gemini",
+                "gemini-3.1-flash",
+                serde_json::json!({"image_input": true}),
+            ),
             catalog_row("qwen", "qwen3.8-27b-tee", Value::Null),
         ];
         let routes = [
-            route("near", "black-forest-labs/FLUX.2-klein-4B", "bfl", "flux.2-klein-4b"),
-            route("deepinfra", "black-forest-labs/FLUX-2-klein-4b", "bfl", "flux.2-klein-4b"),
+            route(
+                "near",
+                "black-forest-labs/FLUX.2-klein-4B",
+                "bfl",
+                "flux.2-klein-4b",
+            ),
+            route(
+                "deepinfra",
+                "black-forest-labs/FLUX-2-klein-4b",
+                "bfl",
+                "flux.2-klein-4b",
+            ),
             route("near", "Qwen/Qwen3.8-27B", "qwen", "qwen3.8-27b-tee"),
-            route("gemini", "gemini-3.1-flash-image", "gemini", "gemini-3.1-flash-image"),
+            route(
+                "gemini",
+                "gemini-3.1-flash-image",
+                "gemini",
+                "gemini-3.1-flash-image",
+            ),
         ];
         let excluded = image_probe_exclusions(&catalog, &routes);
         for (provider, model) in [
