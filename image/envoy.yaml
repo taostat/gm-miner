@@ -822,23 +822,9 @@ static_resources:
                             - x-gm-provider
                             - x-gm-upstream-slot
                         - match:
-                            path: "/v1/chat/completions"
-                            headers:
-                              - name: "x-gm-provider"
-                                string_match:
-                                  exact: "near"
-                          route:
-                            cluster: near_verify_proxy
-                            timeout: 1800s
-                          request_headers_to_remove:
-                            - x-gm-request-id
-                            - x-gm-gateway-sig
-                            - x-gm-product
-                            - x-gm-node-key
-                            - x-gm-provider
-                            - x-gm-upstream-slot
-                        - match:
-                            path: "/v1/images/generations"
+                            safe_regex:
+                              google_re2: {}
+                              regex: "^/v1/(chat/completions|images/generations)$"
                             headers:
                               - name: "x-gm-provider"
                                 string_match:

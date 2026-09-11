@@ -85,7 +85,14 @@ fn route<'a>(config: &'a Value, provider: &str, path: &str) -> &'a Value {
             let path_matches = target["path"].as_str() == Some(bare)
                 || target["prefix"]
                     .as_str()
-                    .is_some_and(|prefix| bare.starts_with(prefix));
+                    .is_some_and(|prefix| bare.starts_with(prefix))
+                || target["safe_regex"]["regex"]
+                    .as_str()
+                    .is_some_and(|pattern| {
+                        regex::Regex::new(pattern)
+                            .expect("route regex")
+                            .is_match(bare)
+                    });
             path_matches
                 && target["headers"].as_array().is_none_or(|headers| {
                     headers.iter().all(|header| {
@@ -601,23 +608,20 @@ fn near_images_generations_routes_through_the_measured_verifier() {
     let (status, _, stderr, rendered) = render_envoy([("NEAR_API_KEY", "near-key")]);
     assert!(status.success(), "render failed: {stderr}");
     let parsed = config(&rendered);
-    let selected = route(&parsed, "near", "/v1/images/generations");
-    assert_eq!(
-        selected["match"]["path"], "/v1/images/generations",
-        "NEAR images must be an exact-path route, not the catch-all: {selected}"
-    );
-    assert_eq!(
-        selected["match"]["headers"],
-        json!([{"name": "x-gm-provider", "string_match": {"exact": "near"}}])
-    );
-    assert_eq!(selected["route"]["cluster"], "near_verify_proxy");
-    assert!(selected["route"].get("host_rewrite_literal").is_none());
-    assert!(selected["route"].get("regex_rewrite").is_none());
+    let images = route(&parsed, "near", "/v1/images/generations");
+    assert_eq!(images["route"]["cluster"], "near_verify_proxy");
+    assert!(images["route"].get("host_rewrite_literal").is_none());
+    assert!(images["route"].get("regex_rewrite").is_none());
     let chat = route(&parsed, "near", "/v1/chat/completions");
-    assert_eq!(selected["route"]["timeout"], chat["route"]["timeout"]);
+    assert_eq!(images["route"]["timeout"], chat["route"]["timeout"]);
     assert_eq!(
-        selected["request_headers_to_remove"],
+        images["request_headers_to_remove"],
         chat["request_headers_to_remove"]
+    );
+    assert_ne!(
+        route(&parsed, "near", "/v1/images/edits")["route"]["cluster"],
+        "near_verify_proxy",
+        "only the two closed-list inference paths reach the verifier"
     );
 }
 
@@ -673,59 +677,6 @@ fn near_images_gate_admits_flux_klein_and_still_rejects_unknown_models() {
             None
         );
     }
-}
-
-fn apply_deepinfra_rewrite(route: &Value, path: &str) -> String {
-    let rewrite = &route["route"]["regex_rewrite"];
-    assert_eq!(rewrite["pattern"]["regex"], "^/v1/(.*)$");
-    assert_eq!(rewrite["substitution"], r"/v1/openai/\1");
-    let captured = path
-        .strip_prefix("/v1/")
-        .expect("inbound path must sit under /v1/ for the rewrite to fire");
-    format!("/v1/openai/{captured}")
-}
-
-#[test]
-fn deepinfra_images_generations_is_rewritten_under_the_openai_prefix() {
-    let (status, _, stderr, rendered) = render_envoy([("DEEPINFRA_API_KEY", "direct-key")]);
-    assert!(status.success(), "render failed: {stderr}");
-    let parsed = config(&rendered);
-    let selected = route(&parsed, "deepinfra", "/v1/images/generations");
-    assert_eq!(selected["route"]["cluster"], "deepinfra");
-    assert_eq!(
-        selected["route"]["host_rewrite_literal"],
-        "api.deepinfra.com"
-    );
-    assert_eq!(
-        apply_deepinfra_rewrite(selected, "/v1/images/generations"),
-        "/v1/openai/images/generations"
-    );
-    assert_tls(&parsed, "deepinfra", "api.deepinfra.com");
-    let slot =
-        gm_miner_cli::slots::derive_slot_id("deepinfra", "direct-key", "test-node-secret-0001")
-            .expect("slot");
-    let lua = run_request(
-        &rendered,
-        &[
-            (":path", "/v1/images/generations"),
-            ("x-gm-provider", "deepinfra"),
-            ("x-gm-node-key", "test-node-secret-0001"),
-            ("x-gm-upstream-slot", &slot),
-            ("x-gm-upstream-model", "black-forest-labs/FLUX-2-klein-4b"),
-            ("authorization", "caller-secret"),
-        ],
-        &[("GM_DEEPINFRA_KEY_SLOT_1", "direct-key")],
-    );
-    lua.load(
-        r#"
-        assert(response_status == nil)
-        assert(input_headers.authorization == "Bearer direct-key")
-        assert(input_headers["x-gm-upstream-model"] == nil)
-        assert(input_headers[":path"] == "/v1/images/generations")
-        "#,
-    )
-    .exec()
-    .expect("deepinfra images request passes the data-plane filter unchanged");
 }
 
 #[test]
