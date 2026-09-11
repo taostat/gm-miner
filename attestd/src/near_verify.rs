@@ -245,6 +245,7 @@ impl NearVerifier {
             .to_str()
             .context("NEAR model selector is not valid ASCII")?;
         let target = target_for_model(selector).context("unsupported NEAR model selector")?;
+        ensure_target_path(&request, target)?;
         let (mut sender, connection, _, _) = self.connect_and_attest(target).await?;
 
         let upstream_request = upstream_request(request, target)?;
@@ -488,20 +489,22 @@ fn validate_request(request: &Request<Body>) -> Result<()> {
     Ok(())
 }
 
+// Runs before the attested connect: a selector on the wrong path must not spend
+// a TDX quote and an NRAS round-trip only to be refused at forwarding time.
+fn ensure_target_path(request: &Request<Body>, target: NearTarget) -> Result<()> {
+    let path = request.uri().path();
+    if path != target.path {
+        bail!("{} is served at {}, not {path}", target.model, target.path);
+    }
+    Ok(())
+}
+
 fn upstream_request(mut request: Request<Body>, target: NearTarget) -> Result<Request<Body>> {
     let path_and_query = request
         .uri()
         .path_and_query()
         .context("NEAR request has no path")?
         .clone();
-    if path_and_query.path() != target.path {
-        bail!(
-            "{} is served at {}, not {}",
-            target.model,
-            target.path,
-            path_and_query.path()
-        );
-    }
     request.headers_mut().remove(SELECTOR_HEADER);
     strip_hop_by_hop(request.headers_mut());
     request.headers_mut().insert(
@@ -931,16 +934,49 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_selector_on_the_images_path_is_refused_before_forwarding() {
+    fn a_selector_is_bound_to_its_own_path() {
+        for (path, target) in [
+            (IMAGES_GENERATIONS, TARGETS[0]),
+            (
+                CHAT_COMPLETIONS,
+                target_for_model(FLUX_KLEIN_MODEL).unwrap(),
+            ),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let error = ensure_target_path(&request, target).unwrap_err();
+            assert!(
+                error.to_string().contains(target.path),
+                "{} on {path} must name its own path, got: {error:#}",
+                target.model
+            );
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(target.path)
+                .body(Body::empty())
+                .unwrap();
+            ensure_target_path(&request, target).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chat_selector_on_the_images_path_is_refused_before_attestation() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = NearVerifier::new().unwrap();
         let request = Request::builder()
             .method(Method::POST)
             .uri(IMAGES_GENERATIONS)
+            .header(SELECTOR_HEADER, TARGETS[0].model)
             .body(Body::from(images_body()))
             .unwrap();
-        let error = upstream_request(request, TARGETS[0]).unwrap_err();
+        let error = verifier.forward(request).await.unwrap_err();
+        let rendered = format!("{error:#}");
         assert!(
-            error.to_string().contains(CHAT_COMPLETIONS),
-            "the chat target must name its own path, got: {error:#}"
+            rendered.contains(CHAT_COMPLETIONS) && !rendered.contains("attest"),
+            "path mismatch must be refused without opening an attested connection, got: {rendered}"
         );
     }
 
