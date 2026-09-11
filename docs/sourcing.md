@@ -246,12 +246,9 @@ requests nonce-bound evidence on that connection, validates the Intel TDX quote,
 the exact model id, the live TLS public-key fingerprint, the compose measurement
 binding, and NVIDIA's GPU verdict, and only then forwards inference on that same
 connection. A missing, stale, substituted, malformed, or failed verdict returns
-an error; there is no direct-origin or unattested fallback route.
-
-Image generation on NEAR (`near/black-forest-labs/FLUX.2-klein-4B`, OpenAI
-images shape at `POST /v1/images/generations`) goes through the same verifier
-with the same checks; the verifier never reads the request body, so the
-images request is forwarded unchanged on the attested connection.
+an error; there is no direct-origin or unattested fallback route. The same
+checks cover `POST /v1/images/generations` for
+`near/black-forest-labs/FLUX.2-klein-4B`; the verifier never reads the body.
 
 The registry's `GET /v1/models` capability check is answered locally from that
 same compiled allowlist. It does not contact an unattested catalog endpoint;

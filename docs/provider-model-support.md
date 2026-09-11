@@ -96,8 +96,7 @@ authority for which explicit routes that registry has published.
 
 `FLUX.2 klein 4B` uses the OpenAI images shape: `POST /v1/images/generations`
 with `response_format: "b64_json"`. The miner forwards that path and body
-unchanged to either upstream; on NEAR it takes the attested verifier path like
-every other NEAR route.
+unchanged to either upstream.
 
 The two Gemini image SKUs use the native
 `POST /v1beta/models/{model}:generateContent` request shape. Envoy forwards

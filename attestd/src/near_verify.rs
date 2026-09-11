@@ -38,42 +38,51 @@ const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(120);
 const NRAS_TIMEOUT: Duration = Duration::from_secs(60);
 const NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 const ATTESTATION_ATTEMPTS: usize = 3;
-const INFERENCE_PATHS: [&str; 2] = ["/v1/chat/completions", "/v1/images/generations"];
+const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+const IMAGES_GENERATIONS: &str = "/v1/images/generations";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NearTarget {
     pub model: &'static str,
     pub host: &'static str,
+    pub path: &'static str,
 }
 
 pub const TARGETS: [NearTarget; 7] = [
     NearTarget {
         model: "zai-org/GLM-5.1-FP8",
         host: "glm-5-1.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "Qwen/Qwen3.6-27B-FP8",
         host: "qwen3-6-27b.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "z-ai/glm-5.2",
         host: "glm-5-2-long.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "deepseek-ai/DeepSeek-V4-Flash",
         host: "dsv4-flash.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "google/gemma-4-31B-it",
         host: "gemma-4-31b.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "Qwen/Qwen3.8-27B",
         host: "qwen3-8-27b.completions.near.ai",
+        path: CHAT_COMPLETIONS,
     },
     NearTarget {
         model: "black-forest-labs/FLUX.2-klein-4B",
         host: "flux2-klein.completions.near.ai",
+        path: IMAGES_GENERATIONS,
     },
 ];
 
@@ -469,24 +478,37 @@ fn verify_nras_response(response: &Value) -> Result<()> {
 }
 
 fn validate_request(request: &Request<Body>) -> Result<()> {
-    if request.method() != Method::POST || !INFERENCE_PATHS.contains(&request.uri().path()) {
-        bail!("NEAR proxy accepts only POST /v1/chat/completions or POST /v1/images/generations");
+    let path = request.uri().path();
+    if request.method() != Method::POST || !TARGETS.iter().any(|target| target.path == path) {
+        bail!(
+            "NEAR proxy accepts only POST to a closed-list inference path, not {} {path}",
+            request.method()
+        );
     }
     Ok(())
 }
 
 fn upstream_request(mut request: Request<Body>, target: NearTarget) -> Result<Request<Body>> {
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .context("NEAR request has no path")?
+        .clone();
+    if path_and_query.path() != target.path {
+        bail!(
+            "{} is served at {}, not {}",
+            target.model,
+            target.path,
+            path_and_query.path()
+        );
+    }
     request.headers_mut().remove(SELECTOR_HEADER);
     strip_hop_by_hop(request.headers_mut());
     request.headers_mut().insert(
         HOST,
         target.host.parse().context("encode NEAR Host header")?,
     );
-    let path = request.uri().path_and_query().map_or(
-        "/v1/chat/completions",
-        axum::http::uri::PathAndQuery::as_str,
-    );
-    *request.uri_mut() = path.parse().context("encode NEAR upstream URI")?;
+    *request.uri_mut() = Uri::from(path_and_query);
     Ok(request)
 }
 
@@ -719,6 +741,7 @@ mod tests {
             Some(NearTarget {
                 model: FLUX_KLEIN_MODEL,
                 host: FLUX_KLEIN_HOST,
+                path: IMAGES_GENERATIONS,
             })
         );
     }
@@ -905,6 +928,20 @@ mod tests {
         assert_eq!(upstream.headers()["content-type"], "application/json");
         let forwarded = upstream.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(forwarded.as_ref(), body.as_slice());
+    }
+
+    #[test]
+    fn a_chat_selector_on_the_images_path_is_refused_before_forwarding() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(IMAGES_GENERATIONS)
+            .body(Body::from(images_body()))
+            .unwrap();
+        let error = upstream_request(request, TARGETS[0]).unwrap_err();
+        assert!(
+            error.to_string().contains(CHAT_COMPLETIONS),
+            "the chat target must name its own path, got: {error:#}"
+        );
     }
 
     #[tokio::test]
