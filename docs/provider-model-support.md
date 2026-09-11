@@ -118,6 +118,6 @@ validator, finalizer, and dashboard evidence belongs to a separate GM
 runbook check. It never prints its prompt, generated image, or either key.
 See [`image-canary.md`](image-canary.md).
 
-`gmcli check-streaming` also skips these native image SKUs because its
-streaming check targets the OpenAI-compatible SSE surface; it never sends an
-image-generation probe.
+`gmcli check-streaming` skips every image SKU, the Gemini pair and
+`FLUX.2 klein 4B` on either upstream, because its streaming check targets the
+OpenAI-compatible SSE surface; it never sends an image-generation probe.

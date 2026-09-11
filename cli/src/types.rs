@@ -22,10 +22,19 @@ use strum::EnumIter;
 pub const GEMINI_IMAGE_MODELS: [&str; 2] =
     ["gemini-3.1-flash-lite-image", "gemini-3.1-flash-image"];
 
-/// Whether a provider/model pair is one of the Gemini image products.
+// Third copy of the FLUX ids: attestd/src/near_verify.rs TARGETS and the Lua
+// NEAR gate in image/envoy.yaml carry the NEAR entry; gmcli cannot depend on attestd.
+pub const OPENAI_IMAGES_MODELS: [(&str, &str); 2] = [
+    ("near", "black-forest-labs/FLUX.2-klein-4B"),
+    ("deepinfra", "black-forest-labs/FLUX-2-klein-4b"),
+];
+
+/// Whether a provider/model pair is an image-generation product, which the
+/// text-only streaming self-test must never probe.
 #[must_use]
-pub fn is_gemini_image_model(provider: &str, model: &str) -> bool {
-    provider == "gemini" && GEMINI_IMAGE_MODELS.contains(&model)
+pub fn is_image_model(provider: &str, model: &str) -> bool {
+    (provider == "gemini" && GEMINI_IMAGE_MODELS.contains(&model))
+        || OPENAI_IMAGES_MODELS.contains(&(provider, model))
 }
 
 /// Provider identifier — must match the canonical enum in product.json.

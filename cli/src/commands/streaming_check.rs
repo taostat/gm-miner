@@ -11,7 +11,7 @@ use gm_miner_cli::{
     cloud_policy::normalize_bedrock_upstream_model,
     config::{Config, ProviderKeys, WorkerRecord},
     types::{
-        is_gemini_image_model, MinerStatus, ProductCatalogResponse, Provider, WorkerEntry,
+        is_image_model, MinerStatus, ProductCatalogResponse, Provider, WorkerEntry,
         WorkerListResponse,
     },
     workers::first_live_worker_id,
@@ -243,13 +243,12 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
             continue;
         }
         for selected in models {
-            if is_gemini_image_model(provider.as_str(), &selected.model.canonical) {
-                // The image SKUs are native generateContent products, not
-                // OpenAI-compatible SSE models. Do not send a streaming
-                // probe to them: even a text-looking prompt could select
-                // image output and charge the miner's Google account.
+            if is_image_model(provider.as_str(), &selected.model.canonical) {
+                // Image SKUs are not OpenAI-compatible SSE models. Do not send
+                // a streaming probe to them: even a text-looking prompt could
+                // select image output and charge the miner's upstream account.
                 println!(
-                    "  [--] {provider}/{}: native generateContent image SKU skipped by streaming self-test (no image request sent)",
+                    "  [--] {provider}/{}: image-generation SKU skipped by streaming self-test (no image request sent)",
                     selected.model.canonical
                 );
                 continue;
