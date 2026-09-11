@@ -1188,23 +1188,30 @@ mod tests {
     }
 
     #[test]
-    fn gemini_image_skus_are_excluded_from_paid_streaming_probes() {
-        assert!(is_gemini_image_model(
-            Provider::Gemini.as_str(),
-            "gemini-3.1-flash-lite-image"
-        ));
-        assert!(is_gemini_image_model(
-            Provider::Gemini.as_str(),
-            "gemini-3.1-flash-image"
-        ));
-        assert!(!is_gemini_image_model(
-            Provider::Gemini.as_str(),
-            "gemini-3.1-flash"
-        ));
-        assert!(!is_gemini_image_model(
-            Provider::OpenAI.as_str(),
-            "gemini-3.1-flash-image"
-        ));
+    fn image_skus_are_excluded_from_paid_streaming_probes() {
+        for (provider, model) in [
+            (Provider::Gemini, "gemini-3.1-flash-lite-image"),
+            (Provider::Gemini, "gemini-3.1-flash-image"),
+            (Provider::Near, "black-forest-labs/FLUX.2-klein-4B"),
+            (Provider::DeepInfra, "black-forest-labs/FLUX-2-klein-4b"),
+        ] {
+            assert!(
+                is_image_model(provider.as_str(), model),
+                "{provider}/{model} must be skipped by the chat-completions probe"
+            );
+        }
+        for (provider, model) in [
+            (Provider::Gemini, "gemini-3.1-flash"),
+            (Provider::OpenAI, "gemini-3.1-flash-image"),
+            (Provider::Near, "Qwen/Qwen3.8-27B"),
+            (Provider::DeepInfra, "black-forest-labs/FLUX.2-klein-4B"),
+            (Provider::Near, "black-forest-labs/FLUX-2-klein-4b"),
+        ] {
+            assert!(
+                !is_image_model(provider.as_str(), model),
+                "{provider}/{model} must still receive a streaming probe"
+            );
+        }
     }
 
     #[test]
