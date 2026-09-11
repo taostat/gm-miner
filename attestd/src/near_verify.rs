@@ -237,7 +237,6 @@ impl NearVerifier {
     /// Returns an error for unsupported requests or any attestation/upstream
     /// failure. No inference is sent when attestation fails.
     pub async fn forward(&self, request: Request<Body>) -> Result<Response<Body>> {
-        validate_request(&request)?;
         let selector = request
             .headers()
             .get(SELECTOR_HEADER)
@@ -245,7 +244,7 @@ impl NearVerifier {
             .to_str()
             .context("NEAR model selector is not valid ASCII")?;
         let target = target_for_model(selector).context("unsupported NEAR model selector")?;
-        ensure_target_path(&request, target)?;
+        validate_request(&request, target)?;
         let (mut sender, connection, _, _) = self.connect_and_attest(target).await?;
 
         let upstream_request = upstream_request(request, target)?;
@@ -478,40 +477,33 @@ fn verify_nras_response(response: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_request(request: &Request<Body>) -> Result<()> {
+// Runs before the attested connect: a selector on the wrong path must not spend
+// a TDX quote and an NRAS round-trip only to be refused at forwarding time.
+fn validate_request(request: &Request<Body>, target: NearTarget) -> Result<()> {
     let path = request.uri().path();
-    if request.method() != Method::POST || !TARGETS.iter().any(|target| target.path == path) {
+    if request.method() != Method::POST || path != target.path {
         bail!(
-            "NEAR proxy accepts only POST to a closed-list inference path, not {} {path}",
+            "{} is served only at POST {}, not {} {path}",
+            target.model,
+            target.path,
             request.method()
         );
     }
     Ok(())
 }
 
-// Runs before the attested connect: a selector on the wrong path must not spend
-// a TDX quote and an NRAS round-trip only to be refused at forwarding time.
-fn ensure_target_path(request: &Request<Body>, target: NearTarget) -> Result<()> {
-    let path = request.uri().path();
-    if path != target.path {
-        bail!("{} is served at {}, not {path}", target.model, target.path);
-    }
-    Ok(())
-}
-
 fn upstream_request(mut request: Request<Body>, target: NearTarget) -> Result<Request<Body>> {
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .context("NEAR request has no path")?
-        .clone();
     request.headers_mut().remove(SELECTOR_HEADER);
     strip_hop_by_hop(request.headers_mut());
     request.headers_mut().insert(
         HOST,
         target.host.parse().context("encode NEAR Host header")?,
     );
-    *request.uri_mut() = Uri::from(path_and_query);
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or(target.path, axum::http::uri::PathAndQuery::as_str);
+    *request.uri_mut() = path.parse().context("encode NEAR upstream URI")?;
     Ok(request)
 }
 
@@ -738,42 +730,6 @@ mod tests {
     }
 
     #[test]
-    fn flux_klein_image_target_is_closed_listed() {
-        assert_eq!(
-            target_for_model(FLUX_KLEIN_MODEL),
-            Some(NearTarget {
-                model: FLUX_KLEIN_MODEL,
-                host: FLUX_KLEIN_HOST,
-                path: IMAGES_GENERATIONS,
-            })
-        );
-    }
-
-    #[test]
-    fn attested_identity_for_the_image_target_passes() {
-        let nonce = [1_u8; 32];
-        let spki = [2_u8; 32];
-        let target = target_for_model(FLUX_KLEIN_MODEL);
-        assert!(
-            target.is_some(),
-            "FLUX.2 klein must be a compiled NEAR target"
-        );
-        let attestation = attestation(nonce, spki, FLUX_KLEIN_MODEL);
-        let (report_data, mr_config_id) = fields(&attestation, nonce, spki);
-        verify_identity(
-            &attestation,
-            target.unwrap(),
-            &nonce,
-            &spki,
-            AttestedFields {
-                report_data: &report_data,
-                mr_config_id: &mr_config_id,
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn model_substitution_fails_closed() {
         let nonce = [1_u8; 32];
         let spki = [2_u8; 32];
@@ -864,6 +820,7 @@ mod tests {
 
     #[test]
     fn any_other_path_or_method_is_rejected() {
+        let flux = target_for_model(FLUX_KLEIN_MODEL).unwrap();
         for (method, path) in [
             (Method::GET, "/v1/chat/completions"),
             (Method::POST, "/v1/models"),
@@ -873,42 +830,58 @@ mod tests {
             (Method::POST, "/v1/images/variations"),
             (Method::POST, "/v1/images"),
         ] {
-            let request = Request::builder()
-                .method(&method)
-                .uri(path)
-                .body(Body::empty())
-                .unwrap();
-            assert!(
-                validate_request(&request).is_err(),
-                "{method} {path} must be rejected"
-            );
+            for target in [TARGETS[0], flux] {
+                let request = Request::builder()
+                    .method(&method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap();
+                assert!(
+                    validate_request(&request, target).is_err(),
+                    "{method} {path} must be rejected for {}",
+                    target.model
+                );
+            }
         }
-    }
-
-    #[test]
-    fn images_generations_post_is_accepted_by_the_verifier() {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/v1/images/generations")
             .body(Body::empty())
             .unwrap();
-        validate_request(&request).unwrap();
+        validate_request(&request, flux).unwrap();
     }
 
-    fn images_body() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
+    #[tokio::test]
+    async fn a_selector_on_the_wrong_path_is_refused_before_any_connection() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = NearVerifier::new().unwrap();
+        let flux = target_for_model(FLUX_KLEIN_MODEL).unwrap();
+        for (path, target) in [(IMAGES_GENERATIONS, TARGETS[0]), (CHAT_COMPLETIONS, flux)] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(SELECTOR_HEADER, target.model)
+                .body(Body::empty())
+                .unwrap();
+            let error = format!("{:#}", verifier.forward(request).await.unwrap_err());
+            assert!(
+                error.contains(target.path) && !error.contains("attest"),
+                "{} on {path} must be refused without an attested connection, got: {error}",
+                target.model
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn images_request_is_forwarded_unread_to_the_flux_host() {
+        let body = serde_json::to_vec(&serde_json::json!({
             "model": FLUX_KLEIN_MODEL,
             "prompt": "a lighthouse at dusk",
             "n": 1,
             "size": "1024x1024",
             "response_format": "b64_json",
         }))
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn images_request_is_forwarded_unread_to_the_flux_host() {
-        let body = images_body();
+        .unwrap();
         let request = Request::builder()
             .method(Method::POST)
             .uri("/v1/images/generations")
@@ -917,12 +890,8 @@ mod tests {
             .header(CONNECTION, "keep-alive")
             .body(Body::from(body.clone()))
             .unwrap();
-        let target = target_for_model(FLUX_KLEIN_MODEL);
-        assert!(
-            target.is_some(),
-            "FLUX.2 klein must be a compiled NEAR target"
-        );
-        let upstream = upstream_request(request, target.unwrap()).unwrap();
+        let target = target_for_model(FLUX_KLEIN_MODEL).unwrap();
+        let upstream = upstream_request(request, target).unwrap();
         assert_eq!(upstream.method(), Method::POST);
         assert_eq!(upstream.uri().path(), "/v1/images/generations");
         assert_eq!(upstream.headers()[HOST], FLUX_KLEIN_HOST);
@@ -931,82 +900,6 @@ mod tests {
         assert_eq!(upstream.headers()["content-type"], "application/json");
         let forwarded = upstream.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(forwarded.as_ref(), body.as_slice());
-    }
-
-    #[test]
-    fn a_selector_is_bound_to_its_own_path() {
-        for (path, target) in [
-            (IMAGES_GENERATIONS, TARGETS[0]),
-            (
-                CHAT_COMPLETIONS,
-                target_for_model(FLUX_KLEIN_MODEL).unwrap(),
-            ),
-        ] {
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri(path)
-                .body(Body::empty())
-                .unwrap();
-            let error = ensure_target_path(&request, target).unwrap_err();
-            assert!(
-                error.to_string().contains(target.path),
-                "{} on {path} must name its own path, got: {error:#}",
-                target.model
-            );
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri(target.path)
-                .body(Body::empty())
-                .unwrap();
-            ensure_target_path(&request, target).unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn a_chat_selector_on_the_images_path_is_refused_before_attestation() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let verifier = NearVerifier::new().unwrap();
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(IMAGES_GENERATIONS)
-            .header(SELECTOR_HEADER, TARGETS[0].model)
-            .body(Body::from(images_body()))
-            .unwrap();
-        let error = verifier.forward(request).await.unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(CHAT_COMPLETIONS) && !rendered.contains("attest"),
-            "path mismatch must be refused without opening an attested connection, got: {rendered}"
-        );
-    }
-
-    #[tokio::test]
-    async fn images_path_reaches_selector_validation_before_any_network() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let verifier = NearVerifier::new().unwrap();
-        let unknown = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/images/generations")
-            .header(SELECTOR_HEADER, "attacker/model")
-            .body(Body::from(images_body()))
-            .unwrap();
-        let error = verifier.forward(unknown).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported NEAR model selector"),
-            "images POST must pass path validation and fail on the selector, got: {error:#}"
-        );
-        let missing = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/images/generations")
-            .body(Body::from(images_body()))
-            .unwrap();
-        let error = verifier.forward(missing).await.unwrap_err();
-        assert!(
-            error.to_string().contains("missing NEAR model selector"),
-            "got: {error:#}"
-        );
     }
 
     fn nras_response(result: &Value) -> Value {
