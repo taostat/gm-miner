@@ -1186,31 +1186,87 @@ mod tests {
         assert_eq!(probe.model, "z-ai/glm-5.2");
     }
 
+    fn catalog_row(provider: &str, model: &str, capabilities: Value) -> Product {
+        serde_json::from_value(serde_json::json!({
+            "provider": provider,
+            "model": model,
+            "status": "active",
+            "retail_price": {"dimensions": {"input_per_mtok_ndollars": 1, "output_per_mtok_ndollars": 2}},
+            "capabilities": capabilities,
+        }))
+        .expect("catalog row")
+    }
+
+    fn route(provider: &str, model: &str, buyer_provider: &str, buyer_model: &str) -> SourceProduct {
+        serde_json::from_value(serde_json::json!({
+            "provider": provider,
+            "model": model,
+            "buyer_provider": buyer_provider,
+            "buyer_model": buyer_model,
+            "retail_price": {"dimensions": {"input_per_mtok_ndollars": 1, "output_per_mtok_ndollars": 2}},
+            "capable_worker_count": 1,
+            "already_offered": true,
+        }))
+        .expect("route")
+    }
+
     #[test]
-    fn image_skus_are_excluded_from_paid_streaming_probes() {
+    fn image_products_are_excluded_from_streaming_probes_by_catalog_capability() {
+        let catalog = [
+            catalog_row(
+                "bfl",
+                "flux.2-klein-4b",
+                serde_json::json!({"image_generation": true, "image_output": true, "api": "openai_images"}),
+            ),
+            catalog_row(
+                "gemini",
+                "gemini-3.1-flash-image",
+                serde_json::json!({"api": "gemini_generate_content", "image_output": true}),
+            ),
+            catalog_row("gemini", "gemini-3.1-flash", serde_json::json!({"image_input": true})),
+            catalog_row("qwen", "qwen3.8-27b-tee", Value::Null),
+        ];
+        let routes = [
+            route("near", "black-forest-labs/FLUX.2-klein-4B", "bfl", "flux.2-klein-4b"),
+            route("deepinfra", "black-forest-labs/FLUX-2-klein-4b", "bfl", "flux.2-klein-4b"),
+            route("near", "Qwen/Qwen3.8-27B", "qwen", "qwen3.8-27b-tee"),
+            route("gemini", "gemini-3.1-flash-image", "gemini", "gemini-3.1-flash-image"),
+        ];
+        let excluded = image_probe_exclusions(&catalog, &routes);
         for (provider, model) in [
-            (Provider::Gemini, "gemini-3.1-flash-lite-image"),
-            (Provider::Gemini, "gemini-3.1-flash-image"),
-            (Provider::Near, "black-forest-labs/FLUX.2-klein-4B"),
-            (Provider::DeepInfra, "black-forest-labs/FLUX-2-klein-4b"),
+            ("near", "black-forest-labs/FLUX.2-klein-4B"),
+            ("deepinfra", "black-forest-labs/FLUX-2-klein-4b"),
+            ("bfl", "flux.2-klein-4b"),
+            ("gemini", "gemini-3.1-flash-image"),
         ] {
             assert!(
-                is_image_model(provider.as_str(), model),
-                "{provider}/{model} must be skipped by the chat-completions probe"
+                excluded.contains(&(provider.to_owned(), model.to_owned())),
+                "{provider}/{model} publishes image generation and must be skipped"
             );
         }
         for (provider, model) in [
-            (Provider::Gemini, "gemini-3.1-flash"),
-            (Provider::OpenAI, "gemini-3.1-flash-image"),
-            (Provider::Near, "Qwen/Qwen3.8-27B"),
-            (Provider::DeepInfra, "black-forest-labs/FLUX.2-klein-4B"),
-            (Provider::Near, "black-forest-labs/FLUX-2-klein-4b"),
+            ("near", "Qwen/Qwen3.8-27B"),
+            ("qwen", "qwen3.8-27b-tee"),
+            ("gemini", "gemini-3.1-flash"),
+            ("near", "black-forest-labs/FLUX-2-klein-4b"),
         ] {
             assert!(
-                !is_image_model(provider.as_str(), model),
-                "{provider}/{model} must still receive a streaming probe"
+                !excluded.contains(&(provider.to_owned(), model.to_owned())),
+                "{provider}/{model} is a text product and must still be probed"
             );
         }
+    }
+
+    #[test]
+    fn a_catalog_row_without_capabilities_still_decodes_as_a_text_product() {
+        let product: Product = serde_json::from_value(serde_json::json!({
+            "provider": "qwen",
+            "model": "qwen3.8-27b-tee",
+            "status": "active",
+            "retail_price": {"dimensions": {"input_per_mtok_ndollars": 1, "output_per_mtok_ndollars": 2}},
+        }))
+        .expect("older registry row");
+        assert!(!product.generates_images());
     }
 
     #[test]
