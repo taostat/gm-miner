@@ -16,7 +16,7 @@ use dcap_qvl::verify::VerifiedReport;
 use http_body_util::{BodyExt as _, Limited};
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper_util::rt::TokioIo;
-use rand::RngCore as _;
+use rand::Rng as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
