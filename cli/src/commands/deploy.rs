@@ -49,7 +49,6 @@ pub(crate) struct DeployArgs {
     pub(crate) image_tag: String,
     pub(crate) instance_type: String,
     pub(crate) disk_size: String,
-    pub(crate) os_image: String,
     pub(crate) repo_root: Option<std::path::PathBuf>,
     pub(crate) version: Option<usize>,
     pub(crate) boot_timeout_secs: u64,
@@ -109,7 +108,6 @@ pub(crate) fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
         image_tag: flags.image_tag,
         instance_type: flags.instance_type,
         disk_size: flags.disk_size,
-        os_image: flags.os_image,
         repo_root: flags.repo_root,
         version: flags.version,
         boot_timeout_secs: flags.boot_timeout_secs,
@@ -137,7 +135,7 @@ pub(crate) async fn cmd_deploy_subcommand(
         args.project_dir.clone(),
         args.instance_type.clone(),
         args.disk_size.clone(),
-        args.os_image.clone(),
+        gm_miner_cli::deploy::DEFAULT_OS_IMAGE.to_owned(),
     )
     .with_api_key(phala_api_key);
     let mut client = RegistryClient::new(cfg.clone());

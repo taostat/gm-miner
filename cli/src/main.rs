@@ -46,11 +46,8 @@ use anyhow::Result;
 use chrono::Timelike as _;
 use clap::{Parser, Subcommand};
 use gm_miner_cli::{
-    client::RegistryClient,
-    deploy::{DEFAULT_BOOT_TIMEOUT_SECS, DEFAULT_OS_IMAGE},
-    network::Network,
-    pricing::parse_discount_pct,
-    types::Provider,
+    client::RegistryClient, deploy::DEFAULT_BOOT_TIMEOUT_SECS, network::Network,
+    pricing::parse_discount_pct, types::Provider,
 };
 
 use crate::commands::deploy::{
@@ -621,12 +618,6 @@ pub(crate) struct DeployFlags {
     #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
     pub(crate) disk_size: String,
 
-    /// Production OS image for the CVM (`phala deploy --image`). The
-    /// version must match the dstack version of the Phala node the CVM
-    /// lands on — prod5/prod9 currently run dstack v0.5.9.
-    #[arg(long, env = "PHALA_OS_IMAGE", default_value = DEFAULT_OS_IMAGE)]
-    pub(crate) os_image: String,
-
     /// Repository root used as the Docker build context. Defaults to
     /// the current directory.
     #[arg(long)]
@@ -1020,7 +1011,6 @@ mod tests {
             image_tag: "v0.1.0".to_owned(),
             instance_type: "tdx.medium".to_owned(),
             disk_size: "40G".to_owned(),
-            os_image: "dstack-0.5.7".to_owned(),
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
@@ -1077,7 +1067,6 @@ mod tests {
             image_tag: "v0.1.0".to_owned(),
             instance_type: "tdx.medium".to_owned(),
             disk_size: "40G".to_owned(),
-            os_image: "dstack-0.5.7".to_owned(),
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
@@ -1144,7 +1133,6 @@ mod tests {
             image_tag: "v0.1.0".to_owned(),
             instance_type: "tdx.medium".to_owned(),
             disk_size: "40G".to_owned(),
-            os_image: "dstack-0.5.7".to_owned(),
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
@@ -1203,7 +1191,6 @@ mod tests {
             image_tag: "v0.1.0".to_owned(),
             instance_type: "tdx.medium".to_owned(),
             disk_size: "40G".to_owned(),
-            os_image: "dstack-0.5.7".to_owned(),
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
@@ -1259,7 +1246,6 @@ mod tests {
             image_tag: "v0.1.0".to_owned(),
             instance_type: "tdx.medium".to_owned(),
             disk_size: "40G".to_owned(),
-            os_image: "dstack-0.5.7".to_owned(),
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
@@ -1493,7 +1479,6 @@ mod tests {
                 image_tag: "unused".to_owned(),
                 instance_type: "tdx.medium".to_owned(),
                 disk_size: "40G".to_owned(),
-                os_image: "dstack-0.5.9".to_owned(),
                 repo_root: None,
                 version: pin,
                 boot_timeout_secs: 300,
@@ -1573,7 +1558,6 @@ mod tests {
             image_tag: "v0.1.0".to_owned(),
             instance_type: "tdx.medium".to_owned(),
             disk_size: "40G".to_owned(),
-            os_image: "dstack-0.5.7".to_owned(),
             repo_root: None,
             version: None,
             boot_timeout_secs: 300,
