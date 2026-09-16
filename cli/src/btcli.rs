@@ -29,7 +29,7 @@ pub fn btcli_network(network: Network) -> &'static str {
 }
 
 /// A hotkey's registration state on a subnet, as read from the metagraph.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Registration {
     /// The hotkey holds `uid` on the subnet.
     Registered { uid: u64 },

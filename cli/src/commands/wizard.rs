@@ -197,7 +197,11 @@ async fn run_steps(
 ) -> Result<(Vec<String>, bool)> {
     let mut outstanding = Vec::new();
 
-    if record(wizard_register_hotkey(&cfg, assume_yes)?, &mut outstanding) == WizardFlow::Stop {
+    if record(
+        wizard_register_hotkey(&cfg, assume_yes).await?,
+        &mut outstanding,
+    ) == WizardFlow::Stop
+    {
         return Ok((outstanding, true));
     }
     let login = wizard_login(explicit_network, api_url.clone(), assume_yes).await?;
@@ -232,7 +236,7 @@ async fn run_steps(
 /// asked whether they already registered a hotkey elsewhere:
 /// - Yes → prompt for their ss58; use the bring-your-own path.
 /// - No  → prompt for wallet/hotkey name; use the assisted path.
-fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<StepOutcome> {
+async fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<StepOutcome> {
     let title = "Step 1/5 · register hotkey";
     if hotkey_step_done(cfg) {
         let detail = cfg.registered_hotkey().map_or_else(
@@ -257,7 +261,7 @@ fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<StepOutcome>
             title,
             &command,
             assume_yes,
-            cmd_register_hotkey(cfg, Some(ss58), None, None, assume_yes)
+            cmd_register_hotkey(cfg, Some(ss58), None, None, assume_yes).await
         );
     }
 
@@ -275,7 +279,7 @@ fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<StepOutcome>
         title,
         &command,
         assume_yes,
-        cmd_register_hotkey(cfg, None, Some(wallet), hotkey, assume_yes)
+        cmd_register_hotkey(cfg, None, Some(wallet), hotkey, assume_yes).await
     )
 }
 
@@ -746,9 +750,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_register_step_with_no_input_is_outstanding() {
-        let outcome = wizard_register_hotkey(&fresh_config(), true).expect("step runs");
+    #[tokio::test]
+    async fn a_register_step_with_no_input_is_outstanding() {
+        let outcome = wizard_register_hotkey(&fresh_config(), true)
+            .await
+            .expect("step runs");
         assert!(
             command_of(&outcome).starts_with("gmcli register-hotkey"),
             "{outcome:?}"

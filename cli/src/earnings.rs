@@ -1,22 +1,10 @@
-//! `gmcli earnings` — the miner's current standing on the subnet.
-//!
-//! v1 is the **chain-emission** view: it reads the miner's neuron row straight
-//! from the subnet metagraph (via the [`BtcliBridge`]) and reports uid, stake,
-//! and per-tempo emission in the subnet's own alpha token. It deliberately does
-//! not touch gm-internal accounting — the USD-spread earnings a miner keeps from
-//! the gateway are a future (v2) view, noted in the output so the distinction is
-//! explicit.
-//!
-//! The pure pieces live here behind the trait so they unit-test against canned
-//! btcli JSON: [`resolve_hotkey`] (flag > registered > error) and
-//! [`render_earnings`] (the summary text). main.rs owns the clap wiring, the
-//! btcli install prompt, and the bridge call.
+//! Registry-served earnings, preserving integer nano-dollar precision.
 
 use std::fmt::Write as _;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
-use crate::btcli::NeuronStats;
 use crate::config::{Config, HotkeyRecord};
 use crate::network::Network;
 
@@ -65,74 +53,108 @@ pub fn resolve_hotkey(cfg: &Config, network: Network) -> Result<ResolvedHotkey> 
     )
 }
 
-/// A rough per-day alpha emission estimate from a per-tempo value.
-///
-/// btcli reports a neuron's emission as alpha granted **per tempo** (epoch), NOT
-/// per block — the raw chain value is nano-alpha/block but btcli converts it for
-/// display (docs.taostats.io/docs/metagraph). A subnet emits ~1 alpha/block, so
-/// a per-block-per-neuron figure of ~150 would be impossible; the ~150 value is
-/// per-tempo. So: blocks are ~12s, a day holds `86400 / 12 = 7200` blocks, a
-/// tempo of `tempo_blocks` blocks recurs `7200 / tempo_blocks` times a day. An
-/// *estimate* — `None` when the metagraph didn't carry the tempo.
-fn per_day_estimate(emission_alpha: f64, tempo_blocks: Option<u64>) -> Option<f64> {
-    const BLOCKS_PER_DAY: f64 = 86_400.0 / 12.0;
-    // A tempo is a small block count (hundreds); a value that won't fit a u32
-    // is nonsense, so treat it as no-estimate rather than casting lossily.
-    let tempo = tempo_blocks
-        .filter(|t| *t > 0)
-        .and_then(|t| u32::try_from(t).ok())?;
-    Some(emission_alpha * (BLOCKS_PER_DAY / f64::from(tempo)))
+/// Public `GET /miners/{hotkey}/earnings` response. The total spans all history.
+#[derive(Debug, Deserialize)]
+pub struct MinerEarnings {
+    pub miner_hotkey: String,
+    pub total_earnings_ndollars: String,
+    pub epochs: Vec<EpochEarnings>,
 }
 
-/// Render the chain-emission summary for a resolved hotkey.
+#[derive(Debug, Deserialize)]
+pub struct EpochEarnings {
+    pub epoch_id: u64,
+    pub finalized_at: chrono::DateTime<chrono::Utc>,
+    pub earnings_ndollars: String,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+}
+
+/// Fetch recent finalized earnings without requiring registry authentication.
 ///
-/// `stats: None` means the hotkey is not on this subnet's metagraph — rendered
-/// as actionable guidance (wrong network? not registered yet?) rather than a
-/// raw dump. `stats: Some` renders uid, stake, and per-tempo emission in alpha,
-/// with a clearly-labelled per-day estimate when the tempo is known.
-#[must_use]
+/// # Errors
+/// Returns an error for invalid addresses, failed requests or malformed responses.
+pub async fn fetch_earnings(registry_url: &str, hotkey: &str) -> Result<MinerEarnings> {
+    crate::register_hotkey::validate_ss58(hotkey).map_err(anyhow::Error::msg)?;
+    let url = format!(
+        "{}/miners/{hotkey}/earnings?limit=10",
+        registry_url.trim_end_matches('/')
+    );
+    let response = crate::client::build_http_client()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("fetch earnings from {url}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "registry earnings request failed ({}); retry or check the selected registry/network",
+            response.status()
+        );
+    }
+    let earnings: MinerEarnings = response
+        .json()
+        .await
+        .context("parse registry earnings response")?;
+    if earnings.miner_hotkey != hotkey {
+        bail!("registry returned earnings for a different hotkey");
+    }
+    Ok(earnings)
+}
+
+fn dollars(value: &str) -> Result<String> {
+    let amount: u128 = value
+        .parse()
+        .context("invalid registry nano-dollar amount")?;
+    let whole = amount / 1_000_000_000;
+    let mut fraction = format!("{:09}", amount % 1_000_000_000);
+    while fraction.len() > 3 && fraction.ends_with('0') {
+        fraction.pop();
+    }
+    Ok(format!("${whole}.{fraction}"))
+}
+
+/// Render lifetime served value and recent history, not chain payments or profit.
+///
+/// # Errors
+/// Returns an error if a registry monetary amount is not an unsigned integer.
 pub fn render_earnings(
     network: Network,
     hotkey: &ResolvedHotkey,
-    stats: Option<&NeuronStats>,
-) -> String {
+    earnings: &MinerEarnings,
+) -> Result<String> {
     let mut out = String::new();
-    let name = hotkey.name.as_deref().unwrap_or("(no local name)");
+    let name = hotkey.name.as_deref().unwrap_or("no local name");
     let netuid = network.netuid();
     let _ = writeln!(out, "gmcli earnings — {network} (netuid {netuid})\n");
     let _ = writeln!(out, "  Hotkey : {} ({name})", hotkey.ss58);
 
-    let Some(stats) = stats else {
-        let _ = write!(
-            out,
-            "\n  {} is not on the {network} subnet (netuid {netuid}).\n  \
-             On the wrong network? Pass `--network mainnet`/`--network testnet`.\n  \
-             Not registered yet? Run `gmcli register-hotkey`.\n",
-            hotkey.ss58
-        );
-        return out;
-    };
-
-    let _ = writeln!(out, "  uid    : {}", stats.uid);
-    out.push_str("\nChain emission (v1):\n");
-    let _ = write!(out, "  Emission : {:.6} α / tempo", stats.emission_alpha);
-    match per_day_estimate(stats.emission_alpha, stats.tempo_blocks) {
-        Some(per_day) => {
-            let _ = writeln!(out, "  (~{per_day:.4} α/day estimate)");
-        }
-        None => out.push('\n'),
-    }
-    let _ = writeln!(out, "  Stake    : {:.6} α", stats.stake_alpha);
     let _ = writeln!(
         out,
-        "  Incentive: {:.4}   Dividends: {:.4}",
-        stats.incentive, stats.dividends
+        "\nRegistry served earnings (USD)\n  Lifetime total: {}",
+        dollars(&earnings.total_earnings_ndollars)?
     );
-    out.push_str(
-        "\nNote: this is on-chain emission in the subnet's alpha token. \
-         Your gm USD-spread earnings are a future (v2) view.\n",
-    );
-    out
+    if earnings.epochs.is_empty() {
+        out.push_str("\nNo finalized earnings history returned. This does not establish subnet registration.\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "\nRecent finalized epochs ({} shown, newest first):",
+            earnings.epochs.len()
+        );
+        for epoch in &earnings.epochs {
+            let _ = writeln!(
+                out,
+                "  Epoch {} | {} | {} successful / {} failed requests | finalized {}",
+                epoch.epoch_id,
+                dollars(&epoch.earnings_ndollars)?,
+                epoch.successful_requests,
+                epoch.failed_requests,
+                epoch.finalized_at.to_rfc3339()
+            );
+        }
+    }
+    out.push_str("\nServed value is not on-chain payments or profit. Unfinalized activity is not included.\n");
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -142,7 +164,6 @@ pub fn render_earnings(
 )]
 mod tests {
     use super::{render_earnings, resolve_hotkey, ResolvedHotkey};
-    use crate::btcli::NeuronStats;
     use crate::config::{Config, HotkeyRecord, TokenEntry};
     use crate::network::Network;
     use base64::Engine as _;
@@ -175,17 +196,6 @@ mod tests {
             refresh_token: None,
         });
         cfg
-    }
-
-    fn stats() -> NeuronStats {
-        NeuronStats {
-            uid: 0,
-            emission_alpha: 148.01,
-            stake_alpha: 56_788.59,
-            incentive: 1.0,
-            dividends: 0.0,
-            tempo_blocks: Some(360),
-        }
     }
 
     #[test]
@@ -254,52 +264,91 @@ mod tests {
         assert!(resolve_hotkey(&cfg, Network::Mainnet).is_err());
     }
 
-    #[test]
-    fn renders_emission_stake_and_per_day_estimate() {
-        let hotkey = ResolvedHotkey {
-            ss58: SS58.to_owned(),
-            name: Some("miner".to_owned()),
-        };
-        let rendered = render_earnings(Network::Testnet, &hotkey, Some(&stats()));
-        assert!(rendered.contains("netuid 482"), "{rendered}");
-        assert!(rendered.contains("uid    : 0"), "{rendered}");
-        assert!(rendered.contains("Chain emission (v1)"), "{rendered}");
-        assert!(rendered.contains("148.010000 α / tempo"), "{rendered}");
-        assert!(rendered.contains("α/day estimate"), "{rendered}");
-        assert!(rendered.contains("56788.590000 α"), "{rendered}");
-        // The chain standing is alpha, never mislabelled USD; the only USD
-        // mention is the v2-future note.
-        assert!(rendered.contains("future (v2) view"), "{rendered}");
-        assert!(!rendered.contains('$'), "{rendered}");
+    fn response() -> super::MinerEarnings {
+        serde_json::from_value(serde_json::json!({
+            "miner_hotkey": SS58,
+            "total_earnings_ndollars": "9007199254740993001",
+            "epochs": [{"epoch_id": 42, "finalized_at": "2026-09-16T12:00:00Z",
+                "earnings_ndollars": "1", "successful_requests": 3, "failed_requests": 1}]
+        }))
+        .expect("fixture")
     }
 
     #[test]
-    fn renders_no_per_day_when_tempo_missing() {
+    fn renders_exact_lifetime_total_independent_of_recent_page() {
         let hotkey = ResolvedHotkey {
             ss58: SS58.to_owned(),
             name: None,
         };
-        let mut s = stats();
-        s.tempo_blocks = None;
-        let rendered = render_earnings(Network::Mainnet, &hotkey, Some(&s));
-        assert!(!rendered.contains("α/day estimate"), "{rendered}");
-        assert!(rendered.contains("(no local name)"), "{rendered}");
+        let rendered = render_earnings(Network::Mainnet, &hotkey, &response()).expect("render");
+        assert!(rendered.contains("$9007199254.740993001"), "{rendered}");
+        assert!(rendered.contains("$0.000000001"), "{rendered}");
+        assert!(rendered.contains("3 successful / 1 failed"));
+        assert!(rendered.contains("2026-09-16T12:00:00+00:00"));
+        assert!(rendered.contains("not on-chain payments or profit"));
     }
 
     #[test]
-    fn renders_actionable_message_when_not_on_subnet() {
+    fn empty_history_does_not_claim_hotkey_is_absent() {
+        let mut earnings = response();
+        earnings.epochs.clear();
+        earnings.total_earnings_ndollars = "0".to_owned();
         let hotkey = ResolvedHotkey {
             ss58: SS58.to_owned(),
-            name: Some("miner".to_owned()),
+            name: None,
         };
-        let rendered = render_earnings(Network::Mainnet, &hotkey, None);
-        assert!(
-            rendered.contains("is not on the mainnet subnet"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("register-hotkey"), "{rendered}");
-        assert!(rendered.contains("--network"), "{rendered}");
-        // No raw chain dump in the not-found path.
-        assert!(!rendered.contains("Emission"), "{rendered}");
+        let rendered = render_earnings(Network::Testnet, &hotkey, &earnings).expect("render");
+        assert!(rendered.contains("$0.000"));
+        assert!(rendered.contains("does not establish subnet registration"));
+        assert!(rendered.contains("netuid 482"));
+    }
+
+    #[test]
+    fn invalid_money_is_never_rendered_as_zero() {
+        for amount in ["NaN", "1.5", "-1", ""] {
+            assert!(super::dollars(amount).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn fetches_public_registry_earnings_without_auth() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/miners/{SS58}/earnings")))
+            .and(query_param("limit", "10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "miner_hotkey": SS58, "total_earnings_ndollars": "0", "epochs": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let earnings = super::fetch_earnings(&server.uri(), SS58)
+            .await
+            .expect("fetch");
+        assert!(earnings.epochs.is_empty());
+        let requests = server.received_requests().await.expect("requests");
+        assert!(!requests[0].headers.contains_key("authorization"));
+    }
+
+    #[tokio::test]
+    async fn failed_or_wrong_hotkey_responses_are_not_zero_earnings() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for response in [
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(200).set_body_string(""),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "miner_hotkey": TOKEN_SS58, "total_earnings_ndollars": "0", "epochs": []
+            })),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            assert!(super::fetch_earnings(&server.uri(), SS58).await.is_err());
+        }
     }
 }

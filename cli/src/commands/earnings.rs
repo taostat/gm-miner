@@ -1,29 +1,19 @@
-//! `gmcli earnings` — the miner's current chain emission on the subnet (v1).
+//! `gmcli earnings` — served earnings from the selected registry.
 
 use anyhow::Result;
 
 use gm_miner_cli::{
-    btcli::{BtcliBridge as _, RealBtcli},
     config::Config,
-    dependency::{ensure_dependency, BTCLI},
-    earnings::{render_earnings, resolve_hotkey},
+    earnings::{fetch_earnings, render_earnings, resolve_hotkey},
 };
 
-/// `gmcli earnings` — the miner's current chain emission on the subnet (v1).
-///
-/// Resolves the hotkey (`--hotkey-ss58` override, else the recorded one), then
-/// reads its neuron row from the subnet metagraph via btcli. btcli is genuinely
-/// required here (the chain read goes through it), so it is ensured lazily — the
-/// command is the only place that pays the install cost. The summary is rendered
-/// by [`render_earnings`]; a hotkey absent from the metagraph yields actionable
-/// guidance, not a raw dump.
-pub(crate) fn cmd_earnings(cfg: &Config, yes: bool) -> Result<()> {
+/// Uses the public registry endpoint without installing btcli or refreshing auth.
+pub(crate) async fn cmd_earnings(cfg: &Config) -> Result<()> {
     let network = cfg.resolved_network();
     let hotkey = resolve_hotkey(cfg, network)?;
 
-    ensure_dependency(&BTCLI, yes)?;
-    let stats = RealBtcli.neuron_stats(network, &hotkey.ss58)?;
+    let earnings = fetch_earnings(&cfg.api_url(), &hotkey.ss58).await?;
 
-    print!("{}", render_earnings(network, &hotkey, stats.as_ref()));
+    print!("{}", render_earnings(network, &hotkey, &earnings)?);
     Ok(())
 }

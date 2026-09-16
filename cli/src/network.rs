@@ -39,7 +39,7 @@ impl Network {
     }
 
     /// The Bittensor chain websocket entrypoint for this network. Consumed by
-    /// the future wallet/subtensor client (`register-hotkey`, `earnings`).
+    /// the read-only Substrate registration client.
     #[must_use]
     pub fn chain_ws(self) -> &'static str {
         match self {

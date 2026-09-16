@@ -85,14 +85,13 @@ wallet, Bittensor explorer, or another machine), pass the ss58 address directly:
 gmcli register-hotkey --hotkey-ss58 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
 ```
 
-If an installed btcli cannot complete the optional lookup, gmcli records the
-address as **unverified**, prints the lookup diagnostic, and continues onboarding.
-A successful lookup that finds the hotkey absent still fails. Recording an address
-locally does not bypass registry admission checks.
+gmcli validates the SS58 checksum and reads the hotkey's UID directly from Substrate
+at a finalized block. This does not invoke btcli or download the full metagraph.
+An absent hotkey or failed chain lookup stops registration with an explanatory error.
 
 **Assisted flow (requires btcli):** if you have not registered yet, omit `--hotkey-ss58` and
 pass the btcli wallet and hotkey name. gmcli resolves the hotkey's ss58 from your local btcli
-wallet, checks the subnet metagraph, and — when the hotkey isn't registered yet — prints the
+wallet, checks subnet membership directly through Substrate, and — when the hotkey isn't registered yet — prints the
 exact `btcli subnet register` command for you to run. gmcli never signs an on-chain extrinsic
 or touches your wallet keys; you run any wallet-signing command yourself:
 
@@ -100,7 +99,7 @@ or touches your wallet keys; you run any wallet-signing command yourself:
 gmcli register-hotkey --wallet miner --hotkey default
 ```
 
-btcli is only needed for these read-only wallet/metagraph lookups in the assisted flow. The
+btcli is only needed for local wallet-name resolution in the assisted flow. The
 bring-your-own path (`--hotkey-ss58`) has no btcli dependency.
 
 ### 2. Log in
@@ -350,9 +349,11 @@ eligible, plus the per-Mtok rate you will actually receive.
 gmcli earnings
 ```
 
-Reads your hotkey's neuron row from the subnet metagraph (via btcli) and reports UID, stake,
-and per-tempo emission. btcli is required for this command; gmcli offers to install it if
-missing.
+Reads the selected registry's public earnings endpoint for your hotkey. Shows lifetime
+served value in USD and the latest 10 finalized epochs with request counts and timestamps.
+Amounts retain nano-dollar precision. These are served earnings, not on-chain payments or
+profit; an empty history does not establish whether the hotkey is registered. No btcli
+installation or live chain query is required.
 
 ## Managing multiple workers
 
@@ -392,7 +393,7 @@ gmcli worker remove <worker_id>
 | `gmcli status` | Registration state + per-product eligibility and rates |
 | `gmcli pricing` | Rank each offer against the eligible field on the scalar the gateway routes on |
 | `gmcli sources` | List [sourcing routes](docs/sourcing.md), separating transport capability from current registry admission |
-| `gmcli earnings` | On-chain hotkey emission from the subnet metagraph (requires btcli) |
+| `gmcli earnings` | Lifetime served earnings and recent finalized epochs from the registry |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |
 | `gmcli image-canary` | Testnet-only, funded native Gemini image preflight and two-SKU settlement reconciliation (paid; never part of health checks) |

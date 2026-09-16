@@ -7,7 +7,6 @@ use gm_miner_cli::{
     config::{Config, HotkeyRecord},
     dependency::{ensure_dependency, BTCLI},
     network::Network,
-    register_hotkey::record_byo,
 };
 
 use crate::commands::persist::persist_registered_hotkey;
@@ -15,12 +14,12 @@ use crate::commands::persist::persist_registered_hotkey;
 /// `gmcli register-hotkey` — record the hotkey the miner serves under.
 ///
 /// Dispatches on `--hotkey-ss58`: present means bring-your-own (just record,
-/// verify via btcli only if it happens to be installed); absent means the
+/// verify directly on-chain); absent means the
 /// assisted btcli flow (offer to install btcli, resolve the local hotkey, and
 /// print the register command for the operator when needed).
 /// Either way the resulting [`HotkeyRecord`] is persisted to the active
 /// network's config so login/deploy/doctor/earnings can reference it.
-pub(crate) fn cmd_register_hotkey(
+pub(crate) async fn cmd_register_hotkey(
     cfg: &Config,
     hotkey_ss58: Option<String>,
     wallet: Option<String>,
@@ -29,18 +28,16 @@ pub(crate) fn cmd_register_hotkey(
 ) -> Result<()> {
     let network = cfg.resolved_network();
     match hotkey_ss58 {
-        Some(ss58) => register_hotkey_byo(network, &ss58),
-        None => register_hotkey_assisted(network, wallet, hotkey, yes),
+        Some(ss58) => register_hotkey_byo(network, &ss58).await,
+        None => register_hotkey_assisted(network, wallet, hotkey, yes).await,
     }
 }
 
 /// Bring-your-own: record an ss58 the operator registered elsewhere. Verifies
-/// against the metagraph only when btcli is already on PATH — never installs it.
-fn register_hotkey_byo(network: Network, ss58: &str) -> Result<()> {
-    let btcli = RealBtcli;
-    let bridge: Option<&dyn BtcliBridge> =
-        gm_miner_cli::dependency::on_path("btcli").then_some(&btcli);
-    let outcome = record_byo(bridge, network, ss58)?;
+/// with a direct Substrate read; btcli is never consulted.
+async fn register_hotkey_byo(network: Network, ss58: &str) -> Result<()> {
+    let registration = gm_miner_cli::chain::registration_of(network, ss58.trim()).await?;
+    let outcome = gm_miner_cli::register_hotkey::record_byo(registration, network, ss58)?;
 
     persist_registered_hotkey(network.as_str(), outcome.record.clone())
         .context("persist registered hotkey")?;
@@ -53,7 +50,7 @@ fn register_hotkey_byo(network: Network, ss58: &str) -> Result<()> {
 
 /// Assisted: resolve a local btcli hotkey and verify it. The only flow that
 /// needs btcli up front — so it (and only it) runs [`ensure_dependency`] for it.
-fn register_hotkey_assisted(
+async fn register_hotkey_assisted(
     network: Network,
     wallet: Option<String>,
     hotkey: Option<String>,
@@ -87,11 +84,13 @@ fn register_hotkey_assisted(
                  `gmcli register-hotkey --wallet {wallet} --hotkey {hotkey}`."
             );
         };
-        // Switch to the BYO read-only path: verify on the metagraph and record.
-        return register_hotkey_byo(network, &ss58);
+        // Verify the supplied address directly on-chain and record it.
+        return register_hotkey_byo(network, &ss58).await;
     };
 
-    if let Registration::Registered { uid } = btcli.registration_of(network, &ss58)? {
+    if let Registration::Registered { uid } =
+        gm_miner_cli::chain::registration_of(network, &ss58).await?
+    {
         return persist_already_registered(network, &wallet, &hotkey, &ss58, uid);
     }
 

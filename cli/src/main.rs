@@ -514,21 +514,19 @@ enum Command {
         gmcli update")]
     Update,
 
-    /// Show your miner's current chain emission on the subnet.
+    /// Show your miner's served earnings from the registry.
     ///
-    /// Reads your hotkey's neuron row straight from the subnet metagraph (via
-    /// btcli) and reports uid, stake, and per-tempo emission in the subnet's
-    /// alpha token. Reports on your own hotkey — taken from your login token,
+    /// Reports lifetime served value in USD and the latest finalized epochs.
+    /// Reports on your own hotkey — taken from your login token,
     /// or the one recorded by `register-hotkey` — so there's nothing to pass.
     ///
-    /// This is the on-chain emission view (v1). Your gm USD-spread earnings are
-    /// a future (v2) view.
+    /// This is served value, not on-chain payments or profit. No btcli is needed.
     #[command(after_help = "Examples:\n  \
         gmcli earnings\n  \
         gmcli --network testnet earnings")]
     Earnings {
-        /// Skip the btcli install prompt for non-interactive use.
-        #[arg(long)]
+        /// Accepted for backwards compatibility; no install prompt is needed.
+        #[arg(long, hide = true)]
         yes: bool,
     },
 
@@ -806,7 +804,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             wallet,
             hotkey,
             yes,
-        } => cmd_register_hotkey(&context.config()?, hotkey_ss58, wallet, hotkey, yes),
+        } => cmd_register_hotkey(&context.config()?, hotkey_ss58, wallet, hotkey, yes).await,
         Command::RegisterImage { app_id } => {
             cmd_register_image_subcommand(context.authenticated_config().await?, &app_id).await
         }
@@ -820,7 +818,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Sources => cmd_sources(&mut context.client().await?).await,
         // Upgrades must work with expired tokens or a damaged config.
         Command::Update => cmd_update().await,
-        Command::Earnings { yes } => cmd_earnings(&context.config()?, yes),
+        Command::Earnings { .. } => cmd_earnings(&context.config()?).await,
         Command::DeclareProduct {
             provider,
             model,

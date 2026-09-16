@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod btcli;
+pub mod chain;
 pub mod client;
 pub mod cloud_policy;
 pub mod compose_hash;
