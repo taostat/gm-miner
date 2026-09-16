@@ -70,11 +70,12 @@ pub struct ByoOutcome {
 /// `verified` with its uid in the note; an *absent* hotkey is an error (the
 /// operator named an address that isn't on this subnet — better to refuse than
 /// to record a hotkey that will never serve). With `bridge: None` we record
-/// the address unverified and say so plainly.
+/// the address unverified and say so plainly. A failed optional lookup follows
+/// the same path, preserving its diagnostic without claiming verification.
 ///
 /// # Errors
-/// Returns an error if the ss58 fails format validation, the metagraph query
-/// fails, or the hotkey is provably absent from the subnet.
+/// Returns an error if the ss58 fails format validation or the hotkey is
+/// provably absent from the subnet.
 pub fn record_byo(
     bridge: Option<&dyn BtcliBridge>,
     network: Network,
@@ -101,8 +102,23 @@ pub fn record_byo(
         });
     };
 
-    match bridge.registration_of(network, &ss58)? {
-        Registration::Registered { uid } => Ok(ByoOutcome {
+    match bridge.registration_of(network, &ss58) {
+        Err(error) => Ok(ByoOutcome {
+            record: HotkeyRecord {
+                ss58,
+                name: None,
+                verified: false,
+            },
+            note: format!(
+                "Warning: registration not yet verified locally on {network} (netuid {}). \
+                 The optional btcli lookup failed: {error:#}\n\
+                 Recorded the supplied address as unverified; registry checks still apply. \
+                 Check `btcli --version` and retry `gmcli register-hotkey --hotkey-ss58 <address>` \
+                 after resolving the btcli lookup failure.",
+                network.netuid()
+            ),
+        }),
+        Ok(Registration::Registered { uid }) => Ok(ByoOutcome {
             record: HotkeyRecord {
                 ss58,
                 name: None,
@@ -113,7 +129,7 @@ pub fn record_byo(
                 network.netuid()
             ),
         }),
-        Registration::Absent => bail!(
+        Ok(Registration::Absent) => bail!(
             "{ss58} is not registered on {network} (netuid {}). \
              Register it first, or pass the address you actually registered. \
              On the wrong network? Pass `--network mainnet`/`--network testnet`.",
@@ -138,6 +154,36 @@ mod tests {
 
     struct StubBridge {
         result: Registration,
+    }
+
+    struct EmptyMetagraphBridge;
+
+    impl BtcliBridge for EmptyMetagraphBridge {
+        fn registration_of(&self, _network: Network, _ss58: &str) -> Result<Registration> {
+            let _: serde_json::Value = serde_json::from_slice(b"")?;
+            Ok(Registration::Absent)
+        }
+        fn hotkey_ss58(&self, _wallet: &str, _hotkey: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn neuron_stats(
+            &self,
+            _network: Network,
+            _ss58: &str,
+        ) -> Result<Option<crate::btcli::NeuronStats>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn byo_empty_btcli_output_records_unverified_and_explains_failure() {
+        let out = record_byo(Some(&EmptyMetagraphBridge), Network::Mainnet, VALID_SS58)
+            .expect("optional local lookup must not block recording a supplied address");
+        assert!(!out.record.verified);
+        assert_eq!(out.record.ss58, VALID_SS58);
+        assert!(out.note.contains("not yet verified"));
+        assert!(out.note.contains("EOF"));
+        assert!(out.note.contains("btcli"));
     }
 
     impl BtcliBridge for StubBridge {

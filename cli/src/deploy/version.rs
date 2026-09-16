@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// A single approved (`compose_hash`, `os_image_hash`) entry from the registry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageVersion {
+    /// Release that published this image and its measured deployment template.
+    #[serde(default)]
+    pub git_tag: Option<String>,
     pub compose_hash: String,
     pub os_image_hash: String,
     pub status: String,
@@ -55,6 +58,8 @@ pub struct ImageVersionsResponse {
 /// registry responses in tests.
 #[derive(Serialize)]
 pub struct ImageVersionOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_tag: Option<String>,
     pub compose_hash: String,
     pub os_image_hash: String,
     pub status: String,
@@ -107,8 +112,8 @@ pub async fn fetch_supported_versions(registry_url: &str) -> Result<Vec<ImageVer
     // Sort newest-first by the parsed `created_at` instant. Raw RFC 3339
     // strings only sort correctly when every offset is `Z`; an entry like
     // `2025-05-01T00:30:00+01:00` would otherwise sort after an older `Z`
-    // timestamp. Unparseable timestamps sort last so they are never picked
-    // as the default newest version.
+    // timestamp. Unparseable timestamps sort last. The default still matches
+    // this CLI's release; ordering controls explicit index pins.
     versions.sort_by_key(|v| std::cmp::Reverse(created_at_key(v)));
 
     Ok(versions)
@@ -123,23 +128,38 @@ fn created_at_key(v: &ImageVersion) -> chrono::DateTime<chrono::Utc> {
         .map_or(chrono::DateTime::<chrono::Utc>::MIN_UTC, |dt| dt.to_utc())
 }
 
-/// Select a version from the list, optionally pinned to a specific index
+/// Select the image belonging to this CLI release, optionally pinned to an index
 /// (1-based, matching the order returned by the registry newest-first).
 ///
 /// # Errors
-/// Returns an error if the list is empty or the requested index is out of range.
+/// Returns an error if this release is not supported or the pin is invalid.
 pub fn select_version(versions: &[ImageVersion], pin: Option<usize>) -> Result<&ImageVersion> {
     if versions.is_empty() {
         bail!("registry returned no supported image versions — no approved version to deploy");
     }
 
     match pin {
-        None => Ok(&versions[0]),
+        None => {
+            let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+            versions
+                .iter()
+                .find(|v| v.status == "supported" && v.git_tag.as_deref() == Some(&tag))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                    "no supported image for gmcli {tag}; upgrade gmcli to an approved release. \
+                     Refusing to deploy another release's image with this CLI's bundled template"
+                )
+                })
+        }
         Some(n) => {
             if n == 0 || n > versions.len() {
                 bail!("--version {n} is out of range (1..={})", versions.len());
             }
-            Ok(&versions[n - 1])
+            let version = &versions[n - 1];
+            if version.status != "supported" {
+                bail!("--version {n} is not supported; refusing to deploy");
+            }
+            Ok(version)
         }
     }
 }
@@ -221,6 +241,7 @@ mod tests {
 
     fn approved(compose: &str, os: &str) -> ImageVersion {
         ImageVersion {
+            git_tag: Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
             compose_hash: compose.to_owned(),
             os_image_hash: os.to_owned(),
             status: "supported".to_owned(),
@@ -289,9 +310,10 @@ mod tests {
     }
 
     #[test]
-    fn select_version_latest_when_no_pin() {
+    fn select_version_matches_cli_release_even_when_newer_image_exists() {
         let versions = vec![
             ImageVersion {
+                git_tag: Some("v99.0.0".to_owned()),
                 created_at: "2025-03-01T00:00:00Z".to_string(),
                 ..approved("new", "new")
             },
@@ -301,7 +323,26 @@ mod tests {
             },
         ];
         let selected = select_version(&versions, None).expect("should select");
-        assert_eq!(selected.compose_hash, "new");
+        assert_eq!(selected.compose_hash, "old");
+    }
+
+    #[test]
+    fn default_never_falls_back_to_another_release_or_unapproved_image() {
+        for tag in [None, Some("v99.0.0".to_owned())] {
+            let versions = [ImageVersion {
+                git_tag: tag,
+                ..approved("x", "x")
+            }];
+            assert!(select_version(&versions, None).is_err());
+        }
+        for status in ["revoked", "deprecated"] {
+            let versions = [ImageVersion {
+                status: status.to_owned(),
+                ..approved("x", "x")
+            }];
+            assert!(select_version(&versions, None).is_err());
+            assert!(select_version(&versions, Some(1)).is_err());
+        }
     }
 
     #[test]

@@ -109,6 +109,7 @@ mod tests {
 
     fn approved(compose: &str, os: &str) -> ImageVersion {
         ImageVersion {
+            git_tag: None,
             compose_hash: compose.to_owned(),
             os_image_hash: os.to_owned(),
             status: "supported".to_owned(),

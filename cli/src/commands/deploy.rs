@@ -607,6 +607,17 @@ pub(crate) async fn cmd_deploy(
              feature; select an image with cloud model binding or wait for this image to be admitted"
         );
     }
+    let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
+    // Reject incompatible templates/images before creating a billable CVM.
+    let expected = gm_miner_cli::deploy::DstackDeployResult {
+        compose_sha256: gm_miner_cli::compose_hash::compute_compose_hash(
+            &target.image_ref,
+            cfg.resolved_network(),
+        )?,
+        os_image_hash: gm_miner_cli::compose_hash::PINNED_OS_IMAGE_HASH.to_owned(),
+    };
+    verify_hashes(&expected, approved)
+        .context("bundled deployment template does not match the selected approval; no CVM was created. Use the matching gmcli release")?;
     let mut record = prepare_worker_record(
         cfg,
         args,
@@ -617,7 +628,6 @@ pub(crate) async fn cmd_deploy(
             backends: worker_backends,
         },
     )?;
-    let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
     println!("Resolved miner image: {}", target.image_ref);
     let registry_creds = resolve_registry_credentials(&target.image_ref).await?;
     println!(

@@ -17,7 +17,7 @@
 //!   2. Auth preflight (`GET /miners/me`) — fail fast if the operator
 //!      forgot `gmcli login` or has a stale token, before any CVM work.
 //!   3. Fetch the approved `ImageVersion` list from the registry.
-//!   4. Select the newest supported version (or a pinned one if `--version`
+//!   4. Select this CLI release's supported image (or a pinned one if `--version`
 //!      given).
 //!   5. Prepare the deploy target ([`prepare_deploy_target`]): build and
 //!      push the miner image to a registry (or accept a pre-built

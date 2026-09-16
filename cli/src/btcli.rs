@@ -119,7 +119,7 @@ struct MetagraphTempo {
 /// subnet `tempo`, used to turn per-tempo emission into a per-day estimate.
 #[derive(Debug, Deserialize)]
 struct MetagraphOutput {
-    #[serde(alias = "neurons", default)]
+    #[serde(alias = "neurons")]
     uids: Vec<MetagraphNeuron>,
     #[serde(default)]
     tempo: Option<MetagraphTempo>,
@@ -269,11 +269,7 @@ impl RealBtcli {
             .args(args)
             .output()
             .with_context(|| format!("run `btcli {}`", args.join(" ")))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!("btcli failed: {}", stderr.trim());
-        }
-        Ok(out.stdout)
+        checked_output(args, out.status.success(), out.stdout, &out.stderr)
     }
 
     /// The metagraph JSON for `network`'s subnet. `--json-output` requires
@@ -286,6 +282,23 @@ impl RealBtcli {
         let args = metagraph_args(&netuid, chain);
         Self::run(&args)
     }
+}
+
+/// Do not discard diagnostics when btcli exits successfully without JSON.
+fn checked_output(args: &[&str], success: bool, stdout: Vec<u8>, stderr: &[u8]) -> Result<Vec<u8>> {
+    let command = format!("btcli {}", args.join(" "));
+    let detail = String::from_utf8_lossy(stderr);
+    if !success {
+        bail!("`{command}` failed: {}", detail.trim());
+    }
+    if stdout.iter().all(u8::is_ascii_whitespace) {
+        bail!(
+            "`{command}` returned no JSON on stdout. {}\n\
+             Run that command directly and check `btcli --version` to diagnose the lookup failure.",
+            detail.trim()
+        );
+    }
+    Ok(stdout)
 }
 
 /// The `btcli subnet metagraph` args for a subnet. Built here so the read-only
@@ -334,6 +347,30 @@ mod tests {
         sanitize_control_chars, wallet_list_args, Registration,
     };
     use crate::network::Network;
+
+    #[test]
+    fn successful_btcli_with_empty_stdout_preserves_diagnostics() {
+        for stdout in [b"".as_slice(), b" \n\t"] {
+            let err = super::checked_output(
+                &metagraph_args("28", "finney"),
+                true,
+                stdout.to_vec(),
+                b"RPC unavailable",
+            )
+            .expect_err("empty output is not JSON");
+            let message = err.to_string();
+            assert!(message.contains("no JSON on stdout"));
+            assert!(message.contains("RPC unavailable"));
+            assert!(message.contains("--netuid 28 --network finney"));
+            assert!(message.contains("btcli --version"));
+        }
+    }
+
+    #[test]
+    fn missing_metagraph_rows_are_not_evidence_of_absence() {
+        assert!(parse_registration(b"{}", "5BBB").is_err());
+        assert!(parse_registration(br#"{"error":"RPC unavailable"}"#, "5BBB").is_err());
+    }
 
     /// btcli subcommands that change chain or wallet state. Every arg list gmcli
     /// hands to `btcli` must avoid all of these — gmcli only ever reads.

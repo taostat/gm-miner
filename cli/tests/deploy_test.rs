@@ -127,6 +127,7 @@ fn versions_body(compose_hash: &str, os_image_hash: &str) -> serde_json::Value {
             "os_image_hash": os_image_hash,
             "status": "supported",
             "notes": "test version",
+            "git_tag": concat!("v", env!("CARGO_PKG_VERSION")),
             "created_at": "2025-05-01T12:00:00Z",
             "image_ref": "ghcr.io/taostat/gm-miner@sha256:supported"
         }]
@@ -142,6 +143,7 @@ fn versions_body(compose_hash: &str, os_image_hash: &str) -> serde_json::Value {
 fn mismatched_hashes_produce_error() {
     let approved = ImageVersion {
         compose_hash: "approved-compose-hash".to_owned(),
+        git_tag: None,
         os_image_hash: "approved-os-hash".to_owned(),
         status: "supported".to_owned(),
         notes: None,
@@ -180,6 +182,7 @@ fn mismatched_hashes_produce_error() {
 #[test]
 fn compose_mismatch_error_is_specific() {
     let approved = ImageVersion {
+        git_tag: None,
         compose_hash: "correct-compose".to_owned(),
         os_image_hash: "correct-os".to_owned(),
         status: "supported".to_owned(),
@@ -206,6 +209,7 @@ fn compose_mismatch_error_is_specific() {
 #[test]
 fn os_hash_mismatch_error_is_specific() {
     let approved = ImageVersion {
+        git_tag: None,
         compose_hash: "correct-compose".to_owned(),
         os_image_hash: "correct-os".to_owned(),
         status: "supported".to_owned(),
@@ -232,6 +236,7 @@ fn os_hash_mismatch_error_is_specific() {
 #[test]
 fn matched_hashes_succeed() {
     let approved = ImageVersion {
+        git_tag: None,
         compose_hash: "abc123".to_owned(),
         os_image_hash: "def456".to_owned(),
         status: "supported".to_owned(),
@@ -458,7 +463,7 @@ fn timeout_error_is_actionable() {
 // ── Version selection with multiple supported versions ────────────────────────
 
 #[tokio::test]
-async fn newest_version_selected_by_default() {
+async fn cli_release_selected_despite_newer_supported_image() {
     let server = MockServer::start().await;
 
     let body = serde_json::json!({
@@ -468,6 +473,7 @@ async fn newest_version_selected_by_default() {
                 "os_image_hash": "old-os",
                 "status": "supported",
                 "notes": "v1",
+                "git_tag": concat!("v", env!("CARGO_PKG_VERSION")),
                 "created_at": "2025-01-01T00:00:00Z"
             },
             {
@@ -475,6 +481,7 @@ async fn newest_version_selected_by_default() {
                 "os_image_hash": "new-os",
                 "status": "supported",
                 "notes": "v2",
+                "git_tag": "v99.0.0",
                 "created_at": "2025-06-01T00:00:00Z"
             }
         ]
@@ -490,8 +497,8 @@ async fn newest_version_selected_by_default() {
     let versions = fetch_supported_versions(&server.uri()).await.unwrap();
     let selected = select_version(&versions, None).unwrap();
     assert_eq!(
-        selected.compose_hash, "new-compose",
-        "newest must be selected by default"
+        selected.compose_hash, "old-compose",
+        "CLI release must be selected even when a newer image is approved"
     );
 }
 
@@ -539,6 +546,7 @@ async fn deploy_errors_when_supported_version_lacks_image_ref() {
             "os_image_hash": "os",
             "status": "supported",
             "notes": "no image_ref",
+            "git_tag": concat!("v", env!("CARGO_PKG_VERSION")),
             "created_at": "2025-05-01T12:00:00Z"
         }]
     });

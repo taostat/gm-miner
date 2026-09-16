@@ -581,14 +581,15 @@ pub(crate) struct DeployFlags {
     ///
     /// Overrides the default. When set (or `GM_IMAGE_REF` is in env), this
     /// ref is embedded in the compose file directly with no build. When
-    /// omitted, `gmcli deploy` defaults to the registry's latest supported
+    /// omitted, `gmcli deploy` defaults to this CLI release's approved
     /// image — a normal miner deploys the gm-published image and never
     /// builds. Pass `--image-repo` instead to build and push your own.
     #[arg(long, env = "GM_IMAGE_REF")]
     pub(crate) image_ref: Option<String>,
 
     /// Pin to a specific approved version by index (1 = newest).
-    /// Defaults to the newest supported version.
+    /// Defaults to this CLI release's supported image. Explicit selections must
+    /// match the bundled deployment template.
     #[arg(long)]
     pub(crate) version: Option<usize>,
 
@@ -1431,6 +1432,97 @@ mod tests {
         )
         .await
         .expect("the only live worker is worker #1 whatever its local position");
+    }
+
+    #[tokio::test]
+    async fn worker_add_rejects_missing_release_and_template_mismatch_before_cvm_creation() {
+        use super::{cmd_deploy, DeployArgs, RegistryClient, WorkerRegistration};
+        use gm_miner_cli::config::ProviderKeys;
+        use gm_miner_cli::deploy::{DeployOutcome, PhalaClient, RegistryCredentials};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct NoDeploy;
+        impl PhalaClient for NoDeploy {
+            fn deploy(
+                &self,
+                _: &str,
+                _: &ProviderKeys,
+                _: &str,
+                _: Option<&RegistryCredentials>,
+                _: u64,
+            ) -> anyhow::Result<DeployOutcome> {
+                anyhow::bail!("unexpected CVM creation attempt");
+            }
+            fn existing_cvm_app_id(&self) -> anyhow::Result<Option<String>> {
+                Ok(None)
+            }
+        }
+
+        for (tag, pin, expected) in [
+            ("v99.0.0", None, "no supported image"),
+            (
+                concat!("v", env!("CARGO_PKG_VERSION")),
+                None,
+                "no CVM was created",
+            ),
+            ("v99.0.0", Some(1), "no CVM was created"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/image-versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": [{
+                        "git_tag": tag, "status": "supported", "notes": null,
+                        "created_at": "2026-09-09T00:00:00Z",
+                        "compose_hash": "incompatible-template", "os_image_hash": "wrong-os",
+                        "image_ref": format!("ghcr.io/taostat/gm-miner@sha256:{}", "a".repeat(64))
+                    }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut cfg = cfg_with_workers(Some(server.uri()), vec![]);
+            cfg.provider_keys = Some(ProviderKeys {
+                anthropic: Some("test-key".to_owned()),
+                ..Default::default()
+            });
+            let args = DeployArgs {
+                app_name: "new-worker".to_owned(),
+                image_ref: None,
+                project_dir: std::path::PathBuf::from("unused"),
+                image_repo: None,
+                image_tag: "unused".to_owned(),
+                instance_type: "tdx.medium".to_owned(),
+                disk_size: "40G".to_owned(),
+                os_image: "dstack-0.5.9".to_owned(),
+                repo_root: None,
+                version: pin,
+                boot_timeout_secs: 300,
+                phala_api_key: None,
+                assume_yes: false,
+                accept_terms: false,
+            };
+            let mut client = RegistryClient::new(cfg.clone());
+            let error = cmd_deploy(
+                &cfg,
+                &mut client,
+                &NoDeploy,
+                &args,
+                &WorkerRegistration::Add {
+                    hotkey: "5HK".to_owned(),
+                },
+            )
+            .await
+            .expect_err("must fail before creating a CVM");
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(server
+                .received_requests()
+                .await
+                .expect("requests")
+                .iter()
+                .all(|request| request.method == "GET"));
+        }
     }
 
     /// The invariant the guard exists for, preserved: `/miners/register`

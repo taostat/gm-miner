@@ -85,6 +85,11 @@ wallet, Bittensor explorer, or another machine), pass the ss58 address directly:
 gmcli register-hotkey --hotkey-ss58 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
 ```
 
+If an installed btcli cannot complete the optional lookup, gmcli records the
+address as **unverified**, prints the lookup diagnostic, and continues onboarding.
+A successful lookup that finds the hotkey absent still fails. Recording an address
+locally does not bypass registry admission checks.
+
 **Assisted flow (requires btcli):** if you have not registered yet, omit `--hotkey-ss58` and
 pass the btcli wallet and hotkey name. gmcli resolves the hotkey's ss58 from your local btcli
 wallet, checks the subnet metagraph, and — when the hotkey isn't registered yet — prints the
@@ -236,6 +241,12 @@ canonical `provider/model` as direct supply.
 
 
 ### 4. Deploy your miner
+
+By default, the CLI selects the approved image for its own release, together with
+its bundled deployment template. Publishing a newer image does not change what
+an older CLI deploys. If that release is no longer supported, update gmcli first.
+The rendered compose and pinned OS hashes are checked before creating a CVM;
+incompatible explicit version/image selections fail at this preflight too.
 
 Deploy creates a Phala Cloud CVM, verifies the deployed image hashes against the registry's
 approved versions, and registers the worker — all in one step.
