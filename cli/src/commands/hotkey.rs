@@ -4,7 +4,7 @@ use anyhow::{bail, Context as _, Result};
 
 use gm_miner_cli::{
     btcli::{BtcliBridge, RealBtcli, Registration},
-    config::{Config, HotkeyRecord},
+    config::Config,
     dependency::{ensure_dependency, BTCLI},
     network::Network,
 };
@@ -142,11 +142,10 @@ fn persist_already_registered(
     ss58: &str,
     uid: u64,
 ) -> Result<()> {
-    let record = HotkeyRecord {
-        ss58: ss58.to_owned(),
-        name: Some(hotkey.to_owned()),
-        verified: true,
-    };
+    let mut record =
+        gm_miner_cli::register_hotkey::record_byo(Registration::Registered { uid }, network, ss58)?
+            .record;
+    record.name = Some(hotkey.to_owned());
     persist_registered_hotkey(network.as_str(), record).context("persist registered hotkey")?;
     println!(
         "{wallet}/{hotkey} ({ss58}) is already registered on {network} — uid {uid}. \

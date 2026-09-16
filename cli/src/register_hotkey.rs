@@ -1,6 +1,7 @@
 //! Record a hotkey after a direct read-only chain registration check.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use subxt::utils::AccountId32;
 
 use crate::btcli::Registration;
 use crate::config::HotkeyRecord;
@@ -55,7 +56,11 @@ pub fn record_byo(registration: Registration, network: Network, ss58: &str) -> R
     if let Err(reason) = validate_ss58(ss58) {
         bail!("invalid --hotkey-ss58: {reason}");
     }
-    let ss58 = ss58.trim().to_owned();
+    let ss58 = ss58
+        .trim()
+        .parse::<AccountId32>()
+        .context("invalid --hotkey-ss58 address or checksum")?
+        .to_string();
 
     match registration {
         Registration::Registered { uid } => Ok(ByoOutcome {
@@ -110,6 +115,19 @@ mod tests {
         let out = record_byo(registration, Network::Testnet, VALID_SS58).expect("record byo");
         assert!(out.record.verified);
         assert!(out.note.contains("uid 5"));
+    }
+
+    #[test]
+    fn byo_records_canonical_prefix_42_address() {
+        // The same public key encoded with prefix 0.
+        let alternate = "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5";
+        let out = record_byo(
+            Registration::Registered { uid: 5 },
+            Network::Testnet,
+            alternate,
+        )
+        .expect("canonical address");
+        assert_eq!(out.record.ss58, VALID_SS58);
     }
 
     #[test]
