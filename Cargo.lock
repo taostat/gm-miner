@@ -2861,6 +2861,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
  "x509-parser 0.18.1",
 ]
 

@@ -59,6 +59,7 @@ fn cli_persists_every_key_group_and_preserves_omitted_values() {
         ("engy", "engy-key"),
         ("moonmath", "moonmath-key"),
         ("near", "near-key"),
+        ("openrouter", "openrouter-key"),
     ];
     let args = fields
         .iter()

@@ -104,6 +104,11 @@ pub(crate) struct SetApiKeysArgs {
     /// NEAR AI Cloud API key.
     #[arg(long)]
     near: Option<String>,
+
+    /// `OpenRouter` API key (sk-or-v1-...). The account must retain no prompts:
+    /// the image verifies that at boot and refuses to serve if it does.
+    #[arg(long)]
+    openrouter: Option<String>,
 }
 
 impl SetApiKeysArgs {
@@ -131,6 +136,7 @@ impl SetApiKeysArgs {
             engy: self.engy,
             moonmath: self.moonmath,
             near: self.near,
+            openrouter: self.openrouter,
             ..ProviderKeys::default()
         };
         self.foundry.merge_into(&mut update);
@@ -280,6 +286,7 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
     group("engy", &[keys.engy.as_ref()]);
     group("moonmath", &[keys.moonmath.as_ref()]);
     group("near", &[keys.near.as_ref()]);
+    group("openrouter", &[keys.openrouter.as_ref()]);
 
     for (name, selector) in [
         ("anthropic-upstream", keys.anthropic_upstream.as_ref()),
@@ -378,6 +385,7 @@ fn validate_update(keys: &ProviderKeys) -> Result<()> {
         ("engy", keys.engy.as_deref()),
         ("moonmath", keys.moonmath.as_deref()),
         ("near", keys.near.as_deref()),
+        ("openrouter", keys.openrouter.as_deref()),
     ] {
         if let Some(value) = value {
             validate_key(name, value)?;
@@ -426,6 +434,7 @@ fn merge_update(keys: &mut ProviderKeys, update: ProviderKeys) {
         (&mut keys.engy, update.engy),
         (&mut keys.moonmath, update.moonmath),
         (&mut keys.near, update.near),
+        (&mut keys.openrouter, update.openrouter),
         (
             &mut keys.azure_foundry_endpoint,
             update.azure_foundry_endpoint,

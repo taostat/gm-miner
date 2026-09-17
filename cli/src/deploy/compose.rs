@@ -133,6 +133,7 @@ fn render_provider_envs(env_vars: &ProviderKeys) -> String {
         ("ENGY_API_KEY", env_vars.engy.as_deref()),
         ("MOONMATH_API_KEY", env_vars.moonmath.as_deref()),
         ("NEAR_API_KEY", env_vars.near.as_deref()),
+        ("OPENROUTER_API_KEY", env_vars.openrouter.as_deref()),
     ] {
         lines.push_str(name);
         lines.push('=');
@@ -422,6 +423,7 @@ mod tests {
                 "ENGY_API_KEY",
                 "MOONMATH_API_KEY",
                 "NEAR_API_KEY",
+                "OPENROUTER_API_KEY",
                 "GM_NODE_SECRET",
             ],
             "the env file must declare every canonical name in CANONICAL_ALLOWED_ENVS order"

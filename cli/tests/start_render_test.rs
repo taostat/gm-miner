@@ -166,6 +166,46 @@ fn run_request(rendered: &str, headers: &[(&str, &str)], env: &[(&str, &str)]) -
     lua
 }
 
+/// Drive the Lua filter's response phase. `metadata` is the `gm.access_log`
+/// namespace the request phase left behind; `body_chunks` is the body the
+/// upstream streams back, handed to the filter one chunk at a time.
+fn run_response(
+    rendered: &str,
+    headers: &[(&str, &str)],
+    metadata: &[(&str, &str)],
+    body_chunks: &[&str],
+) -> Lua {
+    let lua = Lua::new();
+    lua.globals()
+        .set(
+            "input_headers",
+            lua.create_table_from(headers.iter().copied())
+                .expect("headers"),
+        )
+        .expect("input headers");
+    lua.globals()
+        .set(
+            "input_metadata",
+            lua.create_table_from(metadata.iter().copied())
+                .expect("metadata"),
+        )
+        .expect("input metadata");
+    lua.globals()
+        .set(
+            "input_body_chunks",
+            lua.create_sequence_from(body_chunks.iter().copied())
+                .expect("body chunks"),
+        )
+        .expect("input body chunks");
+    lua.load(data_plane_lua(rendered))
+        .exec()
+        .expect("load filter");
+    lua.load(include_str!("fixtures/response_handle.lua"))
+        .exec()
+        .expect("execute response");
+    lua
+}
+
 fn execute_cloud_slot_fixture(rendered: &str, provider: &str, request_path: &str, slot_env: &str) {
     let current_key = if provider == "openai" {
         "azure-key"
@@ -1039,4 +1079,344 @@ fn access_log_uses_only_authenticated_sanitized_correlation_metadata() {
     lua.load("assert(response_status == '401'); assert(next(output_metadata) == nil)")
         .exec()
         .expect("unauthenticated values stay out of logs");
+}
+
+const OPENROUTER_LISTED_MODEL: &str = "z-ai/glm-5.2";
+
+#[test]
+fn openrouter_rewrites_onto_the_api_v1_surface_over_a_pinned_tls_cluster() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    let chat = route(&parsed, "openrouter", "/v1/chat/completions");
+    assert_eq!(chat["route"]["cluster"], "openrouter");
+    assert_eq!(chat["route"]["host_rewrite_literal"], "openrouter.ai");
+    assert_eq!(
+        chat["route"]["regex_rewrite"]["substitution"], "/api/v1/\\1",
+        "OpenRouter serves the OpenAI-compatible surface under /api/v1"
+    );
+    assert_tls(&parsed, "openrouter", "openrouter.ai");
+
+    // The operator key this route attaches also answers OpenRouter's account
+    // endpoints. Pinning the path is what keeps a node-key holder from
+    // reading the key's label, credit, or another buyer's generation record
+    // through the worker.
+    let pin = regex::Regex::new(
+        chat["match"]["safe_regex"]["regex"]
+            .as_str()
+            .expect("the OpenRouter route must pin its path"),
+    )
+    .expect("route regex");
+    for served in ["/v1/chat/completions", "/v1/models"] {
+        assert!(pin.is_match(served), "{served}");
+    }
+    for account in [
+        "/v1/key",
+        "/v1/credits",
+        "/v1/generation",
+        "/api/v1/generation/content",
+        "/v1/chat/completions/../key",
+        "/v1/chat/completionsX",
+    ] {
+        assert!(
+            !pin.is_match(account),
+            "{account} must not reach the broker"
+        );
+    }
+}
+
+#[test]
+fn openrouter_admits_only_listed_models_and_never_forwards_the_selector() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    // `openai/gpt-5.6` is not a slug OpenRouter lists and `z-ai/glm-5.2:batch`
+    // is a listed model's batch variant; both are refused for being off the
+    // list, which is the only thing the gate reads. `None` selects the
+    // no-selector case, which must fail closed rather than pass unchecked.
+    for (selector, expected_status) in [
+        (Some(OPENROUTER_LISTED_MODEL), None),
+        (Some("openai/gpt-5.6"), Some("400".to_owned())),
+        (Some("z-ai/glm-5.2:batch"), Some("400".to_owned())),
+        (None, Some("400".to_owned())),
+    ] {
+        let mut headers = vec![
+            (":path", "/v1/chat/completions"),
+            ("x-gm-provider", "openrouter"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-gm-request-id", "request-123"),
+            ("authorization", "caller-secret"),
+        ];
+        if let Some(model) = selector {
+            headers.push(("x-gm-upstream-model", model));
+        }
+        let lua = run_request(
+            &rendered,
+            &headers,
+            &[
+                ("OPENROUTER_API_KEY", "sk-or-v1-test"),
+                ("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test"),
+            ],
+        );
+        assert_eq!(
+            lua.globals()
+                .get::<Option<String>>("response_status")
+                .expect("status"),
+            expected_status,
+            "selector {selector:?}"
+        );
+        if expected_status.is_some() {
+            continue;
+        }
+        let headers = lua
+            .globals()
+            .get::<mlua::Table>("input_headers")
+            .expect("headers");
+        assert_eq!(
+            headers
+                .get::<Option<String>>("x-gm-upstream-model")
+                .expect("selector"),
+            None,
+            "unlike NEAR there is no loopback verifier to receive the selector, \
+             so it must not reach the broker"
+        );
+        assert_eq!(
+            headers.get::<String>("authorization").expect("auth"),
+            "Bearer sk-or-v1-test",
+            "the caller's Authorization must be replaced by the upstream key"
+        );
+        assert_eq!(
+            headers
+                .get::<Option<String>>("x-gm-request-id")
+                .expect("internal header"),
+            None
+        );
+    }
+}
+
+/// The capability probe and the gate must describe the same worker. A probe
+/// answered upstream would advertise `OpenRouter`'s whole catalog — hundreds of
+/// models, most of them first-party — while every request for one of them is
+/// refused, so this drives the advertised list back through the gate rather
+/// than comparing it to a second copy of the list in the test.
+#[test]
+fn openrouter_advertises_exactly_the_models_it_will_serve() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    let lua = run_request(
+        &rendered,
+        &[
+            (":path", "/v1/models"),
+            ("x-gm-provider", "openrouter"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+        ],
+        &[
+            ("OPENROUTER_API_KEY", "sk-or-v1-test"),
+            ("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test"),
+        ],
+    );
+    assert_eq!(
+        lua.globals()
+            .get::<Option<String>>("response_status")
+            .expect("status"),
+        Some("200".to_owned()),
+        "the probe must be answered in the worker, not forwarded to the broker"
+    );
+    let body = lua
+        .globals()
+        .get::<String>("response_body_text")
+        .expect("body");
+    let advertised = body
+        .split(r#"{"id":""#)
+        .skip(1)
+        .filter_map(|entry| entry.split('"').next())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    // 27: the gm catalog models OpenRouter lists, minus `:batch` variants and
+    // every `-tee` product. Pinned because an empty or truncated list would
+    // satisfy the loop below vacuously.
+    assert_eq!(advertised.len(), 27, "{body}");
+    for expected in [
+        OPENROUTER_LISTED_MODEL,
+        "anthropic/claude-opus-5",
+        "openai/gpt-5.4",
+    ] {
+        assert!(
+            advertised.contains(&expected.to_owned()),
+            "{expected}: {body}"
+        );
+    }
+
+    for model in advertised {
+        let lua = run_request(
+            &rendered,
+            &[
+                (":path", "/v1/chat/completions"),
+                ("x-gm-provider", "openrouter"),
+                ("x-gm-node-key", "test-node-secret-0001"),
+                ("x-gm-upstream-model", &model),
+            ],
+            &[
+                ("OPENROUTER_API_KEY", "sk-or-v1-test"),
+                ("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test"),
+            ],
+        );
+        assert_eq!(
+            lua.globals()
+                .get::<Option<String>>("response_status")
+                .expect("status"),
+            None,
+            "advertised {model} must pass the gate"
+        );
+    }
+}
+
+/// Every other route's disabled state is "forward and let the upstream 401",
+/// which still delivers the prompt; without a key no retention proof has run.
+#[test]
+fn openrouter_serves_nothing_until_the_key_that_gates_it_is_set() {
+    let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    for path in ["/v1/chat/completions", "/v1/models"] {
+        let lua = run_request(
+            &rendered,
+            &[
+                (":path", path),
+                ("x-gm-provider", "openrouter"),
+                ("x-gm-node-key", "test-node-secret-0001"),
+                ("x-gm-upstream-model", OPENROUTER_LISTED_MODEL),
+                ("authorization", "caller-secret"),
+            ],
+            &[("ANTHROPIC_API_KEY", "sk-ant")],
+        );
+        assert_eq!(
+            lua.globals()
+                .get::<Option<String>>("response_status")
+                .expect("status"),
+            Some("501".to_owned()),
+            "{path} must be refused in the worker, not forwarded to a 401"
+        );
+        assert!(
+            lua.globals()
+                .get::<String>("response_body_text")
+                .expect("body")
+                .contains("gm_route_disabled"),
+            "{path}"
+        );
+    }
+}
+
+/// The generation id rides a response *header*, so the audit costs no body
+/// read (the fixture's `handle:body()` raises), but the hand-off waits for the
+/// body to end: the record the auditor reads is written after the response
+/// completes.
+#[test]
+fn openrouter_hands_every_served_generation_to_the_in_image_auditor() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    let lua = run_response(
+        &rendered,
+        &[("x-generation-id", "gen-1789466620-abc")],
+        &[("provider", "openrouter")],
+        &["data: {\"choices\":[]}\n\n", "data: [DONE]\n\n"],
+    );
+    assert_eq!(
+        lua.globals()
+            .get::<i64>("body_chunks_seen")
+            .expect("chunks"),
+        2,
+        "every chunk must stream through the filter"
+    );
+    assert!(
+        !lua.globals()
+            .get::<bool>("http_call_before_body_end")
+            .expect("hand-off position"),
+        "the hand-off must wait for the end of the body"
+    );
+    let call = lua
+        .globals()
+        .get::<mlua::Table>("http_call")
+        .expect("the served generation must be handed over");
+    assert_eq!(call.get::<String>("cluster").expect("cluster"), "attestd");
+    assert_eq!(call.get::<String>("method").expect("method"), "POST");
+    assert_eq!(
+        call.get::<String>("path").expect("path"),
+        "/openrouter/audit"
+    );
+    assert_eq!(
+        call.get::<String>("body").expect("body"),
+        r#"{"id":"gen-1789466620-abc"}"#
+    );
+    assert!(
+        call.get::<bool>("asynchronous").expect("asynchronous"),
+        "the readback cannot finish for seconds; holding the buyer's response \
+         for it would cost latency and still not protect the prompt it holds"
+    );
+}
+
+/// Two responses that must not reach the auditor: another provider's (whose
+/// retention is not `OpenRouter`'s to prove) and an `OpenRouter` error carrying no
+/// generation at all (nothing was served, so nothing could be stored).
+#[test]
+fn openrouter_audits_nothing_it_did_not_serve() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    for (headers, metadata, case) in [
+        (
+            vec![("x-generation-id", "gen-1789466620-abc")],
+            vec![("provider", "deepinfra")],
+            "another provider's response",
+        ),
+        (vec![], vec![("provider", "openrouter")], "no generation id"),
+    ] {
+        let lua = run_response(&rendered, &headers, &metadata, &[]);
+        assert!(
+            lua.globals()
+                .get::<Option<mlua::Table>>("http_call")
+                .expect("call")
+                .is_none(),
+            "{case} must not be audited"
+        );
+    }
+}
+
+/// An id the auditor could not use must not break the hand-off JSON on the
+/// way to it — that would be a generation that silently went unaudited.
+#[test]
+fn openrouter_refuses_to_hand_over_a_malformed_generation_id() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    let oversized = "g".repeat(129);
+    for (id, case) in [
+        (r#"gen-1"}"#, "a quote that would close the JSON string"),
+        (r"gen-1\", "a trailing backslash"),
+        ("gen 1", "whitespace"),
+        (oversized.as_str(), "an oversized id"),
+    ] {
+        let lua = run_response(
+            &rendered,
+            &[("x-generation-id", id)],
+            &[("provider", "openrouter")],
+            &[],
+        );
+        assert!(
+            lua.globals()
+                .get::<Option<mlua::Table>>("http_call")
+                .expect("call")
+                .is_none(),
+            "{case} must not be handed over"
+        );
+        assert!(
+            lua.globals()
+                .get::<Option<String>>("log_warn")
+                .expect("warning")
+                .is_some_and(|line| line.contains("malformed")),
+            "{case} must be logged, not dropped silently"
+        );
+    }
 }

@@ -775,6 +775,51 @@ static_resources:
                             - x-gm-provider
                             - x-gm-upstream-slot
 
+                        ## ── OpenRouter ──────────────────────────────────────
+                        ##  Enabled only when OPENROUTER_API_KEY is set.
+                        ##  OpenRouter's OpenAI-compatible surface lives under
+                        ##  /api/v1, so the inbound /v1/... path is rewritten.
+                        ##
+                        ##  OpenRouter is a broker: the prompt reaches whichever
+                        ##  downstream provider serves the model. The Lua filter
+                        ##  admits only a closed model list, and attestd proves
+                        ##  at boot, on a timer and for every generation served
+                        ##  that the account retains no prompt content.
+                        ##
+                        ##  The path is pinned, not `prefix: "/"`: the operator
+                        ##  key also answers account endpoints (`/api/v1/key`,
+                        ##  `/api/v1/credits`, the generation readbacks), which
+                        ##  a node-key holder must not reach through the worker.
+                        ##  `/v1/models` is answered in the filter before this
+                        ##  match; it is listed so the route reads whole.
+                        - match:
+                            safe_regex:
+                              google_re2: {}
+                              regex: "^/v1/(chat/completions|models)$"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "openrouter"
+                          route:
+                            cluster: openrouter
+                            host_rewrite_literal: openrouter.ai
+                            regex_rewrite:
+                              pattern:
+                                google_re2: {}
+                                regex: "^/v1/(.*)$"
+                              substitution: "/api/v1/\\1"
+                            timeout: 1800s
+                            retry_policy:
+                              retry_on: "reset,connect-failure,refused-stream,5xx"
+                              num_retries: 1
+                          request_headers_to_remove:
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                            - x-gm-upstream-slot
+
                         ## ── Gemini ──────────────────────────────────────────
                         ##  Enabled only when GOOGLE_API_KEY is set.
                         - match:
@@ -976,7 +1021,73 @@ static_resources:
                               default_env = __GM_NEAR_DEFAULT_SLOT_ENV__,
                               slots = __GM_NEAR_SLOT_MAP__,
                             },
+                            openrouter = {
+                              cloud = false,
+                              direct_env = "OPENROUTER_API_KEY",
+                              default_env = __GM_OPENROUTER_DEFAULT_SLOT_ENV__,
+                              slots = __GM_OPENROUTER_SLOT_MAP__,
+                            },
                           }
+
+                          -- OpenRouter is a broker: the prompt reaches whichever
+                          -- downstream provider serves the model, so the set of
+                          -- models this route may carry is closed here instead
+                          -- of being left to the request. Every entry is a gm
+                          -- catalog model that OpenRouter actually lists.
+                          -- Excluded on purpose: `:batch` variants, which are
+                          -- the asynchronous batch API rather than the
+                          -- synchronous surface this route serves, and every
+                          -- `-tee` product, whose whole value is an attestation
+                          -- a broker cannot give. Read from the same
+                          -- x-gm-upstream-model selector the NEAR gate reads.
+                          local openrouter_model_list = {
+                            "anthropic/claude-fable-5",
+                            "anthropic/claude-fable-5.1",
+                            "anthropic/claude-haiku-4.5",
+                            "anthropic/claude-opus-4.6",
+                            "anthropic/claude-opus-4.7",
+                            "anthropic/claude-opus-4.8",
+                            "anthropic/claude-opus-5",
+                            "anthropic/claude-sonnet-4.6",
+                            "anthropic/claude-sonnet-5",
+                            "deepseek/deepseek-v4-flash-0731",
+                            "deepseek/deepseek-v4.1-flash",
+                            "moonshotai/kimi-k3",
+                            "openai/gpt-5.4",
+                            "openai/gpt-5.4-mini",
+                            "openai/gpt-5.4-nano",
+                            "openai/gpt-5.5",
+                            "openai/gpt-5.5-pro",
+                            "openai/gpt-5.6-luna",
+                            "openai/gpt-5.6-sol",
+                            "openai/gpt-5.6-terra",
+                            "openai/o3",
+                            "openai/o4-mini",
+                            "qwen/qwen3.6-35b-a3b",
+                            "qwen/qwen3.8-27b",
+                            "z-ai/glm-5.2",
+                            "z-ai/glm-5.3",
+                            "z-ai/glm-5.3-flash",
+                          }
+
+                          -- The capability probe is answered here from the same
+                          -- list, the way NEAR answers it from the verifier's
+                          -- compiled allowlist. Forwarding /v1/models upstream
+                          -- would advertise OpenRouter's whole catalog as served
+                          -- capability while the gate below refuses all but
+                          -- these — the worker must offer exactly what it serves.
+                          local openrouter_models = {}
+                          local openrouter_models_body
+                          do
+                            local entries = {}
+                            for index, id in ipairs(openrouter_model_list) do
+                              openrouter_models[id] = true
+                              entries[index] = "{\"id\":\"" .. id ..
+                                "\",\"object\":\"model\",\"owned_by\":\"openrouter\"}"
+                            end
+                            openrouter_models_body = "{\"object\":\"list\",\"data\":[" ..
+                              table.concat(entries, ",") .. "]}"
+                          end
 
                           local function json_escape(value)
                             value = tostring(value or "")
@@ -1057,6 +1168,8 @@ static_resources:
                             elseif provider == "moonmath" then
                               headers:add("authorization", "Bearer " .. key)
                             elseif provider == "near" then
+                              headers:add("authorization", "Bearer " .. key)
+                            elseif provider == "openrouter" then
                               headers:add("authorization", "Bearer " .. key)
                             end
                           end
@@ -1170,8 +1283,38 @@ static_resources:
                               "gm.access_log", "authenticated", true)
                             strip_inbound_auth(headers)
                             local provider = headers:get("x-gm-provider")
+                            -- Read before the strip below: the OpenRouter gate
+                            -- needs the selector, but unlike NEAR it must not
+                            -- reach the upstream.
+                            local upstream_model = headers:get("x-gm-upstream-model")
                             if provider ~= "near" or bare == "/v1/models" then
                               headers:remove("x-gm-upstream-model")
+                            end
+                            if provider == "openrouter"
+                              and getenv(slot_config.openrouter.direct_env) == nil then
+                              -- Without a key the retention gate never ran, so
+                              -- the usual "forward and let the upstream 401"
+                              -- would hand the broker an unproven prompt.
+                              handle:respond(
+                                {[":status"] = "501",
+                                 ["content-type"] = "application/json"},
+                                "{\"error\":{\"type\":\"gm_route_disabled\",\"message\":\"OpenRouter is not configured on this miner\"}}")
+                              return
+                            end
+                            if provider == "openrouter" and bare == "/v1/models" then
+                              handle:respond(
+                                {[":status"] = "200",
+                                 ["content-type"] = "application/json"},
+                                openrouter_models_body)
+                              return
+                            end
+                            if provider == "openrouter"
+                              and not openrouter_models[upstream_model or ""] then
+                              handle:respond(
+                                {[":status"] = "400",
+                                 ["content-type"] = "application/json"},
+                                "{\"error\":{\"type\":\"gm_unlisted_model\",\"message\":\"missing or unsupported OpenRouter source model\"}}")
+                              return
                             end
                             if provider == "near" and bare ~= "/v1/models" then
                               local model = headers:get("x-gm-upstream-model")
@@ -1193,6 +1336,54 @@ static_resources:
                               return
                             end
                             strip_internal_headers(headers, provider)
+                          end
+
+                          -- Every OpenRouter response is audited, not just the
+                          -- timer's canary. The generation id is a RESPONSE
+                          -- header, so no body is read, streaming included.
+                          -- The hand-off is asynchronous: the record lands
+                          -- 2.7-6.1s after the response completes (measured),
+                          -- and holding the buyer's response for it would not
+                          -- protect the prompt already at the broker — only
+                          -- every request after it.
+                          function envoy_on_response(handle)
+                            local generation = handle:headers():get("x-generation-id")
+                            if generation == nil or generation == "" then
+                              return
+                            end
+                            local logged = handle:streamInfo():dynamicMetadata():get(
+                              "gm.access_log")
+                            if logged == nil or logged["provider"] ~= "openrouter" then
+                              return
+                            end
+                            -- Upstream input: it must not break the hand-off
+                            -- JSON on its way to the thing that would notice.
+                            if #generation > 128 or not generation:match("^[%w%-_]+$") then
+                              handle:logWarn(
+                                "openrouter audit: refusing a malformed x-generation-id")
+                              return
+                            end
+                            -- The record is written after the response has
+                            -- completed, so a hand-off at the headers would give
+                            -- up on a long stream before there was anything to
+                            -- read. Walking the chunks forwards each unread and
+                            -- buffers nothing.
+                            for _ in handle:bodyChunks() do
+                            end
+                            local ok, err = pcall(function()
+                              handle:httpCall(
+                                "attestd",
+                                {[":method"] = "POST",
+                                 [":path"] = "/openrouter/audit",
+                                 [":authority"] = "attestd",
+                                 ["content-type"] = "application/json"},
+                                "{\"id\":\"" .. json_escape(generation) .. "\"}",
+                                5000,
+                                true)
+                            end)
+                            if not ok then
+                              handle:logWarn("openrouter audit hand-off failed: " .. tostring(err))
+                            end
                           end
                   ## ── Graceful load shedding ──────────────────────────
                   ##  The miner's saturation signal. Without it a miner
@@ -1723,6 +1914,38 @@ static_resources:
                 - san_type: DNS
                   matcher:
                     exact: zro.moonmath.ai
+
+    - name: openrouter
+      type: LOGICAL_DNS
+      connect_timeout: 10s
+      dns_lookup_family: V4_ONLY
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: openrouter
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: openrouter.ai
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: openrouter.ai
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: openrouter.ai
 
     ## ── Gemini ────────────────────────────────────────────────────────
     - name: gemini

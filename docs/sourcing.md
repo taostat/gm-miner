@@ -5,7 +5,7 @@ A **route** is how your worker fulfils it: which host it calls, with which key.
 
 One buyer product can have several routes, and none of them is the canonical one.
 `zai/glm-5.2` is the open GLM weights; Z.ai runs an API for them, and so do
-DeepInfra, Engy, KubeTEE, Moonmath and NEAR. The product id names the model, not the
+DeepInfra, Engy, KubeTEE, Moonmath, NEAR and OpenRouter. The product id names the model, not the
 company you buy it from. Buyers see the product they asked for either way.
 
 Routes differ on more than price — latency, availability, region, context window,
@@ -66,6 +66,33 @@ explains the table and how to set each upstream up.
 | `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `near/black-forest-labs/FLUX.2-klein-4B` | `flux2-klein.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `deepinfra/black-forest-labs/FLUX-2-klein-4b` | `api.deepinfra.com` | `--deepinfra` |
+| `zai/glm-5.2` | `openrouter/z-ai/glm-5.2` | `openrouter.ai` | `--openrouter` |
+| `zai/glm-5.3` | `openrouter/z-ai/glm-5.3` | `openrouter.ai` | `--openrouter` |
+| `zai/glm-5.3-flash` | `openrouter/z-ai/glm-5.3-flash` | `openrouter.ai` | `--openrouter` |
+| `moonshot/kimi-k3` | `openrouter/moonshotai/kimi-k3` | `openrouter.ai` | `--openrouter` |
+| `deepseek/deepseek-v4-flash-0731` | `openrouter/deepseek/deepseek-v4-flash-0731` | `openrouter.ai` | `--openrouter` |
+| `deepseek/deepseek-v4.1-flash` | `openrouter/deepseek/deepseek-v4.1-flash` | `openrouter.ai` | `--openrouter` |
+| `qwen/qwen3.6-35b-a3b` | `openrouter/qwen/qwen3.6-35b-a3b` | `openrouter.ai` | `--openrouter` |
+| `qwen/qwen3.8-27b` | `openrouter/qwen/qwen3.8-27b` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-fable-5` | `openrouter/anthropic/claude-fable-5` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-fable-5-1` | `openrouter/anthropic/claude-fable-5.1` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-haiku-4-5` | `openrouter/anthropic/claude-haiku-4.5` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-opus-4-6` | `openrouter/anthropic/claude-opus-4.6` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-opus-4-7` | `openrouter/anthropic/claude-opus-4.7` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-opus-4-8` | `openrouter/anthropic/claude-opus-4.8` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-opus-5` | `openrouter/anthropic/claude-opus-5` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-sonnet-4-6` | `openrouter/anthropic/claude-sonnet-4.6` | `openrouter.ai` | `--openrouter` |
+| `anthropic/claude-sonnet-5` | `openrouter/anthropic/claude-sonnet-5` | `openrouter.ai` | `--openrouter` |
+| `openai/gpt-5.4` | `openrouter/openai/gpt-5.4` | `openrouter.ai` | `--openrouter` |
+| `openai/gpt-5.4-mini` | `openrouter/openai/gpt-5.4-mini` | `openrouter.ai` | `--openrouter` |
+| `openai/gpt-5.4-nano` | `openrouter/openai/gpt-5.4-nano` | `openrouter.ai` | `--openrouter` |
+| `openai/gpt-5.5` | `openrouter/openai/gpt-5.5` | `openrouter.ai` | `--openrouter` |
+| `openai/gpt-5.5-pro` | `openrouter/openai/gpt-5.5-pro` | `openrouter.ai` | `--openrouter` |
+| `openai/gpt-5.6-luna` | `openrouter/openai/gpt-5.6-luna` | `openrouter.ai` | `--openrouter` |
+| `openai/gpt-5.6-sol` | `openrouter/openai/gpt-5.6-sol` | `openrouter.ai` | `--openrouter` |
+| `openai/gpt-5.6-terra` | `openrouter/openai/gpt-5.6-terra` | `openrouter.ai` | `--openrouter` |
+| `openai/o3` | `openrouter/openai/o3` | `openrouter.ai` | `--openrouter` |
+| `openai/o4-mini` | `openrouter/openai/o4-mini` | `openrouter.ai` | `--openrouter` |
 
 Source pairs that differ from their buyer are absent from the public catalog:
 they are dispatch targets, not products a buyer can request by name. The
@@ -193,6 +220,7 @@ gmcli set-api-keys --engy <key>
 gmcli set-api-keys --kubetee <key>
 gmcli set-api-keys --moonmath <key>
 gmcli set-api-keys --near <key>
+gmcli set-api-keys --openrouter <key>
 ```
 
 Like the other upstream flags, each accepts up to 8 semicolon-separated keys and
@@ -235,6 +263,11 @@ gmcli declare-product --provider near --model Qwen/Qwen3.6-27B-FP8 --discount-pc
 gmcli declare-product --provider near --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider near --model deepseek-ai/DeepSeek-V4-Flash --discount-pct 5
 gmcli declare-product --provider near --model google/gemma-4-31B-it --discount-pct 5
+gmcli declare-product --provider openrouter --model z-ai/glm-5.2 --discount-pct 5
+gmcli declare-product --provider openrouter --model moonshotai/kimi-k3 --discount-pct 5
+gmcli declare-product --provider openrouter --model deepseek/deepseek-v4.1-flash --discount-pct 5
+gmcli declare-product --provider openrouter --model anthropic/claude-opus-5 --discount-pct 5
+gmcli declare-product --provider openrouter --model openai/gpt-5.4 --discount-pct 5
 ```
 
 ### NEAR attestation enforcement
@@ -259,6 +292,62 @@ The verifier's endpoint and model allowlist is compiled into the measured miner
 image. Adding a NEAR model therefore requires a new image build and the normal
 registry image-approval process; changing a CLI catalog row alone cannot make an
 arbitrary NEAR host reachable.
+
+### OpenRouter prompt-retention enforcement
+
+OpenRouter is a broker, not a host: it forwards the prompt to whichever
+downstream provider serves the model, and the account's own settings decide
+whether a copy is kept. No API reports those settings, so the image measures
+the effect. Before Envoy starts, and every 15 minutes after, the in-image
+verifier sends a canary completion carrying a random nonce, waits for
+`GET /api/v1/generation?id=` to record it, then reads
+`GET /api/v1/generation/content?id=`. A 404 there means nothing was stored.
+The nonce coming back, a key OpenRouter refuses, or a generation served
+through a bring-your-own provider key (`is_byok`) stops the container at once
+with the fix in the log: turn prompt logging off at
+<https://openrouter.ai/settings/privacy>, or remove the BYOK integration, and
+redeploy. Anything else — a timeout, a 5xx, a record that never appears — is
+transient: three in a row stop the container, as does thirty minutes without
+a successful proof however the cycles in between were counted. A readback
+that cannot be performed is a failure, not a pass. Every semicolon-separated
+key slot is gated separately, and a fatal takes the whole worker offline,
+every route it carries.
+
+Served traffic is audited too. OpenRouter names each generation in an
+`x-generation-id` response header, so once the body has ended Envoy hands the
+id to the verifier without having read the body. The verifier attempts to read
+each one back after a settle delay and stops the container on the same
+findings as the canary; a transient failure is retried a few times and then
+logged, and readbacks failing for thirty minutes straight stop the container.
+The readback is not held in front of the buyer's response: the record lands
+2.7–6.1 s after the response completes (measured), waiting would cost that on
+every request, and the prompt being held is already at the broker. What an
+audit protects is every request after it.
+
+The canary carries no `provider` preference block (`zdr`, `data_collection`):
+Envoy forwards bodies unchanged, so buyer traffic never asks for one, and a
+canary that did would prove a policy the real requests never request. What
+the gate cannot see: account settings such as Broadcast and request logging
+are readable only with a management key the worker does not hold, and
+retention at the downstream provider is outside OpenRouter's API. The gate
+proves that OpenRouter's own copy is not retrievable through the account that
+served it, and no more.
+
+The route carries a closed model list compiled into the measured image
+(`image/envoy.yaml`), keyed on the same upstream-model selector the NEAR gate
+reads; an unlisted model is refused with a typed 400 before the request leaves
+the worker, and `GET /v1/models` is answered locally from the same list, as
+NEAR's is. The list holds the open-weight gm catalog models OpenRouter lists
+and the Anthropic and OpenAI first-party ones. Excluded: `:batch` variants
+(the asynchronous batch API), every `-tee` product (an attestation no broker
+can give), and Gemini — the image SKUs use Google's native `generateContent`
+shape this route does not carry, and the text models are not listed yet. The
+route match is pinned to `/v1/chat/completions` because the same key answers
+OpenRouter's account endpoints (`/api/v1/key`, `/api/v1/credits`, the
+readbacks), which a node-key holder must not reach through the worker; with
+no key configured the worker answers a typed 501 itself rather than forwarding
+the prompt with an empty credential. Adding a model needs a new image build
+and the normal registry image-approval process.
 
 `gmcli sources` prints this line for you, pre-filled, for every undeclared route
 where declaring it would actually get you somewhere — one a worker already

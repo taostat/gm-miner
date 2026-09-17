@@ -8,6 +8,10 @@
 #      verifies the configured Azure OpenAI account owner-capture
 #      controls before Envoy can serve Azure traffic. A failure aborts
 #      the container.
+#   0b. gm-miner-attestd --verify-openrouter-once (one-shot, OpenRouter
+#      only) — sends a nonce-carrying canary and reads it back through
+#      OpenRouter's stored-content API, proving the account keeps no copy
+#      of a prompt it served. A failure aborts the container.
 #   1. gm-miner-ratls (one-shot) — mints the data-plane RA-TLS
 #      certificate via dstack's GetTlsKey RPC and writes the key/cert
 #      PEM files envoy's :8080 DownstreamTlsContext references. Runs to
@@ -407,10 +411,14 @@ if [[ -n "${NEAR_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "NEAR_API_KEY set (NEAR requests require the local attestation proxy)"
 fi
+if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "OPENROUTER_API_KEY set (OpenRouter requests require the account to retain no prompts)"
+fi
 
 if [[ "${HAS_KEY}" -eq 0 ]]; then
   if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && "${OPENAI_UPSTREAM}" == "direct" ]]; then
-    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY / NEAR_API_KEY must be set"
+    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY / NEAR_API_KEY / OPENROUTER_API_KEY must be set"
   else
     log "error: at least one usable provider key must be set"
   fi
@@ -456,6 +464,9 @@ fi
 if [[ -n "${NEAR_API_KEY:-}" ]]; then
   fan_out_slots near NEAR_API_KEY
 fi
+if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+  fan_out_slots openrouter OPENROUTER_API_KEY
+fi
 if [[ "${ANTHROPIC_UPSTREAM}" == "foundry" && -n "${AZURE_FOUNDRY_API_KEY:-}" ]]; then
   fan_out_slots anthropic AZURE_FOUNDRY_API_KEY
 fi
@@ -485,6 +496,8 @@ GM_MOONMATH_SLOT_MAP="$(lua_slot_map "${GM_MOONMATH_SLOT_IDS:-}" "GM_MOONMATH")"
 GM_MOONMATH_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_MOONMATH_SLOT_IDS:-}" "GM_MOONMATH")"
 GM_NEAR_SLOT_MAP="$(lua_slot_map "${GM_NEAR_SLOT_IDS:-}" "GM_NEAR")"
 GM_NEAR_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_NEAR_SLOT_IDS:-}" "GM_NEAR")"
+GM_OPENROUTER_SLOT_MAP="$(lua_slot_map "${GM_OPENROUTER_SLOT_IDS:-}" "GM_OPENROUTER")"
+GM_OPENROUTER_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_OPENROUTER_SLOT_IDS:-}" "GM_OPENROUTER")"
 
 # ── Resolve the benchmark upstream ────────────────────────────────────
 # The benchmark URL is hardcoded per network in this script, NOT taken
@@ -549,6 +562,21 @@ if [[ "${GM_START_RENDER_ONLY:-}" != "1" ]] &&
   log "Azure owner-capture verification passed"
 fi
 
+# ── Gate OpenRouter data-plane startup ────────────────────────────────
+# OpenRouter is a broker: the prompt reaches whichever downstream provider
+# serves the model, and the account's retention setting decides whether a
+# copy survives. No API reports that setting, so the gate measures it —
+# a canary prompt carrying a nonce, read back through the stored-content
+# API. Runs before rendering for the same reason the Azure gate does: an
+# account that retains must restart the container, not serve one buyer
+# prompt. Render-only mode is an offline config check and never starts
+# Envoy, so it skips the network round trip.
+if [[ "${GM_START_RENDER_ONLY:-}" != "1" && -n "${OPENROUTER_API_KEY:-}" ]]; then
+  log "verifying OpenRouter prompt retention before starting data plane"
+  gm-miner-attestd --verify-openrouter-once
+  log "OpenRouter prompt-retention verification passed"
+fi
+
 # ── Render the envoy config ───────────────────────────────────────────
 # Literal token replaces (awk index/substr, not gsub) so values with
 # regex- or replacement-special characters are handled verbatim. The
@@ -603,6 +631,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_MOONMATH_DEFAULT_SLOT_ENV="${GM_MOONMATH_DEFAULT_SLOT_ENV}" \
   GM_NEAR_SLOT_MAP="${GM_NEAR_SLOT_MAP}" \
   GM_NEAR_DEFAULT_SLOT_ENV="${GM_NEAR_DEFAULT_SLOT_ENV}" \
+  GM_OPENROUTER_SLOT_MAP="${GM_OPENROUTER_SLOT_MAP}" \
+  GM_OPENROUTER_DEFAULT_SLOT_ENV="${GM_OPENROUTER_DEFAULT_SLOT_ENV}" \
   GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
   GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
   GM_OPENAI_AZURE_TLS="${OPENAI_AZURE_TLS}" \
@@ -656,6 +686,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     moonmath_default_slot_env = ENVIRON["GM_MOONMATH_DEFAULT_SLOT_ENV"]
     near_slot_map = ENVIRON["GM_NEAR_SLOT_MAP"]
     near_default_slot_env = ENVIRON["GM_NEAR_DEFAULT_SLOT_ENV"]
+    openrouter_slot_map = ENVIRON["GM_OPENROUTER_SLOT_MAP"]
+    openrouter_default_slot_env = ENVIRON["GM_OPENROUTER_DEFAULT_SLOT_ENV"]
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
     openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
@@ -722,6 +754,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_MOONMATH_DEFAULT_SLOT_ENV__", moonmath_default_slot_env)
     line = subst(line, "__GM_NEAR_SLOT_MAP__", near_slot_map)
     line = subst(line, "__GM_NEAR_DEFAULT_SLOT_ENV__", near_default_slot_env)
+    line = subst(line, "__GM_OPENROUTER_SLOT_MAP__", openrouter_slot_map)
+    line = subst(line, "__GM_OPENROUTER_DEFAULT_SLOT_ENV__", openrouter_default_slot_env)
     line = subst(line, "__GM_OPENAI_SAN_MATCH__", openai_san_match)
     line = subst(line, "__GM_OPENAI_SAN_VALUE__", openai_san_value)
     # Substitute the node secret last: an accepted secret may itself look like a
@@ -825,13 +859,16 @@ log "starting attestation server on ${ATTESTD_BIND_ADDR}"
 gm-miner-attestd &
 ATTESTD_PID=$!
 
-# The one-shot check predates certificate provisioning. Wait for the serving
+# The one-shot checks predate certificate provisioning. Wait for the serving
 # verifier to refresh that evidence and start its success-anchored pollers.
-if [[ "${AZURE_ENABLED}" -eq 1 ]]; then
+# Both gates re-run inside the serving attestd before it binds, so a readiness
+# answer means every configured gate has passed there too, not just in the
+# one-shots above.
+if [[ "${AZURE_ENABLED}" -eq 1 || -n "${OPENROUTER_API_KEY:-}" ]]; then
   until gm-miner-attestd --check-ready >/dev/null 2>&1; do
     if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
       wait "${ATTESTD_PID}" || true
-      log "error: attestation server exited before Azure readiness"
+      log "error: attestation server exited before the serving gate passed"
       if [[ -n "${NEAR_PROXY_PID}" ]]; then
         kill -TERM "${NEAR_PROXY_PID}" 2>/dev/null || true
       fi

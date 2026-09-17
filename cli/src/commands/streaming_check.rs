@@ -499,13 +499,14 @@ fn bind_models_to_worker(
     }
 }
 
-fn sourcing_providers() -> [Provider; 5] {
+fn sourcing_providers() -> [Provider; 6] {
     [
         Provider::DeepInfra,
         Provider::Engy,
         Provider::Kubetee,
         Provider::Moonmath,
         Provider::Near,
+        Provider::OpenRouter,
     ]
 }
 
@@ -571,6 +572,9 @@ fn configured_providers(keys: Option<&ProviderKeys>) -> Result<Vec<Provider>> {
     }
     if non_empty(keys.near.as_deref()) {
         providers.push(Provider::Near);
+    }
+    if non_empty(keys.openrouter.as_deref()) {
+        providers.push(Provider::OpenRouter);
     }
     Ok(providers)
 }
@@ -800,6 +804,7 @@ fn fallback_model(provider: &Provider) -> &'static str {
         // over kimi; flash is probed once declared (see #185 / sources).
         Provider::Kubetee => "z-ai/glm-5.2",
         Provider::Near => "Qwen/Qwen3.6-27B-FP8",
+        Provider::OpenRouter => "deepseek/deepseek-v4-flash-0731",
         Provider::Benchmark => "benchmark",
     }
 }
@@ -831,6 +836,7 @@ fn build_probe(provider: Provider, model: &ProbeModel, slot: Option<String>) -> 
         | Provider::Engy
         | Provider::Moonmath
         | Provider::Near
+        | Provider::OpenRouter
         | Provider::Benchmark => {
             openai_compatible_probe(provider, model, slot, "/v1/chat/completions")
         }
@@ -875,10 +881,13 @@ async fn run_provider_probe(
         .header("content-type", "application/json")
         .header("x-gm-node-key", &target.node_secret)
         .header("x-gm-provider", probe.provider.as_str());
-    if probe.provider == Provider::Near {
+    // The two routes that decide on the source model before the body is
+    // forwarded: NEAR's attesting verifier, and OpenRouter's closed model list
+    // in the Lua filter. Envoy never reads a body, so both select on a header.
+    if matches!(probe.provider, Provider::Near | Provider::OpenRouter) {
         let selector = probe.body["model"]
             .as_str()
-            .context("NEAR probe has no upstream source model")?;
+            .with_context(|| format!("{} probe has no upstream source model", probe.provider))?;
         request = request.header("x-gm-upstream-model", selector);
     }
     request = apply_upstream_slot(request, probe.slot.as_deref());
@@ -2006,6 +2015,7 @@ mod tests {
                 Provider::Kubetee,
                 Provider::Moonmath,
                 Provider::Near,
+                Provider::OpenRouter,
             ]
         );
     }

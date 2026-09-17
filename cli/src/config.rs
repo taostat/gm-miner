@@ -370,6 +370,8 @@ pub struct ProviderKeys {
     pub moonmath: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub near: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openrouter: Option<String>,
 }
 
 /// True when `v` holds a non-empty, non-whitespace value. `Some("")` and
@@ -529,6 +531,7 @@ impl ProviderKeys {
             Provider::Engy => Some(("ENGY_API_KEY", self.engy.as_deref())),
             Provider::Moonmath => Some(("MOONMATH_API_KEY", self.moonmath.as_deref())),
             Provider::Near => Some(("NEAR_API_KEY", self.near.as_deref())),
+            Provider::OpenRouter => Some(("OPENROUTER_API_KEY", self.openrouter.as_deref())),
             Provider::Benchmark => None,
         }
     }
@@ -1087,6 +1090,7 @@ mod tests {
             engy: Some("eng".to_owned()),
             moonmath: Some("moon".to_owned()),
             near: Some("near".to_owned()),
+            openrouter: Some("or".to_owned()),
             ..ProviderKeys::default()
         };
 
@@ -1097,6 +1101,10 @@ mod tests {
         assert_eq!(
             keys.direct_key(&Provider::Moonmath),
             Some(("MOONMATH_API_KEY", Some("moon")))
+        );
+        assert_eq!(
+            keys.direct_key(&Provider::OpenRouter),
+            Some(("OPENROUTER_API_KEY", Some("or")))
         );
         assert_eq!(keys.direct_key(&Provider::Benchmark), None);
         assert_eq!(
@@ -1121,6 +1129,7 @@ mod tests {
                 "ENGY_API_KEY",
                 "MOONMATH_API_KEY",
                 "NEAR_API_KEY",
+                "OPENROUTER_API_KEY",
             ]
         );
     }

@@ -101,6 +101,7 @@ services:
       - ENGY_API_KEY
       - MOONMATH_API_KEY
       - NEAR_API_KEY
+      - OPENROUTER_API_KEY
       ## Node secret — enforced by envoy's inbound x-gm-node-key check.
       - GM_NODE_SECRET
       ## Active network — `testnet` or `mainnet`. Rendered as a literal

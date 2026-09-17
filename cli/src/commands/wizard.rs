@@ -431,6 +431,7 @@ fn wizard_has_provider_key(keys: &ProviderKeys) -> bool {
         || keys.engy.is_some()
         || keys.moonmath.is_some()
         || keys.near.is_some()
+        || keys.openrouter.is_some()
 }
 
 /// Prompt for each provider key in turn (blank to skip a provider).
@@ -465,6 +466,7 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         engy: prompt_line("Engy API key (blank to skip):", assume_yes)?,
         moonmath: prompt_line("Moonmath ZRO API key (blank to skip):", assume_yes)?,
         near: prompt_line("NEAR AI Cloud API key (blank to skip):", assume_yes)?,
+        openrouter: prompt_line("OpenRouter API key (blank to skip):", assume_yes)?,
     })
 }
 
@@ -516,6 +518,9 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     }
     if keys.near.is_some() {
         cmd.push_str(" --near <key>");
+    }
+    if keys.openrouter.is_some() {
+        cmd.push_str(" --openrouter <key>");
     }
     cmd
 }

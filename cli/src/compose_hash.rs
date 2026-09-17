@@ -62,10 +62,10 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// not values, so every miner produces the same `compose_hash`. The order
 /// matches `render_env_file`: Anthropic direct/Bedrock/Foundry, `OpenAI`
 /// direct/Azure, Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, Engy,
-/// Moonmath, NEAR and the node secret.
+/// Moonmath, NEAR, `OpenRouter` and the node secret.
 /// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
 /// gm image is public and those vars do not appear in `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 31] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -95,6 +95,7 @@ const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
     "ENGY_API_KEY",
     "MOONMATH_API_KEY",
     "NEAR_API_KEY",
+    "OPENROUTER_API_KEY",
     "GM_NODE_SECRET",
 ];
 
@@ -240,7 +241,7 @@ mod tests {
     /// Keep the candidate pin separate: deterministic rendering does not confer
     /// registry approval, and template changes must not move the approved anchor.
     const CANDIDATE_TESTNET_COMPOSE_HASH: &str =
-        "6d41a82c6c49def6e6e84b182fe9d89e60621da21482c74543b2e1d8630210f2";
+        "0caa0e23551072c82dc4ccd85444b8258e6869283746f09510688ab89042f3da";
 
     const APPROVED_BASELINE_ALLOWED_ENVS: [&str; 30] = [
         "ANTHROPIC_API_KEY",

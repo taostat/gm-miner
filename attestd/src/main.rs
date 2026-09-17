@@ -2,8 +2,10 @@
 //!
 //! Bootstraps a TEE-bound ed25519 keypair from the dstack guest agent,
 //! then serves `GET /attestation/info` on a loopback address. Envoy
-//! (the miner's data plane) routes that single path here; the registry
-//! probes it through Envoy's public `:8080` port.
+//! (the miner's data plane) routes that single buyer-facing path here
+//! and the registry probes it through Envoy's public `:8080` port; the
+//! same listener takes Envoy's own `POST /openrouter/audit` hand-offs
+//! and answers the entrypoint's `/readyz` probe.
 //!
 //! Configuration (environment):
 //!
@@ -22,10 +24,16 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::routing::get;
-use axum::Router;
-use gm_azure_verify::{spawn_periodic_azure_verification_from_env, verify_azure_config_from_env};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use gm_azure_verify::{
+    spawn_periodic_azure_verification_from_env, verify_azure_config_from_env, AzureBindingReadiness,
+};
 use gm_miner_attestd::info::AppState;
+use gm_miner_attestd::openrouter_verify::{
+    spawn_generation_audit, spawn_periodic_retention_verification, verify_retention_from_env,
+    AuditQueue, AuditRequest, RetentionReadiness,
+};
 use gm_miner_attestd::{
     attestation_info, validate_miner_id, DstackAttestationProvider, SigningKeypair,
 };
@@ -37,6 +45,7 @@ const DEFAULT_MINER_ID: &str = "gm-miner";
 /// nothing external should hit the attestation server directly.
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8081";
 const VERIFY_AZURE_ONCE_ARG: &str = "--verify-azure-once";
+const VERIFY_OPENROUTER_ONCE_ARG: &str = "--verify-openrouter-once";
 
 /// True when either upstream selector routes through an Azure account whose
 /// owner-capture controls `attestd` must verify before the data plane serves.
@@ -75,6 +84,16 @@ async fn run() -> Result<()> {
         verify_azure_config_from_env()
             .await
             .context("Azure owner-capture verification failed")?;
+        return Ok(());
+    }
+    if args == [VERIFY_OPENROUTER_ONCE_ARG] {
+        tracing::info!("running one-shot OpenRouter prompt-retention verification");
+        let verified = verify_retention_from_env()
+            .await
+            .context("OpenRouter prompt-retention verification failed")?;
+        if verified == 0 {
+            tracing::info!("no OpenRouter key configured; nothing to verify");
+        }
         return Ok(());
     }
     if !args.is_empty() {
@@ -126,6 +145,13 @@ async fn run() -> Result<()> {
         Vec::new()
     };
 
+    // Fail-closed boot gate for the OpenRouter broker route: prove the
+    // configured account keeps no copy of a prompt it just served before Envoy
+    // can forward a buyer's.
+    let openrouter_keys = verify_retention_from_env()
+        .await
+        .context("OpenRouter prompt-retention verification failed")?;
+
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("bind attestation server to {bind_addr}"))?;
@@ -135,12 +161,71 @@ async fn run() -> Result<()> {
             .await
             .context("start periodic Azure owner-capture verification")?;
     let azure_shutdown_rx = azure_upstream.then_some(fatal_shutdown_rx);
-    let app = Router::new()
+
+    let (openrouter_fatal_tx, openrouter_fatal_rx) = oneshot::channel();
+    let (_periodic_openrouter_verify_task, openrouter_readiness) =
+        spawn_periodic_retention_verification(openrouter_keys, openrouter_fatal_tx);
+    let openrouter_shutdown_rx = (openrouter_keys > 0).then_some(openrouter_fatal_rx);
+
+    // Per-response audit. The periodic canary above proves the account while
+    // the worker is idle; this proves it against the buyer traffic itself.
+    let (audit_fatal_tx, audit_fatal_rx) = oneshot::channel();
+    let (audit_queue, _generation_audit_task) =
+        spawn_generation_audit(openrouter_keys, audit_fatal_tx);
+    let audit_shutdown_rx = audit_queue.as_ref().map(|_| audit_fatal_rx);
+
+    let app = build_router(provider, readiness, openrouter_readiness, audit_queue);
+    tracing::info!(bind_addr = %bind_addr, "miner attestation server listening");
+
+    let fatal_shutdown_rx = first_fatal(
+        [
+            ("Azure owner-capture", azure_shutdown_rx),
+            ("OpenRouter prompt-retention", openrouter_shutdown_rx),
+            ("OpenRouter served-generation audit", audit_shutdown_rx),
+        ]
+        .into_iter()
+        .filter_map(|(label, receiver)| receiver.map(|receiver| (label, receiver)))
+        .collect(),
+    );
+    serve_attestation(listener, app, fatal_shutdown_rx).await
+}
+
+/// The attestation surface plus `/readyz`, which reports ready only while
+/// every periodic verifier this configuration runs still holds a recent
+/// success. A verifier that is not running reports fresh, so a worker without
+/// an Azure or `OpenRouter` upstream is not held back by a gate it never needs.
+fn build_router(
+    provider: AppState,
+    azure_readiness: AzureBindingReadiness,
+    openrouter_readiness: RetentionReadiness,
+    audit_queue: Option<AuditQueue>,
+) -> Router {
+    let mut router = Router::new();
+    if let Some(queue) = audit_queue {
+        // Envoy's response filter posts the generation id here, from
+        // loopback, after the buyer already has the answer. It is accepted
+        // and queued, never awaited: the data plane must not wait on a
+        // readback that cannot complete for several seconds anyway.
+        router = router.route(
+            "/openrouter/audit",
+            post(move |Json(request): Json<AuditRequest>| {
+                let accepted = queue.submit(request.id);
+                async move {
+                    if accepted {
+                        axum::http::StatusCode::ACCEPTED
+                    } else {
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    }
+                }
+            }),
+        );
+    }
+    router
         .route("/attestation/info", get(attestation_info))
         .route(
             "/readyz",
             get(move || {
-                let fresh = readiness.is_fresh();
+                let fresh = azure_readiness.is_fresh() && openrouter_readiness.is_fresh();
                 async move {
                     if fresh {
                         axum::http::StatusCode::OK
@@ -150,10 +235,33 @@ async fn run() -> Result<()> {
                 }
             }),
         )
-        .with_state(provider);
-    tracing::info!(bind_addr = %bind_addr, "miner attestation server listening");
+        .with_state(provider)
+}
 
-    serve_attestation(listener, app, azure_shutdown_rx).await
+/// Collapse the periodic verifiers' fatal channels into the single one the
+/// server selects on. Whichever fires first stops the data plane, and the
+/// reason names which gate failed; a verifier that is not running for this
+/// configuration contributes no channel at all.
+fn first_fatal(
+    sources: Vec<(&'static str, oneshot::Receiver<String>)>,
+) -> Option<oneshot::Receiver<String>> {
+    if sources.is_empty() {
+        return None;
+    }
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut pending = tokio::task::JoinSet::new();
+        for (label, receiver) in sources {
+            pending.spawn(async move {
+                let reason = receiver.await.unwrap_or_else(|_| "task ended".to_owned());
+                format!("periodic {label} verification failure: {reason}")
+            });
+        }
+        if let Some(Ok(reason)) = pending.join_next().await {
+            let _ = tx.send(reason);
+        }
+    });
+    Some(rx)
 }
 
 fn init_logging() {
@@ -179,10 +287,10 @@ async fn check_readiness(addr: &str) -> Result<()> {
         .get(format!("http://{addr}/readyz"))
         .send()
         .await
-        .context("read local Azure readiness")?;
+        .context("read local verifier readiness")?;
     anyhow::ensure!(
         response.status() == reqwest::StatusCode::OK,
-        "Azure bindings are not ready"
+        "upstream verifiers are not ready"
     );
     Ok(())
 }
@@ -190,9 +298,9 @@ async fn check_readiness(addr: &str) -> Result<()> {
 async fn serve_attestation(
     listener: tokio::net::TcpListener,
     app: Router,
-    azure_shutdown_rx: Option<oneshot::Receiver<String>>,
+    fatal_shutdown_rx: Option<oneshot::Receiver<String>>,
 ) -> Result<()> {
-    let Some(azure_shutdown_rx) = azure_shutdown_rx else {
+    let Some(fatal_shutdown_rx) = fatal_shutdown_rx else {
         return axum::serve(listener, app)
             .await
             .context("attestation server terminated");
@@ -201,9 +309,10 @@ async fn serve_attestation(
     // request is still waiting on dstack; a graceful drain would keep Envoy alive.
     tokio::select! {
         result = axum::serve(listener, app) => result.context("attestation server terminated"),
-        reason = azure_shutdown_rx => {
-            let reason = reason.unwrap_or_else(|_| "periodic Azure verification task ended".to_owned());
-            anyhow::bail!("attestd stopped after periodic Azure verification failure: {reason}");
+        reason = fatal_shutdown_rx => {
+            let reason =
+                reason.unwrap_or_else(|_| "periodic verification task ended".to_owned());
+            anyhow::bail!("attestd stopped after {reason}");
         }
     }
 }
