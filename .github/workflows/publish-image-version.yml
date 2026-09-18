@@ -38,8 +38,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify-tag:
+    name: Verify tag matches the crate version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `dist` and `deploy/version.rs` both derive the release identity from
+      # the CRATE version, while this workflow derives the target networks from
+      # the TAG. When the two disagree the failure is silent and split: dist
+      # refuses to release (no gmcli binaries) while the ImageVersion still
+      # publishes, leaving a row no CLI build can select. Fail here instead.
+      - name: Compare tag against Cargo.toml
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "${crate}" ]]; then
+            echo "::error::could not read the workspace version from Cargo.toml"
+            exit 1
+          fi
+          if [[ "${REF_NAME}" != "v${crate}" ]]; then
+            echo "::error::tag ${REF_NAME} does not match Cargo.toml version ${crate}."
+            echo "::error::Tag v${crate}, or bump Cargo.toml to ${REF_NAME#v} — a -dev tag needs a -dev crate version."
+            exit 1
+          fi
+          echo "tag ${REF_NAME} matches Cargo.toml version ${crate}"
+
   plan:
     name: Resolve target networks
+    needs: [verify-tag]
     runs-on: ubuntu-24.04
     outputs:
       networks: ${{ steps.networks.outputs.networks }}
@@ -63,6 +95,7 @@ jobs:
 
   build-image:
     name: Build and push miner image
+    needs: [verify-tag]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
