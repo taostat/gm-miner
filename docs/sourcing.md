@@ -55,6 +55,7 @@ explains the table and how to set each upstream up.
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | `llm.kubetee.ai` | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash` | `kubetee/deepseek/deepseek-v4.1-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `ornith/ornith-1.5-397b` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
+| `flux.2-klein-4b` | `kubetee/black-forest-labs/flux.2-klein-4b` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
 | `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
@@ -72,6 +73,21 @@ they are dispatch targets, not products a buyer can request by name. The
 `gmcli sources` uses `GET /miners/products/routes` and lists every explicit
 route, including self routes. It falls back to the older cross-product-only
 endpoint while reporting a registry that predates the complete route catalog.
+
+### FLUX.2 Klein image generation
+
+`flux.2-klein-4b` is the buyer product. KubeTEE serves it using its
+OpenAI-compatible `POST /v1/images/generations` endpoint and the source model
+id shown in the route table. The existing `--kubetee` key and Envoy route carry
+the request; no separate image key or model-specific miner transport is needed.
+The buyer price is per generated image.
+
+The KubeTEE source route remains disabled until workers using the no-retry
+image route are the only eligible KubeTEE workers. Older miner images use a
+retrying catch-all route, which can replay a paid generation after a reset.
+After the updated image is deployed and older workers are excluded, activate
+the KubeTEE registry route and miners can declare it with
+`gmcli declare-product --provider kubetee --model black-forest-labs/flux.2-klein-4b`.
 
 ### Gemini image products
 
@@ -228,6 +244,7 @@ gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.3 --discount-pct 5
 gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
 gmcli declare-product --provider kubetee --model deepseek/deepseek-v4.1-flash --discount-pct 5
+gmcli declare-product --provider kubetee --model black-forest-labs/flux.2-klein-4b --discount-pct 5
 gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
 gmcli declare-product --provider near --model zai-org/GLM-5.1-FP8 --discount-pct 5

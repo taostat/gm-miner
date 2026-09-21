@@ -749,6 +749,25 @@ static_resources:
                         ##  Enabled only when KUBETEE_API_KEY is set.
                         ##  llm.kubetee.ai serves the OpenAI-compatible surface
                         ##  under /v1 itself, so no path rewrite is needed.
+                        ##  Image generation is paid and non-idempotent; never
+                        ##  retry it after an upstream reset or 5xx.
+                        - match:
+                            path: "/v1/images/generations"
+                            headers:
+                              - name: "x-gm-provider"
+                                string_match:
+                                  exact: "kubetee"
+                          route:
+                            cluster: kubetee
+                            host_rewrite_literal: llm.kubetee.ai
+                            timeout: 1800s
+                          request_headers_to_remove:
+                            - x-gm-request-id
+                            - x-gm-gateway-sig
+                            - x-gm-product
+                            - x-gm-node-key
+                            - x-gm-provider
+                            - x-gm-upstream-slot
                         - match:
                             prefix: "/"
                             headers:
@@ -1190,6 +1209,12 @@ static_resources:
                             strip_inbound_auth(headers)
                             local provider = headers:get("x-gm-provider")
                             if provider == "deepinfra" and bare:sub(1, 14) == "/v1/inference/" then
+                              headers:remove("x-envoy-retry-on")
+                              headers:remove("x-envoy-retry-grpc-on")
+                              headers:remove("x-envoy-max-retries")
+                              headers:remove("x-envoy-hedge-on-per-try-timeout")
+                            end
+                            if provider == "kubetee" and bare == "/v1/images/generations" then
                               headers:remove("x-envoy-retry-on")
                               headers:remove("x-envoy-retry-grpc-on")
                               headers:remove("x-envoy-max-retries")
