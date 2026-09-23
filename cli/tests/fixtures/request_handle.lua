@@ -31,7 +31,12 @@ input_headers = collected
 local headers = setmetatable(input_headers, {__index = methods})
 local metadata = {}
 local metadata_api = {}
+route_metadata = {}
 function metadata_api:set(namespace, name, value)
+  if namespace == "gm.route" then
+    route_metadata[name] = value
+    return
+  end
   assert(namespace == "gm.access_log")
   metadata[name] = value
 end

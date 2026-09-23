@@ -62,6 +62,7 @@ render direct-all GM_NETWORK=testnet GM_NODE_SECRET="${SECRET}" \
   ZAI_API_KEY=z MOONSHOT_API_KEY=m DEEPINFRA_API_KEY=d KUBETEE_API_KEY=k \
   ENGY_API_KEY=e MOONMATH_API_KEY=mm NEAR_API_KEY=n
 render chutes-slots GM_NETWORK=testnet GM_NODE_SECRET="${SECRET}" CHUTES_API_KEY="c1;c2"
+render chutes-runtime GM_NETWORK=testnet CHUTES_API_KEY=c
 render mainnet GM_NETWORK=mainnet GM_NODE_SECRET="${SECRET}" ANTHROPIC_API_KEY=a
 render no-node-secret GM_NETWORK=testnet OPENAI_API_KEY=o
 render azure-clouds GM_NETWORK=testnet GM_NODE_SECRET="${SECRET}" \
@@ -91,4 +92,40 @@ for config in "${WORK}"/configs/*.yaml; do
     failed=1
   fi
 done
+# Runtime check of the Chutes routes in the same image: Envoy serves the
+# chutes-runtime variant with no verifier listening on 127.0.0.1:8083.
+chutes_runtime() {
+  local container port code
+  container="$(docker run -d --rm -e ENVOY_UID=0 -e CHUTES_API_KEY=c \
+    -v "${WORK}/configs:/configs:ro" \
+    -v "${WORK}/ratls:/tmp/gm-ratls:ro" \
+    -p 127.0.0.1::8080 \
+    "${ENVOY_IMAGE}" -c /configs/chutes-runtime.yaml)"
+  port="$(docker port "${container}" 8080/tcp | head -n 1 | sed 's/.*://')"
+  request() {
+    curl -sk -o /dev/null -w '%{http_code}' -X POST -d '{}' \
+      -H 'x-gm-provider: chutes' "$@" \
+      "https://127.0.0.1:${port}/v1/chat/completions" || true
+  }
+  for _ in $(seq 50); do
+    [[ "$(request -H 'x-gm-upstream-model: zai-org/GLM-5.2-TEE')" != "000" ]] && break
+    sleep 0.2
+  done
+  local ok=0
+  code="$(request -H 'x-gm-upstream-model;')"
+  [[ "${code}" == "400" ]] || {
+    echo "FAIL: chutes empty selector answered ${code}, expected 400" >&2
+    ok=1
+  }
+  code="$(request -H 'x-gm-upstream-model: zai-org/GLM-5.2-TEE')"
+  [[ "${code}" == "503" ]] || {
+    echo "FAIL: chutes unreachable verifier answered ${code}, expected 503" >&2
+    ok=1
+  }
+  docker stop "${container}" >/dev/null
+  [[ "${ok}" -eq 0 ]] && echo "ok: chutes-runtime"
+  return "${ok}"
+}
+chutes_runtime || failed=1
+
 exit "${failed}"

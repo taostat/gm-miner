@@ -1519,3 +1519,103 @@ fn the_ordinary_marker_is_stripped_from_other_providers() {
         "zai"
     );
 }
+
+#[test]
+fn chutes_empty_selector_is_refused() {
+    let rendered = chutes_config();
+    for selector in ["", " ", "\t"] {
+        for path in ["/v1/chat/completions", "/v1/models"] {
+            let forwarded = forward_chutes(&rendered, path, &[("x-gm-upstream-model", selector)]);
+            assert_eq!(
+                forwarded.status.as_deref(),
+                Some("400"),
+                "{path} {selector:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn chutes_tee_with_an_empty_key_is_unavailable() {
+    let rendered = chutes_config();
+    let forwarded = forward_chutes_with(
+        &rendered,
+        "/v1/chat/completions",
+        &[("x-gm-upstream-model", "zai-org/GLM-5.2-TEE")],
+        &[
+            ("CHUTES_API_KEY", ""),
+            ("GM_CHUTES_KEY_SLOT_1", "chutes-key"),
+        ],
+    );
+    assert_eq!(forwarded.status.as_deref(), Some("503"));
+}
+
+#[test]
+fn an_unreachable_chutes_verifier_answers_503() {
+    let rendered = chutes_config();
+    let lua = run_request(
+        &rendered,
+        &[
+            (":path", "/v1/chat/completions"),
+            ("x-gm-provider", "chutes"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-gm-upstream-model", "zai-org/GLM-5.2-TEE"),
+        ],
+        &[
+            ("CHUTES_API_KEY", "chutes-key"),
+            ("GM_CHUTES_KEY_SLOT_1", "chutes-key"),
+        ],
+    );
+    let marked = lua
+        .globals()
+        .get::<mlua::Table>("route_metadata")
+        .expect("route metadata")
+        .get::<Option<bool>>("chutes_verifier")
+        .expect("marker");
+    assert_eq!(marked, Some(true));
+
+    let parsed = config(&rendered);
+    let mappers = ingress(&parsed)["local_reply_config"]["mappers"]
+        .as_array()
+        .expect("mappers");
+    let first_failure_mapper = mappers
+        .iter()
+        .find(|mapper| {
+            let filter = &mapper["filter"];
+            filter["response_flag_filter"].is_object()
+                || filter["and_filter"]["filters"]
+                    .as_array()
+                    .is_some_and(|filters| {
+                        filters
+                            .iter()
+                            .any(|f| f["response_flag_filter"].is_object())
+                    })
+        })
+        .expect("connection-failure mapper");
+    assert_eq!(first_failure_mapper["status_code"], 503);
+    let filters = first_failure_mapper["filter"]["and_filter"]["filters"]
+        .as_array()
+        .expect("verifier mapper conditions");
+    assert!(filters.iter().any(|filter| {
+        filter["metadata_filter"]["matcher"]["filter"] == "gm.route"
+            && filter["metadata_filter"]["matcher"]["path"][0]["key"] == "chutes_verifier"
+    }));
+
+    let direct = run_request(
+        &rendered,
+        &[
+            (":path", "/v1/chat/completions"),
+            ("x-gm-provider", "chutes"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-gm-upstream-model", "zai-org/GLM-5.2"),
+        ],
+        &[("GM_CHUTES_KEY_SLOT_1", "chutes-key")],
+    );
+    assert!(direct
+        .globals()
+        .get::<mlua::Table>("route_metadata")
+        .expect("route metadata")
+        .get::<Option<bool>>("chutes_verifier")
+        .expect("marker")
+        .is_none());
+}
