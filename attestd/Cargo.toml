@@ -41,6 +41,10 @@ path = "src/bin/ratls.rs"
 name = "gm-near-verify-proxy"
 path = "src/bin/near_verify_proxy.rs"
 
+[[bin]]
+name = "gm-chutes-verify-proxy"
+path = "src/bin/chutes_verify_proxy.rs"
+
 [lib]
 name = "gm_miner_attestd"
 path = "src/lib.rs"
@@ -71,6 +75,10 @@ rand = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 x509-parser = { workspace = true }
+flate2 = { workspace = true }
+futures-util = { workspace = true }
+ml-kem = { workspace = true }
+ring = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

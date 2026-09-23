@@ -9,6 +9,7 @@
 //! — the same one the gm gateway's attestation surface produces, so the
 //! registry's single attestation checker verifies both services.
 
+pub mod chutes_verify;
 pub mod identity;
 pub mod info;
 pub mod keypair;
@@ -16,6 +17,7 @@ pub mod near_verify;
 pub mod provider;
 pub mod ratls;
 pub mod report_data;
+pub mod tee_evidence;
 
 pub use identity::validate_miner_id;
 pub use info::{attestation_info, AppState, AttestationInfoQuery};

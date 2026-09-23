@@ -4,6 +4,8 @@ repos:
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
+        # Published payloads are committed byte-for-byte; their SHA-256 is pinned.
+        exclude: ^attestd/references/
       - id: check-yaml
         # envoy.yaml is a pre-processor template: sentinel blocks produce
         # duplicate mapping keys that are mutually exclusive at render time.

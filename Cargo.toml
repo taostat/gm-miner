@@ -41,6 +41,10 @@ rand = "0.10"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 x509-parser = "0.18.1"
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+futures-util = { version = "=0.3.32", default-features = false }
+ml-kem = { version = "=0.3.2", features = ["getrandom", "zeroize"] }
+ring = "=0.17.14"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 # dstack-sdk's locked Alloy macros pull proc-macro-error2 2.0.1, which emits
 # future-incompatibility E0365 on proc_macro re-export. Keep this dependency

@@ -8,15 +8,10 @@ use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
 use axum::http::header::{CONNECTION, HOST, TRANSFER_ENCODING, UPGRADE};
 use axum::http::{HeaderMap, HeaderName, Method, Request, Response, StatusCode, Uri};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
 use dcap_qvl::collateral::CollateralClient;
-use dcap_qvl::quote::Report;
-use dcap_qvl::verify::VerifiedReport;
 use http_body_util::{BodyExt as _, Limited};
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper_util::rt::TokioIo;
-use rand::Rng as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -29,7 +24,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tracing::warn;
-use x509_parser::parse_x509_certificate;
+
+use crate::tee_evidence::{self, nras};
 
 pub const SELECTOR_HEADER: &str = "x-gm-upstream-model";
 const ATTESTATION_LIMIT: usize = 2 * 1024 * 1024;
@@ -200,7 +196,7 @@ impl NearVerifier {
             .context("build NVIDIA attestation client")?;
         Ok(Self {
             tls: TlsConnector::from(Arc::new(tls_config)),
-            collateral: CollateralClient::from_env().context("build DCAP collateral client")?,
+            collateral: tee_evidence::collateral_client()?,
             nras,
         })
     }
@@ -342,7 +338,8 @@ impl NearVerifier {
             .peer_certificates()
             .and_then(|certificates| certificates.first())
             .context("NEAR TLS peer sent no certificate")?;
-        let live_spki = spki_sha256(peer_certificate.as_ref())?;
+        let live_spki = tee_evidence::spki_sha256(peer_certificate.as_ref())
+            .context("hash NEAR TLS certificate key")?;
         let (sender, connection) = http1::handshake(TokioIo::new(tls))
             .await
             .context("start HTTP/1.1 over NEAR TLS")?;
@@ -356,7 +353,7 @@ impl NearVerifier {
         target: NearTarget,
         live_spki: &[u8; 32],
     ) -> Result<()> {
-        let nonce = random_nonce();
+        let nonce = tee_evidence::random_nonce();
         let uri: Uri = format!(
             "/v1/attestation/report?include_tls_fingerprint=true&signing_algo=ed25519&nonce={}",
             hex::encode(nonce)
@@ -384,12 +381,14 @@ impl NearVerifier {
         let attestation: NearAttestation =
             serde_json::from_slice(&body).context("decode NEAR attestation response")?;
         let raw_quote = hex::decode(&attestation.intel_quote).context("decode NEAR TDX quote")?;
-        let verified = self
-            .collateral
-            .fetch_and_verify(&raw_quote)
+        let claims = tee_evidence::verify_quote(&self.collateral, &raw_quote)
             .await
             .context("verify NEAR TDX quote against Intel collateral")?;
-        let fields = attested_fields(&verified)?;
+        let td = tee_evidence::td_report(&claims.report).context("NEAR attestation")?;
+        let fields = AttestedFields {
+            report_data: &td.report_data,
+            mr_config_id: &td.mr_config_id,
+        };
         verify_identity(&attestation, target, &nonce, live_spki, fields)?;
         self.verify_gpu(&attestation, &nonce).await
     }
@@ -451,30 +450,8 @@ where
 }
 
 fn verify_nras_response(response: &Value) -> Result<()> {
-    let token = response
-        .as_array()
-        .and_then(|outer| outer.first())
-        .and_then(Value::as_array)
-        .and_then(|entry| entry.get(1))
-        .and_then(Value::as_str)
-        .context("NVIDIA NRAS response has no verdict token")?;
-    let payload_segment = token
-        .split('.')
-        .nth(1)
-        .context("NVIDIA NRAS verdict is not a JWT")?;
-    let verdict_bytes = URL_SAFE_NO_PAD
-        .decode(payload_segment)
-        .context("decode NVIDIA NRAS verdict payload")?;
-    let verdict: Value =
-        serde_json::from_slice(&verdict_bytes).context("parse NVIDIA NRAS verdict payload")?;
-    if verdict
-        .get("x-nvidia-overall-att-result")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
-        bail!("NVIDIA NRAS did not return a successful GPU attestation verdict");
-    }
-    Ok(())
+    let verdict = nras::unverified_claims(nras::aggregate_token(response)?)?;
+    nras::require_overall_success(&verdict)
 }
 
 // Runs before the attested connect: a selector on the wrong path must not spend
@@ -518,39 +495,6 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     ] {
         headers.remove(header);
     }
-}
-
-fn random_nonce() -> [u8; 32] {
-    let mut nonce = [0_u8; 32];
-    rand::rng().fill_bytes(&mut nonce);
-    nonce
-}
-
-fn spki_sha256(certificate_der: &[u8]) -> Result<[u8; 32]> {
-    let (_, certificate) = parse_x509_certificate(certificate_der)
-        .map_err(|error| anyhow::anyhow!("parse NEAR TLS certificate: {error}"))?;
-    Ok(Sha256::digest(certificate.public_key().raw).into())
-}
-
-fn attested_fields(report: &VerifiedReport) -> Result<AttestedFields<'_>> {
-    if report.status != "UpToDate" {
-        bail!(
-            "NEAR TDX status is {}, expected UpToDate (platform={}, qe={}, advisories={:?})",
-            report.status,
-            report.platform_status.status,
-            report.qe_status.status,
-            report.advisory_ids
-        );
-    }
-    let td = match &report.report {
-        Report::TD10(td) => td,
-        Report::TD15(td) => &td.base,
-        Report::SgxEnclave(_) => bail!("NEAR attestation is SGX, expected TDX"),
-    };
-    Ok(AttestedFields {
-        report_data: &td.report_data,
-        mr_config_id: &td.mr_config_id,
-    })
 }
 
 fn verify_identity(
@@ -641,6 +585,8 @@ pub fn error_response(error: &anyhow::Error) -> Response<Body> {
 )]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const FLUX_KLEIN_MODEL: &str = "black-forest-labs/FLUX.2-klein-4B";
