@@ -8,7 +8,7 @@
 //! Issued nonces are remembered outside the scopes, for their full validity,
 //! in a bounded ledger that refuses to issue when full.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -32,6 +32,12 @@ const NONCE_MARGIN: Duration = Duration::from_secs(5);
 const MAX_ADMISSIONS_PER_REQUEST: usize = 2;
 // A second discovery covers nonces that expired while an admission ran.
 const MAX_DISCOVERIES_PER_REQUEST: usize = 2;
+/// Discoveries per credential per minute, under Chutes' 10 rpm limit.
+pub const DISCOVERIES_PER_MINUTE: usize = 8;
+const DISCOVERY_WINDOW: Duration = Duration::from_secs(60);
+const BACKOFF_START: Duration = Duration::from_secs(5);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+const MAX_CREDENTIALS: usize = 4_096;
 
 /// Admission outcome for one discovered instance.
 #[derive(Debug)]
@@ -181,10 +187,17 @@ impl ChuteState {
         }
     }
 
-    fn refill(&mut self, discovery: Discovery, asked: Instant) {
-        let valid_until = asked + discovery.nonce_lifetime();
-        self.issue_until = Some(valid_until.checked_sub(NONCE_MARGIN).unwrap_or(asked));
-        self.valid_until = Some(valid_until);
+    // Issuance ends a margin before the lifetime counted from the request;
+    // retention runs a margin past the lifetime counted from the response, so
+    // it outlasts the validity Chutes advertises from when it made the nonces.
+    fn refill(&mut self, discovery: Discovery, asked: Instant, received: Instant) {
+        let lifetime = discovery.nonce_lifetime();
+        self.issue_until = Some(
+            (asked + lifetime)
+                .checked_sub(NONCE_MARGIN)
+                .unwrap_or(asked),
+        );
+        self.valid_until = Some(received + lifetime + NONCE_MARGIN);
         self.pool = discovery.instances;
     }
 
@@ -246,6 +259,110 @@ impl NonceLedger {
     }
 }
 
+/// Per-credential discovery rate, single-flight lock and per-chute backoff.
+#[derive(Default)]
+struct Budget {
+    in_flight: Arc<tokio::sync::Mutex<()>>,
+    recent: VecDeque<Instant>,
+    backoff: HashMap<&'static str, Backoff>,
+}
+
+struct Backoff {
+    until: Instant,
+    step: Duration,
+    cause: String,
+}
+
+impl Budget {
+    fn prune(&mut self, now: Instant) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| *at + DISCOVERY_WINDOW <= now)
+        {
+            self.recent.pop_front();
+        }
+        // A chute's backoff resets once it has gone two maximum steps without failing.
+        self.backoff
+            .retain(|_, backoff| backoff.until + 2 * BACKOFF_MAX > now);
+    }
+
+    fn idle(&self) -> bool {
+        self.recent.is_empty() && self.backoff.is_empty() && Arc::strong_count(&self.in_flight) == 1
+    }
+}
+
+#[derive(Default)]
+struct Discoveries {
+    budgets: Mutex<HashMap<[u8; 32], Budget>>,
+}
+
+impl Discoveries {
+    /// Claim one discovery for `chute_id`, returning the credential's
+    /// single-flight lock; fails fast while the chute backs off or the
+    /// credential's per-minute budget is spent.
+    fn claim(
+        &self,
+        credential: [u8; 32],
+        chute_id: &'static str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, ChutesError> {
+        let now = Instant::now();
+        let mut budgets = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+        budgets.retain(|_, budget| {
+            budget.prune(now);
+            !budget.idle()
+        });
+        if !budgets.contains_key(&credential) && budgets.len() >= MAX_CREDENTIALS {
+            return Err(ChutesError::Unavailable(anyhow::anyhow!(
+                "discovery budgets for {MAX_CREDENTIALS} credentials are in use"
+            )));
+        }
+        let budget = budgets.entry(credential).or_default();
+        if let Some(backoff) = budget
+            .backoff
+            .get(chute_id)
+            .filter(|backoff| backoff.until > now)
+        {
+            return Err(ChutesError::Unavailable(anyhow::anyhow!(
+                "discovery for chute {chute_id} is backing off after: {}",
+                backoff.cause
+            )));
+        }
+        if budget.recent.len() >= DISCOVERIES_PER_MINUTE {
+            return Err(ChutesError::Unavailable(anyhow::anyhow!(
+                "discovery budget of {DISCOVERIES_PER_MINUTE} per minute is spent"
+            )));
+        }
+        budget.recent.push_back(now);
+        Ok(Arc::clone(&budget.in_flight))
+    }
+
+    fn failed(&self, credential: [u8; 32], chute_id: &'static str, cause: String) {
+        let now = Instant::now();
+        let mut budgets = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+        let budget = budgets.entry(credential).or_default();
+        let step = budget
+            .backoff
+            .get(chute_id)
+            .map_or(BACKOFF_START, |backoff| (backoff.step * 2).min(BACKOFF_MAX));
+        budget.backoff.insert(
+            chute_id,
+            Backoff {
+                until: now + step,
+                step,
+                cause,
+            },
+        );
+    }
+
+    fn succeeded(&self, credential: [u8; 32], chute_id: &'static str) {
+        let mut budgets = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(budget) = budgets.get_mut(&credential) {
+            budget.backoff.remove(chute_id);
+        }
+    }
+}
+
 struct Scope {
     state: Arc<tokio::sync::Mutex<ChuteState>>,
     last_used: Instant,
@@ -264,6 +381,7 @@ pub struct Admissions<A> {
     scopes: Mutex<HashMap<ChuteScope, Scope>>,
     max_scopes: usize,
     ledger: Mutex<NonceLedger>,
+    discoveries: Discoveries,
 }
 
 impl<A: ChutesApi> Admissions<A> {
@@ -280,6 +398,7 @@ impl<A: ChutesApi> Admissions<A> {
                 issued: HashMap::new(),
                 capacity: max_nonces,
             }),
+            discoveries: Discoveries::default(),
         }
     }
 
@@ -316,25 +435,45 @@ impl<A: ChutesApi> Admissions<A> {
         api_key: &str,
         chute_id: &'static str,
     ) -> Result<Ticket, ChutesError> {
+        let credential = scope_of(api_key, chute_id).0;
         let mut discoveries = 0;
         let mut admissions = 0;
         loop {
             state.prune(Instant::now());
             if let Some(ticket) = state.take_ticket(&self.ledger, chute_id)? {
+                if discoveries > 0 {
+                    self.discoveries.succeeded(credential, chute_id);
+                }
                 return Ok(ticket);
             }
             let unjudged = state.unjudged();
+            // Rediscovering in the same request helps only when the pool is used up.
+            let may_discover = discoveries == 0 || state.pool.is_empty();
             if !unjudged.is_empty() && admissions < MAX_ADMISSIONS_PER_REQUEST {
                 admissions += 1;
                 let verdicts = self.api.admit(api_key, chute_id, &unjudged).await?;
                 state.record(verdicts, Instant::now());
-            } else if discoveries < MAX_DISCOVERIES_PER_REQUEST {
+            } else if may_discover && discoveries < MAX_DISCOVERIES_PER_REQUEST {
                 discoveries += 1;
+                let in_flight = self.discoveries.claim(credential, chute_id)?;
+                let _single_flight = in_flight.lock().await;
                 let asked = Instant::now();
-                let discovery = self.api.discover(api_key, chute_id).await?;
-                state.refill(discovery, asked);
+                let discovery =
+                    self.api
+                        .discover(api_key, chute_id)
+                        .await
+                        .inspect_err(|error| {
+                            self.discoveries
+                                .failed(credential, chute_id, error.to_string());
+                        })?;
+                state.refill(discovery, asked, Instant::now());
             } else {
-                return Err(state.exhausted(chute_id));
+                let error = state.exhausted(chute_id);
+                if discoveries > 0 {
+                    self.discoveries
+                        .failed(credential, chute_id, error.to_string());
+                }
+                return Err(error);
             }
         }
     }
@@ -424,6 +563,7 @@ pub(crate) mod tests {
         pub(crate) repeat_nonces: bool,
         pub(crate) failing_key: Option<&'static str>,
         pub(crate) slow_key: Option<&'static str>,
+        pub(crate) discover_delay: Duration,
         pub(crate) answer: Mutex<Option<Answer>>,
         pub(crate) invoked: Mutex<Vec<Invocation>>,
     }
@@ -445,6 +585,7 @@ pub(crate) mod tests {
                 repeat_nonces: false,
                 failing_key: None,
                 slow_key: None,
+                discover_delay: Duration::ZERO,
                 answer: Mutex::new(None),
                 invoked: Mutex::new(Vec::new()),
             }
@@ -461,6 +602,7 @@ pub(crate) mod tests {
                 });
             }
             let round = self.discoveries.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.discover_delay).await;
             let round = if self.repeat_nonces { 0 } else { round };
             let instances = self
                 .instances
@@ -755,7 +897,7 @@ pub(crate) mod tests {
         admissions.ticket("key", CHUTE).await.unwrap();
         tokio::time::advance(Duration::from_secs(57)).await;
         assert!(admissions.ticket("key", CHUTE).await.is_err());
-        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::time::advance(Duration::from_secs(9)).await;
         admissions.ticket("key", CHUTE).await.unwrap();
     }
 
@@ -791,7 +933,69 @@ pub(crate) mod tests {
         }
         let error = admissions.ticket("key", CHUTE).await.unwrap_err();
         assert!(error.to_string().contains("refusing"), "{error}");
-        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::advance(Duration::from_secs(66)).await;
+        admissions.ticket("key", CHUTE).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nonces_are_retained_past_validity_counted_from_the_response() {
+        let mut api = FakeApi::new(1);
+        api.repeat_nonces = true;
+        api.discover_delay = Duration::from_secs(2);
+        let (_, admissions) = cache(api);
+        admissions.ticket("key", CHUTE).await.unwrap();
+        admissions.ticket("key", CHUTE).await.unwrap();
+        // Issued from a response received at 2s with a 60s lifetime: Chutes
+        // accepts them until 62s, so a rediscovery at 61s must not reissue them.
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(admissions.ticket("key", CHUTE).await.is_err());
+        tokio::time::advance(Duration::from_secs(8)).await;
+        admissions.ticket("key", CHUTE).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_budget_is_shared_per_credential_and_fails_fast() {
+        let mut api = FakeApi::new(1);
+        api.nonces_per_instance = 1;
+        let (api, admissions) = cache(api);
+        for _ in 0..DISCOVERIES_PER_MINUTE {
+            admissions.ticket("key", CHUTE).await.unwrap();
+        }
+        let error = admissions.ticket("key", CHUTE).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.to_string().contains("budget"), "{error}");
+        assert_eq!(
+            api.discoveries.load(Ordering::SeqCst),
+            DISCOVERIES_PER_MINUTE
+        );
+        admissions.ticket("other-key", CHUTE).await.unwrap();
+        tokio::time::advance(DISCOVERY_WINDOW).await;
+        admissions.ticket("key", CHUTE).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chute_with_no_admissible_instance_backs_off() {
+        let api = FakeApi::new(1);
+        api.rejected.lock().unwrap().push("instance-0".to_owned());
+        let (api, admissions) = cache(api);
+        admissions.ticket("key", CHUTE).await.unwrap_err();
+        assert_eq!(api.discoveries.load(Ordering::SeqCst), 1);
+        let error = admissions.ticket("key", CHUTE).await.unwrap_err();
+        assert!(error.to_string().contains("backing off"), "{error}");
+        assert_eq!(api.discoveries.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(BACKOFF_START + REJECTION_TTL).await;
+        admissions.ticket("key", CHUTE).await.unwrap_err();
+        assert_eq!(api.discoveries.load(Ordering::SeqCst), 2);
+        tokio::time::advance(BACKOFF_START).await;
+        let error = admissions.ticket("key", CHUTE).await.unwrap_err();
+        assert!(
+            error.to_string().contains("backing off"),
+            "the backoff did not grow: {error}"
+        );
+
+        api.rejected.lock().unwrap().clear();
+        tokio::time::advance(REJECTION_TTL).await;
         admissions.ticket("key", CHUTE).await.unwrap();
     }
 }
