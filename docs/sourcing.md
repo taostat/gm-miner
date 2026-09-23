@@ -296,7 +296,8 @@ Each request is then encrypted end to end to an admitted instance's key and
 sent through Chutes' encrypted invocation endpoint; the response is released
 only after it authenticates under the per-request key. Admissions are reused
 for up to 15 minutes, within the evidence's own validity. Chutes routes whose
-model id does not end in `-TEE` keep the direct HTTPS path to `llm.chutes.ai`.
+model id does not end in `-TEE`, and requests the gateway marks as serving a
+non-confidential product, keep the direct HTTPS path to `llm.chutes.ai`.
 
 The verifier's chute list and measurement references are compiled into the
 measured image, so a new Chutes model or VM release is admitted after a new

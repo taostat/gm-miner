@@ -1247,7 +1247,11 @@ fn chutes_tee_selectors_reach_the_verification_proxy_with_the_selector_and_key()
         "zai-org/glm-5.2-tee",
         "unknown/Model-TEE",
     ] {
-        for extra in [vec![], vec![("x-gm-ordinary", "1")]] {
+        for extra in [
+            vec![],
+            vec![("x-gm-ordinary", "0")],
+            vec![("x-gm-ordinary", "true")],
+        ] {
             let mut headers = vec![("x-gm-upstream-model", selector)];
             headers.extend(extra);
             let forwarded = forward_chutes(&rendered, "/v1/chat/completions", &headers);
@@ -1303,6 +1307,27 @@ fn chutes_other_selectors_go_direct_without_gm_headers() {
         );
     }
     assert_tls(&config(&rendered), "chutes", "llm.chutes.ai");
+}
+
+#[test]
+fn chutes_ordinary_tee_selectors_go_direct_without_gm_headers() {
+    let rendered = chutes_config();
+    for selector in ["zai-org/GLM-5.2-TEE", "moonshotai/kimi-k3-tee"] {
+        let forwarded = forward_chutes(
+            &rendered,
+            "/v1/chat/completions",
+            &[("x-gm-upstream-model", selector), ("x-gm-ordinary", "1")],
+        );
+        assert_eq!(forwarded.status, None);
+        assert_eq!(forwarded.cluster, "chutes", "{selector}");
+        for (name, _) in &forwarded.headers {
+            assert!(!name.starts_with("x-gm-"), "{name} left for Chutes");
+        }
+        assert_eq!(
+            forwarded_header(&forwarded, "authorization"),
+            Some("Bearer chutes-key")
+        );
+    }
 }
 
 #[test]
