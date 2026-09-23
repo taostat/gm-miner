@@ -126,8 +126,27 @@ expect() {
   fi
 }
 
+# Waits for the access-log line of the request tagged `id` and checks it
+# contains every given `"field":value` fragment.
+expect_log() {
+  local container="$1" id="$2" line="" fragment
+  shift 2
+  for _ in $(seq 50); do
+    line="$(docker logs "${container}" 2>/dev/null | grep -F "\"request_id\":\"${id}\"" | tail -n 1)"
+    [[ -n "${line}" ]] && break
+    sleep 0.2
+  done
+  for fragment in "$@"; do
+    if [[ "${line}" != *"${fragment}"* ]]; then
+      echo "FAIL: chutes-runtime ${id}: access log lacks ${fragment}: '${line}'" >&2
+      return 1
+    fi
+  done
+  echo "ok: chutes-runtime ${id} access log"
+}
+
 chutes_runtime() {
-  local keyed empty port empty_port ok=0 tee='x-gm-upstream-model: zai-org/GLM-5.2-TEE'
+  local keyed empty port empty_port got ok=0 tee='x-gm-upstream-model: zai-org/GLM-5.2-TEE'
   keyed="$(serve c)"
   empty="$(serve '')"
   port="$(docker port "${keyed}" 8080/tcp | head -n 1 | sed 's/.*://')"
@@ -148,11 +167,25 @@ chutes_runtime() {
     "$(request "${port}" POST /v1/chat/completions \
       -H 'x-gm-upstream-model: zai-org/GLM-5.2, zai-org/GLM-5.2-TEE')" || ok=1
   expect "unreachable verifier" 503 "gm_chutes_verifier_unavailable" \
-    "$(request "${port}" POST /v1/chat/completions -H "${tee}")" || ok=1
-  expect "-TEE model list reaches the verifier" 503 "gm_chutes_verifier_unavailable" \
-    "$(request "${port}" GET /v1/models -H "${tee}")" || ok=1
-  expect "empty key" 503 "Chutes verifier unavailable" \
-    "$(request "${empty_port}" POST /v1/chat/completions -H "${tee}")" || ok=1
+    "$(request "${port}" POST /v1/chat/completions -H "${tee}" \
+      -H 'x-gm-request-id: unreachable')" || ok=1
+  expect_log "${keyed}" unreachable '"upstream_cluster":"chutes_verify_proxy"' \
+    '"response_flags":"UF"' || ok=1
+  expect "-TEE model list" 503 "gm_chutes_verifier_unavailable" \
+    "$(request "${port}" GET /v1/models -H "${tee}" -H 'x-gm-request-id: tee-models')" || ok=1
+  expect_log "${keyed}" tee-models '"upstream_cluster":"chutes_verify_proxy"' \
+    '"response_flags":"UF"' || ok=1
+  got="$(request "${empty_port}" POST /v1/chat/completions -H "${tee}" \
+    -H 'x-gm-request-id: empty-key')"
+  if [[ "${got}" == '503 {"error":"Chutes verifier unavailable"}' ]]; then
+    echo "ok: chutes-runtime empty key"
+  else
+    echo "FAIL: chutes-runtime empty key: got '${got}'" >&2
+    ok=1
+  fi
+  # Answered by the Lua guard: no upstream connection was attempted.
+  expect_log "${empty}" empty-key '"response_code_details":"lua_response"' \
+    '"response_flags":"-"' || ok=1
   docker stop "${keyed}" "${empty}" >/dev/null
   return "${ok}"
 }
