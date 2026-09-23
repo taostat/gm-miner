@@ -143,12 +143,12 @@ fn execute_lua(source: &str) {
 
 fn run_request(rendered: &str, headers: &[(&str, &str)], env: &[(&str, &str)]) -> Lua {
     let lua = Lua::new();
+    let list = lua.create_table().expect("header list");
+    for (index, (name, value)) in headers.iter().enumerate() {
+        list.set(index + 1, [*name, *value]).expect("header pair");
+    }
     lua.globals()
-        .set(
-            "input_headers",
-            lua.create_table_from(headers.iter().copied())
-                .expect("headers"),
-        )
+        .set("input_header_list", list)
         .expect("input headers");
     lua.globals()
         .set(
@@ -747,7 +747,7 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
                 .expect("removed headers")
                 .contains(&json!("x-gm-provider")));
             let routed_selector =
-                (provider == "near" || provider == "chutes") && path != "/v1/models";
+                (provider == "near" && path != "/v1/models") || provider == "chutes";
             assert_eq!(
                 headers
                     .get::<Option<String>>("x-gm-upstream-model")
@@ -1182,6 +1182,23 @@ struct Forwarded {
 /// Run the data-plane Lua on a request, select its route from the headers
 /// Lua leaves, and apply that route's header removals: what leaves Envoy.
 fn forward_chutes(rendered: &str, path: &str, extra: &[(&str, &str)]) -> Forwarded {
+    forward_chutes_with(
+        rendered,
+        path,
+        extra,
+        &[
+            ("CHUTES_API_KEY", "chutes-key"),
+            ("GM_CHUTES_KEY_SLOT_1", "chutes-key"),
+        ],
+    )
+}
+
+fn forward_chutes_with(
+    rendered: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+    env: &[(&str, &str)],
+) -> Forwarded {
     let mut input = vec![
         (":path", path),
         ("x-gm-provider", "chutes"),
@@ -1190,11 +1207,18 @@ fn forward_chutes(rendered: &str, path: &str, extra: &[(&str, &str)]) -> Forward
         ("authorization", "caller-secret"),
     ];
     input.extend_from_slice(extra);
-    let lua = run_request(rendered, &input, &[("GM_CHUTES_KEY_SLOT_1", "chutes-key")]);
+    let lua = run_request(rendered, &input, env);
     let status = lua
         .globals()
         .get::<Option<String>>("response_status")
         .expect("status");
+    if status.is_some() {
+        return Forwarded {
+            status,
+            cluster: String::new(),
+            headers: Vec::new(),
+        };
+    }
     let mut headers = lua
         .globals()
         .get::<mlua::Table>("input_headers")
@@ -1202,13 +1226,6 @@ fn forward_chutes(rendered: &str, path: &str, extra: &[(&str, &str)]) -> Forward
         .pairs::<String, String>()
         .map(|pair| pair.expect("header"))
         .collect::<Vec<_>>();
-    if status.is_some() {
-        return Forwarded {
-            status,
-            cluster: String::new(),
-            headers,
-        };
-    }
     let parsed = config(rendered);
     let selected = matching_route(&parsed, path, &headers);
     let removed = selected["request_headers_to_remove"]
@@ -1242,10 +1259,12 @@ fn forwarded_header<'a>(forwarded: &'a Forwarded, name: &str) -> Option<&'a str>
 #[test]
 fn chutes_tee_selectors_reach_the_verification_proxy_with_the_selector_and_key() {
     let rendered = chutes_config();
-    for selector in [
-        "zai-org/GLM-5.2-TEE",
-        "zai-org/glm-5.2-tee",
-        "unknown/Model-TEE",
+    for (path, selector) in [
+        ("/v1/chat/completions", "zai-org/GLM-5.2-TEE"),
+        ("/v1/chat/completions", "zai-org/glm-5.2-tee"),
+        ("/v1/chat/completions", "unknown/Model-TEE"),
+        ("/v1/models", "zai-org/GLM-5.2-TEE"),
+        ("/v1/completions", "zai-org/GLM-5.2-TEE"),
     ] {
         for extra in [
             vec![],
@@ -1254,9 +1273,12 @@ fn chutes_tee_selectors_reach_the_verification_proxy_with_the_selector_and_key()
         ] {
             let mut headers = vec![("x-gm-upstream-model", selector)];
             headers.extend(extra);
-            let forwarded = forward_chutes(&rendered, "/v1/chat/completions", &headers);
+            let forwarded = forward_chutes(&rendered, path, &headers);
             assert_eq!(forwarded.status, None);
-            assert_eq!(forwarded.cluster, "chutes_verify_proxy", "{selector}");
+            assert_eq!(
+                forwarded.cluster, "chutes_verify_proxy",
+                "{path} {selector}"
+            );
             assert_eq!(
                 forwarded_header(&forwarded, "x-gm-upstream-model"),
                 Some(selector)
@@ -1289,7 +1311,7 @@ fn chutes_other_selectors_go_direct_without_gm_headers() {
         ("/v1/chat/completions", Some("zai-org/GLM-5.2")),
         ("/v1/chat/completions", Some("zai-org/GLM-5.2-TEE-mirror")),
         ("/v1/models", None),
-        ("/v1/models", Some("zai-org/GLM-5.2-TEE")),
+        ("/v1/models", Some("zai-org/GLM-5.2")),
     ] {
         let mut headers = vec![("x-gm-ordinary", "1")];
         if let Some(selector) = selector {
@@ -1335,4 +1357,88 @@ fn chutes_chat_without_a_selector_is_refused() {
     let rendered = chutes_config();
     let forwarded = forward_chutes(&rendered, "/v1/chat/completions?x=1", &[]);
     assert_eq!(forwarded.status.as_deref(), Some("400"));
+}
+
+#[test]
+fn chutes_selector_must_be_one_value() {
+    let rendered = chutes_config();
+    let tee = "zai-org/GLM-5.2-TEE";
+    let open = "zai-org/GLM-5.2";
+    let joined = format!("{tee}, {open}");
+    let joined_reversed = format!("{open},{tee}");
+    for headers in [
+        vec![("x-gm-upstream-model", tee), ("x-gm-upstream-model", open)],
+        vec![("x-gm-upstream-model", open), ("x-gm-upstream-model", tee)],
+        vec![("x-gm-upstream-model", tee), ("X-GM-Upstream-Model", tee)],
+        vec![("x-gm-upstream-model", joined.as_str())],
+        vec![("x-gm-upstream-model", joined_reversed.as_str())],
+    ] {
+        for path in ["/v1/chat/completions", "/v1/models"] {
+            let forwarded = forward_chutes(&rendered, path, &headers);
+            assert_eq!(
+                forwarded.status.as_deref(),
+                Some("400"),
+                "{path} {headers:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn chutes_header_names_match_in_any_case() {
+    let rendered = chutes_config();
+    let forwarded = forward_chutes(
+        &rendered,
+        "/v1/chat/completions",
+        &[("X-GM-Upstream-Model", "zai-org/GLM-5.2-TEE")],
+    );
+    assert_eq!(forwarded.cluster, "chutes_verify_proxy");
+    assert_eq!(
+        forwarded_header(&forwarded, "x-gm-upstream-model"),
+        Some("zai-org/GLM-5.2-TEE")
+    );
+}
+
+#[test]
+fn chutes_requests_other_than_the_model_list_need_a_selector() {
+    let rendered = chutes_config();
+    for path in [
+        "/v1/chat/completions",
+        "/v1/chat/completions/",
+        "/v1//chat/completions",
+        "/V1/chat/completions",
+        "/v1/completions",
+        "/",
+    ] {
+        let forwarded = forward_chutes(&rendered, path, &[]);
+        assert_eq!(forwarded.status.as_deref(), Some("400"), "{path}");
+    }
+}
+
+#[test]
+fn chutes_tee_without_a_verifier_is_unavailable_never_direct() {
+    let rendered = chutes_config();
+    for extra in [
+        vec![("x-gm-upstream-model", "zai-org/GLM-5.2-TEE")],
+        vec![
+            ("x-gm-upstream-model", "zai-org/GLM-5.2-TEE"),
+            ("x-gm-upstream-slot", "slot-1"),
+        ],
+    ] {
+        for env in [vec![], vec![("GM_CHUTES_KEY_SLOT_1", "chutes-key")]] {
+            let forwarded = forward_chutes_with(&rendered, "/v1/chat/completions", &extra, &env);
+            assert_eq!(
+                forwarded.status.as_deref(),
+                Some("503"),
+                "{extra:?} {env:?}"
+            );
+        }
+    }
+    let direct = forward_chutes_with(
+        &rendered,
+        "/v1/chat/completions",
+        &[("x-gm-upstream-model", "zai-org/GLM-5.2")],
+        &[("GM_CHUTES_KEY_SLOT_1", "chutes-key")],
+    );
+    assert_eq!(direct.cluster, "chutes");
 }

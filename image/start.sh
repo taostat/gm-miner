@@ -523,8 +523,8 @@ if [[ -n "${NEAR_API_KEY:-}" ]]; then
 fi
 
 # ── Launch the Chutes verification proxy ──────────────────────────────
-# Envoy sends confidential Chutes requests (a `-TEE` selector without
-# `x-gm-ordinary: 1`) to this proxy on 127.0.0.1:8083. It admits instances
+# Envoy sends Chutes requests with a `-TEE` selector to this proxy on
+# 127.0.0.1:8083. It admits instances
 # per request credential on demand, so it has no startup dependency on
 # Chutes; supervision below brings the container down if it exits.
 if [[ -n "${CHUTES_API_KEY:-}" ]]; then

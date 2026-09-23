@@ -1,7 +1,33 @@
+-- Models Envoy's request header map: names are case-insensitive (stored
+-- lowercase) and a repeated header keeps every value; `get` joins them with
+-- "," and `getNumValues` counts them.
 local methods = {}
-function methods:get(name) return self[name] end
-function methods:remove(name) self[name] = nil end
-function methods:add(name, value) self[name] = value end
+function methods:get(name)
+  local value = rawget(self, name:lower())
+  if type(value) == "table" then return table.concat(value, ",") end
+  return value
+end
+function methods:getNumValues(name)
+  local value = rawget(self, name:lower())
+  if value == nil then return 0 end
+  if type(value) == "table" then return #value end
+  return 1
+end
+function methods:remove(name) rawset(self, name:lower(), nil) end
+function methods:add(name, value) rawset(self, name:lower(), value) end
+local collected = {}
+for _, pair in ipairs(input_header_list) do
+  local name, value = pair[1]:lower(), pair[2]
+  local existing = collected[name]
+  if existing == nil then
+    collected[name] = value
+  elseif type(existing) == "table" then
+    existing[#existing + 1] = value
+  else
+    collected[name] = {existing, value}
+  end
+end
+input_headers = collected
 local headers = setmetatable(input_headers, {__index = methods})
 local metadata = {}
 local metadata_api = {}
