@@ -74,6 +74,17 @@ impl Discovery {
                 instance.instance_id
             );
         }
+        let mut nonces = std::collections::HashSet::new();
+        for nonce in discovery
+            .instances
+            .iter()
+            .flat_map(|instance| &instance.nonces)
+        {
+            ensure!(
+                nonces.insert(nonce),
+                "Chutes discovery repeats an invocation nonce"
+            );
+        }
         Ok(discovery)
     }
 
@@ -200,7 +211,13 @@ fn check_attested_body(body: &[u8], row: &EvidenceRow, nonce_hex: &str) -> Resul
 }
 
 /// Require `report_data` to bind the nonce and instance key in its first half
-/// and the attestation proxy's TLS key in its second.
+/// and the evidence certificate's key in its second.
+///
+/// Only the first half carries confidentiality: it ties our nonce to the
+/// ML-KEM key requests are encrypted to. The second half proves the key of the
+/// certificate inside this evidence belongs to the attested VM. It is not a
+/// live TLS binding: requests go through Chutes' public relay, and no
+/// connection to the instance's attestation proxy exists to compare against.
 ///
 /// # Errors
 ///
@@ -216,7 +233,7 @@ pub fn check_report_data(
     );
     ensure!(
         report_data[32..] == spki_sha256[..],
-        "TDX report_data does not bind the attestation proxy TLS key"
+        "TDX report_data does not bind the evidence certificate key"
     );
     Ok(())
 }
@@ -277,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn report_data_must_bind_nonce_key_and_proxy_tls_key() {
+    fn report_data_must_bind_nonce_key_and_evidence_certificate_key() {
         let instance = Instance::new();
         let binding = key_binding(NONCE, &instance.public_b64);
         let spki = [7_u8; 32];
@@ -294,7 +311,7 @@ mod tests {
         assert!(check_report_data(&report_data, &swapped_key, &spki).is_err());
 
         let error = check_report_data(&report_data, &binding, &[8_u8; 32]).unwrap_err();
-        assert!(error.to_string().contains("TLS"), "{error:#}");
+        assert!(error.to_string().contains("certificate"), "{error:#}");
     }
 
     #[test]
@@ -305,28 +322,26 @@ mod tests {
 
     #[test]
     fn discovery_rejects_repeats_bad_keys_and_bad_lifetimes() {
-        let instance = Instance::new();
-        let entry = |id: &str, key: &str| serde_json::json!({"instance_id": id, "e2e_pubkey": key, "nonces": ["n1"]});
+        let (first, second) = (Instance::new(), Instance::new());
+        let entry = |id: &str, key: &str, nonces: &[&str]| serde_json::json!({"instance_id": id, "e2e_pubkey": key, "nonces": nonces});
         let body = |instances: Vec<Value>, lifetime: u64| {
             serde_json::json!({"instances": instances, "nonce_expires_in": lifetime}).to_string()
         };
-        let good = body(vec![entry("a", &instance.public_b64)], 60);
+        let a = |nonces: &[&str]| entry("a", &first.public_b64, nonces);
+        let b = |nonces: &[&str]| entry("b", &second.public_b64, nonces);
+        let good = body(vec![a(&["n1", "n2"]), b(&["n3"])], 60);
         assert_eq!(
             Discovery::parse(good.as_bytes()).unwrap().instances.len(),
-            1
+            2
         );
         for bad in [
             body(vec![], 60),
-            body(vec![entry("a", &instance.public_b64)], 0),
-            body(vec![entry("a", &instance.public_b64)], 600),
-            body(vec![entry("a", "AAAA")], 60),
-            body(
-                vec![
-                    entry("a", &instance.public_b64),
-                    entry("b", &instance.public_b64),
-                ],
-                60,
-            ),
+            body(vec![a(&["n1"])], 0),
+            body(vec![a(&["n1"])], 600),
+            body(vec![entry("a", "AAAA", &["n1"])], 60),
+            body(vec![a(&["n1"]), entry("b", &first.public_b64, &["n2"])], 60),
+            body(vec![a(&["n1", "n1"])], 60),
+            body(vec![a(&["n1"]), b(&["n1"])], 60),
         ] {
             assert!(Discovery::parse(bad.as_bytes()).is_err(), "{bad}");
         }

@@ -2,13 +2,15 @@
 
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use anyhow::{ensure, Context, Result};
 use async_trait::async_trait;
 use dcap_qvl::collateral::CollateralClient;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::chutes_verify::admission::{ChutesApi, Invocation, Verdict, ADMISSION_TTL};
+use crate::chutes_verify::admission::{deadline, ChutesApi, Invocation, Verdict};
 use crate::chutes_verify::error::ChutesError;
 use crate::chutes_verify::evidence::{self, DiscoveredInstance, Discovery, EvidenceResponse};
 use crate::chutes_verify::{references, CHAT_COMPLETIONS};
@@ -86,15 +88,16 @@ impl LiveChutes {
         })
     }
 
-    /// Verify one discovered instance against its evidence row, returning how
-    /// long the admission may be reused.
+    /// Verify one discovered instance against its evidence row, returning the
+    /// Unix second its evidence expires: the earliest of the NRAS tokens, the
+    /// proxy certificate and the Intel collateral.
     async fn admit_instance(
         &self,
         instance: &DiscoveredInstance,
         evidence: &EvidenceResponse,
         nonce_hex: &str,
         jwks: &Jwks,
-    ) -> Result<Duration> {
+    ) -> Result<u64> {
         let row = evidence
             .evidence
             .iter()
@@ -104,6 +107,10 @@ impl LiveChutes {
         let claims = tee_evidence::verify_quote(&self.collateral, &signed.quote).await?;
         let td = tee_evidence::td_report(&claims.report)?;
         let binding = evidence::key_binding(nonce_hex, &instance.e2e_pubkey);
+        // Confidentiality rests on the ML-KEM key bound in report_data[0..32].
+        // The second half only shows the evidence certificate's key lives in
+        // the attested VM: we reach Chutes' relay, never the instance proxy,
+        // so there is no live TLS peer to bind it to.
         evidence::check_report_data(&td.report_data, &binding, &signed.spki_sha256)?;
         let reference = references::match_td(references::published()?, td)?;
         let arch = reference.gpu_arch.with_context(|| {
@@ -138,7 +145,7 @@ impl LiveChutes {
             gpus = gpu_count,
             "Chutes instance admitted"
         );
-        Ok(Duration::from_secs(expires.saturating_sub(now)).min(ADMISSION_TTL))
+        Ok(expires)
     }
 }
 
@@ -194,6 +201,10 @@ impl ChutesApi for LiveChutes {
         chute_id: &str,
         instances: &[DiscoveredInstance],
     ) -> Result<Vec<Verdict>, ChutesError> {
+        // Deadlines are anchored before any network call, so a slow batch
+        // shortens later verdicts instead of extending earlier ones.
+        let anchor = Instant::now();
+        let anchor_unix = tee_evidence::unix_now().map_err(ChutesError::Unavailable)?;
         let nonce_hex = hex::encode(tee_evidence::random_nonce());
         let path = format!("/chutes/{chute_id}/evidence?nonce={nonce_hex}");
         let body = self
@@ -217,6 +228,7 @@ impl ChutesApi for LiveChutes {
             let outcome = self
                 .admit_instance(instance, &evidence, &nonce_hex, &jwks)
                 .await
+                .map(|expires| deadline(anchor, anchor_unix, expires))
                 .map_err(|error| {
                     warn!(instance = %instance.instance_id, cause = %format!("{error:#}"), "Chutes instance rejected");
                     format!("{error:#}")

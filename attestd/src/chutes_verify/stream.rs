@@ -5,7 +5,9 @@
 //! carries no counter, so drops and duplicates are undetectable and reordering
 //! is caught only when it makes usage fall. What is enforced is that the stream
 //! ends with the instance's own encrypted `[DONE]`, preceded by a content-free
-//! usage frame, and that cumulative usage never decreases.
+//! usage frame with billable counts, and that cumulative usage never decreases.
+//! Usage is released only with the authenticated `[DONE]`: running usage is
+//! stripped from content chunks and the terminal frame is held until then.
 
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
@@ -20,7 +22,8 @@ pub struct StreamDecryptor {
     stream_key: Option<StreamKey>,
     pending: Vec<u8>,
     usage_total: u64,
-    terminal_usage: bool,
+    /// The latest content-free usage frame, released only with `[DONE]`.
+    held_usage: Option<String>,
     done: bool,
 }
 
@@ -33,7 +36,7 @@ impl StreamDecryptor {
             stream_key: None,
             pending: Vec::new(),
             usage_total: 0,
-            terminal_usage: false,
+            held_usage: None,
             done: false,
         }
     }
@@ -110,18 +113,33 @@ impl StreamDecryptor {
             return Ok(());
         };
         if data == "[DONE]" {
-            ensure!(
-                self.terminal_usage,
-                "encrypted [DONE] without a preceding content-free usage frame"
-            );
+            let usage = self
+                .held_usage
+                .take()
+                .context("encrypted [DONE] without a preceding content-free usage frame")?;
+            emit(output, &usage);
+            emit(output, "[DONE]");
             self.done = true;
-        } else {
-            let chunk: Value = serde_json::from_str(data).context("decrypted chunk is not JSON")?;
-            self.check_chunk(&chunk)?;
+            return Ok(());
         }
-        output.extend_from_slice(b"data: ");
-        output.extend_from_slice(data.as_bytes());
-        output.extend_from_slice(b"\n\n");
+        let mut chunk: Value = serde_json::from_str(data).context("decrypted chunk is not JSON")?;
+        let usage = chunk.get("usage").filter(|usage| !usage.is_null());
+        let content_free = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if let (Some(usage), true) = (usage, content_free) {
+            require_billable(usage)?;
+            self.check_chunk(&chunk)?;
+            self.held_usage = Some(data.to_owned());
+            return Ok(());
+        }
+        self.check_chunk(&chunk)?;
+        self.held_usage = None;
+        if let Some(fields) = chunk.as_object_mut() {
+            fields.remove("usage");
+        }
+        emit(output, &chunk.to_string());
         Ok(())
     }
 
@@ -133,8 +151,7 @@ impl StreamDecryptor {
                 self.model
             );
         }
-        let usage = chunk.get("usage").filter(|usage| !usage.is_null());
-        if let Some(usage) = usage {
+        if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
             let total = usage_total(usage);
             ensure!(
                 total >= self.usage_total,
@@ -143,13 +160,35 @@ impl StreamDecryptor {
             );
             self.usage_total = total;
         }
-        let content_free = chunk
-            .get("choices")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty);
-        self.terminal_usage = usage.is_some() && content_free;
         Ok(())
     }
+}
+
+fn emit(output: &mut Vec<u8>, data: &str) {
+    output.extend_from_slice(b"data: ");
+    output.extend_from_slice(data.as_bytes());
+    output.extend_from_slice(b"\n\n");
+}
+
+/// The terminal usage frame is what the request is billed on: it must carry
+/// non-negative integer prompt and completion counts, and a total, if given,
+/// equal to their sum.
+fn require_billable(usage: &Value) -> Result<()> {
+    let count = |name: &str| {
+        usage
+            .get(name)
+            .and_then(Value::as_u64)
+            .with_context(|| format!("terminal usage has no integer {name}"))
+    };
+    let prompt = count("prompt_tokens")?;
+    let completion = count("completion_tokens")?;
+    if usage.get("total_tokens").is_some() {
+        ensure!(
+            Some(count("total_tokens")?) == prompt.checked_add(completion),
+            "terminal usage total_tokens is not prompt_tokens + completion_tokens"
+        );
+    }
+    Ok(())
 }
 
 fn usage_total(usage: &Value) -> u64 {
@@ -269,8 +308,14 @@ pub(crate) mod tests {
         let events = upstream.happy();
         let output = upstream.run(&events).unwrap();
         assert_eq!(released_contents(&output), ["Hel", "lo"]);
-        assert!(output.ends_with("data: [DONE]\n\n"));
+        let tail = format!("data: {}\n\ndata: [DONE]\n\n", usage_frame(12));
+        assert!(output.ends_with(&tail), "{output}");
         assert_eq!(output.matches("[DONE]").count(), 1);
+        assert_eq!(
+            output.matches("usage").count(),
+            1,
+            "running usage was forwarded"
+        );
         assert!(!output.contains("424242"), "relay plaintext usage leaked");
     }
 
@@ -398,5 +443,45 @@ pub(crate) mod tests {
             released_contents(&upstream.run(&events).unwrap()),
             ["Hel", "Hel", "lo"]
         );
+    }
+
+    #[test]
+    fn usage_is_held_until_the_encrypted_done_validates() {
+        let mut upstream = Upstream::new();
+        let events = upstream.happy();
+        let mut decryptor = upstream.decryptor.take().unwrap();
+        let mut before_done = Vec::new();
+        for event in &events[..5] {
+            before_done.extend(decryptor.feed(event.as_bytes()).unwrap());
+        }
+        let before_done = String::from_utf8(before_done).unwrap();
+        assert_eq!(released_contents(&before_done), ["Hel", "lo"]);
+        assert!(!before_done.contains("usage"), "{before_done}");
+        let after = String::from_utf8(decryptor.feed(events[5].as_bytes()).unwrap()).unwrap();
+        assert!(
+            after.starts_with(&format!("data: {}", usage_frame(12))),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_frame_without_billable_counts_aborts() {
+        for usage in [
+            serde_json::json!({}),
+            serde_json::json!({"prompt_tokens": 10}),
+            serde_json::json!({"prompt_tokens": 10, "completion_tokens": 2.5}),
+            serde_json::json!({"prompt_tokens": -1, "completion_tokens": 2}),
+            serde_json::json!({"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 99}),
+        ] {
+            let mut upstream = Upstream::new();
+            let mut events = upstream.happy();
+            let frame = serde_json::json!({"model": MODEL, "choices": [], "usage": usage});
+            events[4] = upstream.encrypted(&frame.to_string());
+            let error = upstream.run(&events).unwrap_err();
+            assert!(
+                error.to_string().contains("terminal usage"),
+                "{usage}: {error:#}"
+            );
+        }
     }
 }
