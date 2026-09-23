@@ -170,63 +170,55 @@ fn nras_request(gpu_evidence: &[Value], nonce_hex: &str, arch: &str) -> Result<V
 }
 
 const DETAIL_READ_BYTES: usize = 4096;
-const DETAIL_CHARS: usize = 200;
-const TOKEN_RUN: usize = 20;
-const WITHHELD: &str = "(detail withheld)";
+const DETAIL_WITHHELD: &str = "upstream detail withheld";
 
-/// The `detail` message of a Chutes error body, for operator logs only.
-async fn error_detail(mut response: reqwest::Response) -> String {
-    let mut body = Vec::new();
+// Chutes `detail` prefixes mapped to gm-authored log text; no body text is logged.
+const KNOWN_DETAILS: [(&str, &str); 7] = [
+    (
+        "Instances requires chutes_version >= 0.6.0",
+        "chute version below the evidence minimum",
+    ),
+    ("Rate limit exceeded", "Chutes rate limit reached"),
+    ("Chute not found", "chute not found"),
+    ("No active instances found", "chute has no active instances"),
+    (
+        "No E2E-capable instances",
+        "chute has no E2E-capable instances",
+    ),
+    ("Instance is at maximum capacity", "instance at capacity"),
+    (
+        "Instance has no deployment_id",
+        "instance not yet TEE-verified",
+    ),
+];
+
+/// A gm-authored description of a Chutes error body, for operator logs.
+async fn error_detail(mut response: reqwest::Response) -> &'static str {
+    let mut body = Vec::with_capacity(DETAIL_READ_BYTES);
     while body.len() < DETAIL_READ_BYTES {
         match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                let room = DETAIL_READ_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
             Ok(None) | Err(_) => break,
         }
     }
-    loggable_detail(&body)
+    describe_detail(&body)
 }
 
-/// The top-level JSON `detail` string when it passes an allow-list: printable
-/// ASCII, at most [`DETAIL_CHARS`] characters, no run of [`TOKEN_RUN`] or more
-/// token-like characters, and no mention of a key, token or bearer.
-/// Otherwise [`WITHHELD`], or nothing when the body carries no detail.
-fn loggable_detail(body: &[u8]) -> String {
-    let Some(detail) = serde_json::from_slice::<Value>(body)
+fn describe_detail(body: &[u8]) -> &'static str {
+    let detail = serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|value| value.get("detail")?.as_str().map(str::to_owned))
-    else {
-        return String::new();
-    };
-    let lower = detail.to_ascii_lowercase();
-    let allowed = detail.len() <= DETAIL_CHARS
-        && detail
-            .chars()
-            .all(|character| character == ' ' || character.is_ascii_graphic())
-        && longest_token_run(&detail) < TOKEN_RUN
-        && !["key", "token", "bearer"]
-            .iter()
-            .any(|word| lower.contains(word));
-    if allowed {
-        detail
-    } else {
-        WITHHELD.to_owned()
-    }
-}
-
-fn longest_token_run(text: &str) -> usize {
-    let token_like =
-        |character: char| character.is_ascii_alphanumeric() || "_-.=+/".contains(character);
-    let mut longest = 0;
-    let mut current = 0;
-    for character in text.chars() {
-        current = if token_like(character) {
-            current + 1
-        } else {
-            0
-        };
-        longest = longest.max(current);
-    }
-    longest
+        .and_then(|value| value.get("detail")?.as_str().map(str::to_owned));
+    detail
+        .and_then(|detail| {
+            KNOWN_DETAILS
+                .iter()
+                .find(|(prefix, _)| detail.starts_with(prefix))
+                .map(|(_, description)| *description)
+        })
+        .unwrap_or(DETAIL_WITHHELD)
 }
 
 async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -371,29 +363,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_an_allow_listed_detail_is_logged() {
-        let detail = |body: &str| loggable_detail(body.as_bytes());
+    fn known_details_map_to_fixed_text_and_all_else_is_withheld() {
+        let describe = |body: &str| describe_detail(body.as_bytes());
         assert_eq!(
-            detail(
+            describe(
                 r#"{"detail":"Instances requires chutes_version >= 0.6.0 to retrieve evidence."}"#
             ),
-            "Instances requires chutes_version >= 0.6.0 to retrieve evidence."
+            "chute version below the evidence minimum"
         );
-        assert_eq!(detail("plain text error"), "");
-        assert_eq!(detail(r#"{"message":"elsewhere"}"#), "");
-        assert_eq!(detail(r#"{"detail":{"nested":"x"}}"#), "");
+        assert_eq!(
+            describe(r#"{"detail":"Rate limit exceeded. Try again later."}"#),
+            "Chutes rate limit reached"
+        );
         for withheld in [
+            r#"{"detail":"invalid credential cpk_secret"}"#,
             r#"{"detail":"invalid credential cpk_\u0041bcdefghijklmnopqrstuvwxyz"}"#,
             r#"{"detail":"Authorization: Bearer abc"}"#,
-            r#"{"detail":"bad api key"}"#,
             r#"{"detail":"got eyJhbGciOiJFUzM4NCJ9.eyJzdWIiOiJ4In0 back"}"#,
-            r#"{"detail":"line\nbreak"}"#,
+            r#"{"detail":{"nested":"Rate limit exceeded"}}"#,
+            r#"{"message":"Rate limit exceeded"}"#,
+            "Rate limit exceeded",
+            "",
         ] {
-            assert_eq!(detail(withheld), WITHHELD, "{withheld}");
+            assert_eq!(describe(withheld), DETAIL_WITHHELD, "{withheld}");
         }
-        let long = format!(r#"{{"detail":"{}"}}"#, "word ".repeat(60));
-        assert_eq!(detail(&long), WITHHELD);
-        assert!(detail(&format!(r#"{{"detail":"{}"}}"#, "ab ".repeat(66))).len() <= DETAIL_CHARS);
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_read_limit_is_truncated_inside_a_chunk() {
+        let body = format!(
+            r#"{{"pad":"{}","detail":"Rate limit exceeded. Try again later."}}"#,
+            "x".repeat(5_000)
+        );
+        let (first, second) = body.as_bytes().split_at(3_000);
+        let chunks = vec![Ok::<_, std::io::Error>(first.to_vec()), Ok(second.to_vec())];
+        let response = axum::http::Response::builder()
+            .status(429)
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .unwrap();
+        let detail = error_detail(reqwest::Response::from(response)).await;
+        assert_eq!(detail, DETAIL_WITHHELD);
     }
 
     #[test]
