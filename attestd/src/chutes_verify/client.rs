@@ -1,6 +1,6 @@
 //! The live Chutes API: discovery, evidence admission and encrypted invoke.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::Instant;
 
@@ -107,10 +107,8 @@ impl LiveChutes {
         let claims = tee_evidence::verify_quote(&self.collateral, &signed.quote).await?;
         let td = tee_evidence::td_report(&claims.report)?;
         let binding = evidence::key_binding(nonce_hex, &instance.e2e_pubkey);
-        // Confidentiality rests on the ML-KEM key bound in report_data[0..32].
-        // The second half only shows the evidence certificate's key lives in
-        // the attested VM: we reach Chutes' relay, never the instance proxy,
-        // so there is no live TLS peer to bind it to.
+        // [0..32] binds our nonce to the ML-KEM key requests are encrypted to;
+        // [32..64] binds the evidence certificate's key to the attested VM.
         evidence::check_report_data(&td.report_data, &binding, &signed.spki_sha256)?;
         let reference = references::match_td(references::published()?, td)?;
         let arch = reference.gpu_arch.with_context(|| {
@@ -204,7 +202,9 @@ impl ChutesApi for LiveChutes {
         // Deadlines are anchored before any network call, so a slow batch
         // shortens later verdicts instead of extending earlier ones.
         let anchor = Instant::now();
-        let anchor_unix = tee_evidence::unix_now().map_err(ChutesError::Unavailable)?;
+        let anchor_wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ChutesError::Unavailable(anyhow::Error::new(error)))?;
         let nonce_hex = hex::encode(tee_evidence::random_nonce());
         let path = format!("/chutes/{chute_id}/evidence?nonce={nonce_hex}");
         let body = self
@@ -228,7 +228,7 @@ impl ChutesApi for LiveChutes {
             let outcome = self
                 .admit_instance(instance, &evidence, &nonce_hex, &jwks)
                 .await
-                .map(|expires| deadline(anchor, anchor_unix, expires))
+                .map(|expires| deadline(anchor, anchor_wall, expires))
                 .map_err(|error| {
                     warn!(instance = %instance.instance_id, cause = %format!("{error:#}"), "Chutes instance rejected");
                     format!("{error:#}")

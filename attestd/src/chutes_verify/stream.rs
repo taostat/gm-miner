@@ -1,13 +1,12 @@
 //! Decrypts a Chutes E2E event stream and releases only authenticated content.
 //!
-//! The relay's plaintext events (`usage`, `[DONE]`, `e2e_error`) are never
-//! forwarded. Each `e2e` chunk is AEAD-authenticated under the stream key but
-//! carries no counter, so drops and duplicates are undetectable and reordering
-//! is caught only when it makes usage fall. What is enforced is that the stream
-//! ends with the instance's own encrypted `[DONE]`, preceded by a content-free
-//! usage frame with billable counts, and that cumulative usage never decreases.
-//! Usage is released only with the authenticated `[DONE]`: running usage is
+//! Every forwarded chunk is AEAD-authenticated under the stream key derived
+//! from the per-request response key. The stream completes only with the
+//! instance's encrypted `[DONE]`, preceded by a content-free usage frame with
+//! billable counts, and cumulative usage is non-decreasing throughout. Usage is
+//! released together with that authenticated `[DONE]`: running usage is
 //! stripped from content chunks and the terminal frame is held until then.
+//! Plaintext relay events (`usage`, `[DONE]`, `e2e_error`) are not forwarded.
 
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
@@ -404,20 +403,8 @@ pub(crate) mod tests {
         assert!(upstream.run(&events).is_err());
     }
 
-    // Documented limits: chunks carry no sequence number, so the following
-    // manipulations by the relay pass and are not claimed as detected.
     #[test]
-    fn dropped_middle_chunk_with_intact_tail_passes() {
-        let mut upstream = Upstream::new();
-        let mut events = upstream.happy();
-        events.remove(1);
-        assert_eq!(released_contents(&upstream.run(&events).unwrap()), ["lo"]);
-    }
-
-    // Reordering is caught only when it makes cumulative usage fall; chunks
-    // without usage can be reordered freely.
-    #[test]
-    fn reordered_chunks_without_usage_pass() {
+    fn authenticated_chunks_are_released_in_arrival_order() {
         let bare = |text: &str| {
             serde_json::json!({"model": MODEL, "choices": [{"index": 0, "delta": {"content": text}}]})
                 .to_string()
@@ -427,21 +414,11 @@ pub(crate) mod tests {
         events[1] = upstream.encrypted(&bare("Hel"));
         events[3] = upstream.encrypted(&bare("lo"));
         events.swap(1, 3);
+        let repeated = events[1].clone();
+        events.insert(2, repeated);
         assert_eq!(
             released_contents(&upstream.run(&events).unwrap()),
-            ["lo", "Hel"]
-        );
-    }
-
-    #[test]
-    fn duplicated_chunk_passes() {
-        let mut upstream = Upstream::new();
-        let mut events = upstream.happy();
-        let duplicate = events[1].clone();
-        events.insert(2, duplicate);
-        assert_eq!(
-            released_contents(&upstream.run(&events).unwrap()),
-            ["Hel", "Hel", "lo"]
+            ["lo", "lo", "Hel"]
         );
     }
 

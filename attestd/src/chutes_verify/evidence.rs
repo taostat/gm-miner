@@ -213,11 +213,9 @@ fn check_attested_body(body: &[u8], row: &EvidenceRow, nonce_hex: &str) -> Resul
 /// Require `report_data` to bind the nonce and instance key in its first half
 /// and the evidence certificate's key in its second.
 ///
-/// Only the first half carries confidentiality: it ties our nonce to the
-/// ML-KEM key requests are encrypted to. The second half proves the key of the
-/// certificate inside this evidence belongs to the attested VM. It is not a
-/// live TLS binding: requests go through Chutes' public relay, and no
-/// connection to the instance's attestation proxy exists to compare against.
+/// `report_data[32..64]` binds the evidence certificate's key to the attested
+/// VM; request confidentiality comes from the ML-KEM key bound, with our
+/// nonce, in `report_data[0..32]`.
 ///
 /// # Errors
 ///

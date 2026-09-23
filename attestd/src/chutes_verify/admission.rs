@@ -3,7 +3,10 @@
 //! Chutes serves evidence under a small rate limit shared by every API
 //! caller, so an instance is admitted once and reused until its admission
 //! expires. Each chute has one lock: concurrent requests wait for a single
-//! discovery or admission instead of each spending an evidence call.
+//! discovery or admission instead of each spending an evidence call. A scope
+//! is evicted only while no request holds it, so its lock is never split.
+//! Issued nonces are remembered outside the scopes, for their full validity,
+//! in a bounded ledger that refuses to issue when full.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,6 +25,8 @@ pub const ADMISSION_TTL: Duration = Duration::from_secs(15 * 60);
 pub const REJECTION_TTL: Duration = Duration::from_secs(60);
 /// Most `(credential, chute)` scopes held; the least recently used goes first.
 pub const MAX_SCOPES: usize = 256;
+/// Most nonces remembered as issued; beyond it no nonce is issued.
+pub const MAX_ISSUED_NONCES: usize = 65_536;
 // Chutes' advertised nonce lifetime is shortened so a nonce is never sent as it expires.
 const NONCE_MARGIN: Duration = Duration::from_secs(5);
 const MAX_ADMISSIONS_PER_REQUEST: usize = 2;
@@ -38,11 +43,15 @@ pub struct Verdict {
 }
 
 /// The absolute deadline for evidence expiring at `expires_unix`, measured
-/// from `anchor` (taken at `anchor_unix`, before any evidence was fetched)
-/// and capped at [`ADMISSION_TTL`] after it.
+/// from `anchor`, taken when the wall clock read `anchor_wall` after the Unix
+/// epoch and before any evidence was fetched, and capped at [`ADMISSION_TTL`].
+/// Sub-second wall time is kept so the deadline never passes the expiry.
 #[must_use]
-pub fn deadline(anchor: Instant, anchor_unix: u64, expires_unix: u64) -> Instant {
-    anchor + Duration::from_secs(expires_unix.saturating_sub(anchor_unix)).min(ADMISSION_TTL)
+pub fn deadline(anchor: Instant, anchor_wall: Duration, expires_unix: u64) -> Instant {
+    anchor
+        + Duration::from_secs(expires_unix)
+            .saturating_sub(anchor_wall)
+            .min(ADMISSION_TTL)
 }
 
 /// One encrypted invocation of an admitted instance.
@@ -101,39 +110,50 @@ type ChuteScope = ([u8; 32], &'static str);
 #[derive(Default)]
 struct ChuteState {
     pool: Vec<DiscoveredInstance>,
-    pool_expires: Option<Instant>,
+    /// Last instant a pooled nonce is issued: its validity less a margin.
+    issue_until: Option<Instant>,
+    /// When the pooled nonces stop being valid at Chutes.
+    valid_until: Option<Instant>,
     admitted: HashMap<InstanceKey, Instant>,
     rejected: HashMap<InstanceKey, (Instant, String)>,
-    /// Nonces already handed out, kept until the pool they came from expires.
-    consumed: HashMap<String, Instant>,
 }
 
 impl ChuteState {
     fn prune(&mut self, now: Instant) {
         self.admitted.retain(|_, until| *until > now);
         self.rejected.retain(|_, (until, _)| *until > now);
-        self.consumed.retain(|_, until| *until > now);
-        if self.pool_expires.is_none_or(|expires| expires <= now) {
+        if self.issue_until.is_none_or(|until| until <= now) {
             self.pool.clear();
         }
         self.pool.retain(|instance| !instance.nonces.is_empty());
     }
 
     // Callers prune first, so every admission and nonce seen here is unexpired.
-    fn take_ticket(&mut self) -> Option<Ticket> {
-        let admitted = &self.admitted;
-        let instance = self
-            .pool
-            .iter_mut()
-            .find(|instance| admitted.contains_key(&key_of(instance)))?;
-        let nonce = instance.nonces.pop()?;
-        let pool_expires = self.pool_expires?;
-        self.consumed.insert(nonce.clone(), pool_expires);
-        Some(Ticket {
-            instance_id: instance.instance_id.clone(),
-            e2e_pubkey: instance.e2e_pubkey.clone(),
-            nonce,
-        })
+    fn take_ticket(
+        &mut self,
+        ledger: &Mutex<NonceLedger>,
+        chute_id: &'static str,
+    ) -> Result<Option<Ticket>, ChutesError> {
+        let Some(valid_until) = self.valid_until else {
+            return Ok(None);
+        };
+        let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+        ledger.prune(Instant::now());
+        for instance in &mut self.pool {
+            if !self.admitted.contains_key(&key_of(instance)) {
+                continue;
+            }
+            while let Some(nonce) = instance.nonces.pop() {
+                if ledger.record(chute_id, &nonce, valid_until)? {
+                    return Ok(Some(Ticket {
+                        instance_id: instance.instance_id.clone(),
+                        e2e_pubkey: instance.e2e_pubkey.clone(),
+                        nonce,
+                    }));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn unjudged(&self) -> Vec<DiscoveredInstance> {
@@ -162,15 +182,10 @@ impl ChuteState {
     }
 
     fn refill(&mut self, discovery: Discovery, asked: Instant) {
-        let lifetime = discovery.nonce_lifetime().saturating_sub(NONCE_MARGIN);
-        let consumed = &self.consumed;
+        let valid_until = asked + discovery.nonce_lifetime();
+        self.issue_until = Some(valid_until.checked_sub(NONCE_MARGIN).unwrap_or(asked));
+        self.valid_until = Some(valid_until);
         self.pool = discovery.instances;
-        for instance in &mut self.pool {
-            instance
-                .nonces
-                .retain(|nonce| !consumed.contains_key(nonce));
-        }
-        self.pool_expires = Some(asked + lifetime);
     }
 
     fn exhausted(&self, chute_id: &str) -> ChutesError {
@@ -195,22 +210,76 @@ fn key_of(instance: &DiscoveredInstance) -> InstanceKey {
     (instance.instance_id.clone(), instance.e2e_pubkey.clone())
 }
 
+/// Every nonce issued, per chute, until Chutes stops accepting it.
+struct NonceLedger {
+    issued: HashMap<(&'static str, String), Instant>,
+    capacity: usize,
+}
+
+impl NonceLedger {
+    fn prune(&mut self, now: Instant) {
+        self.issued.retain(|_, until| *until > now);
+        if self.issued.capacity() > 2 * self.issued.len() + 64 {
+            self.issued.shrink_to_fit();
+        }
+    }
+
+    /// Record `nonce` as issued; `false` when it already was.
+    fn record(
+        &mut self,
+        chute_id: &'static str,
+        nonce: &str,
+        valid_until: Instant,
+    ) -> Result<bool, ChutesError> {
+        let key = (chute_id, nonce.to_owned());
+        if self.issued.contains_key(&key) {
+            return Ok(false);
+        }
+        if self.issued.len() >= self.capacity {
+            return Err(ChutesError::Unavailable(anyhow::anyhow!(
+                "{} unexpired nonces already issued; refusing to issue more",
+                self.capacity
+            )));
+        }
+        self.issued.insert(key, valid_until);
+        Ok(true)
+    }
+}
+
 struct Scope {
     state: Arc<tokio::sync::Mutex<ChuteState>>,
     last_used: Instant,
+}
+
+impl Scope {
+    // The map holds one reference; any other is a request using the scope.
+    fn in_use(&self) -> bool {
+        Arc::strong_count(&self.state) > 1
+    }
 }
 
 /// Admission cache over a [`ChutesApi`].
 pub struct Admissions<A> {
     api: Arc<A>,
     scopes: Mutex<HashMap<ChuteScope, Scope>>,
+    max_scopes: usize,
+    ledger: Mutex<NonceLedger>,
 }
 
 impl<A: ChutesApi> Admissions<A> {
     pub fn new(api: Arc<A>) -> Self {
+        Self::with_limits(api, MAX_SCOPES, MAX_ISSUED_NONCES)
+    }
+
+    fn with_limits(api: Arc<A>, max_scopes: usize, max_nonces: usize) -> Self {
         Self {
             api,
             scopes: Mutex::new(HashMap::new()),
+            max_scopes,
+            ledger: Mutex::new(NonceLedger {
+                issued: HashMap::new(),
+                capacity: max_nonces,
+            }),
         }
     }
 
@@ -224,14 +293,15 @@ impl<A: ChutesApi> Admissions<A> {
     /// Returns the discovery or admission error, or [`ChutesError::Rejected`]
     /// with every instance's cause when none passed. Admissions already cached
     /// keep serving while evidence is unavailable. A scope left with no
-    /// admission after an error is dropped, so failing credentials are not kept.
+    /// admission after an error is dropped, so failing credentials are not
+    /// kept. Fails closed when every scope is in use or the nonce ledger is full.
     pub async fn ticket(
         &self,
         api_key: &str,
         chute_id: &'static str,
     ) -> Result<Ticket, ChutesError> {
         let scope = scope_of(api_key, chute_id);
-        let cell = self.scope(scope);
+        let cell = self.scope(scope)?;
         let mut state = cell.lock().await;
         let result = self.issue(&mut state, api_key, chute_id).await;
         if result.is_err() && state.admitted.is_empty() {
@@ -250,7 +320,7 @@ impl<A: ChutesApi> Admissions<A> {
         let mut admissions = 0;
         loop {
             state.prune(Instant::now());
-            if let Some(ticket) = state.take_ticket() {
+            if let Some(ticket) = state.take_ticket(&self.ledger, chute_id)? {
                 return Ok(ticket);
             }
             let unjudged = state.unjudged();
@@ -258,7 +328,7 @@ impl<A: ChutesApi> Admissions<A> {
                 admissions += 1;
                 let verdicts = self.api.admit(api_key, chute_id, &unjudged).await?;
                 state.record(verdicts, Instant::now());
-            } else if discoveries < MAX_DISCOVERIES_PER_REQUEST && state.pool.is_empty() {
+            } else if discoveries < MAX_DISCOVERIES_PER_REQUEST {
                 discoveries += 1;
                 let asked = Instant::now();
                 let discovery = self.api.discover(api_key, chute_id).await?;
@@ -269,32 +339,39 @@ impl<A: ChutesApi> Admissions<A> {
         }
     }
 
-    fn scope(&self, scope: ChuteScope) -> Arc<tokio::sync::Mutex<ChuteState>> {
+    fn scope(&self, scope: ChuteScope) -> Result<Arc<tokio::sync::Mutex<ChuteState>>, ChutesError> {
         let now = Instant::now();
         let mut scopes = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
-        scopes.retain(|_, held| held.last_used + ADMISSION_TTL > now);
-        if !scopes.contains_key(&scope) && scopes.len() >= MAX_SCOPES {
-            if let Some(oldest) = scopes
+        scopes.retain(|_, held| held.in_use() || held.last_used + ADMISSION_TTL > now);
+        if !scopes.contains_key(&scope) && scopes.len() >= self.max_scopes {
+            let idle = scopes
                 .iter()
+                .filter(|(_, held)| !held.in_use())
                 .min_by_key(|(_, held)| held.last_used)
                 .map(|(key, _)| *key)
-            {
-                scopes.remove(&oldest);
-            }
+                .ok_or_else(|| {
+                    ChutesError::Unavailable(anyhow::anyhow!(
+                        "all {} admission scopes are in use",
+                        self.max_scopes
+                    ))
+                })?;
+            scopes.remove(&idle);
         }
         let held = scopes.entry(scope).or_insert_with(|| Scope {
             state: Arc::default(),
             last_used: now,
         });
         held.last_used = now;
-        Arc::clone(&held.state)
+        Ok(Arc::clone(&held.state))
     }
 
     fn forget(&self, scope: ChuteScope, cell: &Arc<tokio::sync::Mutex<ChuteState>>) {
         let mut scopes = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
-        if scopes
-            .get(&scope)
-            .is_some_and(|held| Arc::ptr_eq(&held.state, cell))
+        // Only the map and this request hold it: no other request is waiting.
+        if Arc::strong_count(cell) == 2
+            && scopes
+                .get(&scope)
+                .is_some_and(|held| Arc::ptr_eq(&held.state, cell))
         {
             scopes.remove(&scope);
         }
@@ -306,6 +383,14 @@ impl<A: ChutesApi> Admissions<A> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
+    }
+
+    #[cfg(test)]
+    fn holds(&self, api_key: &str, chute_id: &'static str) -> bool {
+        self.scopes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&scope_of(api_key, chute_id))
     }
 }
 
@@ -338,6 +423,7 @@ pub(crate) mod tests {
         pub(crate) valid_for: Duration,
         pub(crate) repeat_nonces: bool,
         pub(crate) failing_key: Option<&'static str>,
+        pub(crate) slow_key: Option<&'static str>,
         pub(crate) answer: Mutex<Option<Answer>>,
         pub(crate) invoked: Mutex<Vec<Invocation>>,
     }
@@ -358,6 +444,7 @@ pub(crate) mod tests {
                 valid_for: ADMISSION_TTL,
                 repeat_nonces: false,
                 failing_key: None,
+                slow_key: None,
                 answer: Mutex::new(None),
                 invoked: Mutex::new(Vec::new()),
             }
@@ -396,13 +483,15 @@ pub(crate) mod tests {
 
         async fn admit(
             &self,
-            _: &str,
+            api_key: &str,
             _: &str,
             instances: &[DiscoveredInstance],
         ) -> Result<Vec<Verdict>, ChutesError> {
             self.admissions.fetch_add(1, Ordering::SeqCst);
             let anchor = Instant::now();
-            tokio::time::sleep(self.admit_delay).await;
+            if self.slow_key.is_none_or(|slow| slow == api_key) {
+                tokio::time::sleep(self.admit_delay).await;
+            }
             if let Err(status) = *self.evidence.lock().unwrap() {
                 return Err(ChutesError::Unavailable(anyhow::anyhow!(
                     "Chutes evidence answered {status}"
@@ -437,6 +526,18 @@ pub(crate) mod tests {
     fn cache(api: FakeApi) -> (Arc<FakeApi>, Admissions<FakeApi>) {
         let api = Arc::new(api);
         (Arc::clone(&api), Admissions::new(api))
+    }
+
+    fn cache_with(
+        api: FakeApi,
+        scopes: usize,
+        nonces: usize,
+    ) -> (Arc<FakeApi>, Admissions<FakeApi>) {
+        let api = Arc::new(api);
+        (
+            Arc::clone(&api),
+            Admissions::with_limits(api, scopes, nonces),
+        )
     }
 
     #[tokio::test(start_paused = true)]
@@ -557,14 +658,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn deadlines_are_measured_from_the_anchor_and_capped() {
+    fn deadlines_keep_sub_second_wall_time_and_are_capped() {
         let anchor = Instant::now();
+        let wall = |millis| Duration::from_millis(millis);
         assert_eq!(
-            deadline(anchor, 1_000, 1_060),
-            anchor + Duration::from_secs(60)
+            deadline(anchor, wall(1_000_900), 1_060),
+            anchor + Duration::from_millis(59_100)
         );
-        assert_eq!(deadline(anchor, 1_000, 900), anchor);
-        assert_eq!(deadline(anchor, 1_000, 1_000_000), anchor + ADMISSION_TTL);
+        assert_eq!(deadline(anchor, wall(1_000_000), 900), anchor);
+        assert_eq!(
+            deadline(anchor, wall(1_000_000), 1_000_000),
+            anchor + ADMISSION_TTL
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -608,5 +713,85 @@ pub(crate) mod tests {
         tokio::time::advance(ADMISSION_TTL).await;
         admissions.ticket("fresh", CHUTE).await.unwrap();
         assert_eq!(admissions.scope_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leftover_nonces_of_a_rejected_instance_do_not_block_a_refresh() {
+        let api = FakeApi::new(2);
+        api.rejected.lock().unwrap().push("instance-1".to_owned());
+        let (api, admissions) = cache(api);
+        for _ in 0..3 {
+            let ticket = admissions.ticket("key", CHUTE).await.unwrap();
+            assert_eq!(ticket.instance_id, "instance-0");
+        }
+        assert_eq!(api.discoveries.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issued_nonces_are_remembered_across_scope_eviction() {
+        let mut api = FakeApi::new(1);
+        api.repeat_nonces = true;
+        let (_, admissions) = cache_with(api, 2, MAX_ISSUED_NONCES);
+        admissions.ticket("a", CHUTE).await.unwrap();
+        admissions.ticket("a", CHUTE).await.unwrap();
+        for other in ["b", "c"] {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            admissions.ticket(other, CHUTE).await.unwrap_err();
+        }
+        assert!(
+            !admissions.holds("a", CHUTE),
+            "the idle scope was not evicted"
+        );
+        let error = admissions.ticket("a", CHUTE).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issued_nonces_are_remembered_for_their_full_validity() {
+        let mut api = FakeApi::new(1);
+        api.repeat_nonces = true;
+        let (_, admissions) = cache(api);
+        admissions.ticket("key", CHUTE).await.unwrap();
+        admissions.ticket("key", CHUTE).await.unwrap();
+        tokio::time::advance(Duration::from_secs(57)).await;
+        assert!(admissions.ticket("key", CHUTE).await.is_err());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        admissions.ticket("key", CHUTE).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scope_in_use_is_never_evicted() {
+        let mut api = FakeApi::new(1);
+        api.admit_delay = Duration::from_secs(10);
+        api.slow_key = Some("busy");
+        let (api, admissions) = cache_with(api, 1, MAX_ISSUED_NONCES);
+        let admissions = Arc::new(admissions);
+        let busy = {
+            let admissions = Arc::clone(&admissions);
+            tokio::spawn(async move { admissions.ticket("busy", CHUTE).await })
+        };
+        while api.admissions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let error = admissions.ticket("other", CHUTE).await.unwrap_err();
+        assert!(error.to_string().contains("in use"), "{error}");
+        assert!(admissions.holds("busy", CHUTE));
+        busy.await.unwrap().unwrap();
+        admissions.ticket("other", CHUTE).await.unwrap();
+        assert!(!admissions.holds("busy", CHUTE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_nonce_ledger_refuses_to_issue() {
+        let mut api = FakeApi::new(1);
+        api.nonces_per_instance = 5;
+        let (_, admissions) = cache_with(api, MAX_SCOPES, 3);
+        for _ in 0..3 {
+            admissions.ticket("key", CHUTE).await.unwrap();
+        }
+        let error = admissions.ticket("key", CHUTE).await.unwrap_err();
+        assert!(error.to_string().contains("refusing"), "{error}");
+        tokio::time::advance(Duration::from_secs(61)).await;
+        admissions.ticket("key", CHUTE).await.unwrap();
     }
 }

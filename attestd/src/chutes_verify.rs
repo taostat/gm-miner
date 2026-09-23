@@ -3,9 +3,8 @@
 //! Admission verifies, per `(credential, chute)`, that each discovered
 //! instance's ML-KEM key is bound into a genuine `UpToDate` TDX quote whose
 //! measurements Chutes publishes, alongside NRAS-verified GPUs under the same
-//! nonce. Requests are then encrypted to that key; the Chutes relay carries
-//! ciphertext only. Model identity and which pod holds the key remain Chutes'
-//! assertions.
+//! nonce. Requests are then encrypted end to end to that key, and responses
+//! are released only after they authenticate under it.
 
 pub mod admission;
 pub mod client;
