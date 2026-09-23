@@ -657,6 +657,7 @@ pub(crate) mod tests {
                 return Err(ChutesError::Upstream {
                     stage: "discovery",
                     status: StatusCode::UNAUTHORIZED,
+                    detail: String::new(),
                 });
             }
             let round = self.discoveries.fetch_add(1, Ordering::SeqCst);

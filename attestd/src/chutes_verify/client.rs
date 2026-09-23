@@ -81,7 +81,12 @@ impl LiveChutes {
             })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(ChutesError::Upstream { stage, status });
+            let detail = error_excerpt(response, api_key).await;
+            return Err(ChutesError::Upstream {
+                stage,
+                status,
+                detail,
+            });
         }
         read_bounded(response, limit).await.map_err(|error| {
             ChutesError::Unavailable(error.context(format!("read Chutes {stage}")))
@@ -167,6 +172,62 @@ fn nras_request(gpu_evidence: &[Value], nonce_hex: &str, arch: &str) -> Result<V
     }))
 }
 
+const EXCERPT_READ_BYTES: usize = 1024;
+const EXCERPT_CHARS: usize = 200;
+
+/// `": "` and a short excerpt of an error body, or nothing when it is empty.
+async fn error_excerpt(mut response: reqwest::Response, api_key: &str) -> String {
+    let mut body = Vec::new();
+    while body.len() < EXCERPT_READ_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body.truncate(EXCERPT_READ_BYTES);
+    let excerpt = sanitise_excerpt(&body, api_key);
+    if excerpt.is_empty() {
+        excerpt
+    } else {
+        format!(": {excerpt}")
+    }
+}
+
+/// Printable ASCII only, whitespace collapsed, the credential and any
+/// `cpk_` token redacted, at most [`EXCERPT_CHARS`] characters.
+fn sanitise_excerpt(body: &[u8], api_key: &str) -> String {
+    let mut text = String::from_utf8_lossy(body).into_owned();
+    if !api_key.is_empty() {
+        text = text.replace(api_key, "[redacted]");
+    }
+    let printable: String = text
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words = printable
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("cpk_") {
+                "[redacted]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if words.len() > EXCERPT_CHARS {
+        format!("{}...", &words[..EXCERPT_CHARS])
+    } else {
+        words
+    }
+}
+
 async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
@@ -211,9 +272,13 @@ impl ChutesApi for LiveChutes {
             .get(api_key, &path, "evidence", MAX_EVIDENCE_BYTES)
             .await
             .map_err(|error| match error {
-                ChutesError::Upstream { stage, status } => {
-                    ChutesError::Unavailable(anyhow::anyhow!("Chutes {stage} answered {status}"))
-                }
+                ChutesError::Upstream {
+                    stage,
+                    status,
+                    detail,
+                } => ChutesError::Unavailable(anyhow::anyhow!(
+                    "Chutes {stage} answered {status}{detail}"
+                )),
                 other => other,
             })?;
         let evidence: EvidenceResponse = serde_json::from_slice(&body)
@@ -307,6 +372,25 @@ pub async fn check_target_ids(targets: &[crate::chutes_verify::ChutesTarget]) ->
 #[expect(clippy::unwrap_used, reason = "test fixtures fail the test")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_excerpts_are_short_printable_and_redacted() {
+        let body =
+            br#"{"detail":"Instances requires chutes_version >= 0.6.0 to retrieve evidence."}"#;
+        assert_eq!(
+            sanitise_excerpt(body, "secret-key"),
+            r#"{"detail":"Instances requires chutes_version >= 0.6.0 to retrieve evidence."}"#
+        );
+        let leaky = "bad key secret-key and cpk_abc.def\n\u{7}\tend".as_bytes();
+        let excerpt = sanitise_excerpt(leaky, "secret-key");
+        assert_eq!(excerpt, "bad key [redacted] and [redacted] end");
+        let long = "x".repeat(5_000);
+        assert_eq!(
+            sanitise_excerpt(long.as_bytes(), "k").len(),
+            EXCERPT_CHARS + 3
+        );
+        assert_eq!(sanitise_excerpt(b"", "k"), "");
+    }
 
     #[test]
     fn nras_request_requires_the_reference_architecture() {

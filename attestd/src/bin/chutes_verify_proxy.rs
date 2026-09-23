@@ -14,6 +14,10 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 const BIND_ADDR: &str = "127.0.0.1:8083";
+/// Spaces `--verify-once` discoveries to stay within the per-minute budget.
+const DISCOVERY_SPACING: std::time::Duration = std::time::Duration::from_secs(
+    60 / gm_miner_attestd::chutes_verify::admission::DISCOVERIES_PER_MINUTE as u64 + 1,
+);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -59,7 +63,8 @@ async fn run() -> Result<()> {
 }
 
 /// Check every compiled target against Chutes' model list, then admit one
-/// instance of each (or of `--model`) with `CHUTES_API_KEY`, sending no inference.
+/// instance of each (or of `--model`) with `CHUTES_API_KEY`, spaced by
+/// [`DISCOVERY_SPACING`], sending no inference.
 async fn verify_once(model: Option<&str>) -> Result<()> {
     let targets = TARGETS
         .into_iter()
@@ -73,7 +78,10 @@ async fn verify_once(model: Option<&str>) -> Result<()> {
     let api_key = std::env::var("CHUTES_API_KEY").context("CHUTES_API_KEY is not set")?;
     let admissions = Admissions::new(Arc::new(LiveChutes::new()?));
     let mut failures = 0;
-    for target in targets {
+    for (index, target) in targets.into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(DISCOVERY_SPACING).await;
+        }
         match admissions.ticket(&api_key, target.chute_id).await {
             Ok(ticket) => info!(model = target.model, instance = %ticket.instance_id, "admitted"),
             Err(error) => {

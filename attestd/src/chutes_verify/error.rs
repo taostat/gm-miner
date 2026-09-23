@@ -14,10 +14,12 @@ pub enum ChutesError {
     #[error("the request carries no Chutes bearer credential")]
     MissingCredential,
     /// Chutes answered a non-success status; it is passed through.
-    #[error("Chutes {stage} answered {status}")]
+    /// `detail` is empty or `": "` plus a sanitised excerpt of Chutes' body.
+    #[error("Chutes {stage} answered {status}{detail}")]
     Upstream {
         stage: &'static str,
         status: StatusCode,
+        detail: String,
     },
     /// Admission could not run: an attestation or Chutes service was
     /// unreachable or refused, and no cached admission covers the chute.
@@ -82,6 +84,7 @@ mod tests {
         let response = ChutesError::Upstream {
             stage: "invoke",
             status: StatusCode::TOO_MANY_REQUESTS,
+            detail: String::new(),
         }
         .into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
