@@ -3,6 +3,12 @@ slots:
   auth_header: authorization
   auth_prefix: "Bearer "
 
+##  Routing on the gateway's selector (`x-gm-upstream-model`), in match order:
+##    1. a `-TEE` model goes to the co-located chutes-verify-proxy, which
+##       admits the instance on verified TDX and GPU evidence and encrypts
+##       the request end to end to its attested key;
+##    2. every other request goes to Chutes directly.
+##  The Lua filter answers a chat request without a selector with 400.
 routes:
   - match:
       prefix: "/"
@@ -10,6 +16,21 @@ routes:
         - name: "x-gm-provider"
           string_match:
             exact: "chutes"
+        - name: "x-gm-upstream-model"
+          string_match:
+            suffix: "-TEE"
+            ignore_case: true
+    route:
+      cluster: chutes_verify_proxy
+      timeout: 1800s
+  - match:
+      prefix: "/"
+      headers:
+        - name: "x-gm-provider"
+          string_match:
+            exact: "chutes"
+    request_headers_to_remove:
+      - x-gm-upstream-model
     route:
       cluster: chutes
       host_rewrite_literal: llm.chutes.ai
@@ -50,3 +71,15 @@ clusters:
               - san_type: DNS
                 matcher:
                   exact: llm.chutes.ai
+  - name: chutes_verify_proxy
+    type: STATIC
+    connect_timeout: 5s
+    load_assignment:
+      cluster_name: chutes_verify_proxy
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 8083

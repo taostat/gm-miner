@@ -746,19 +746,20 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
                 .as_array()
                 .expect("removed headers")
                 .contains(&json!("x-gm-provider")));
-            let near_model = provider == "near" && path != "/v1/models";
+            let routed_selector =
+                (provider == "near" || provider == "chutes") && path != "/v1/models";
             assert_eq!(
                 headers
                     .get::<Option<String>>("x-gm-upstream-model")
                     .expect("model"),
-                near_model.then(|| "Qwen/Qwen3.8-27B".to_owned())
+                routed_selector.then(|| "Qwen/Qwen3.8-27B".to_owned())
             );
             for pair in headers.pairs::<String, String>() {
                 let (name, _) = pair.expect("header");
                 assert!(
                     !name.starts_with("x-gm-")
                         || name == "x-gm-provider"
-                        || (near_model && name == "x-gm-upstream-model"),
+                        || (routed_selector && name == "x-gm-upstream-model"),
                     "{provider} leaked {name}"
                 );
             }
@@ -1118,4 +1119,195 @@ fn deepinfra_native_inference_preserves_path_and_disables_replay() {
             }
         }
     }
+}
+
+/// The route Envoy selects for a request: the first whose path and every
+/// header matcher (`exact`, or `suffix` with optional `ignore_case`) match.
+fn matching_route<'a>(config: &'a Value, path: &str, headers: &[(String, String)]) -> &'a Value {
+    let bare = path.split('?').next().expect("path");
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    ingress(config)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes")
+        .iter()
+        .find(|route| {
+            let target = &route["match"];
+            let path_matches = target["path"].as_str() == Some(bare)
+                || target["prefix"]
+                    .as_str()
+                    .is_some_and(|prefix| bare.starts_with(prefix))
+                || target["safe_regex"]["regex"]
+                    .as_str()
+                    .is_some_and(|pattern| {
+                        regex::Regex::new(pattern)
+                            .expect("route regex")
+                            .is_match(bare)
+                    });
+            path_matches
+                && target["headers"].as_array().is_none_or(|matchers| {
+                    matchers.iter().all(|matcher| {
+                        let name = matcher["name"].as_str().expect("header name");
+                        let rule = &matcher["string_match"];
+                        let Some(value) = header(name) else {
+                            return false;
+                        };
+                        if let Some(exact) = rule["exact"].as_str() {
+                            return value == exact;
+                        }
+                        let suffix = rule["suffix"].as_str().expect("suffix or exact matcher");
+                        if rule["ignore_case"] == true {
+                            value
+                                .to_ascii_lowercase()
+                                .ends_with(&suffix.to_ascii_lowercase())
+                        } else {
+                            value.ends_with(suffix)
+                        }
+                    })
+                })
+        })
+        .expect("matching route")
+}
+
+struct Forwarded {
+    status: Option<String>,
+    cluster: String,
+    headers: Vec<(String, String)>,
+}
+
+/// Run the data-plane Lua on a request, select its route from the headers
+/// Lua leaves, and apply that route's header removals: what leaves Envoy.
+fn forward_chutes(rendered: &str, path: &str, extra: &[(&str, &str)]) -> Forwarded {
+    let mut input = vec![
+        (":path", path),
+        ("x-gm-provider", "chutes"),
+        ("x-gm-node-key", "test-node-secret-0001"),
+        ("x-gm-request-id", "request-123"),
+        ("authorization", "caller-secret"),
+    ];
+    input.extend_from_slice(extra);
+    let lua = run_request(rendered, &input, &[("GM_CHUTES_KEY_SLOT_1", "chutes-key")]);
+    let status = lua
+        .globals()
+        .get::<Option<String>>("response_status")
+        .expect("status");
+    let mut headers = lua
+        .globals()
+        .get::<mlua::Table>("input_headers")
+        .expect("headers")
+        .pairs::<String, String>()
+        .map(|pair| pair.expect("header"))
+        .collect::<Vec<_>>();
+    if status.is_some() {
+        return Forwarded {
+            status,
+            cluster: String::new(),
+            headers,
+        };
+    }
+    let parsed = config(rendered);
+    let selected = matching_route(&parsed, path, &headers);
+    let removed = selected["request_headers_to_remove"]
+        .as_array()
+        .expect("removed headers");
+    headers.retain(|(name, _)| !removed.contains(&json!(name)));
+    Forwarded {
+        status,
+        cluster: selected["route"]["cluster"]
+            .as_str()
+            .expect("cluster")
+            .to_owned(),
+        headers,
+    }
+}
+
+fn chutes_config() -> String {
+    let (status, _, stderr, rendered) = render_envoy([("CHUTES_API_KEY", "chutes-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    rendered
+}
+
+fn forwarded_header<'a>(forwarded: &'a Forwarded, name: &str) -> Option<&'a str> {
+    forwarded
+        .headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+#[test]
+fn chutes_tee_selectors_reach_the_verification_proxy_with_the_selector_and_key() {
+    let rendered = chutes_config();
+    for selector in [
+        "zai-org/GLM-5.2-TEE",
+        "zai-org/glm-5.2-tee",
+        "unknown/Model-TEE",
+    ] {
+        for extra in [vec![], vec![("x-gm-ordinary", "1")]] {
+            let mut headers = vec![("x-gm-upstream-model", selector)];
+            headers.extend(extra);
+            let forwarded = forward_chutes(&rendered, "/v1/chat/completions", &headers);
+            assert_eq!(forwarded.status, None);
+            assert_eq!(forwarded.cluster, "chutes_verify_proxy", "{selector}");
+            assert_eq!(
+                forwarded_header(&forwarded, "x-gm-upstream-model"),
+                Some(selector)
+            );
+            assert_eq!(
+                forwarded_header(&forwarded, "authorization"),
+                Some("Bearer chutes-key")
+            );
+            for (name, _) in &forwarded.headers {
+                assert!(
+                    !name.starts_with("x-gm-") || name == "x-gm-upstream-model",
+                    "{name} reached the proxy"
+                );
+            }
+        }
+    }
+    let parsed = config(&rendered);
+    let proxy = cluster(&parsed, "chutes_verify_proxy");
+    assert_eq!(
+        proxy["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]["address"]
+            ["socket_address"],
+        json!({"address": "127.0.0.1", "port_value": 8083})
+    );
+}
+
+#[test]
+fn chutes_other_selectors_go_direct_without_gm_headers() {
+    let rendered = chutes_config();
+    for (path, selector) in [
+        ("/v1/chat/completions", Some("zai-org/GLM-5.2")),
+        ("/v1/chat/completions", Some("zai-org/GLM-5.2-TEE-mirror")),
+        ("/v1/models", None),
+        ("/v1/models", Some("zai-org/GLM-5.2-TEE")),
+    ] {
+        let mut headers = vec![("x-gm-ordinary", "1")];
+        if let Some(selector) = selector {
+            headers.push(("x-gm-upstream-model", selector));
+        }
+        let forwarded = forward_chutes(&rendered, path, &headers);
+        assert_eq!(forwarded.status, None, "{path} {selector:?}");
+        assert_eq!(forwarded.cluster, "chutes", "{path} {selector:?}");
+        for (name, _) in &forwarded.headers {
+            assert!(!name.starts_with("x-gm-"), "{name} left for Chutes");
+        }
+        assert_eq!(
+            forwarded_header(&forwarded, "authorization"),
+            Some("Bearer chutes-key")
+        );
+    }
+    assert_tls(&config(&rendered), "chutes", "llm.chutes.ai");
+}
+
+#[test]
+fn chutes_chat_without_a_selector_is_refused() {
+    let rendered = chutes_config();
+    let forwarded = forward_chutes(&rendered, "/v1/chat/completions?x=1", &[]);
+    assert_eq!(forwarded.status.as_deref(), Some("400"));
 }

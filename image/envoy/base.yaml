@@ -219,13 +219,15 @@ static_resources:
 
                           local function strip_internal_headers(headers, provider)
                             -- Envoy forbids header mutation during iteration. Keep the
-                            -- route discriminator until route actions remove it, and
-                            -- NEAR's validated selector until its loopback verifier.
+                            -- route discriminator until route actions remove it,
+                            -- NEAR's validated selector until its loopback verifier,
+                            -- and Chutes' selector, which chooses its route.
                             local names = {}
                             for name in pairs(headers) do
                               if name:sub(1, 5) == "x-gm-"
                                 and name ~= "x-gm-provider"
-                                and not (provider == "near" and name == "x-gm-upstream-model") then
+                                and not ((provider == "near" or provider == "chutes")
+                                  and name == "x-gm-upstream-model") then
                                 names[#names + 1] = name
                               end
                             end
@@ -369,8 +371,16 @@ static_resources:
                               headers:remove("x-envoy-max-retries")
                               headers:remove("x-envoy-hedge-on-per-try-timeout")
                             end
-                            if provider ~= "near" or bare == "/v1/models" then
+                            if (provider ~= "near" and provider ~= "chutes") or bare == "/v1/models" then
                               headers:remove("x-gm-upstream-model")
+                            end
+                            if provider == "chutes" and bare == "/v1/chat/completions"
+                              and headers:get("x-gm-upstream-model") == nil then
+                              handle:respond(
+                                {[":status"] = "400",
+                                 ["content-type"] = "application/json"},
+                                "{\"error\":\"missing Chutes source model\"}")
+                              return
                             end
                             if provider == "near" and bare ~= "/v1/models" then
                               local model = headers:get("x-gm-upstream-model")

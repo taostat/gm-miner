@@ -18,7 +18,11 @@
 #   3. gm-near-verify-proxy (when NEAR_API_KEY is configured) — verifies
 #      nonce-bound TDX, GPU, model and live TLS-key evidence on the exact
 #      upstream connection used for each NEAR inference request.
-#   4. envoy — the data plane on :8080. Terminates RA-TLS with the
+#   4. gm-chutes-verify-proxy (when CHUTES_API_KEY is configured) — admits
+#      Chutes instances on verified TDX, GPU and measurement evidence and
+#      carries confidential Chutes requests end to end encrypted to the
+#      admitted instance key.
+#   5. envoy — the data plane on :8080. Terminates RA-TLS with the
 #      minted certificate, proxies provider inference traffic and the
 #      registry's x-gm-provider capability probes, and forwards
 #      /attestation/info to the attestation server.
@@ -42,7 +46,7 @@
 # stays PID 1 and watches all of them. When any exits the
 # whole container exits non-zero so the runtime's `restart:
 # unless-stopped` policy recreates the stack — a miner missing Envoy,
-# attestd, or the configured NEAR verifier cannot serve the registry, so crashing fast and recovering is
+# attestd, or a configured NEAR or Chutes verifier cannot serve the registry, so crashing fast and recovering is
 # the correct behaviour. The exit log names which process died and its
 # status, so a genuine crash is diagnosable from `phala cvms logs`.
 
@@ -484,6 +488,7 @@ log "RA-TLS certificate ready"
 # Install the trap before starting children: Azure readiness can take time,
 # and PID 1 must forward termination even while the data plane is disabled.
 NEAR_PROXY_PID=""
+CHUTES_PROXY_PID=""
 ATTESTD_PID=""
 ENVOY_PID=""
 # shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
@@ -491,7 +496,7 @@ shutdown() {
   log "received signal — shutting down"
   local -a pids=()
   local pid
-  for pid in "${ENVOY_PID}" "${ATTESTD_PID}" "${NEAR_PROXY_PID}"; do
+  for pid in "${ENVOY_PID}" "${ATTESTD_PID}" "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}"; do
     if [[ -n "${pid}" ]]; then
       pids+=("${pid}")
     fi
@@ -517,6 +522,17 @@ if [[ -n "${NEAR_API_KEY:-}" ]]; then
   NEAR_PROXY_PID=$!
 fi
 
+# ── Launch the Chutes verification proxy ──────────────────────────────
+# Envoy sends confidential Chutes requests (a `-TEE` selector without
+# `x-gm-ordinary: 1`) to this proxy on 127.0.0.1:8083. It admits instances
+# per request credential on demand, so it has no startup dependency on
+# Chutes; supervision below brings the container down if it exits.
+if [[ -n "${CHUTES_API_KEY:-}" ]]; then
+  log "starting Chutes verification proxy on 127.0.0.1:8083"
+  gm-chutes-verify-proxy &
+  CHUTES_PROXY_PID=$!
+fi
+
 # ── Launch the attestation server ─────────────────────────────────────
 # gm-miner-attestd binds 127.0.0.1:8081 (envoy's `attestd` cluster
 # target) and fetches TDX quotes over /var/run/dstack.sock. The socket
@@ -535,9 +551,11 @@ if [[ "${AZURE_ENABLED}" -eq 1 ]]; then
     if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
       wait "${ATTESTD_PID}" || true
       log "error: attestation server exited before Azure readiness"
-      if [[ -n "${NEAR_PROXY_PID}" ]]; then
-        kill -TERM "${NEAR_PROXY_PID}" 2>/dev/null || true
-      fi
+      for pid in "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}"; do
+        if [[ -n "${pid}" ]]; then
+          kill -TERM "${pid}" 2>/dev/null || true
+        fi
+      done
       exit 1
     fi
     sleep 0.1
@@ -546,7 +564,7 @@ fi
 
 # ── Launch envoy ──────────────────────────────────────────────────────
 # Not `exec`d: the script stays PID 1 so it can supervise the attestation
-# server, optional NEAR verifier, and Envoy. SIGTERM from the container runtime is
+# server, optional NEAR and Chutes verifiers, and Envoy. SIGTERM from the container runtime is
 # forwarded to every child.
 log "starting envoy"
 envoy \
@@ -562,7 +580,8 @@ ENVOY_PID=$!
 # keeps the startup/supervision integration tests honest. Whichever process
 # exits first, the container must come down so the runtime's
 # `restart: unless-stopped` policy recreates the whole stack: a miner
-# missing Envoy, attestd, or the configured NEAR verifier cannot serve the registry.
+# missing Envoy, attestd, or a configured NEAR or Chutes verifier cannot serve
+# the registry.
 #
 # `|| FIRST_EXIT_STATUS=$?` captures the exited child's status AND keeps
 # `set -e` from aborting the script the instant a process exits
@@ -573,6 +592,9 @@ FIRST_EXIT_PID=""
 SUPERVISED_PIDS=("${ATTESTD_PID}" "${ENVOY_PID}")
 if [[ -n "${NEAR_PROXY_PID}" ]]; then
   SUPERVISED_PIDS+=("${NEAR_PROXY_PID}")
+fi
+if [[ -n "${CHUTES_PROXY_PID}" ]]; then
+  SUPERVISED_PIDS+=("${CHUTES_PROXY_PID}")
 fi
 while [[ -z "${FIRST_EXIT_PID}" ]]; do
   RUNNING_PIDS=" $(jobs -pr | tr '\n' ' ') "
@@ -593,6 +615,8 @@ if [[ "${FIRST_EXIT_PID}" == "${ATTESTD_PID}" ]]; then
   log "error: attestation server exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 elif [[ -n "${NEAR_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${NEAR_PROXY_PID}" ]]; then
   log "error: NEAR verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
+elif [[ -n "${CHUTES_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${CHUTES_PROXY_PID}" ]]; then
+  log "error: Chutes verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 elif [[ "${FIRST_EXIT_PID}" == "${ENVOY_PID}" ]]; then
   log "error: envoy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 else

@@ -85,7 +85,7 @@ These apply to every provider route unless its file says otherwise.
   - A body larger than the connection buffer cannot be replayed, so Envoy
     skips that retry.
 - **No retry** on non-idempotent paths (DeepInfra `/v1/inference/`, KubeTEE
-  image generation), on the loopback NEAR and attestation routes (a retry
+  image generation), on the loopback NEAR, Chutes-verifier and attestation routes (a retry
   would mask a local failure), or on benchmark (it would distort the
   measurement). The Lua filter also strips caller-supplied `x-envoy-retry-*`
   headers on the two non-idempotent paths.

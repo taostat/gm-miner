@@ -77,10 +77,11 @@ pub struct AdminImageVersionRequest {
 
 /// Features this release's image supports. Stamped verbatim onto every
 /// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 3] = [
+pub const IMAGE_FEATURES: [&str; 4] = [
     "upstream-key-slots",
     "upstream-model-hop",
     "deepinfra-native-images",
+    "chutes-verified-chat",
 ];
 
 /// The git provenance stamped onto a published version.
@@ -439,7 +440,8 @@ mod tests {
             serde_json::json!([
                 "upstream-key-slots",
                 "upstream-model-hop",
-                "deepinfra-native-images"
+                "deepinfra-native-images",
+                "chutes-verified-chat"
             ]),
         );
     }

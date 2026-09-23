@@ -278,6 +278,30 @@ image. Adding a NEAR model therefore requires a new image build and the normal
 registry image-approval process; changing a CLI catalog row alone cannot make an
 arbitrary NEAR host reachable.
 
+### Chutes TEE verification
+
+With a Chutes key set, the image runs a co-located Chutes verifier, and every
+`chutes/...-TEE` route is served through it. Before the first request to a
+chute, the verifier fetches Chutes' signed evidence for the instances Chutes
+offers under a fresh nonce and admits an instance when:
+
+- its Intel TDX quote verifies at `UpToDate` TCB with the debug bit clear;
+- the quote's `report_data` binds that nonce to the instance's end-to-end
+  encryption key, and binds the key of the certificate that signed the evidence;
+- its MRTD and runtime RTMR0-3 match a VM release Chutes publishes, from the
+  measurement list compiled into this image;
+- NVIDIA's attestation service verifies its GPUs under the same nonce.
+
+Each request is then encrypted end to end to an admitted instance's key and
+sent through Chutes' encrypted invocation endpoint; the response is released
+only after it authenticates under the per-request key. Admissions are reused
+for up to 15 minutes, within the evidence's own validity. Chutes routes whose
+model id does not end in `-TEE` keep the direct HTTPS path to `llm.chutes.ai`.
+
+The verifier's chute list and measurement references are compiled into the
+measured image, so a new Chutes model or VM release is admitted after a new
+image build and the normal image-approval process.
+
 `gmcli sources` prints this line for you, pre-filled, for every undeclared route
 where declaring it would actually get you somewhere — one a worker already
 serves, or any route under a provider you have no live offer under. It stays

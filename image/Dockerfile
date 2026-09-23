@@ -38,14 +38,15 @@ COPY azure-verify/Cargo.toml ./azure-verify/
 COPY dstack/ ./dstack/
 
 ## Pre-build a dummy workspace to cache dependencies. The attestd crate
-## ships a lib and three bins (gm-miner-attestd, gm-miner-ratls, and the
-## fail-closed NEAR verification proxy), so the
-## dummy tree needs an entry file for each declared target.
+## ships a lib and four bins (gm-miner-attestd, gm-miner-ratls, and the
+## NEAR and Chutes verification proxies), so the dummy tree needs an entry
+## file for each declared target.
 RUN mkdir -p cli/src attestd/src/bin azure-verify/src \
   && echo "fn main() {}" > cli/src/main.rs \
   && echo "fn main() {}" > attestd/src/main.rs \
   && echo "fn main() {}" > attestd/src/bin/ratls.rs \
   && echo "fn main() {}" > attestd/src/bin/near_verify_proxy.rs \
+  && echo "fn main() {}" > attestd/src/bin/chutes_verify_proxy.rs \
   && echo "" > attestd/src/lib.rs \
   && echo "" > azure-verify/src/lib.rs \
   && cargo build --release --workspace 2>/dev/null || true \
@@ -60,10 +61,12 @@ COPY azure-verify/ ./azure-verify/
 ## build cache so the real sources compile.
 RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
     attestd/src/bin/ratls.rs attestd/src/bin/near_verify_proxy.rs \
+    attestd/src/bin/chutes_verify_proxy.rs \
     azure-verify/src/lib.rs \
   && cargo build --release --workspace \
   && strip target/release/gmcli target/release/gm-miner-attestd \
-    target/release/gm-miner-ratls target/release/gm-near-verify-proxy
+    target/release/gm-miner-ratls target/release/gm-near-verify-proxy \
+    target/release/gm-chutes-verify-proxy
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
 ## Pin the base by digest so a mutable tag cannot change the attested runtime.
@@ -92,6 +95,10 @@ COPY --from=builder /build/target/release/gm-miner-ratls /usr/local/bin/gm-miner
 ## Copy the NEAR verifier. It attests and forwards each NEAR inference over
 ## one exact TLS connection; Envoy never has a direct NEAR origin route.
 COPY --from=builder /build/target/release/gm-near-verify-proxy /usr/local/bin/gm-near-verify-proxy
+
+## Copy the Chutes verifier. It admits Chutes instances on verified evidence
+## and carries confidential requests end to end encrypted to them.
+COPY --from=builder /build/target/release/gm-chutes-verify-proxy /usr/local/bin/gm-chutes-verify-proxy
 
 ## Copy the Envoy config templates; start.sh renders them with gmcli render-envoy.
 COPY image/envoy/ /etc/envoy/
