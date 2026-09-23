@@ -92,38 +92,68 @@ for config in "${WORK}"/configs/*.yaml; do
     failed=1
   fi
 done
-# Runtime check of the Chutes routes in the same image: Envoy serves the
-# chutes-runtime variant with no verifier listening on 127.0.0.1:8083.
-chutes_runtime() {
-  local container port code
-  container="$(docker run -d --rm -e ENVOY_UID=0 -e CHUTES_API_KEY=c \
+# Runtime checks of the Chutes routes in the pinned Envoy image, with no
+# verifier listening on 127.0.0.1:8083.
+serve() {
+  local key="$1" container
+  container="$(docker run -d --rm -e ENVOY_UID=0 -e CHUTES_API_KEY="${key}" \
     -v "${WORK}/configs:/configs:ro" \
     -v "${WORK}/ratls:/tmp/gm-ratls:ro" \
     -p 127.0.0.1::8080 \
     "${ENVOY_IMAGE}" -c /configs/chutes-runtime.yaml)"
-  port="$(docker port "${container}" 8080/tcp | head -n 1 | sed 's/.*://')"
-  request() {
-    curl -sk -o /dev/null -w '%{http_code}' -X POST -d '{}' \
-      -H 'x-gm-provider: chutes' "$@" \
-      "https://127.0.0.1:${port}/v1/chat/completions" || true
-  }
+  echo "${container}"
+}
+
+# Prints "<status> <body>" for one request to the served config.
+request() {
+  local port="$1" method="$2" path="$3"
+  shift 3
+  local body status
+  body="$(mktemp)"
+  status="$(curl -sk -o "${body}" -X "${method}" -w '%{http_code}' \
+    -H 'x-gm-provider: chutes' "$@" "https://127.0.0.1:${port}${path}" || true)"
+  echo "${status:-000} $(tr '\n' ' ' <"${body}")"
+  rm "${body}"
+}
+
+expect() {
+  local label="$1" want_status="$2" want_body="$3" got="$4"
+  if [[ "${got%% *}" == "${want_status}" && "${got}" == *"${want_body}"* ]]; then
+    echo "ok: chutes-runtime ${label}"
+  else
+    echo "FAIL: chutes-runtime ${label}: got '${got}', expected ${want_status} with ${want_body}" >&2
+    return 1
+  fi
+}
+
+chutes_runtime() {
+  local keyed empty port empty_port ok=0 tee='x-gm-upstream-model: zai-org/GLM-5.2-TEE'
+  keyed="$(serve c)"
+  empty="$(serve '')"
+  port="$(docker port "${keyed}" 8080/tcp | head -n 1 | sed 's/.*://')"
+  empty_port="$(docker port "${empty}" 8080/tcp | head -n 1 | sed 's/.*://')"
   for _ in $(seq 50); do
-    [[ "$(request -H 'x-gm-upstream-model: zai-org/GLM-5.2-TEE')" != "000" ]] && break
+    if [[ "$(request "${port}" GET /v1/models)" != 000* ]] &&
+      [[ "$(request "${empty_port}" GET /v1/models)" != 000* ]]; then
+      break
+    fi
     sleep 0.2
   done
-  local ok=0
-  code="$(request -H 'x-gm-upstream-model;')"
-  [[ "${code}" == "400" ]] || {
-    echo "FAIL: chutes empty selector answered ${code}, expected 400" >&2
-    ok=1
-  }
-  code="$(request -H 'x-gm-upstream-model: zai-org/GLM-5.2-TEE')"
-  [[ "${code}" == "503" ]] || {
-    echo "FAIL: chutes unreachable verifier answered ${code}, expected 503" >&2
-    ok=1
-  }
-  docker stop "${container}" >/dev/null
-  [[ "${ok}" -eq 0 ]] && echo "ok: chutes-runtime"
+  expect "empty selector" 400 "empty Chutes source model" \
+    "$(request "${port}" POST /v1/chat/completions -H 'x-gm-upstream-model;')" || ok=1
+  expect "repeated selector" 400 "ambiguous Chutes source model" \
+    "$(request "${port}" POST /v1/chat/completions -H "${tee}" \
+      -H 'x-gm-upstream-model: zai-org/GLM-5.2')" || ok=1
+  expect "comma-joined selector" 400 "ambiguous Chutes source model" \
+    "$(request "${port}" POST /v1/chat/completions \
+      -H 'x-gm-upstream-model: zai-org/GLM-5.2, zai-org/GLM-5.2-TEE')" || ok=1
+  expect "unreachable verifier" 503 "gm_chutes_verifier_unavailable" \
+    "$(request "${port}" POST /v1/chat/completions -H "${tee}")" || ok=1
+  expect "-TEE model list reaches the verifier" 503 "gm_chutes_verifier_unavailable" \
+    "$(request "${port}" GET /v1/models -H "${tee}")" || ok=1
+  expect "empty key" 503 "Chutes verifier unavailable" \
+    "$(request "${empty_port}" POST /v1/chat/completions -H "${tee}")" || ok=1
+  docker stop "${keyed}" "${empty}" >/dev/null
   return "${ok}"
 }
 chutes_runtime || failed=1
