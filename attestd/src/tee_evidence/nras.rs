@@ -50,7 +50,9 @@ pub fn aggregate_token(response: &Value) -> Result<&str> {
         .context("NVIDIA NRAS response has no verdict token")
 }
 
-/// The claims of a compact JWT, without checking its signature.
+/// The JSON claims carried in a compact JWT's payload segment. Callers that
+/// need the signature verified use [`Jwks::verify`], which returns the same
+/// claims after checking it.
 ///
 /// # Errors
 ///
