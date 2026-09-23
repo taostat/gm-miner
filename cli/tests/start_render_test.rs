@@ -1619,3 +1619,29 @@ fn an_unreachable_chutes_verifier_answers_503() {
         .expect("marker")
         .is_none());
 }
+
+#[test]
+fn ordinary_requests_are_not_marked_for_the_verifier() {
+    let rendered = chutes_config();
+    let lua = run_request(
+        &rendered,
+        &[
+            (":path", "/v1/chat/completions"),
+            ("x-gm-provider", "chutes"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-gm-upstream-model", "zai-org/GLM-5.2-TEE"),
+            ("x-gm-ordinary", "1"),
+        ],
+        &[
+            ("CHUTES_API_KEY", "chutes-key"),
+            ("GM_CHUTES_KEY_SLOT_1", "chutes-key"),
+        ],
+    );
+    assert!(lua
+        .globals()
+        .get::<mlua::Table>("route_metadata")
+        .expect("route metadata")
+        .get::<Option<bool>>("chutes_verifier")
+        .expect("marker")
+        .is_none());
+}

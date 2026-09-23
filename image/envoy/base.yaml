@@ -368,9 +368,11 @@ static_resources:
                                 return false
                               end
                               -- Lets the local reply mapper answer 503 if the verifier
-                              -- cannot be reached.
-                              handle:streamInfo():dynamicMetadata():set(
-                                "gm.route", "chutes_verifier", true)
+                              -- cannot be reached; an ordinary request goes direct.
+                              if headers:get("x-gm-ordinary") ~= "1" then
+                                handle:streamInfo():dynamicMetadata():set(
+                                  "gm.route", "chutes_verifier", true)
+                              end
                             end
                             return true
                           end
