@@ -311,6 +311,37 @@ static_resources:
                             return true
                           end
 
+                          local function reject(handle, status, message)
+                            handle:respond(
+                              {[":status"] = status,
+                               ["content-type"] = "application/json"},
+                              "{\"error\":\"" .. message .. "\"}")
+                          end
+
+                          -- Chutes routes on one exact selector: a single value with no
+                          -- comma, required on every path but the model list. A `-TEE`
+                          -- selector needs the verifier, which runs only with a key.
+                          local function chutes_selector_accepted(handle, headers, bare)
+                            local selector = headers:get("x-gm-upstream-model")
+                            if selector == nil then
+                              if bare == "/v1/models" then
+                                return true
+                              end
+                              reject(handle, "400", "missing Chutes source model")
+                              return false
+                            end
+                            if selector:find(",", 1, true)
+                              or headers:getNumValues("x-gm-upstream-model") ~= 1 then
+                              reject(handle, "400", "ambiguous Chutes source model")
+                              return false
+                            end
+                            if selector:lower():sub(-4) == "-tee" and getenv("CHUTES_API_KEY") == nil then
+                              reject(handle, "503", "Chutes verifier unavailable")
+                              return false
+                            end
+                            return true
+                          end
+
                           function envoy_on_request(handle)
                             -- The attestation surface is public by
                             -- contract: the registry's control loop
@@ -371,15 +402,11 @@ static_resources:
                               headers:remove("x-envoy-max-retries")
                               headers:remove("x-envoy-hedge-on-per-try-timeout")
                             end
-                            if (provider ~= "near" and provider ~= "chutes") or bare == "/v1/models" then
+                            if (provider ~= "near" and provider ~= "chutes")
+                              or (provider == "near" and bare == "/v1/models") then
                               headers:remove("x-gm-upstream-model")
                             end
-                            if provider == "chutes" and bare == "/v1/chat/completions"
-                              and headers:get("x-gm-upstream-model") == nil then
-                              handle:respond(
-                                {[":status"] = "400",
-                                 ["content-type"] = "application/json"},
-                                "{\"error\":\"missing Chutes source model\"}")
+                            if provider == "chutes" and not chutes_selector_accepted(handle, headers, bare) then
                               return
                             end
                             if provider == "near" and bare ~= "/v1/models" then
