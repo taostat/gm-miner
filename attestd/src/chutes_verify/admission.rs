@@ -618,6 +618,7 @@ pub(crate) mod tests {
         pub(crate) failing_key: Option<&'static str>,
         pub(crate) slow_key: Option<&'static str>,
         pub(crate) discover_delay: Duration,
+        pub(crate) chute_discover_delay: HashMap<&'static str, Duration>,
         pub(crate) discovery_starts: Mutex<Vec<Instant>>,
         pub(crate) answer: Mutex<Option<Answer>>,
         pub(crate) invoked: Mutex<Vec<Invocation>>,
@@ -641,6 +642,7 @@ pub(crate) mod tests {
                 failing_key: None,
                 slow_key: None,
                 discover_delay: Duration::ZERO,
+                chute_discover_delay: HashMap::new(),
                 discovery_starts: Mutex::new(Vec::new()),
                 answer: Mutex::new(None),
                 invoked: Mutex::new(Vec::new()),
@@ -650,7 +652,7 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ChutesApi for FakeApi {
-        async fn discover(&self, api_key: &str, _: &str) -> Result<Discovery, ChutesError> {
+        async fn discover(&self, api_key: &str, chute_id: &str) -> Result<Discovery, ChutesError> {
             if self.failing_key == Some(api_key) {
                 return Err(ChutesError::Upstream {
                     stage: "discovery",
@@ -659,7 +661,12 @@ pub(crate) mod tests {
             }
             let round = self.discoveries.fetch_add(1, Ordering::SeqCst);
             self.discovery_starts.lock().unwrap().push(Instant::now());
-            tokio::time::sleep(self.discover_delay).await;
+            let delay = self
+                .chute_discover_delay
+                .get(chute_id)
+                .copied()
+                .unwrap_or(self.discover_delay);
+            tokio::time::sleep(delay).await;
             let round = if self.repeat_nonces { 0 } else { round };
             let instances = self
                 .instances
@@ -1120,5 +1127,51 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("backing off"), "{error}");
         assert_eq!(api.admissions.load(Ordering::SeqCst), 1);
         assert_eq!(api.discoveries.load(Ordering::SeqCst), 1);
+    }
+
+    fn most_starts_in_a_window(starts: &[Instant]) -> usize {
+        starts
+            .iter()
+            .map(|first| {
+                starts
+                    .iter()
+                    .filter(|start| *start >= first && **start < *first + DISCOVERY_WINDOW)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_discovery_does_not_let_queued_ones_escape_the_budget() {
+        let targets = crate::chutes_verify::TARGETS.map(|target| target.chute_id);
+        let mut api = FakeApi::new(1);
+        api.nonces_per_instance = 1;
+        api.discover_delay = Duration::from_secs(1);
+        api.chute_discover_delay
+            .insert(targets[0], Duration::from_secs(20));
+        let (api, admissions) = cache(api);
+        let admissions = Arc::new(admissions);
+        let spawn = |chutes: Vec<&'static str>| {
+            chutes
+                .into_iter()
+                .map(|chute| {
+                    let admissions = Arc::clone(&admissions);
+                    tokio::spawn(async move { admissions.ticket("key", chute).await })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut tasks = spawn(targets[..8].to_vec());
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        tasks.extend(spawn(targets[5..13].to_vec()));
+        for task in tasks {
+            let _ = task.await.unwrap();
+        }
+        let starts = api.discovery_starts.lock().unwrap().clone();
+        assert!(
+            starts.len() > DISCOVERIES_PER_MINUTE,
+            "the second round never ran"
+        );
+        assert!(most_starts_in_a_window(&starts) <= DISCOVERIES_PER_MINUTE);
     }
 }

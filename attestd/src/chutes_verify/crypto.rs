@@ -194,8 +194,7 @@ fn gzip(input: &[u8]) -> Result<Vec<u8>> {
     encoder.finish().context("gzip E2E payload")
 }
 
-// The buffered decoder stops at the member boundary, so bytes appended after an
-// authenticated gzip member are detected instead of silently ignored.
+// The decoder requires exactly one gzip member and rejects trailing bytes.
 fn gunzip(input: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = GzDecoder::new(input);
     let mut output = Vec::new();
