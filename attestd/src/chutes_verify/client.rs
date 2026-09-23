@@ -81,12 +81,9 @@ impl LiveChutes {
             })?;
         let status = response.status();
         if !status.is_success() {
-            let detail = error_excerpt(response, api_key).await;
-            return Err(ChutesError::Upstream {
-                stage,
-                status,
-                detail,
-            });
+            let detail = error_detail(response).await;
+            warn!(stage, %status, detail = %detail, "Chutes answered an error");
+            return Err(ChutesError::Upstream { stage, status });
         }
         read_bounded(response, limit).await.map_err(|error| {
             ChutesError::Unavailable(error.context(format!("read Chutes {stage}")))
@@ -172,60 +169,64 @@ fn nras_request(gpu_evidence: &[Value], nonce_hex: &str, arch: &str) -> Result<V
     }))
 }
 
-const EXCERPT_READ_BYTES: usize = 1024;
-const EXCERPT_CHARS: usize = 200;
+const DETAIL_READ_BYTES: usize = 4096;
+const DETAIL_CHARS: usize = 200;
+const TOKEN_RUN: usize = 20;
+const WITHHELD: &str = "(detail withheld)";
 
-/// `": "` and a short excerpt of an error body, or nothing when it is empty.
-async fn error_excerpt(mut response: reqwest::Response, api_key: &str) -> String {
+/// The `detail` message of a Chutes error body, for operator logs only.
+async fn error_detail(mut response: reqwest::Response) -> String {
     let mut body = Vec::new();
-    while body.len() < EXCERPT_READ_BYTES {
+    while body.len() < DETAIL_READ_BYTES {
         match response.chunk().await {
             Ok(Some(chunk)) => body.extend_from_slice(&chunk),
             Ok(None) | Err(_) => break,
         }
     }
-    body.truncate(EXCERPT_READ_BYTES);
-    let excerpt = sanitise_excerpt(&body, api_key);
-    if excerpt.is_empty() {
-        excerpt
+    loggable_detail(&body)
+}
+
+/// The top-level JSON `detail` string when it passes an allow-list: printable
+/// ASCII, at most [`DETAIL_CHARS`] characters, no run of [`TOKEN_RUN`] or more
+/// token-like characters, and no mention of a key, token or bearer.
+/// Otherwise [`WITHHELD`], or nothing when the body carries no detail.
+fn loggable_detail(body: &[u8]) -> String {
+    let Some(detail) = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("detail")?.as_str().map(str::to_owned))
+    else {
+        return String::new();
+    };
+    let lower = detail.to_ascii_lowercase();
+    let allowed = detail.len() <= DETAIL_CHARS
+        && detail
+            .chars()
+            .all(|character| character == ' ' || character.is_ascii_graphic())
+        && longest_token_run(&detail) < TOKEN_RUN
+        && !["key", "token", "bearer"]
+            .iter()
+            .any(|word| lower.contains(word));
+    if allowed {
+        detail
     } else {
-        format!(": {excerpt}")
+        WITHHELD.to_owned()
     }
 }
 
-/// Printable ASCII only, whitespace collapsed, the credential and any
-/// `cpk_` token redacted, at most [`EXCERPT_CHARS`] characters.
-fn sanitise_excerpt(body: &[u8], api_key: &str) -> String {
-    let mut text = String::from_utf8_lossy(body).into_owned();
-    if !api_key.is_empty() {
-        text = text.replace(api_key, "[redacted]");
+fn longest_token_run(text: &str) -> usize {
+    let token_like =
+        |character: char| character.is_ascii_alphanumeric() || "_-.=+/".contains(character);
+    let mut longest = 0;
+    let mut current = 0;
+    for character in text.chars() {
+        current = if token_like(character) {
+            current + 1
+        } else {
+            0
+        };
+        longest = longest.max(current);
     }
-    let printable: String = text
-        .chars()
-        .map(|character| {
-            if character.is_ascii_graphic() {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    let words = printable
-        .split_whitespace()
-        .map(|word| {
-            if word.contains("cpk_") {
-                "[redacted]"
-            } else {
-                word
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    if words.len() > EXCERPT_CHARS {
-        format!("{}...", &words[..EXCERPT_CHARS])
-    } else {
-        words
-    }
+    longest
 }
 
 async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -272,13 +273,9 @@ impl ChutesApi for LiveChutes {
             .get(api_key, &path, "evidence", MAX_EVIDENCE_BYTES)
             .await
             .map_err(|error| match error {
-                ChutesError::Upstream {
-                    stage,
-                    status,
-                    detail,
-                } => ChutesError::Unavailable(anyhow::anyhow!(
-                    "Chutes {stage} answered {status}{detail}"
-                )),
+                ChutesError::Upstream { stage, status } => {
+                    ChutesError::Unavailable(anyhow::anyhow!("Chutes {stage} answered {status}"))
+                }
                 other => other,
             })?;
         let evidence: EvidenceResponse = serde_json::from_slice(&body)
@@ -374,22 +371,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_excerpts_are_short_printable_and_redacted() {
-        let body =
-            br#"{"detail":"Instances requires chutes_version >= 0.6.0 to retrieve evidence."}"#;
+    fn only_an_allow_listed_detail_is_logged() {
+        let detail = |body: &str| loggable_detail(body.as_bytes());
         assert_eq!(
-            sanitise_excerpt(body, "secret-key"),
-            r#"{"detail":"Instances requires chutes_version >= 0.6.0 to retrieve evidence."}"#
+            detail(
+                r#"{"detail":"Instances requires chutes_version >= 0.6.0 to retrieve evidence."}"#
+            ),
+            "Instances requires chutes_version >= 0.6.0 to retrieve evidence."
         );
-        let leaky = "bad key secret-key and cpk_abc.def\n\u{7}\tend".as_bytes();
-        let excerpt = sanitise_excerpt(leaky, "secret-key");
-        assert_eq!(excerpt, "bad key [redacted] and [redacted] end");
-        let long = "x".repeat(5_000);
-        assert_eq!(
-            sanitise_excerpt(long.as_bytes(), "k").len(),
-            EXCERPT_CHARS + 3
-        );
-        assert_eq!(sanitise_excerpt(b"", "k"), "");
+        assert_eq!(detail("plain text error"), "");
+        assert_eq!(detail(r#"{"message":"elsewhere"}"#), "");
+        assert_eq!(detail(r#"{"detail":{"nested":"x"}}"#), "");
+        for withheld in [
+            r#"{"detail":"invalid credential cpk_\u0041bcdefghijklmnopqrstuvwxyz"}"#,
+            r#"{"detail":"Authorization: Bearer abc"}"#,
+            r#"{"detail":"bad api key"}"#,
+            r#"{"detail":"got eyJhbGciOiJFUzM4NCJ9.eyJzdWIiOiJ4In0 back"}"#,
+            r#"{"detail":"line\nbreak"}"#,
+        ] {
+            assert_eq!(detail(withheld), WITHHELD, "{withheld}");
+        }
+        let long = format!(r#"{{"detail":"{}"}}"#, "word ".repeat(60));
+        assert_eq!(detail(&long), WITHHELD);
+        assert!(detail(&format!(r#"{{"detail":"{}"}}"#, "ab ".repeat(66))).len() <= DETAIL_CHARS);
     }
 
     #[test]

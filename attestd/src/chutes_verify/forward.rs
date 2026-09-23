@@ -65,7 +65,6 @@ impl<A: ChutesApi> ChutesVerifier<A> {
             return Err(ChutesError::Upstream {
                 stage: "invoke",
                 status,
-                detail: String::new(),
             });
         }
         if prepared.stream {
