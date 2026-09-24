@@ -10,12 +10,16 @@ use serde_json::{Map, Value};
 use tracing::warn;
 
 use crate::chutes_verify::admission::{Admissions, ChutesApi, Invocation};
+use crate::chutes_verify::client::error_detail;
 use crate::chutes_verify::crypto::{self, ResponseKey, MAX_PLAINTEXT_BYTES};
 use crate::chutes_verify::error::ChutesError;
 use crate::chutes_verify::stream::StreamDecryptor;
 use crate::chutes_verify::{target_for_model, ChutesTarget, CHAT_COMPLETIONS, SELECTOR_HEADER};
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// Most instances one request is offered to when instances turn it away at capacity.
+const MAX_INVOKE_INSTANCES: usize = 3;
+const ERROR_DETAIL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub struct ChutesVerifier<A> {
     api: Arc<A>,
@@ -47,34 +51,52 @@ impl<A: ChutesApi> ChutesVerifier<A> {
 
     async fn try_forward(&self, request: Request<Body>) -> Result<Response<Body>, ChutesError> {
         let prepared = prepare(request).await?;
-        let ticket = self
-            .admissions
-            .ticket(&prepared.api_key, prepared.target.chute_id)
-            .await?;
-        let encrypted = crypto::encrypt_request(&ticket.e2e_pubkey, prepared.payload)
-            .map_err(ChutesError::Rejected)?;
-        let invocation = Invocation {
-            chute_id: prepared.target.chute_id,
-            ticket,
-            stream: prepared.stream,
-            blob: encrypted.blob,
-        };
-        let response = self.api.invoke(&prepared.api_key, invocation).await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ChutesError::Upstream {
+        let chute_id = prepared.target.chute_id;
+        let mut ticket = self.admissions.ticket(&prepared.api_key, chute_id).await?;
+        let mut turned_away = Vec::new();
+        loop {
+            let instance_id = ticket.instance_id.clone();
+            let encrypted = crypto::encrypt_request(&ticket.e2e_pubkey, prepared.payload.clone())
+                .map_err(ChutesError::Rejected)?;
+            let invocation = Invocation {
+                chute_id,
+                ticket,
+                stream: prepared.stream,
+                blob: encrypted.blob,
+            };
+            let response = self.api.invoke(&prepared.api_key, invocation).await?;
+            let status = response.status();
+            if status.is_success() {
+                let model = prepared.target.model;
+                if prepared.stream {
+                    return Ok(stream_response(response, encrypted.response_key, model));
+                }
+                return complete_response(response, &encrypted.response_key, model).await;
+            }
+            // The status decides the outcome; the body is only for the operator log.
+            let detail = tokio::time::timeout(ERROR_DETAIL_WAIT, error_detail(response))
+                .await
+                .unwrap_or("error body not received in time");
+            warn!(chute = chute_id, instance = %instance_id, %status, detail, "Chutes invoke answered an error");
+            let failed = ChutesError::Upstream {
                 stage: "invoke",
                 status,
-            });
+            };
+            // A 429 here is one instance at its concurrency limit; another may have room.
+            turned_away.push(instance_id);
+            if status != StatusCode::TOO_MANY_REQUESTS || turned_away.len() >= MAX_INVOKE_INSTANCES
+            {
+                return Err(failed);
+            }
+            let Some(next) = self
+                .admissions
+                .retry_ticket(&prepared.api_key, chute_id, &turned_away)
+                .await
+            else {
+                return Err(failed);
+            };
+            ticket = next;
         }
-        if prepared.stream {
-            return Ok(stream_response(
-                response,
-                encrypted.response_key,
-                prepared.target.model,
-            ));
-        }
-        complete_response(response, &encrypted.response_key, prepared.target.model).await
     }
 }
 
@@ -424,5 +446,132 @@ mod tests {
         let response = verifier.forward(request(&chat(true))).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_text(response).await.is_err());
+    }
+
+    /// Two instances with their own keys: the first invoke is answered
+    /// `first`, every later one with a completion sealed by the instance the
+    /// invocation named, so a blob encrypted to the wrong key fails the test.
+    fn two_instances(first: StatusCode) -> (ChutesVerifier<FakeApi>, Vec<Arc<Instance>>) {
+        let api = FakeApi::new(2);
+        let players: Vec<Arc<Instance>> = (0..2).map(|_| Arc::new(Instance::new())).collect();
+        let keys = players.clone();
+        for (entry, player) in api.instances.lock().unwrap().iter_mut().zip(&players) {
+            entry.1.clone_from(&player.public_b64);
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        *api.answer.lock().unwrap() = Some(Box::new(move |blob| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (status, body) = if call == 0 {
+                (first, Vec::new())
+            } else {
+                // Only the key the retry encrypted to can open it.
+                let player = players
+                    .iter()
+                    .find(|player| player.try_open_request(blob).is_some())
+                    .unwrap();
+                let responder = Responder::new(&player.open_request(blob));
+                let completion = serde_json::json!({"model": MODEL, "choices": []});
+                (
+                    StatusCode::OK,
+                    responder.response_blob(completion.to_string().as_bytes()),
+                )
+            };
+            axum::http::Response::builder()
+                .status(status)
+                .body(reqwest::Body::from(body))
+                .unwrap()
+        }));
+        (ChutesVerifier::new(api), keys)
+    }
+
+    fn invoked_instances(verifier: &ChutesVerifier<FakeApi>) -> Vec<String> {
+        verifier
+            .api
+            .invoked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|invocation| invocation.ticket.instance_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_instance_at_capacity_hands_the_request_to_another() {
+        let (verifier, players) = two_instances(StatusCode::TOO_MANY_REQUESTS);
+        let response = verifier.forward(request(&chat(false))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let invoked = invoked_instances(&verifier);
+        assert_eq!(invoked.len(), 2);
+        assert_ne!(
+            invoked[0], invoked[1],
+            "the retry went to the full instance"
+        );
+        for invocation in verifier.api.invoked.lock().unwrap().iter() {
+            let index: usize = invocation
+                .ticket
+                .instance_id
+                .trim_start_matches("instance-")
+                .parse()
+                .unwrap();
+            assert!(
+                players[index].try_open_request(&invocation.blob).is_some(),
+                "{} was sent a blob it cannot open",
+                invocation.ticket.instance_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_is_offered_to_a_bounded_number_of_instances() {
+        let api = FakeApi::new(MAX_INVOKE_INSTANCES + 2);
+        *api.answer.lock().unwrap() = Some(Box::new(|_| {
+            axum::http::Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(reqwest::Body::from(Vec::new()))
+                .unwrap()
+        }));
+        let verifier = ChutesVerifier::new(api);
+        let response = verifier.forward(request(&chat(true))).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let mut invoked = invoked_instances(&verifier);
+        assert_eq!(invoked.len(), MAX_INVOKE_INSTANCES);
+        invoked.sort();
+        invoked.dedup();
+        assert_eq!(
+            invoked.len(),
+            MAX_INVOKE_INSTANCES,
+            "an instance was offered twice"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_error_body_does_not_hold_the_response() {
+        let api = FakeApi::new(1);
+        *api.answer.lock().unwrap() = Some(Box::new(|_| {
+            let never = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+            axum::http::Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(reqwest::Body::wrap_stream(never))
+                .unwrap()
+        }));
+        let verifier = ChutesVerifier::new(api);
+        let response = verifier.forward(request(&chat(false))).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn other_invoke_errors_are_not_retried() {
+        let (verifier, _) = two_instances(StatusCode::SERVICE_UNAVAILABLE);
+        let response = verifier.forward(request(&chat(false))).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(invoked_instances(&verifier).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capacity_with_no_other_instance_passes_the_429_through() {
+        let (verifier, _) = verifier(|_| (StatusCode::TOO_MANY_REQUESTS, Vec::new()));
+        let response = verifier.forward(request(&chat(false))).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(verifier.api.invoked.lock().unwrap().len(), 1);
     }
 }

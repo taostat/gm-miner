@@ -48,6 +48,8 @@ pub const MAX_ISSUED_NONCES: usize = 65_536;
 // Chutes' advertised nonce lifetime is shortened so a nonce is never sent as it expires.
 const NONCE_MARGIN: Duration = Duration::from_secs(5);
 const MAX_ADMISSIONS_PER_REQUEST: usize = 2;
+/// How long a retry waits for a scope another request holds.
+const RETRY_SCOPE_WAIT: Duration = Duration::from_secs(2);
 // A second discovery covers nonces that expired while an admission ran.
 const MAX_DISCOVERIES_PER_REQUEST: usize = 2;
 /// Discoveries per credential per minute. Chutes' nonces live 60s, so every
@@ -67,8 +69,18 @@ const MAX_CREDENTIALS: usize = 4_096;
 pub struct Verdict {
     pub instance_id: String,
     pub e2e_pubkey: String,
-    /// The instant the admission stops being usable, or why the instance failed.
-    pub outcome: Result<Instant, String>,
+    pub outcome: Outcome,
+}
+
+#[derive(Debug)]
+pub enum Outcome {
+    /// Verified; usable until this instant.
+    Admitted(Instant),
+    /// Evidence was served and failed verification, for this reason.
+    Rejected(String),
+    /// Chutes served no evidence for the instance in this batch, which leaves
+    /// it undecided: it is not admitted, and an earlier admission stands.
+    NoEvidence,
 }
 
 /// The absolute deadline for evidence expiring at `expires_unix`, measured
@@ -230,31 +242,46 @@ impl ChuteState {
     }
 
     // Callers prune first, so every admission and nonce seen here is unexpired.
+    // Tickets go to the admitted instance with the most unused nonces, so
+    // concurrent requests spread across instances instead of filling one.
     fn take_ticket(
         &mut self,
         ledger: &Mutex<NonceLedger>,
         chute_id: &'static str,
+        avoid: &[String],
     ) -> Result<Option<Ticket>, ChutesError> {
         let Some(valid_until) = self.valid_until else {
             return Ok(None);
         };
         let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
         ledger.prune(Instant::now());
-        for instance in &mut self.pool {
-            if !self.admitted.contains_key(&key_of(instance)) {
-                continue;
-            }
-            while let Some(nonce) = instance.nonces.pop() {
-                if ledger.record(chute_id, &nonce, valid_until)? {
-                    return Ok(Some(Ticket {
-                        instance_id: instance.instance_id.clone(),
-                        e2e_pubkey: instance.e2e_pubkey.clone(),
-                        nonce,
-                    }));
+        loop {
+            let mut chosen: Option<usize> = None;
+            for (index, instance) in self.pool.iter().enumerate() {
+                let eligible = !instance.nonces.is_empty()
+                    && self.admitted.contains_key(&key_of(instance))
+                    && !avoid.contains(&instance.instance_id);
+                let fuller =
+                    chosen.is_none_or(|best| instance.nonces.len() > self.pool[best].nonces.len());
+                if eligible && fuller {
+                    chosen = Some(index);
                 }
             }
+            let Some(index) = chosen else {
+                return Ok(None);
+            };
+            let instance = &mut self.pool[index];
+            let Some(nonce) = instance.nonces.pop() else {
+                continue;
+            };
+            if ledger.record(chute_id, &nonce, valid_until)? {
+                return Ok(Some(Ticket {
+                    instance_id: instance.instance_id.clone(),
+                    e2e_pubkey: instance.e2e_pubkey.clone(),
+                    nonce,
+                }));
+            }
         }
-        Ok(None)
     }
 
     fn unjudged(&self) -> Vec<DiscoveredInstance> {
@@ -295,7 +322,7 @@ impl ChuteState {
         for verdict in verdicts {
             let key = (verdict.instance_id, verdict.e2e_pubkey);
             match verdict.outcome {
-                Ok(until) => {
+                Outcome::Admitted(until) => {
                     let superseded = since
                         .is_some_and(|since| self.decided.get(&key).is_some_and(|at| *at > since));
                     if superseded {
@@ -303,11 +330,12 @@ impl ChuteState {
                     }
                     self.admitted.insert(key.clone(), until);
                 }
-                Err(cause) => {
+                Outcome::Rejected(cause) => {
                     self.admitted.remove(&key);
                     self.rejected
                         .insert(key.clone(), (now + REJECTION_TTL, cause));
                 }
+                Outcome::NoEvidence => continue,
             }
             self.decided.insert(key, self.generation);
         }
@@ -327,7 +355,13 @@ impl ChuteState {
         self.pool = discovery.instances;
     }
 
-    fn exhausted(&self, chute_id: &str) -> ChutesError {
+    fn exhausted(&self, chute_id: &str, unevidenced: &[String]) -> ChutesError {
+        if self.rejected.is_empty() && !unevidenced.is_empty() {
+            return ChutesError::Unavailable(anyhow::anyhow!(
+                "Chutes served no evidence for chute {chute_id} instance(s) {}",
+                unevidenced.join(", ")
+            ));
+        }
         if self.rejected.is_empty() {
             return ChutesError::Unavailable(anyhow::anyhow!(
                 "no admitted instance of chute {chute_id} has an unused, unexpired nonce"
@@ -659,13 +693,17 @@ impl<A: ChutesApi> Issuer<A> {
         let credential = scope_of(api_key, chute_id).0;
         let mut discoveries = 0;
         let mut admissions = 0;
+        // Instances Chutes served no evidence for in this request; asking again
+        // now would spend evidence budget on the same answer.
+        let mut unevidenced = Vec::new();
         loop {
             state.prune(Instant::now());
-            if let Some(ticket) = state.take_ticket(&self.ledger, chute_id)? {
+            if let Some(ticket) = state.take_ticket(&self.ledger, chute_id, &[])? {
                 self.discoveries.succeeded(credential, chute_id);
                 return Ok(ticket);
             }
-            let unjudged = state.unjudged();
+            let mut unjudged = state.unjudged();
+            unjudged.retain(|instance| !unevidenced.contains(&instance.instance_id));
             // Rediscovering in the same request helps only when the pool is used up.
             let may_discover = discoveries == 0 || state.pool.is_empty();
             if !unjudged.is_empty() && admissions < MAX_ADMISSIONS_PER_REQUEST {
@@ -678,6 +716,11 @@ impl<A: ChutesApi> Issuer<A> {
                     .inspect_err(|error| {
                         self.discoveries.failed(credential, chute_id, error);
                     })?;
+                for verdict in &verdicts {
+                    if let Outcome::NoEvidence = verdict.outcome {
+                        unevidenced.push(verdict.instance_id.clone());
+                    }
+                }
                 state.record(verdicts, Instant::now(), None);
             } else if may_discover && discoveries < MAX_DISCOVERIES_PER_REQUEST {
                 discoveries += 1;
@@ -694,7 +737,7 @@ impl<A: ChutesApi> Issuer<A> {
                         })?;
                 state.refill(discovery, asked, Instant::now());
             } else {
-                let error = state.exhausted(chute_id);
+                let error = state.exhausted(chute_id, &unevidenced);
                 if discoveries + admissions > 0 {
                     self.discoveries.failed(credential, chute_id, &error);
                 }
@@ -785,6 +828,36 @@ impl<A: ChutesApi> Admissions<A> {
             Err(_) => {}
         }
         result
+    }
+
+    /// A ticket for another cached admitted instance of `chute_id`, avoiding
+    /// the instances in `avoid`, for retrying an invocation an instance turned
+    /// away. Spends no discovery or evidence call; `None` when no other
+    /// admitted instance has an unused nonce or the scope stays busy.
+    pub async fn retry_ticket(
+        &self,
+        api_key: &str,
+        chute_id: &'static str,
+        avoid: &[String],
+    ) -> Option<Ticket> {
+        let scope = scope_of(api_key, chute_id);
+        let cell = {
+            let scopes = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(&scopes.get(&scope)?.state)
+        };
+        let mut state = tokio::time::timeout(RETRY_SCOPE_WAIT, cell.lock())
+            .await
+            .ok()?;
+        state.prune(Instant::now());
+        let ticket = match state.take_ticket(&self.ledger, chute_id, avoid) {
+            Ok(ticket) => ticket?,
+            Err(error) => {
+                warn!(chute = chute_id, cause = %error, "no retry ticket issued");
+                return None;
+            }
+        };
+        state.last_served = Some(Instant::now());
+        Some(ticket)
     }
 
     fn keep_warm(
@@ -985,6 +1058,8 @@ pub(crate) mod tests {
         pub(crate) nonces_per_instance: usize,
         pub(crate) evidence: Mutex<Result<(), StatusCode>>,
         pub(crate) rejected: Mutex<Vec<String>>,
+        /// Instances Chutes serves no evidence for.
+        pub(crate) unevidenced: Mutex<Vec<String>>,
         pub(crate) discoveries: AtomicUsize,
         pub(crate) admissions: AtomicUsize,
         pub(crate) admit_delay: Duration,
@@ -1012,6 +1087,7 @@ pub(crate) mod tests {
                 nonces_per_instance: 2,
                 evidence: Mutex::new(Ok(())),
                 rejected: Mutex::new(Vec::new()),
+                unevidenced: Mutex::new(Vec::new()),
                 discoveries: AtomicUsize::new(0),
                 admissions: AtomicUsize::new(0),
                 admit_delay: Duration::ZERO,
@@ -1078,6 +1154,7 @@ pub(crate) mod tests {
             self.admission_starts.lock().unwrap().push(anchor);
             // Verdicts reflect the instance as it was when its evidence was fetched.
             let rejected = self.rejected.lock().unwrap().clone();
+            let unevidenced = self.unevidenced.lock().unwrap().clone();
             let queued = self.admit_delays.lock().unwrap().pop_front();
             if let Some(delay) = queued {
                 tokio::time::sleep(delay).await;
@@ -1101,9 +1178,13 @@ pub(crate) mod tests {
                     instance_id: instance.instance_id.clone(),
                     e2e_pubkey: instance.e2e_pubkey.clone(),
                     outcome: if rejected.contains(&instance.instance_id) {
-                        Err("MRTD is not in the published Chutes references".to_owned())
+                        Outcome::Rejected(
+                            "MRTD is not in the published Chutes references".to_owned(),
+                        )
+                    } else if unevidenced.contains(&instance.instance_id) {
+                        Outcome::NoEvidence
                     } else {
-                        Ok(anchor + self.valid_for)
+                        Outcome::Admitted(anchor + self.valid_for)
                     },
                 })
                 .collect())
@@ -2275,5 +2356,84 @@ pub(crate) mod tests {
             "the second round never ran"
         );
         assert!(most_starts_in_a_window(&starts) <= DISCOVERIES_PER_MINUTE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tickets_spread_across_admitted_instances() {
+        let mut api = FakeApi::new(3);
+        api.nonces_per_instance = 4;
+        let (_, admissions) = cache(api);
+        let mut served = Vec::new();
+        for _ in 0..3 {
+            served.push(admissions.ticket("key", CHUTE).await.unwrap().instance_id);
+        }
+        served.sort();
+        served.dedup();
+        assert_eq!(
+            served.len(),
+            3,
+            "concurrent tickets piled onto one instance"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_ticket_names_another_instance_and_spends_nothing() {
+        let (api, admissions) = cache(FakeApi::new(2));
+        let first = admissions.ticket("key", CHUTE).await.unwrap();
+        let spent = (
+            api.discoveries.load(Ordering::SeqCst),
+            api.admissions.load(Ordering::SeqCst),
+        );
+        let avoid = vec![first.instance_id.clone()];
+        let retry = admissions.retry_ticket("key", CHUTE, &avoid).await.unwrap();
+        assert_ne!(retry.instance_id, first.instance_id);
+        let both = vec![first.instance_id, retry.instance_id];
+        assert!(admissions.retry_ticket("key", CHUTE, &both).await.is_none());
+        assert!(admissions.retry_ticket("other", CHUTE, &[]).await.is_none());
+        assert_eq!(
+            (
+                api.discoveries.load(Ordering::SeqCst),
+                api.admissions.load(Ordering::SeqCst)
+            ),
+            spent,
+            "a retry ticket spent a Chutes call"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_instance_chutes_served_no_evidence_for_is_unavailable_not_rejected() {
+        let api = FakeApi::new(1);
+        api.unevidenced
+            .lock()
+            .unwrap()
+            .push("instance-0".to_owned());
+        let (api, admissions) = cache(api);
+        let error = admissions.ticket("key", CHUTE).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{error}");
+        assert!(error.to_string().contains("no evidence"), "{error}");
+        assert_eq!(
+            api.admissions.load(Ordering::SeqCst),
+            1,
+            "the same request asked for evidence again"
+        );
+        api.unevidenced.lock().unwrap().clear();
+        tokio::time::advance(BACKOFF_MAX).await;
+        let ticket = admissions.ticket("key", CHUTE).await.unwrap();
+        assert_eq!(ticket.instance_id, "instance-0");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_renewal_without_evidence_keeps_the_standing_admission() {
+        let (api, admissions) = cache(FakeApi::new(1));
+        admissions.ticket("key", CHUTE).await.unwrap();
+        api.unevidenced
+            .lock()
+            .unwrap()
+            .push("instance-0".to_owned());
+        tokio::time::advance(FIRST_RENEWAL).await;
+        settle().await;
+        assert!(api.admissions.load(Ordering::SeqCst) >= 2, "no renewal ran");
+        let ticket = admissions.ticket("key", CHUTE).await.unwrap();
+        assert_eq!(ticket.instance_id, "instance-0");
     }
 }

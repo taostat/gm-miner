@@ -235,10 +235,15 @@ pub(crate) mod tests {
 
         /// Open a request blob as the instance would, returning its JSON.
         pub(crate) fn open_request(&self, blob: &[u8]) -> Map<String, Value> {
+            self.try_open_request(blob).unwrap()
+        }
+
+        /// The request, if `blob` was encrypted to this instance's key.
+        pub(crate) fn try_open_request(&self, blob: &[u8]) -> Option<Map<String, Value>> {
             let (kem_ciphertext, sealed) = blob.split_at(MLKEM768_CIPHERTEXT_BYTES);
-            let shared = self.secret.decapsulate_slice(kem_ciphertext).unwrap();
-            let key = derive_key(shared.as_slice(), kem_ciphertext, INFO_REQUEST).unwrap();
-            serde_json::from_slice(&gunzip(&open(&key, sealed).unwrap()).unwrap()).unwrap()
+            let shared = self.secret.decapsulate_slice(kem_ciphertext).ok()?;
+            let key = derive_key(shared.as_slice(), kem_ciphertext, INFO_REQUEST).ok()?;
+            serde_json::from_slice(&gunzip(&open(&key, sealed).ok()?).ok()?).ok()
         }
     }
 

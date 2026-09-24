@@ -10,9 +10,11 @@ use dcap_qvl::collateral::CollateralClient;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::chutes_verify::admission::{deadline, ChutesApi, Invocation, Verdict};
+use crate::chutes_verify::admission::{deadline, ChutesApi, Invocation, Outcome, Verdict};
 use crate::chutes_verify::error::ChutesError;
-use crate::chutes_verify::evidence::{self, DiscoveredInstance, Discovery, EvidenceResponse};
+use crate::chutes_verify::evidence::{
+    self, DiscoveredInstance, Discovery, EvidenceResponse, EvidenceRow,
+};
 use crate::chutes_verify::{references, CHAT_COMPLETIONS};
 use crate::tee_evidence;
 use crate::tee_evidence::nras::{self, Jwks, NrasClient};
@@ -93,15 +95,10 @@ impl LiveChutes {
     async fn admit_instance(
         &self,
         instance: &DiscoveredInstance,
-        evidence: &EvidenceResponse,
+        row: &EvidenceRow,
         nonce_hex: &str,
         jwks: &Jwks,
     ) -> Result<u64> {
-        let row = evidence
-            .evidence
-            .iter()
-            .find(|row| row.instance_id.as_deref() == Some(instance.instance_id.as_str()))
-            .context("Chutes returned no evidence for this instance")?;
         let signed = evidence::verify_signed_row(row, nonce_hex)?;
         let claims = tee_evidence::verify_quote(&self.collateral, &signed.quote).await?;
         let td = tee_evidence::td_report(&claims.report)?;
@@ -215,7 +212,7 @@ fn upstream_error(
 }
 
 /// A gm-authored description of a Chutes error body, for operator logs.
-async fn error_detail(mut response: reqwest::Response) -> &'static str {
+pub(crate) async fn error_detail(mut response: reqwest::Response) -> &'static str {
     let mut body = Vec::with_capacity(DETAIL_READ_BYTES);
     while body.len() < DETAIL_READ_BYTES {
         match response.chunk().await {
@@ -301,14 +298,28 @@ impl ChutesApi for LiveChutes {
             })?;
         let mut verdicts = Vec::with_capacity(instances.len());
         for instance in instances {
-            let outcome = self
-                .admit_instance(instance, &evidence, &nonce_hex, &jwks)
-                .await
-                .map(|expires| deadline(anchor, anchor_wall, expires))
-                .map_err(|error| {
-                    warn!(instance = %instance.instance_id, cause = %format!("{error:#}"), "Chutes instance rejected");
-                    format!("{error:#}")
+            let row = evidence
+                .evidence
+                .iter()
+                .find(|row| row.instance_id.as_deref() == Some(instance.instance_id.as_str()));
+            let Some(row) = row else {
+                // Chutes lists instances its attestation proxy could not reach this time.
+                warn!(instance = %instance.instance_id, "Chutes served no evidence for the instance");
+                verdicts.push(Verdict {
+                    instance_id: instance.instance_id.clone(),
+                    e2e_pubkey: instance.e2e_pubkey.clone(),
+                    outcome: Outcome::NoEvidence,
                 });
+                continue;
+            };
+            let outcome = match self.admit_instance(instance, row, &nonce_hex, &jwks).await {
+                Ok(expires) => Outcome::Admitted(deadline(anchor, anchor_wall, expires)),
+                Err(error) => {
+                    let cause = format!("{error:#}");
+                    warn!(instance = %instance.instance_id, cause = %cause, "Chutes instance rejected");
+                    Outcome::Rejected(cause)
+                }
+            };
             verdicts.push(Verdict {
                 instance_id: instance.instance_id.clone(),
                 e2e_pubkey: instance.e2e_pubkey.clone(),
