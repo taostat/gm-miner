@@ -799,7 +799,7 @@ fn fallback_model(provider: &Provider) -> &'static str {
         // Last resort only when `/miners/me` has no kubetee offer. Prefer GLM
         // over kimi; flash is probed once declared (see #185 / sources).
         Provider::Kubetee => "z-ai/glm-5.2",
-        Provider::Near => "Qwen/Qwen3.6-27B-FP8",
+        Provider::Near => "Qwen/Qwen3.8-27B",
         Provider::Benchmark => "benchmark",
     }
 }

@@ -44,32 +44,7 @@ pub struct NearTarget {
     pub path: &'static str,
 }
 
-pub const TARGETS: [NearTarget; 7] = [
-    NearTarget {
-        model: "zai-org/GLM-5.1-FP8",
-        host: "glm-5-1.completions.near.ai",
-        path: CHAT_COMPLETIONS,
-    },
-    NearTarget {
-        model: "Qwen/Qwen3.6-27B-FP8",
-        host: "qwen3-6-27b.completions.near.ai",
-        path: CHAT_COMPLETIONS,
-    },
-    NearTarget {
-        model: "z-ai/glm-5.2",
-        host: "glm-5-2-long.completions.near.ai",
-        path: CHAT_COMPLETIONS,
-    },
-    NearTarget {
-        model: "deepseek-ai/DeepSeek-V4-Flash",
-        host: "dsv4-flash.completions.near.ai",
-        path: CHAT_COMPLETIONS,
-    },
-    NearTarget {
-        model: "google/gemma-4-31B-it",
-        host: "gemma-4-31b.completions.near.ai",
-        path: CHAT_COMPLETIONS,
-    },
+pub const TARGETS: [NearTarget; 2] = [
     NearTarget {
         model: "Qwen/Qwen3.8-27B",
         host: "qwen3-8-27b.completions.near.ai",
@@ -661,14 +636,6 @@ mod tests {
         assert_eq!(
             actual,
             vec![
-                ("zai-org/GLM-5.1-FP8", "glm-5-1.completions.near.ai"),
-                ("Qwen/Qwen3.6-27B-FP8", "qwen3-6-27b.completions.near.ai"),
-                ("z-ai/glm-5.2", "glm-5-2-long.completions.near.ai"),
-                (
-                    "deepseek-ai/DeepSeek-V4-Flash",
-                    "dsv4-flash.completions.near.ai",
-                ),
-                ("google/gemma-4-31B-it", "gemma-4-31b.completions.near.ai"),
                 ("Qwen/Qwen3.8-27B", "qwen3-8-27b.completions.near.ai"),
                 (FLUX_KLEIN_MODEL, FLUX_KLEIN_HOST),
             ]

@@ -60,11 +60,9 @@ explains the table and how to set each upstream up.
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
 | `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
-| `zai/glm-5.1-tee` | `near/zai-org/GLM-5.1-FP8` | `glm-5-1.completions.near.ai` | `--near` |
-| `qwen/qwen3.6-27b-tee` | `near/Qwen/Qwen3.6-27B-FP8` | `qwen3-6-27b.completions.near.ai` | `--near` |
-| `zai/glm-5.2-tee` | `near/z-ai/glm-5.2` | `glm-5-2-long.completions.near.ai` | `--near` |
-| `deepseek/deepseek-v4-flash-0731-tee` | `near/deepseek-ai/DeepSeek-V4-Flash` | `dsv4-flash.completions.near.ai` | `--near` |
-| `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
+| `zai/glm-5.1-tee` | `near/zai-org/GLM-5.1-FP8` | retired by NEAR (2026-09-24) | `--near` |
+| `zai/glm-5.2-tee` | `near/z-ai/glm-5.2` | retired by NEAR (2026-09-24) | `--near` |
+| `deepseek/deepseek-v4-flash-0731-tee` | `near/deepseek-ai/DeepSeek-V4-Flash` | retired by NEAR (2026-09-24) | `--near` |
 | `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `near/black-forest-labs/FLUX.2-klein-4B` | `flux2-klein.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `deepinfra/black-forest-labs/FLUX-2-klein-4b` | `api.deepinfra.com` | `--deepinfra` |
@@ -248,11 +246,6 @@ gmcli declare-product --provider kubetee --model deepseek/deepseek-v4.1-flash --
 gmcli declare-product --provider kubetee --model black-forest-labs/flux.2-klein-4b --discount-pct 5
 gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
-gmcli declare-product --provider near --model zai-org/GLM-5.1-FP8 --discount-pct 5
-gmcli declare-product --provider near --model Qwen/Qwen3.6-27B-FP8 --discount-pct 5
-gmcli declare-product --provider near --model z-ai/glm-5.2 --discount-pct 5
-gmcli declare-product --provider near --model deepseek-ai/DeepSeek-V4-Flash --discount-pct 5
-gmcli declare-product --provider near --model google/gemma-4-31B-it --discount-pct 5
 ```
 
 ### NEAR attestation enforcement
