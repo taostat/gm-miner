@@ -23,6 +23,13 @@ pub enum ChutesError {
     /// unreachable or refused, and no cached admission covers the chute.
     #[error("attestation unavailable: {0:#}")]
     Unavailable(anyhow::Error),
+    /// Chutes refused an attestation call under its rate limit, and no cached
+    /// admission covers the chute.
+    #[error("attestation unavailable: Chutes {stage} answered 429 Too Many Requests")]
+    RateLimited { stage: &'static str },
+    /// Chutes serves no evidence for this chute's version.
+    #[error("attestation rejected: the chute's version is below Chutes' evidence minimum")]
+    BelowEvidenceMinimum,
     /// Evidence was obtained and failed verification.
     #[error("attestation rejected: {0:#}")]
     Rejected(anyhow::Error),
@@ -38,8 +45,10 @@ impl ChutesError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::MissingCredential => StatusCode::UNAUTHORIZED,
             Self::Upstream { status, .. } => *status,
-            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Rejected(_) | Self::BadResponse(_) => StatusCode::BAD_GATEWAY,
+            Self::Unavailable(_) | Self::RateLimited { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::BelowEvidenceMinimum | Self::Rejected(_) | Self::BadResponse(_) => {
+                StatusCode::BAD_GATEWAY
+            }
         }
     }
 
@@ -48,8 +57,8 @@ impl ChutesError {
             Self::BadRequest(_) => "gm_chutes_bad_request",
             Self::MissingCredential => "gm_chutes_missing_credential",
             Self::Upstream { .. } => "gm_chutes_upstream_status",
-            Self::Unavailable(_) => "gm_chutes_attestation_unavailable",
-            Self::Rejected(_) => "gm_chutes_attestation_rejected",
+            Self::Unavailable(_) | Self::RateLimited { .. } => "gm_chutes_attestation_unavailable",
+            Self::BelowEvidenceMinimum | Self::Rejected(_) => "gm_chutes_attestation_rejected",
             Self::BadResponse(_) => "gm_chutes_response_rejected",
         }
     }

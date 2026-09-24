@@ -79,11 +79,8 @@ impl LiveChutes {
                     anyhow::Error::new(error).context(format!("reach Chutes {stage}")),
                 )
             })?;
-        let status = response.status();
-        if !status.is_success() {
-            let detail = error_detail(response).await;
-            warn!(stage, %status, detail = %detail, "Chutes answered an error");
-            return Err(ChutesError::Upstream { stage, status });
+        if !response.status().is_success() {
+            return Err(upstream_failure(stage, response).await);
         }
         read_bounded(response, limit).await.map_err(|error| {
             ChutesError::Unavailable(error.context(format!("read Chutes {stage}")))
@@ -169,6 +166,7 @@ fn nras_request(gpu_evidence: &[Value], nonce_hex: &str, arch: &str) -> Result<V
     }))
 }
 
+const BELOW_EVIDENCE_MINIMUM: &str = "chute version below the evidence minimum";
 const DETAIL_READ_BYTES: usize = 4096;
 const DETAIL_WITHHELD: &str = "upstream detail withheld";
 
@@ -176,7 +174,7 @@ const DETAIL_WITHHELD: &str = "upstream detail withheld";
 const KNOWN_DETAILS: [(&str, &str); 7] = [
     (
         "Instances requires chutes_version >= 0.6.0",
-        "chute version below the evidence minimum",
+        BELOW_EVIDENCE_MINIMUM,
     ),
     ("Rate limit exceeded", "Chutes rate limit reached"),
     ("Chute not found", "chute not found"),
@@ -191,6 +189,30 @@ const KNOWN_DETAILS: [(&str, &str); 7] = [
         "instance not yet TEE-verified",
     ),
 ];
+
+// Evidence is rate-limited per fixed window and refused by chute version; both shape the backoff.
+async fn upstream_failure(stage: &'static str, response: reqwest::Response) -> ChutesError {
+    let status = response.status();
+    // Known from the status alone, so a stalled body read cannot lose it.
+    if stage == "evidence" && status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        warn!(stage, %status, "Chutes rate-limited evidence");
+        return ChutesError::RateLimited { stage };
+    }
+    let detail = error_detail(response).await;
+    warn!(stage, %status, detail = %detail, "Chutes answered an error");
+    upstream_error(stage, status, detail)
+}
+
+fn upstream_error(
+    stage: &'static str,
+    status: reqwest::StatusCode,
+    detail: &'static str,
+) -> ChutesError {
+    if stage == "evidence" && detail == BELOW_EVIDENCE_MINIMUM {
+        return ChutesError::BelowEvidenceMinimum;
+    }
+    ChutesError::Upstream { stage, status }
+}
 
 /// A gm-authored description of a Chutes error body, for operator logs.
 async fn error_detail(mut response: reqwest::Response) -> &'static str {
@@ -387,6 +409,50 @@ mod tests {
         ] {
             assert_eq!(describe(withheld), DETAIL_WITHHELD, "{withheld}");
         }
+    }
+
+    #[test]
+    fn evidence_rate_limits_and_version_refusals_are_told_apart() {
+        let below = describe_detail(
+            br#"{"detail":"Instances requires chutes_version >= 0.6.0 to retrieve evidence."}"#,
+        );
+        let limited = describe_detail(br#"{"detail":"Rate limit exceeded. Try again later."}"#);
+        let status = |stage, status, detail| upstream_error(stage, status, detail).status();
+        assert_eq!(
+            status("evidence", reqwest::StatusCode::BAD_REQUEST, below),
+            reqwest::StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status("discovery", reqwest::StatusCode::TOO_MANY_REQUESTS, limited),
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            status(
+                "evidence",
+                reqwest::StatusCode::BAD_REQUEST,
+                DETAIL_WITHHELD
+            ),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_evidence_rate_limit_is_known_before_its_body_arrives() {
+        let stalled = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+        let response = axum::http::Response::builder()
+            .status(429)
+            .body(reqwest::Body::wrap_stream(stalled))
+            .unwrap();
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream_failure("evidence", reqwest::Response::from(response)),
+        )
+        .await
+        .unwrap();
+        let ChutesError::RateLimited { stage } = failure else {
+            unreachable!("an evidence 429 must be a rate limit, got {failure}");
+        };
+        assert_eq!(stage, "evidence");
     }
 
     #[tokio::test]
