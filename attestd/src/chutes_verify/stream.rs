@@ -96,8 +96,12 @@ impl StreamDecryptor {
                 .stream_key
                 .as_ref()
                 .context("e2e chunk before e2e_init")?;
-            ensure!(!self.done, "encrypted chunk after the encrypted [DONE]");
             let text = key.decrypt_chunk(chunk.as_str().context("e2e chunk is not a string")?)?;
+            // The instance seals the blank line ending the engine's `[DONE]` event on its own.
+            ensure!(
+                !self.done || text.trim().is_empty(),
+                "encrypted chunk after the encrypted [DONE]"
+            );
             for inner in text.lines() {
                 self.release(inner.trim_end(), output)?;
             }
@@ -255,7 +259,13 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn encrypted(&self, data: &str) -> String {
-            let chunk = self.responder.stream_chunk(&format!("data: {data}\n\n"));
+            self.sealed(&format!("data: {data}\n\n"))
+        }
+
+        /// One chunk sealing `text` as given; the instance seals each line it
+        /// reads from the engine, and the blank line after it, separately.
+        pub(crate) fn sealed(&self, text: &str) -> String {
+            let chunk = self.responder.stream_chunk(text);
             format!("data: {}\n\n", serde_json::json!({"e2e": chunk}))
         }
 
@@ -316,6 +326,35 @@ pub(crate) mod tests {
             "running usage was forwarded"
         );
         assert!(!output.contains("424242"), "relay plaintext usage leaked");
+    }
+
+    #[test]
+    fn a_line_per_chunk_stream_ending_in_a_sealed_blank_line_completes() {
+        let mut upstream = Upstream::new();
+        let mut events = vec![upstream.init()];
+        for data in [content("Hel", 11), content("lo", 12), usage_frame(12)] {
+            events.push(upstream.sealed(&format!("data: {data}\n")));
+            events.push(upstream.sealed("\n"));
+        }
+        events.push(upstream.sealed("data: [DONE]\n"));
+        events.push(upstream.sealed("\n"));
+        events.push("data: [DONE]\n\n".to_owned());
+        let output = upstream.run(&[events.concat()]).unwrap();
+        assert_eq!(released_contents(&output), ["Hel", "lo"]);
+        let tail = format!("data: {}\n\ndata: [DONE]\n\n", usage_frame(12));
+        assert!(output.ends_with(&tail), "{output}");
+    }
+
+    #[test]
+    fn sealed_data_after_the_encrypted_done_aborts() {
+        let mut upstream = Upstream::new();
+        let mut events = upstream.happy();
+        events.insert(6, upstream.encrypted(&content("late", 13)));
+        let error = upstream.run(&events).unwrap_err();
+        assert!(
+            error.to_string().contains("after the encrypted [DONE]"),
+            "{error:#}"
+        );
     }
 
     #[test]
