@@ -39,6 +39,7 @@ explains the table and how to set each upstream up.
 | `deepseek/deepseek-v4.1-flash` | `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash` | `api.deepinfra.com` | `--deepinfra` |
 | `qwen/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
 | `qwen/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
+| `openai/gpt-oss-20b` | `deepinfra/openai/gpt-oss-20b` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4.1-flash` | `engy/deepseek-v4.1-flash` | `api.engy.ai` | `--engy` |
@@ -241,6 +242,7 @@ gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4.1-Flash --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.6-35B-A3B --discount-pct 5
 gmcli declare-product --provider deepinfra --model Qwen/Qwen3.8-27B --discount-pct 5
+gmcli declare-product --provider deepinfra --model openai/gpt-oss-20b --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.3 --discount-pct 5
 gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
