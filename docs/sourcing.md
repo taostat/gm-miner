@@ -63,6 +63,8 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.1-tee` | `near/zai-org/GLM-5.1-FP8` | retired by NEAR (2026-09-24) | `--near` |
 | `zai/glm-5.2-tee` | `near/z-ai/glm-5.2` | retired by NEAR (2026-09-24) | `--near` |
 | `deepseek/deepseek-v4-flash-0731-tee` | `near/deepseek-ai/DeepSeek-V4-Flash` | retired by NEAR (2026-09-24) | `--near` |
+| `qwen/qwen3.6-27b-tee` | `near/Qwen/Qwen3.6-27B-FP8` | retired by NEAR (2026-09-24) | `--near` |
+| `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | retired by NEAR (2026-09-24) | `--near` |
 | `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `near/black-forest-labs/FLUX.2-klein-4B` | `flux2-klein.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `deepinfra/black-forest-labs/FLUX-2-klein-4b` | `api.deepinfra.com` | `--deepinfra` |
