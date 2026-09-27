@@ -8,6 +8,7 @@ use axum::http::{Request, Response, StatusCode};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use gm_miner_attestd::near_verify::{error_response, NearVerifier, TARGETS};
+use gm_miner_attestd::upstream_proxy::option_value;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -84,17 +85,6 @@ async fn run() -> Result<()> {
     axum::serve(listener, app)
         .await
         .context("serve NEAR verification proxy")
-}
-
-fn option_value<'a>(arguments: &'a [String], option: &str) -> Result<Option<&'a str>> {
-    let Some(index) = arguments.iter().position(|argument| argument == option) else {
-        return Ok(None);
-    };
-    arguments
-        .get(index + 1)
-        .map(String::as_str)
-        .map(Some)
-        .with_context(|| format!("{option} requires a value"))
 }
 
 async fn health() -> StatusCode {

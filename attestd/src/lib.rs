@@ -18,6 +18,7 @@ pub mod provider;
 pub mod ratls;
 pub mod report_data;
 pub mod tee_evidence;
+pub mod upstream_proxy;
 
 pub use identity::validate_miner_id;
 pub use info::{attestation_info, AppState, AttestationInfoQuery};

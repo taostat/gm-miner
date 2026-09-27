@@ -10,6 +10,7 @@ use axum::routing::{any, get};
 use axum::{Json, Router};
 use gm_miner_attestd::chutes_verify::admission::{Admissions, ChutesApi};
 use gm_miner_attestd::chutes_verify::{client, references, ChutesVerifier, LiveChutes, TARGETS};
+use gm_miner_attestd::upstream_proxy::option_value;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -92,17 +93,6 @@ async fn verify_once(model: Option<&str>) -> Result<()> {
     }
     anyhow::ensure!(failures == 0, "{failures} Chutes targets failed admission");
     Ok(())
-}
-
-fn option_value<'a>(arguments: &'a [String], option: &str) -> Result<Option<&'a str>> {
-    let Some(index) = arguments.iter().position(|argument| argument == option) else {
-        return Ok(None);
-    };
-    arguments
-        .get(index + 1)
-        .map(String::as_str)
-        .map(Some)
-        .with_context(|| format!("{option} requires a value"))
 }
 
 async fn health() -> StatusCode {

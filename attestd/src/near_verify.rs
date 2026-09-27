@@ -1,17 +1,15 @@
 use std::fmt;
-use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use axum::body::{Body, Bytes};
-use axum::http::header::{CONNECTION, HOST, TRANSFER_ENCODING, UPGRADE};
-use axum::http::{HeaderMap, HeaderName, Method, Request, Response, StatusCode, Uri};
+use axum::body::Body;
+use axum::http::header::HOST;
+use axum::http::{Method, Request, Response, StatusCode, Uri};
 use dcap_qvl::collateral::CollateralClient;
 use http_body_util::{BodyExt as _, Limited};
-use hyper::client::conn::http1::{self, SendRequest};
-use hyper_util::rt::TokioIo;
+use hyper::client::conn::http1::SendRequest;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -19,21 +17,20 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, Signatur
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use tokio::net::{lookup_host, TcpStream};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::warn;
 
 use crate::tee_evidence::{self, nras};
+use crate::upstream_proxy::{self, retry_attestation, strip_hop_by_hop};
 
 pub const SELECTOR_HEADER: &str = "x-gm-upstream-model";
+const PROVIDER: &str = "NEAR";
 const ATTESTATION_LIMIT: usize = 2 * 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(120);
 const NRAS_TIMEOUT: Duration = Duration::from_secs(60);
 const NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
-const ATTESTATION_ATTEMPTS: usize = 3;
 const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 const IMAGES_GENERATIONS: &str = "/v1/images/generations";
 
@@ -184,7 +181,7 @@ impl NearVerifier {
     pub async fn preflight(&self, target: NearTarget) -> Result<()> {
         let (sender, connection, _, _) = self.connect_and_attest(target).await?;
         drop(sender);
-        finish_connection(connection).await
+        upstream_proxy::finish_connection(PROVIDER, connection).await
     }
 
     /// Verify one configured endpoint while pinning the TCP connection to an
@@ -198,7 +195,7 @@ impl NearVerifier {
     pub async fn preflight_at(&self, target: NearTarget, ip: IpAddr) -> Result<()> {
         let (sender, connection, _, _) = self.connect_and_attest_once(target, Some(ip), 0).await?;
         drop(sender);
-        finish_connection(connection).await
+        upstream_proxy::finish_connection(PROVIDER, connection).await
     }
 
     /// Attest the selected endpoint and forward on that same TLS connection.
@@ -242,7 +239,7 @@ impl NearVerifier {
         SocketAddr,
     )> {
         let mut attempt = 0;
-        retry_attestation(|| {
+        retry_attestation(PROVIDER, || {
             let current_attempt = attempt;
             attempt += 1;
             self.connect_and_attest_once(target, None, current_attempt)
@@ -280,46 +277,22 @@ impl NearVerifier {
         [u8; 32],
         SocketAddr,
     )> {
-        let address = if let Some(ip) = ip {
-            SocketAddr::new(ip, 443)
-        } else {
-            let mut addresses = lookup_host((target.host, 443))
-                .await
-                .with_context(|| format!("resolve {}", target.host))?
-                .collect::<Vec<_>>();
-            addresses.sort_unstable();
-            addresses.dedup();
-            *addresses
-                .get(attempt % addresses.len().max(1))
-                .with_context(|| format!("{} resolved to no addresses", target.host))?
-        };
-        let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
-            .await
-            .context("NEAR TCP connect timed out")?
-            .with_context(|| format!("connect to {} via {address}", target.host))?;
-        let peer = tcp
-            .peer_addr()
-            .with_context(|| format!("read NEAR peer address for {}", target.host))?;
-        let server_name = ServerName::try_from(target.host)
-            .context("invalid NEAR TLS server name")?
-            .to_owned();
-        let tls = timeout(CONNECT_TIMEOUT, self.tls.connect(server_name, tcp))
-            .await
-            .context("NEAR TLS handshake timed out")?
-            .context("complete NEAR TLS handshake")?;
-        let peer_certificate = tls
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|certificates| certificates.first())
-            .context("NEAR TLS peer sent no certificate")?;
-        let live_spki = tee_evidence::spki_sha256(peer_certificate.as_ref())
+        let connection = upstream_proxy::connect(
+            &self.tls,
+            PROVIDER,
+            target.host,
+            ip.map(|ip| SocketAddr::new(ip, 443)),
+            attempt,
+        )
+        .await?;
+        let live_spki = tee_evidence::spki_sha256(connection.leaf.as_ref())
             .context("hash NEAR TLS certificate key")?;
-        let (sender, connection) = http1::handshake(TokioIo::new(tls))
-            .await
-            .context("start HTTP/1.1 over NEAR TLS")?;
-        let connection = tokio::spawn(connection);
-        Ok((sender, connection, live_spki, peer))
+        Ok((
+            connection.sender,
+            connection.driver,
+            live_spki,
+            connection.peer,
+        ))
     }
 
     async fn attest(
@@ -394,36 +367,6 @@ impl NearVerifier {
     }
 }
 
-async fn retry_attestation<T, Operation, Attempt>(mut operation: Operation) -> Result<T>
-where
-    Operation: FnMut() -> Attempt,
-    Attempt: Future<Output = Result<T>>,
-{
-    let mut failures = Vec::with_capacity(ATTESTATION_ATTEMPTS);
-    for attempt in 1..=ATTESTATION_ATTEMPTS {
-        match operation().await {
-            Ok(value) => return Ok(value),
-            Err(error) => {
-                warn!(
-                    attempt,
-                    max_attempts = ATTESTATION_ATTEMPTS,
-                    will_retry = attempt < ATTESTATION_ATTEMPTS,
-                    error = %format!("{error:#}"),
-                    "NEAR attestation attempt failed"
-                );
-                failures.push(format!("attempt {attempt}: {error:#}"));
-            }
-        }
-        if attempt < ATTESTATION_ATTEMPTS {
-            sleep(Duration::from_millis(100 * attempt as u64)).await;
-        }
-    }
-    bail!(
-        "NEAR attestation failed after {ATTESTATION_ATTEMPTS} attempts: {}",
-        failures.join("; ")
-    )
-}
-
 fn verify_nras_response(response: &Value) -> Result<()> {
     let verdict = nras::unverified_claims(nras::aggregate_token(response)?)?;
     nras::require_overall_success(&verdict)
@@ -457,19 +400,6 @@ fn upstream_request(mut request: Request<Body>, target: NearTarget) -> Result<Re
         .map_or(target.path, axum::http::uri::PathAndQuery::as_str);
     *request.uri_mut() = path.parse().context("encode NEAR upstream URI")?;
     Ok(request)
-}
-
-fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    for header in [
-        &CONNECTION,
-        &TRANSFER_ENCODING,
-        &UPGRADE,
-        &HeaderName::from_static("keep-alive"),
-        &HeaderName::from_static("proxy-authenticate"),
-        &HeaderName::from_static("proxy-authorization"),
-    ] {
-        headers.remove(header);
-    }
 }
 
 fn verify_identity(
@@ -533,24 +463,10 @@ fn verify_compose_binding(attestation: &NearAttestation, mr_config_id: &[u8; 48]
     Ok(())
 }
 
-async fn finish_connection(connection: JoinHandle<Result<(), hyper::Error>>) -> Result<()> {
-    match timeout(Duration::from_secs(2), connection).await {
-        Ok(joined) => joined
-            .context("join NEAR HTTP connection")?
-            .context("NEAR HTTP connection"),
-        Err(_) => Ok(()),
-    }
-}
-
+/// The 502 the NEAR proxy answers with when it refuses a request.
+#[must_use]
 pub fn error_response(error: &anyhow::Error) -> Response<Body> {
-    warn!(error = %format!("{error:#}"), "NEAR attestation proxy rejected request");
-    Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({"error": "NEAR upstream attestation failed"}).to_string(),
-        ))
-        .unwrap_or_else(|_| Response::new(Body::from(Bytes::new())))
+    upstream_proxy::error_response(PROVIDER, error)
 }
 
 #[cfg(test)]
@@ -560,6 +476,7 @@ pub fn error_response(error: &anyhow::Error) -> Response<Body> {
 )]
 mod tests {
     use super::*;
+    use axum::http::header::CONNECTION;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -839,7 +756,7 @@ mod tests {
     async fn transient_attestation_failure_is_retried_before_inference() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&attempts);
-        retry_attestation(|| {
+        retry_attestation("NEAR", || {
             let attempt = observed.fetch_add(1, Ordering::SeqCst);
             async move {
                 if attempt < 2 {
@@ -857,19 +774,22 @@ mod tests {
     async fn attestation_stays_failed_after_bounded_attempts() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&attempts);
-        let error = retry_attestation::<(), _, _>(|| {
+        let error = retry_attestation::<(), _, _>("NEAR", || {
             observed.fetch_add(1, Ordering::SeqCst);
             async { bail!("persistent verifier failure") }
         })
         .await
         .unwrap_err();
-        assert_eq!(attempts.load(Ordering::SeqCst), ATTESTATION_ATTEMPTS);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            upstream_proxy::ATTESTATION_ATTEMPTS
+        );
         assert!(error.to_string().contains("failed after 3 attempts"));
         assert_eq!(
             format!("{error:#}")
                 .matches("persistent verifier failure")
                 .count(),
-            ATTESTATION_ATTEMPTS
+            upstream_proxy::ATTESTATION_ATTEMPTS
         );
     }
 }
