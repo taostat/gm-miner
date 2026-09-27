@@ -688,6 +688,14 @@ mod tests {
     }
 
     #[test]
+    fn openai_probe_body_budgets_for_reasoning_models() {
+        let (path, body) = cloud_probe_body(AzureProvider::OpenAi, "gpt-5.4-mini");
+        assert_eq!(path, "/openai/v1/chat/completions");
+        assert_eq!(body["model"], "gpt-5.4-mini");
+        assert_eq!(body["max_completion_tokens"], 256);
+    }
+
+    #[test]
     fn cloud_probe_url_discards_endpoint_path_query_and_fragment() {
         let url = cloud_probe_url(
             "https://acct.openai.azure.com/old/path?api-version=1#fragment",
@@ -723,7 +731,7 @@ mod tests {
             .and(body_json(json!({
                 "model": "gpt-5.5",
                 "messages": [{"role": "user", "content": "Reply with one token."}],
-                "max_completion_tokens": 1,
+                "max_completion_tokens": 256,
                 "stream": false,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

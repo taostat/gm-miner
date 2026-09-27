@@ -110,7 +110,11 @@ pub(super) fn cloud_probe_body(
             serde_json::json!({
                 "model": deployment,
                 "messages": [{"role": "user", "content": "Reply with one token."}],
-                "max_completion_tokens": 1,
+                // Reasoning models burn part of this budget on hidden reasoning
+                // tokens before any visible output; 1 starves them into a 400
+                // ("max_tokens or model output limit was reached") even though
+                // the deployment is healthy. 256 clears every catalog model.
+                "max_completion_tokens": 256,
                 "stream": false,
             }),
         ),
