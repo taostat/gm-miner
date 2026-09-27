@@ -23,6 +23,8 @@ pub const MAX_REQUESTS: usize = 100;
 pub const MAX_IDLE: usize = 8;
 /// How long fetching an attestation or the model list may take, body included.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long reading a chat request body from the caller may take.
+pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The limits a pool enforces.
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +33,7 @@ pub struct Limits {
     pub max_requests: usize,
     pub max_idle: usize,
     pub fetch_timeout: Duration,
+    pub request_read_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -40,6 +43,7 @@ impl Default for Limits {
             max_requests: MAX_REQUESTS,
             max_idle: MAX_IDLE,
             fetch_timeout: FETCH_TIMEOUT,
+            request_read_timeout: REQUEST_READ_TIMEOUT,
         }
     }
 }

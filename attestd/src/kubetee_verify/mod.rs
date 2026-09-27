@@ -186,7 +186,12 @@ impl KubeteeVerifier {
     /// connection whose attestation failed, and never sent twice.
     pub async fn forward(&self, request: Request<Body>) -> Result<Response<Body>> {
         let selector = validate_request(&request)?;
-        let request = require_body_model(request, selector).await?;
+        let request = timeout(
+            self.pool.limits().request_read_timeout,
+            require_body_model(request, selector),
+        )
+        .await
+        .context("reading the KubeTEE chat request timed out")??;
         let mut connection = self.checkout().await?;
         let upstream = upstream_request(request)?;
         connection.requests += 1;

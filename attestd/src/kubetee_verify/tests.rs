@@ -38,6 +38,7 @@ const COLLATERAL: &[u8] = include_bytes!("../../tests/fixtures/kubetee/collatera
 const TEST_ROOT: &[u8] = include_bytes!("../../tests/fixtures/kubetee/test_ca.der");
 const TEST_LEAF: &[u8] = include_bytes!("../../tests/fixtures/kubetee/test_leaf.der");
 const TEST_KEY: &[u8] = include_bytes!("../../tests/fixtures/kubetee/test_leaf_key.pk8");
+const FIRST_EVENT: &[u8] = b"data: {\"choices\":[]}\n\n";
 const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n";
 
 fn payload() -> AttestationPayload {
@@ -261,6 +262,8 @@ enum Chat {
     Dropped,
     /// The model list sends headers and half its body, then nothing.
     StalledModelList,
+    /// The chat sends its first event, then nothing more.
+    FirstEventOnly,
 }
 
 #[derive(Clone, Copy)]
@@ -373,6 +376,15 @@ async fn chat_reply(chat: Chat) -> Option<Reply> {
         Chat::Unauthorized => return Some(reply(401, "{\"error\":\"unauthorized\"}")),
         Chat::Dropped => return None,
         Chat::Slow => tokio::time::sleep(Duration::from_millis(300)).await,
+        Chat::FirstEventOnly => {
+            let response = Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Either::Right(Stalled(Some(Bytes::from_static(
+                    FIRST_EVENT,
+                )))));
+            return Some(response.unwrap());
+        }
         Chat::Served | Chat::StalledModelList => {}
     }
     let response = Response::builder()
@@ -731,6 +743,39 @@ async fn a_model_list_body_that_stalls_times_out_and_retires_its_connection() {
     assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
     assert_eq!(verifier.idle_connections(), 0);
     assert_eq!(upstream.model_lists.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn each_event_reaches_the_caller_as_it_arrives() {
+    let (verifier, _) = serve(Evidence::Genuine, Chat::FirstEventOnly, limits()).await;
+    let response =
+        tokio::time::timeout(Duration::from_secs(10), verifier.forward(chat(TARGETS[0])))
+            .await
+            .unwrap()
+            .unwrap();
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(10), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.into_data().unwrap(), FIRST_EVENT);
+}
+
+#[tokio::test]
+async fn a_chat_body_that_stalls_is_refused_before_any_connection() {
+    let slow_caller = Limits {
+        request_read_timeout: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, slow_caller).await;
+    let mut request = chat(TARGETS[0]);
+    *request.body_mut() = Body::new(Stalled(Some(Bytes::from_static(b"{\"model\":"))));
+    let result = tokio::time::timeout(Duration::from_secs(10), verifier.forward(request))
+        .await
+        .unwrap();
+    assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
+    assert_eq!(counts(&upstream), (0, 0, 0));
 }
 
 #[tokio::test]
