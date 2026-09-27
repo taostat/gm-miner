@@ -19,7 +19,7 @@ use std::time::Duration;
 use dcap_qvl::policy::QuoteClaims;
 use dcap_qvl::quote::{EnclaveReport, Report, TDReport10};
 use dcap_qvl::tcb_info::TcbStatus;
-use http_body_util::Full;
+use http_body_util::{Either, Full};
 use hyper::service::service_fn;
 use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
@@ -204,7 +204,7 @@ fn a_non_rs256_proof_fails_closed() {
 }
 
 #[test]
-fn the_model_list_is_narrowed_to_the_targets() {
+fn the_model_list_is_narrowed_to_the_chat_and_image_models() {
     let list = serde_json::json!({"object": "list", "data": [
         {"id": "z-ai/glm-5.3", "object": "model"},
         {"id": "minimax/h3", "object": "model"},
@@ -218,6 +218,7 @@ fn the_model_list_is_narrowed_to_the_targets() {
         served["data"],
         serde_json::json!([
             {"id": "z-ai/glm-5.3", "object": "model"},
+            {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
             {"id": "xiaomi/mimo-v2.6-pro", "object": "model"},
         ])
     );
@@ -258,6 +259,8 @@ enum Chat {
     Slow,
     Unauthorized,
     Dropped,
+    /// The model list sends headers and half its body, then nothing.
+    StalledModelList,
 }
 
 #[derive(Clone, Copy)]
@@ -268,6 +271,8 @@ enum Evidence {
     OtherCertificate,
     /// The recorded quote, echoed under a nonce other than the one sent.
     Replayed,
+    /// Headers and half the body, then nothing.
+    Stalled,
 }
 
 struct Upstream {
@@ -325,12 +330,41 @@ fn attestation_body(evidence: Evidence) -> Vec<u8> {
     serde_json::to_vec(&payload).unwrap()
 }
 
-type Reply = Response<Full<Bytes>>;
+type Reply = Response<Either<Full<Bytes>, Stalled>>;
 
 fn reply(status: u16, body: impl Into<Bytes>) -> Reply {
     Response::builder()
         .status(status)
-        .body(Full::new(body.into()))
+        .body(Either::Left(Full::new(body.into())))
+        .unwrap()
+}
+
+/// A body that sends its first bytes and then never another.
+struct Stalled(Option<Bytes>);
+
+impl hyper::body::Body for Stalled {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        match self.0.take() {
+            Some(first) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(first)))),
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Headers announcing `body` in full, and only its first half sent.
+fn stalled(body: &[u8]) -> Reply {
+    Response::builder()
+        .status(200)
+        .header("content-length", body.len())
+        .body(Either::Right(Stalled(Some(Bytes::copy_from_slice(
+            &body[..body.len() / 2],
+        )))))
         .unwrap()
 }
 
@@ -339,7 +373,7 @@ async fn chat_reply(chat: Chat) -> Option<Reply> {
         Chat::Unauthorized => return Some(reply(401, "{\"error\":\"unauthorized\"}")),
         Chat::Dropped => return None,
         Chat::Slow => tokio::time::sleep(Duration::from_millis(300)).await,
-        Chat::Served => {}
+        Chat::Served | Chat::StalledModelList => {}
     }
     let response = Response::builder()
         .status(200)
@@ -350,7 +384,7 @@ async fn chat_reply(chat: Chat) -> Option<Reply> {
         .header("x-request-id", "served");
     Some(
         response
-            .body(Full::new(Bytes::from_static(SSE.as_bytes())))
+            .body(Either::Left(Full::new(Bytes::from_static(SSE.as_bytes()))))
             .unwrap(),
     )
 }
@@ -371,6 +405,7 @@ async fn handle(
             .push((parts.headers, body.len()));
         return Ok(match upstream.evidence {
             Evidence::Unavailable => reply(502, "{\"error\":\"attestation agent unavailable\"}"),
+            Evidence::Stalled => stalled(&attestation_body(Evidence::Genuine)),
             evidence => reply(200, attestation_body(evidence)),
         });
     }
@@ -384,8 +419,11 @@ async fn handle(
         let list = serde_json::json!({"object": "list", "data": [
             {"id": "z-ai/glm-5.3", "object": "model"},
             {"id": "minimax/h3", "object": "model"},
+            {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
         ]});
-        return Ok(if authorized {
+        return Ok(if matches!(upstream.chat, Chat::StalledModelList) {
+            stalled(list.to_string().as_bytes())
+        } else if authorized {
             reply(200, list.to_string())
         } else {
             reply(401, "{\"error\":\"no key\"}")
@@ -647,6 +685,42 @@ async fn a_connection_that_fails_attestation_never_carries_a_chat() {
     }
 }
 
+fn quick_fetch() -> Limits {
+    Limits {
+        fetch_timeout: Duration::from_millis(300),
+        ..Limits::default()
+    }
+}
+
+#[tokio::test]
+async fn an_attestation_body_that_stalls_times_out_and_is_retried() {
+    let (verifier, upstream) = serve(Evidence::Stalled, Chat::Served, quick_fetch()).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), verifier.forward(chat(TARGETS[0])))
+        .await
+        .unwrap();
+    let error = result.unwrap_err();
+    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    assert_eq!(counts(&upstream), (3, 3, 0), "three attempts, no chat");
+    assert_eq!(verifier.idle_connections(), 0);
+}
+
+#[tokio::test]
+async fn a_model_list_body_that_stalls_times_out_and_retires_its_connection() {
+    let (verifier, upstream) =
+        serve(Evidence::Genuine, Chat::StalledModelList, quick_fetch()).await;
+    let request = Request::builder()
+        .uri(MODELS)
+        .header(AUTHORIZATION, "Bearer kt")
+        .body(Body::empty())
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), verifier.models(request))
+        .await
+        .unwrap();
+    assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
+    assert_eq!(verifier.idle_connections(), 0);
+    assert_eq!(upstream.model_lists.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn a_failed_chat_is_never_retried_and_its_connection_is_retired() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Dropped, limits()).await;
@@ -677,7 +751,10 @@ async fn the_model_list_is_fetched_on_an_attested_connection_and_narrowed() {
     let list: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         list["data"],
-        serde_json::json!([{"id": "z-ai/glm-5.3", "object": "model"}])
+        serde_json::json!([
+            {"id": "z-ai/glm-5.3", "object": "model"},
+            {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
+        ])
     );
     let keyless = Request::builder().uri(MODELS).body(Body::empty()).unwrap();
     let response = verifier.models(keyless).await.unwrap();

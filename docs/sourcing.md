@@ -333,9 +333,12 @@ The verifier serves only the chat models compiled into the image:
 `z-ai/glm-5.2`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`,
 `deepseek/deepseek-v4.1-flash`, `ornith/ornith-1.5-397b` and
 `xiaomi/mimo-v2.6-pro`. Envoy answers a chat request for any other KubeTEE model
-with 400. Its `GET /v1/models` answer is KubeTEE's own list narrowed to those
-models. Image generation keeps its direct route. Adding a KubeTEE chat model
-requires a new image build and the normal image-approval process.
+with 400. Image generation keeps its direct route. Its `GET /v1/models` answer
+is KubeTEE's own list narrowed to those chat models and the image model the
+image route serves, `black-forest-labs/flux.2-klein-4b`. Fetching the model list
+or an attestation is bounded at 60 seconds, response body included. Adding a
+KubeTEE chat model requires a new image build and the normal image-approval
+process.
 
 `gmcli sources` prints this line for you, pre-filled, for every undeclared route
 where declaring it would actually get you somewhere — one a worker already

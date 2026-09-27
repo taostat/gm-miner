@@ -21,6 +21,8 @@ pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
 pub const MAX_REQUESTS: usize = 100;
 /// How many idle attested connections are kept for reuse.
 pub const MAX_IDLE: usize = 8;
+/// How long fetching an attestation or the model list may take, body included.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The limits a pool enforces.
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +30,7 @@ pub struct Limits {
     pub max_age: Duration,
     pub max_requests: usize,
     pub max_idle: usize,
+    pub fetch_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -36,6 +39,7 @@ impl Default for Limits {
             max_age: MAX_AGE,
             max_requests: MAX_REQUESTS,
             max_idle: MAX_IDLE,
+            fetch_timeout: FETCH_TIMEOUT,
         }
     }
 }
@@ -122,6 +126,12 @@ impl Pool {
     #[must_use]
     pub fn usable(&self, connection: &Attested) -> bool {
         connection.usable(self.limits)
+    }
+
+    /// The limits this pool enforces.
+    #[must_use]
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// How many idle connections the pool holds.

@@ -60,9 +60,12 @@ pub const TARGETS: [&str; 6] = [
 ];
 
 /// Header families the supplier sets that are removed in both directions.
+/// Image models the direct `/v1/images/generations` route serves. They are
+/// listed in model discovery; chat for them is refused.
+pub const IMAGE_MODELS: [&str; 1] = ["black-forest-labs/flux.2-klein-4b"];
+
 const SUPPLIER_HEADER_PREFIXES: [&str; 2] = ["x-kubetee-", "x-litellm-"];
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
-const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a pooled connection may take to accept its next request.
 const READY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Envoy's route timeout: a non-streaming completion sends its headers
@@ -203,7 +206,7 @@ impl KubeteeVerifier {
         Ok(Response::from_parts(parts, Body::new(body)))
     }
 
-    /// The upstream model list, narrowed to [`TARGETS`], fetched on an
+    /// The upstream model list, narrowed to [`TARGETS`] and [`IMAGE_MODELS`], fetched on an
     /// attested connection.
     ///
     /// # Errors
@@ -223,7 +226,13 @@ impl KubeteeVerifier {
             .context("build KubeTEE model list request")?;
         let mut connection = self.checkout().await?;
         connection.requests += 1;
-        let result = read_models(&mut connection.sender, upstream).await;
+        let result = timeout(
+            self.pool.limits().fetch_timeout,
+            read_models(&mut connection.sender, upstream),
+        )
+        .await
+        .context("KubeTEE model list fetch timed out")
+        .and_then(|result| result);
         if result.is_ok() {
             self.pool.give_back(connection);
         } else {
@@ -293,16 +302,21 @@ impl KubeteeVerifier {
             .header(HOST, HOST_NAME)
             .body(Body::empty())
             .context("build KubeTEE attestation request")?;
-        let response = timeout(ATTESTATION_TIMEOUT, connection.sender.send_request(request))
-            .await
-            .context("KubeTEE attestation request timed out")?
-            .context("send KubeTEE attestation request")?;
-        ensure!(
-            response.status() == StatusCode::OK,
-            "KubeTEE attestation endpoint returned {}",
-            response.status()
-        );
-        let body = read_body(response.into_body()).await?;
+        let body = timeout(self.pool.limits().fetch_timeout, async {
+            let response = connection
+                .sender
+                .send_request(request)
+                .await
+                .context("send KubeTEE attestation request")?;
+            ensure!(
+                response.status() == StatusCode::OK,
+                "KubeTEE attestation endpoint returned {}",
+                response.status()
+            );
+            read_body(response.into_body()).await
+        })
+        .await
+        .context("KubeTEE attestation fetch timed out")??;
         let payload: AttestationPayload =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
         let quote =
@@ -334,9 +348,9 @@ async fn read_models(
     sender: &mut hyper::client::conn::http1::SendRequest<Body>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let response = timeout(ATTESTATION_TIMEOUT, sender.send_request(request))
+    let response = sender
+        .send_request(request)
         .await
-        .context("KubeTEE model list request timed out")?
         .context("send KubeTEE model list request")?;
     let (mut parts, body) = response.into_parts();
     let body = read_body(body).await?;
@@ -351,7 +365,8 @@ async fn read_models(
     Ok(Response::from_parts(parts, Body::from(served)))
 }
 
-/// The upstream model list with every entry outside [`TARGETS`] removed.
+/// The upstream model list with every entry outside [`TARGETS`] and
+/// [`IMAGE_MODELS`] removed.
 #[must_use]
 pub fn served_targets(list: &Value) -> Value {
     let data = list
@@ -364,7 +379,7 @@ pub fn served_targets(list: &Value) -> Value {
                     model
                         .get("id")
                         .and_then(Value::as_str)
-                        .is_some_and(|id| TARGETS.contains(&id))
+                        .is_some_and(|id| TARGETS.contains(&id) || IMAGE_MODELS.contains(&id))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
