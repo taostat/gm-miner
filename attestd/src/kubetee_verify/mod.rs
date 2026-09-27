@@ -66,6 +66,8 @@ pub const IMAGE_MODELS: [&str; 1] = ["black-forest-labs/flux.2-klein-4b"];
 
 const SUPPLIER_HEADER_PREFIXES: [&str; 2] = ["x-kubetee-", "x-litellm-"];
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// The largest chat request body the proxy reads.
+const REQUEST_LIMIT: usize = 32 * 1024 * 1024;
 /// How long a pooled connection may take to accept its next request.
 const READY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Envoy's route timeout: a non-streaming completion sends its headers
@@ -183,7 +185,8 @@ impl KubeteeVerifier {
     /// attestation or upstream failure. A request is never sent on a
     /// connection whose attestation failed, and never sent twice.
     pub async fn forward(&self, request: Request<Body>) -> Result<Response<Body>> {
-        validate_request(&request)?;
+        let selector = validate_request(&request)?;
+        let request = require_body_model(request, selector).await?;
         let mut connection = self.checkout().await?;
         let upstream = upstream_request(request)?;
         connection.requests += 1;
@@ -408,6 +411,29 @@ fn validate_request(request: &Request<Body>) -> Result<&'static str> {
         .into_iter()
         .find(|target| *target == selector)
         .context("unsupported KubeTEE model selector")
+}
+
+/// Read the chat body and require its `model` to be the selected target, so
+/// the model sent upstream is the one the allowlist admitted. Runs before
+/// any connection is used or opened.
+async fn require_body_model(request: Request<Body>, selector: &str) -> Result<Request<Body>> {
+    #[derive(serde::Deserialize)]
+    struct ChatModel {
+        model: String,
+    }
+    let (parts, body) = request.into_parts();
+    let body = Limited::new(body, REQUEST_LIMIT)
+        .collect()
+        .await
+        .map_err(|error| anyhow::anyhow!("read KubeTEE chat request: {error}"))?
+        .to_bytes();
+    let chat: ChatModel =
+        serde_json::from_slice(&body).context("KubeTEE chat request has no model")?;
+    ensure!(
+        chat.model == selector,
+        "KubeTEE chat request names a model other than its selector"
+    );
+    Ok(Request::from_parts(parts, Body::from(body)))
 }
 
 fn upstream_request(mut request: Request<Body>) -> Result<Request<Body>> {

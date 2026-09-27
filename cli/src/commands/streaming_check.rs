@@ -875,10 +875,10 @@ async fn run_provider_probe(
         .header("content-type", "application/json")
         .header("x-gm-node-key", &target.node_secret)
         .header("x-gm-provider", probe.provider.as_str());
-    if probe.provider == Provider::Near {
+    if matches!(probe.provider, Provider::Near | Provider::Kubetee) {
         let selector = probe.body["model"]
             .as_str()
-            .context("NEAR probe has no upstream source model")?;
+            .with_context(|| format!("{} probe has no upstream source model", probe.provider))?;
         request = request.header("x-gm-upstream-model", selector);
     }
     request = apply_upstream_slot(request, probe.slot.as_deref());
@@ -1149,6 +1149,43 @@ mod tests {
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
+    }
+
+    #[tokio::test]
+    async fn a_kubetee_probe_names_its_upstream_model_to_the_selector_gate() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("x-gm-provider", "kubetee"))
+            .and(header("x-gm-upstream-model", "z-ai/glm-5.3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {}\n\ndata: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let target = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: "secret".to_owned(),
+            provider_models: None,
+            worker_backends: HashMap::new(),
+        };
+        let probe = ProviderProbe {
+            provider: Provider::Kubetee,
+            model: "zai/glm-5.3-tee".to_owned(),
+            slot: None,
+            fallback: false,
+            path: "/v1/chat/completions",
+            body: serde_json::json!({"model": "z-ai/glm-5.3", "stream": true}),
+        };
+        run_provider_probe(&target, &probe)
+            .await
+            .expect("a KubeTEE probe carries its selector");
     }
 
     #[test]

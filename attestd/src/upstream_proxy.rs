@@ -52,8 +52,9 @@ pub async fn connect(
     let address = if let Some(address) = address {
         address
     } else {
-        let mut addresses = lookup_host((host, 443))
+        let mut addresses = timeout(CONNECT_TIMEOUT, lookup_host((host, 443)))
             .await
+            .with_context(|| format!("resolving {host} timed out"))?
             .with_context(|| format!("resolve {host}"))?
             .collect::<Vec<_>>();
         addresses.sort_unstable();

@@ -283,8 +283,8 @@ struct Upstream {
     chats: AtomicUsize,
     model_lists: AtomicUsize,
     chat_headers: Mutex<Vec<HeaderMap>>,
-    /// Every attestation request's headers and body length.
-    attestation_requests: Mutex<Vec<(HeaderMap, usize)>>,
+    /// Every attestation request's query, headers and body length.
+    attestation_requests: Mutex<Vec<(String, HeaderMap, usize)>>,
 }
 
 struct FixtureCollateral;
@@ -398,11 +398,12 @@ async fn handle(
         upstream.attestations.fetch_add(1, Ordering::SeqCst);
         let (parts, body) = request.into_parts();
         let body = body.collect().await.unwrap().to_bytes();
+        let query = parts.uri.query().unwrap_or_default().to_owned();
         upstream
             .attestation_requests
             .lock()
             .unwrap()
-            .push((parts.headers, body.len()));
+            .push((query, parts.headers, body.len()));
         return Ok(match upstream.evidence {
             Evidence::Unavailable => reply(502, "{\"error\":\"attestation agent unavailable\"}"),
             Evidence::Stalled => stalled(&attestation_body(Evidence::Genuine)),
@@ -543,6 +544,8 @@ async fn a_chat_streams_through_unchanged_without_supplier_headers() {
         (1, 1, 1),
         "one connection, one quote, one chat"
     );
+    let (query, _, _) = upstream.attestation_requests.lock().unwrap().remove(0);
+    assert_eq!(query, format!("nonce={}", payload().nonce));
     let sent = upstream.chat_headers.lock().unwrap().remove(0);
     assert!(sent
         .keys()
@@ -647,7 +650,16 @@ async fn off_list_requests_are_refused_before_any_connection() {
     two_selectors
         .headers_mut()
         .append(SELECTOR_HEADER, HeaderValue::from_static("z-ai/glm-5.3"));
+    let mut other_body_model = chat(TARGETS[1]);
+    *other_body_model.body_mut() = Body::from(r#"{"model":"minimax/h3"}"#);
+    let mut no_body_model = chat(TARGETS[1]);
+    *no_body_model.body_mut() = Body::from(r#"{"messages":[]}"#);
+    let mut not_json = chat(TARGETS[1]);
+    *not_json.body_mut() = Body::from("model=z-ai/glm-5.3");
     for request in [
+        other_body_model,
+        no_body_model,
+        not_json,
         chat("minimax/h3"),
         chat("black-forest-labs/flux.2-klein-4b"),
         wrong_path,
@@ -677,7 +689,7 @@ async fn a_connection_that_fails_attestation_never_carries_a_chat() {
             "three attested attempts, no chat"
         );
         assert_eq!(verifier.idle_connections(), 0);
-        for (headers, body) in upstream.attestation_requests.lock().unwrap().iter() {
+        for (_, headers, body) in upstream.attestation_requests.lock().unwrap().iter() {
             assert_eq!(*body, 0, "an attestation request carries no body");
             assert!(!headers.contains_key("x-buyer-sentinel"));
             assert!(!headers.contains_key(AUTHORIZATION));
