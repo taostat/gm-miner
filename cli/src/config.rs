@@ -102,14 +102,18 @@ impl TokenEntry {
         expiry.with_timezone(&chrono::Utc) <= cutoff
     }
 
-    /// Seconds from now until `token_expires_at`, clamped to zero for an
-    /// already-past expiry. `None` when there is no stored expiry or it is
+    /// Whole seconds from now until `token_expires_at`, rounded down and
+    /// clamped to zero for an already-past expiry. `None` when there is no stored expiry or it is
     /// unparseable — the caller has no boundary to wait for in that case.
     #[must_use]
     pub fn seconds_until_expiry(&self) -> Option<i64> {
+        self.seconds_until_expiry_at(chrono::Utc::now())
+    }
+
+    fn seconds_until_expiry_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
         let raw = self.token_expires_at.as_deref()?;
         let expiry = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
-        let remaining = expiry.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        let remaining = expiry.with_timezone(&chrono::Utc) - now;
         Some(remaining.num_seconds().max(0))
     }
 }
@@ -1464,6 +1468,29 @@ mod tests {
         );
         assert!(entry.worker_by_app_name("absent").is_none());
         assert!(entry.worker_by_id("absent").is_none());
+    }
+
+    #[test]
+    fn seconds_until_expiry_handles_invalid_past_and_fractional_timestamps() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-27T12:00:00Z")
+            .expect("fixed time")
+            .with_timezone(&chrono::Utc);
+        for (raw, expected) in [
+            (None, None),
+            (Some("corrupt"), None),
+            (Some("2000-01-01T00:00:00Z"), Some(0)),
+            (Some("2026-09-27T12:00:00Z"), Some(0)),
+            (Some("2026-09-27T11:59:59.5Z"), Some(0)),
+            (Some("2026-09-27T12:00:00.9Z"), Some(0)),
+            (Some("2026-09-27T12:05:00.9Z"), Some(300)),
+            (Some("2026-09-27T13:05:00+01:00"), Some(300)),
+        ] {
+            let token = super::TokenEntry {
+                token_expires_at: raw.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(token.seconds_until_expiry_at(now), expected, "{raw:?}");
+        }
     }
 
     // ── On-disk save/load round-trips ────────────────────────────────────────
