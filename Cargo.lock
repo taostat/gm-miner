@@ -2908,6 +2908,7 @@ dependencies = [
  "dirs",
  "fd-lock",
  "gm-azure-verify",
+ "gm-miner-attestd",
  "hex",
  "hmac 0.13.0",
  "mlua",

@@ -547,7 +547,7 @@ fn direct_routes_preserve_native_paths_and_tls_pins() {
             "generativelanguage.googleapis.com",
             "/v1beta/models/gemini:generateContent",
         ),
-        ("kubetee", "llm.kubetee.ai", "/v1/chat/completions"),
+        ("kubetee", "llm.kubetee.ai", "/v1/images/generations"),
         ("engy", "api.engy.ai", "/v1/chat/completions"),
         ("moonmath", "zro.moonmath.ai", "/v1/chat/completions"),
     ] {
@@ -681,6 +681,120 @@ fn near_images_gate_admits_flux_klein_and_still_rejects_unknown_models() {
 }
 
 #[test]
+fn kubetee_chat_and_models_reach_only_the_measured_verifier() {
+    let (status, _, stderr, rendered) = render_envoy([("KUBETEE_API_KEY", "kt-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    for path in ["/v1/chat/completions?trace=1", "/v1/models"] {
+        let selected = route(&parsed, "kubetee", path);
+        assert_eq!(
+            selected["route"]["cluster"], "kubetee_verify_proxy",
+            "{path}"
+        );
+        assert_eq!(selected["route"]["timeout"], "1800s");
+        assert!(selected["route"].get("retry_policy").is_none(), "{path}");
+        assert!(selected["route"].get("host_rewrite_literal").is_none());
+    }
+    let images = route(&parsed, "kubetee", "/v1/images/generations");
+    assert_eq!(images["route"]["cluster"], "kubetee");
+    assert!(images["route"].get("retry_policy").is_none());
+    for path in ["/v1/completions", "/v1/embeddings", "/v1/responses"] {
+        assert!(
+            route(&parsed, "kubetee", path)
+                .get("direct_response")
+                .is_some(),
+            "{path} must not reach KubeTEE unverified"
+        );
+    }
+    let bind: std::net::SocketAddr = gm_miner_attestd::kubetee_verify::BIND_ADDR
+        .parse()
+        .expect("verifier bind address");
+    let endpoint = &cluster(&parsed, "kubetee_verify_proxy")["load_assignment"]["endpoints"][0]
+        ["lb_endpoints"][0]["endpoint"]["address"]["socket_address"];
+    assert_eq!(endpoint["address"], bind.ip().to_string());
+    assert_eq!(endpoint["port_value"], bind.port());
+}
+
+fn kubetee_request(rendered: &str, path: &str, selector: Option<&str>) -> Lua {
+    let mut headers = vec![
+        (":path", path),
+        ("x-gm-provider", "kubetee"),
+        ("x-gm-node-key", "test-node-secret-0001"),
+        ("authorization", "caller-secret"),
+    ];
+    if let Some(selector) = selector {
+        headers.push(("x-gm-upstream-model", selector));
+    }
+    run_request(rendered, &headers, &[("GM_KUBETEE_KEY_SLOT_1", "kt-key")])
+}
+
+fn forwarded(lua: &Lua) -> Option<mlua::Table> {
+    let status = lua
+        .globals()
+        .get::<Option<String>>("response_status")
+        .expect("status");
+    status.is_none().then(|| {
+        lua.globals()
+            .get::<mlua::Table>("input_headers")
+            .expect("headers")
+    })
+}
+
+#[test]
+fn kubetee_chat_gate_admits_exactly_the_verifier_targets() {
+    let (status, _, stderr, rendered) = render_envoy([("KUBETEE_API_KEY", "kt-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    for model in gm_miner_attestd::kubetee_verify::TARGETS {
+        let lua = kubetee_request(&rendered, "/v1/chat/completions", Some(model));
+        let headers = forwarded(&lua).expect("a target selector is forwarded");
+        assert_eq!(
+            headers
+                .get::<Option<String>>("x-gm-upstream-model")
+                .expect("selector"),
+            Some(model.to_owned()),
+            "the validated selector must survive to the loopback verifier"
+        );
+        assert_eq!(
+            headers.get::<String>("authorization").expect("auth"),
+            "Bearer kt-key"
+        );
+    }
+    for model in [
+        Some("minimax/h3"),
+        Some("black-forest-labs/flux.2-klein-4b"),
+        Some("z-ai/glm-5.3,z-ai/glm-5.2"),
+        Some(""),
+        None,
+    ] {
+        let lua = kubetee_request(&rendered, "/v1/chat/completions", model);
+        assert_eq!(
+            lua.globals()
+                .get::<Option<String>>("response_status")
+                .expect("status")
+                .as_deref(),
+            Some("400"),
+            "{model:?}"
+        );
+    }
+    for (path, selector) in [
+        ("/v1/images/generations", Some("z-ai/glm-5.3")),
+        ("/v1/models", Some("z-ai/glm-5.3")),
+        ("/v1/models", None),
+    ] {
+        let lua = kubetee_request(&rendered, path, selector);
+        let headers =
+            forwarded(&lua).expect("a selector off the chat path is dropped, not refused");
+        assert_eq!(
+            headers
+                .get::<Option<String>>("x-gm-upstream-model")
+                .expect("selector"),
+            None,
+            "{path}"
+        );
+    }
+}
+
+#[test]
 fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
     let (status, _, stderr, rendered) = render_envoy([
         ("GOOGLE_API_KEY", "google-key"),
@@ -702,6 +816,11 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
         "near",
         "benchmark",
     ] {
+        let selector = if provider == "kubetee" {
+            "z-ai/glm-5.3"
+        } else {
+            "Qwen/Qwen3.8-27B"
+        };
         for path in ["/v1/chat/completions?trace=1", "/v1/models"] {
             let lua = run_request(
                 &rendered,
@@ -709,7 +828,7 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
                     (":path", path),
                     ("x-gm-provider", provider),
                     ("x-gm-node-key", "test-node-secret-0001"),
-                    ("x-gm-upstream-model", "Qwen/Qwen3.8-27B"),
+                    ("x-gm-upstream-model", selector),
                     ("x-gm-private", "private"),
                     ("x-gm-request-id", "request-123"),
                     ("anthropic-beta", "caller-beta"),
@@ -736,23 +855,24 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
             let selected = route(&parsed, &routed_provider, &routed_path);
             assert_eq!(
                 selected["route"]["cluster"],
-                if provider == "near" {
-                    "near_verify_proxy"
-                } else {
-                    provider
+                match provider {
+                    "near" => "near_verify_proxy",
+                    "kubetee" => "kubetee_verify_proxy",
+                    _ => provider,
                 }
             );
             assert!(selected["request_headers_to_remove"]
                 .as_array()
                 .expect("removed headers")
                 .contains(&json!("x-gm-provider")));
-            let routed_selector =
-                (provider == "near" && path != "/v1/models") || provider == "chutes";
+            let routed_selector = ((provider == "near" || provider == "kubetee")
+                && path != "/v1/models")
+                || provider == "chutes";
             assert_eq!(
                 headers
                     .get::<Option<String>>("x-gm-upstream-model")
                     .expect("model"),
-                routed_selector.then(|| "Qwen/Qwen3.8-27B".to_owned())
+                routed_selector.then(|| selector.to_owned())
             );
             for pair in headers.pairs::<String, String>() {
                 let (name, _) = pair.expect("header");

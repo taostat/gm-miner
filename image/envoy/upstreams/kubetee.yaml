@@ -18,19 +18,29 @@ routes:
       cluster: kubetee
       host_rewrite_literal: llm.kubetee.ai
       timeout: 1800s
+  ##  Chat and the model list terminate only at the co-located
+  ##  measured kubetee-verify-proxy. It owns the closed selector
+  ##  allowlist and sends chat requests only on upstream TLS
+  ##  connections it has attested. No retry: a retry would mask a
+  ##  local failure. There is no direct KubeTEE chat route.
   - match:
-      prefix: "/"
+      path: "/v1/models"
       headers:
         - name: "x-gm-provider"
           string_match:
             exact: "kubetee"
     route:
-      cluster: kubetee
-      host_rewrite_literal: llm.kubetee.ai
+      cluster: kubetee_verify_proxy
       timeout: 1800s
-      retry_policy:
-        retry_on: "reset,connect-failure,refused-stream,5xx"
-        num_retries: 1
+  - match:
+      path: "/v1/chat/completions"
+      headers:
+        - name: "x-gm-provider"
+          string_match:
+            exact: "kubetee"
+    route:
+      cluster: kubetee_verify_proxy
+      timeout: 1800s
 
 clusters:
   ##  TLS 1.3 is mandatory for KubeTEE (security). Envoy clients default
@@ -70,3 +80,15 @@ clusters:
               - san_type: DNS
                 matcher:
                   exact: llm.kubetee.ai
+  - name: kubetee_verify_proxy
+    type: STATIC
+    connect_timeout: 5s
+    load_assignment:
+      cluster_name: kubetee_verify_proxy
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 8084

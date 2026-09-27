@@ -63,7 +63,12 @@ fn runtime(keys: &[(&str, &str)], exits: &[(&str, u8)]) -> Runtime {
     fs::create_dir_all(&bin).expect("create mock bin");
     fs::create_dir_all(&markers).expect("create marker dir");
     executable(&bin.join("gm-miner-ratls"), "#!/usr/bin/env bash\nexit 0\n");
-    for name in ["gm-miner-attestd", "gm-chutes-verify-proxy", "envoy"] {
+    for name in [
+        "gm-miner-attestd",
+        "gm-chutes-verify-proxy",
+        "gm-kubetee-verify-proxy",
+        "envoy",
+    ] {
         executable(&bin.join(name), &service(name));
     }
     let mut command = Command::new("bash");
@@ -111,58 +116,83 @@ fn terminate(child: Child) -> Output {
     child.wait_with_output().expect("collect start.sh output")
 }
 
+/// Each key-gated verification proxy: its key, its binary and the name
+/// start.sh gives it when it exits.
+const PROXIES: [(&str, &str, &str); 2] = [
+    ("CHUTES_API_KEY", "gm-chutes-verify-proxy", "Chutes"),
+    ("KUBETEE_API_KEY", "gm-kubetee-verify-proxy", "KubeTEE"),
+];
+
 #[test]
-fn a_chutes_key_starts_the_verification_proxy_under_supervision() {
-    let mut runtime = runtime(&[("CHUTES_API_KEY", "chutes-key")], &[("envoy", 17)]);
-    let output = run(&mut runtime);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(17), "{stderr}");
-    assert!(runtime.markers.join("gm-chutes-verify-proxy").exists());
-    assert!(
-        runtime.markers.join("gm-chutes-verify-proxy-term").exists(),
-        "the proxy was not stopped with the container"
-    );
+fn a_key_starts_its_verification_proxy_under_supervision() {
+    for (key, proxy, _) in PROXIES {
+        let mut runtime = runtime(&[(key, "provider-key")], &[("envoy", 17)]);
+        let output = run(&mut runtime);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(17), "{stderr}");
+        assert!(runtime.markers.join(proxy).exists(), "{proxy} not started");
+        assert!(
+            runtime.markers.join(format!("{proxy}-term")).exists(),
+            "{proxy} was not stopped with the container"
+        );
+    }
 }
 
 #[test]
-fn without_a_chutes_key_the_proxy_is_not_started() {
+fn without_its_key_no_proxy_is_started() {
     let mut runtime = runtime(&[("OPENAI_API_KEY", "openai-key")], &[("envoy", 17)]);
     let output = run(&mut runtime);
     assert_eq!(output.status.code(), Some(17));
     assert!(runtime.markers.join("envoy").exists());
-    assert!(!runtime.markers.join("gm-chutes-verify-proxy").exists());
+    for (_, proxy, _) in PROXIES {
+        assert!(!runtime.markers.join(proxy).exists(), "{proxy} started");
+    }
 }
 
 #[test]
 fn a_proxy_exit_brings_down_the_container_and_names_it() {
-    let mut runtime = runtime(
-        &[("CHUTES_API_KEY", "chutes-key")],
-        &[("gm-chutes-verify-proxy", 23)],
-    );
-    let output = run(&mut runtime);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(23), "{stderr}");
-    assert!(
-        stderr.contains("Chutes verification proxy exited (status 23)"),
-        "{stderr}"
-    );
-    assert!(runtime.markers.join("envoy-term").exists());
-    assert!(runtime.markers.join("gm-miner-attestd-term").exists());
+    for (key, proxy, label) in PROXIES {
+        let mut runtime = runtime(&[(key, "provider-key")], &[(proxy, 23)]);
+        let output = run(&mut runtime);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(23), "{stderr}");
+        assert!(
+            stderr.contains(&format!("{label} verification proxy exited (status 23)")),
+            "{stderr}"
+        );
+        assert!(runtime.markers.join("envoy-term").exists());
+        assert!(runtime.markers.join("gm-miner-attestd-term").exists());
+    }
 }
 
 #[test]
-fn sigterm_stops_the_proxy_with_every_other_service() {
-    let mut runtime = runtime(&[("CHUTES_API_KEY", "chutes-key")], &[]);
+fn sigterm_stops_every_proxy_with_every_other_service() {
+    let mut runtime = runtime(
+        &[
+            ("CHUTES_API_KEY", "chutes-key"),
+            ("KUBETEE_API_KEY", "kubetee-key"),
+        ],
+        &[],
+    );
     let child = runtime
         .command
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("start start.sh");
-    wait_for(&runtime.markers, "envoy");
+    let services = [
+        "gm-chutes-verify-proxy",
+        "gm-kubetee-verify-proxy",
+        "envoy",
+        "gm-miner-attestd",
+    ];
+    // A mock records its start only once its TERM trap is installed.
+    for service in services {
+        wait_for(&runtime.markers, service);
+    }
     let output = terminate(child);
     assert_eq!(output.status.code(), Some(1));
-    for service in ["gm-chutes-verify-proxy", "envoy", "gm-miner-attestd"] {
+    for service in services {
         assert!(
             runtime.markers.join(format!("{service}-term")).exists(),
             "{service} was not stopped"

@@ -22,7 +22,11 @@
 #      Chutes instances on verified TDX, GPU and measurement evidence and
 #      carries confidential Chutes requests end to end encrypted to the
 #      admitted instance key.
-#   5. envoy — the data plane on :8080. Terminates RA-TLS with the
+#   5. gm-kubetee-verify-proxy (when KUBETEE_API_KEY is configured) —
+#      attests each upstream connection to KubeTEE (nonce-bound TDX quote,
+#      event-log replay, TLS-possession proof) before sending chat
+#      requests on it, and renews it every 10 minutes.
+#   6. envoy — the data plane on :8080. Terminates RA-TLS with the
 #      minted certificate, proxies provider inference traffic and the
 #      registry's x-gm-provider capability probes, and forwards
 #      /attestation/info to the attestation server.
@@ -489,6 +493,7 @@ log "RA-TLS certificate ready"
 # and PID 1 must forward termination even while the data plane is disabled.
 NEAR_PROXY_PID=""
 CHUTES_PROXY_PID=""
+KUBETEE_PROXY_PID=""
 ATTESTD_PID=""
 ENVOY_PID=""
 # shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
@@ -496,7 +501,8 @@ shutdown() {
   log "received signal — shutting down"
   local -a pids=()
   local pid
-  for pid in "${ENVOY_PID}" "${ATTESTD_PID}" "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}"; do
+  for pid in "${ENVOY_PID}" "${ATTESTD_PID}" "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}" \
+    "${KUBETEE_PROXY_PID}"; do
     if [[ -n "${pid}" ]]; then
       pids+=("${pid}")
     fi
@@ -533,6 +539,17 @@ if [[ -n "${CHUTES_API_KEY:-}" ]]; then
   CHUTES_PROXY_PID=$!
 fi
 
+# ── Launch the KubeTEE verification proxy ─────────────────────────────
+# Envoy sends KubeTEE chat and model-list requests to this proxy on
+# 127.0.0.1:8084. It attests each upstream connection when it opens it, so
+# it has no startup dependency on KubeTEE; supervision below brings the container
+# down if it exits.
+if [[ -n "${KUBETEE_API_KEY:-}" ]]; then
+  log "starting KubeTEE verification proxy on 127.0.0.1:8084"
+  gm-kubetee-verify-proxy &
+  KUBETEE_PROXY_PID=$!
+fi
+
 # ── Launch the attestation server ─────────────────────────────────────
 # gm-miner-attestd binds 127.0.0.1:8081 (envoy's `attestd` cluster
 # target) and fetches TDX quotes over /var/run/dstack.sock. The socket
@@ -551,7 +568,7 @@ if [[ "${AZURE_ENABLED}" -eq 1 ]]; then
     if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
       wait "${ATTESTD_PID}" || true
       log "error: attestation server exited before Azure readiness"
-      for pid in "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}"; do
+      for pid in "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}" "${KUBETEE_PROXY_PID}"; do
         if [[ -n "${pid}" ]]; then
           kill -TERM "${pid}" 2>/dev/null || true
         fi
@@ -564,8 +581,8 @@ fi
 
 # ── Launch envoy ──────────────────────────────────────────────────────
 # Not `exec`d: the script stays PID 1 so it can supervise the attestation
-# server, optional NEAR and Chutes verifiers, and Envoy. SIGTERM from the container runtime is
-# forwarded to every child.
+# server, optional NEAR, Chutes and KubeTEE verifiers, and Envoy. SIGTERM
+# from the container runtime is forwarded to every child.
 log "starting envoy"
 envoy \
   -c "${RENDERED_CONFIG}" \
@@ -580,8 +597,8 @@ ENVOY_PID=$!
 # keeps the startup/supervision integration tests honest. Whichever process
 # exits first, the container must come down so the runtime's
 # `restart: unless-stopped` policy recreates the whole stack: a miner
-# missing Envoy, attestd, or a configured NEAR or Chutes verifier cannot serve
-# the registry.
+# missing Envoy, attestd, or a configured NEAR, Chutes or KubeTEE verifier
+# cannot serve the registry.
 #
 # `|| FIRST_EXIT_STATUS=$?` captures the exited child's status AND keeps
 # `set -e` from aborting the script the instant a process exits
@@ -595,6 +612,9 @@ if [[ -n "${NEAR_PROXY_PID}" ]]; then
 fi
 if [[ -n "${CHUTES_PROXY_PID}" ]]; then
   SUPERVISED_PIDS+=("${CHUTES_PROXY_PID}")
+fi
+if [[ -n "${KUBETEE_PROXY_PID}" ]]; then
+  SUPERVISED_PIDS+=("${KUBETEE_PROXY_PID}")
 fi
 while [[ -z "${FIRST_EXIT_PID}" ]]; do
   RUNNING_PIDS=" $(jobs -pr | tr '\n' ' ') "
@@ -617,6 +637,8 @@ elif [[ -n "${NEAR_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${NEAR_PROXY_PID}" ]];
   log "error: NEAR verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 elif [[ -n "${CHUTES_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${CHUTES_PROXY_PID}" ]]; then
   log "error: Chutes verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
+elif [[ -n "${KUBETEE_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${KUBETEE_PROXY_PID}" ]]; then
+  log "error: KubeTEE verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 elif [[ "${FIRST_EXIT_PID}" == "${ENVOY_PID}" ]]; then
   log "error: envoy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 else
