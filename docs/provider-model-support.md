@@ -54,7 +54,7 @@ authority for which explicit routes that registry has published.
 | `claude-sonnet-4-6` | Anthropic API: `anthropic/claude-sonnet-4-6` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
 | `claude-sonnet-5` | Anthropic API: `anthropic/claude-sonnet-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
 | `DeepSeek V3.2 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V3.2-TEE` (`--chutes`) |
-| `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`); Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`) |
+| `DeepSeek V4 Flash 0731` | Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`) |
 | `DeepSeek V4.1 Flash` | KubeTEE: `kubetee/deepseek/deepseek-v4.1-flash` (`--kubetee`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash` (`--deepinfra`); Engy: `engy/deepseek-v4.1-flash` (`--engy`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`) |
 | `FLUX.2 klein 4B` | NEAR confidential inference: `near/black-forest-labs/FLUX.2-klein-4B` (`--near`); DeepInfra: `deepinfra/black-forest-labs/FLUX-2-klein-4b` (`--deepinfra`) |
@@ -79,7 +79,7 @@ authority for which explicit routes that registry has published.
 | `GPT-5.6 Terra` | OpenAI API: `openai/gpt-5.6-terra` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `gpt-oss-20b` | DeepInfra: `deepinfra/openai/gpt-oss-20b` (`--deepinfra`); chat completions only |
 | `Kimi K2.6 TEE` | Chutes: `chutes/moonshotai/Kimi-K2.6-TEE` (`--chutes`) |
-| `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); KubeTEE: `kubetee/moonshotai/kimi-k3` (`--kubetee`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`) |
+| `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`) |
 | `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
 | `Mistral Nemo Instruct 2407 TEE` | Chutes: `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` (`--chutes`) |
 | `Nemotron 3 Nano Omni 30B TEE` | Chutes: `chutes/Nemotron-3-Nano-Omni-30B-TEE` (`--chutes`) |
@@ -93,7 +93,6 @@ authority for which explicit routes that registry has published.
 | `Qwen3.6 27B TEE` | Chutes: `chutes/Qwen/Qwen3.6-27B-TEE` (`--chutes`) |
 | `Qwen3.8 27B` | Engy: `engy/qwen3.8-27b` (`--engy`); DeepInfra: `deepinfra/Qwen/Qwen3.8-27B` (`--deepinfra`) |
 | `Qwen3.8 27B TEE` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
-| `Qwen3.8-Flash-Next` | KubeTEE: `kubetee/qwen/qwen3.8-flash-next` (`--kubetee`) |
 
 `FLUX.2 klein 4B` uses the OpenAI images shape, `POST /v1/images/generations`
 with `response_format: "b64_json"`, forwarded unchanged to either upstream.

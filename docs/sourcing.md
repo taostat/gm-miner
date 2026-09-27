@@ -51,9 +51,9 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.2-tee` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-flash-tee` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-tee` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
-| `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | `llm.kubetee.ai` | `--kubetee` |
-| `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
-| `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | `llm.kubetee.ai` | `--kubetee` |
+| `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | retired by KubeTEE | `--kubetee` |
+| `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | retired by KubeTEE (2026-09-24) | `--kubetee` |
+| `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash-tee` | `kubetee/deepseek/deepseek-v4.1-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `ornith/ornith-1.5-397b-tee` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
 | `xiaomi/mimo-v2.6-pro-ultraspeed-tee` | `kubetee/xiaomi/mimo-v2.6-pro` | `llm.kubetee.ai` | `--kubetee` |
@@ -324,9 +324,10 @@ An attested connection carries one request at a time and is renewed after 10
 minutes or 100 requests; a connection that fails or closes is retired and the
 next request attests a new one. A connection whose attestation fails is never
 used, and the request gets a 502. A chat request is never sent twice.
-KubeTEE's `x-kubetee-*` response headers are removed before the response leaves
-the worker. The verifier logs the replica's pod name and measured registers
-(MRTD, MRCONFIGID, RTMR0-3) for each attested connection.
+The supplier's `x-kubetee-*` and `x-litellm-*` response headers are removed
+before the response leaves the worker. The verifier logs the replica's pod name
+and measured registers (MRTD, MRCONFIGID, RTMR0-3) for each attested
+connection.
 
 The verifier serves only the chat models compiled into the image:
 `z-ai/glm-5.2`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`,
