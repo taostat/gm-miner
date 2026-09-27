@@ -60,6 +60,15 @@ pub(crate) fn load_config(
 ///   3. No refresh token, or the refresh was rejected (revoked / expired /
 ///      grant not permitted) → fall back to the full device-code flow.
 ///
+/// The auth-gateway mints `exp` at the next subnet epoch boundary rather
+/// than a flat TTL, so a refresh grant taken in the closing seconds of an
+/// epoch comes back still inside [`config::TOKEN_EXPIRY_MARGIN_SECS`] — the
+/// issuer cannot mint a token past the boundary it hasn't crossed yet.
+/// Retrying step 2 immediately would land the same result. Instead, once,
+/// this waits out the remaining epoch and refreshes again: the next epoch
+/// is a full tempo away, so that refresh comes back with close to the full
+/// epoch's TTL, comfortably clearing the margin.
+///
 /// `open_browser` only affects the step-3 fallback; the refresh path never
 /// opens a browser.
 ///
@@ -67,30 +76,57 @@ pub(crate) fn load_config(
 /// Returns an error if `/auth/config` cannot be fetched, the device-flow
 /// fallback fails, or the refreshed config cannot be saved.
 pub(crate) async fn ensure_fresh_token(mut cfg: Config) -> Result<Config> {
-    let needs_refresh = cfg
-        .active_tokens()
-        .is_some_and(config::TokenEntry::is_expired_or_near);
-    if !needs_refresh {
-        return Ok(cfg);
+    // One retry covers the epoch-boundary case; a token still near expiry
+    // after that indicates a genuine problem (e.g. a misbehaving clock),
+    // which the unchanged `preflight_auth` check surfaces to the operator.
+    const MAX_ATTEMPTS: u32 = 2;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let needs_refresh = cfg
+            .active_tokens()
+            .is_some_and(config::TokenEntry::is_expired_or_near);
+        if !needs_refresh {
+            return Ok(cfg);
+        }
+
+        let api_url = cfg.api_url();
+        let auth_cfg = get_auth_config(&api_url)
+            .await
+            .with_context(|| format!("fetch auth config from {api_url}/auth/config"))?;
+
+        let (token, from_refresh_grant) = obtain_fresh_token(&cfg, &auth_cfg).await?;
+
+        // A refresh response may omit `refresh_token` when the auth-gateway
+        // chooses not to rotate it — keep the previously stored value so the
+        // next refresh still has something to present.
+        let previous_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
+        let entry = token.to_entry_keeping(previous_refresh);
+        let network = cfg.active_network().to_owned();
+        let override_active = cfg.api_url_override.is_some();
+        cfg.active_entry_mut().tokens = Some(entry.clone());
+        persist_refreshed_tokens(network, entry, override_active, from_refresh_grant)
+            .context("save refreshed token")?;
+
+        let still_near_boundary = cfg
+            .active_tokens()
+            .is_some_and(config::TokenEntry::is_expired_or_near);
+        if !still_near_boundary || attempt + 1 == MAX_ATTEMPTS {
+            return Ok(cfg);
+        }
+
+        let wait_secs = cfg
+            .active_tokens()
+            .and_then(config::TokenEntry::seconds_until_expiry)
+            .unwrap_or(0)
+            .saturating_add(5);
+        eprintln!(
+            "Access token is capped at the current subnet epoch boundary \
+             ({wait_secs}s away) — waiting for the next epoch before continuing."
+        );
+        let wait_secs = u64::try_from(wait_secs).unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
     }
 
-    let api_url = cfg.api_url();
-    let auth_cfg = get_auth_config(&api_url)
-        .await
-        .with_context(|| format!("fetch auth config from {api_url}/auth/config"))?;
-
-    let (token, from_refresh_grant) = obtain_fresh_token(&cfg, &auth_cfg).await?;
-
-    // A refresh response may omit `refresh_token` when the auth-gateway
-    // chooses not to rotate it — keep the previously stored value so the
-    // next refresh still has something to present.
-    let previous_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
-    let entry = token.to_entry_keeping(previous_refresh);
-    let network = cfg.active_network().to_owned();
-    let override_active = cfg.api_url_override.is_some();
-    cfg.active_entry_mut().tokens = Some(entry.clone());
-    persist_refreshed_tokens(network, entry, override_active, from_refresh_grant)
-        .context("save refreshed token")?;
     Ok(cfg)
 }
 
@@ -388,4 +424,177 @@ pub(crate) fn remove_provisional_worker(network: &str, id: &str) -> Result<()> {
         None => println!("No provisional worker matched '{id}'."),
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test fixtures panic when their declared setup is unexpectedly invalid"
+)]
+mod tests {
+    use super::*;
+    use gm_miner_cli::config::{NetworkEntry, TokenEntry};
+    use std::collections::HashMap;
+    use std::sync::MutexGuard;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// `GMCLI_CONFIG_DIR` is process-global, so tests that mutate it must not
+    /// run concurrently. Serialise them on a local mutex, and clear the
+    /// override on drop even if the test panics. Mirrors the identical
+    /// pattern in `commands::wizard`'s test module (each bin-crate test
+    /// module needs its own copy — the lib crate's equivalent helper is
+    /// `#[cfg(test)]`-gated to the lib's own test build and invisible here,
+    /// and this bin crate is `#![forbid(unsafe_code)]` so it cannot reuse
+    /// the lib's `unsafe { set_var(..) }` form either).
+    static CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ConfigDirGuard {
+        /// Held to serialise env mutation; never read.
+        _lock: MutexGuard<'static, ()>,
+        /// Owns the tempdir so it outlives the test; never read.
+        _dir: tempfile::TempDir,
+    }
+
+    impl ConfigDirGuard {
+        fn new() -> Self {
+            let lock = CONFIG_DIR_ENV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("GMCLI_CONFIG_DIR", dir.path());
+            Self {
+                _lock: lock,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("GMCLI_CONFIG_DIR");
+        }
+    }
+
+    fn config_with_near_expiry(api_url: &str, expires_in_secs: i64) -> Config {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "testnet".to_owned(),
+            NetworkEntry {
+                api_url: Some(api_url.to_owned()),
+                tokens: Some(TokenEntry {
+                    access_token: Some("stale-access".to_owned()),
+                    token_expires_at: Some(
+                        (chrono::Utc::now() + chrono::Duration::seconds(expires_in_secs))
+                            .to_rfc3339(),
+                    ),
+                    refresh_token: Some("stored-refresh".to_owned()),
+                }),
+                ..Default::default()
+            },
+        );
+        Config {
+            networks,
+            active_network: Some("testnet".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    async fn mount_auth_config(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/auth/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code_url": format!("{}/device/code", server.uri()),
+                "token_url": format!("{}/token", server.uri()),
+                "client_id": "gm-miner-cli",
+                "scopes": ["subnet:482:miner"],
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// The auth-gateway mints `exp` at the next subnet epoch boundary, so a
+    /// refresh taken near the end of an epoch can come back still inside the
+    /// margin. `ensure_fresh_token` must wait out that boundary and refresh
+    /// again rather than handing back a token `preflight_auth` will reject —
+    /// the regression this guards is `ensure_fresh_token` returning after a
+    /// single refresh even when the result is still unusable.
+    #[tokio::test]
+    async fn epoch_boundary_refresh_waits_and_retries_once() {
+        let _guard = ConfigDirGuard::new();
+        let server = MockServer::start().await;
+        mount_auth_config(&server).await;
+
+        // First refresh: still inside the margin (epoch boundary 2s away).
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "boundary-access",
+                "refresh_token": "boundary-refresh",
+                "token_type": "Bearer",
+                "expires_in": 2,
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second refresh, after the wait: a fresh epoch, comfortably clear
+        // of the margin.
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-epoch-access",
+                "refresh_token": "fresh-epoch-refresh",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = config_with_near_expiry(&server.uri(), 2);
+        let cfg = ensure_fresh_token(cfg)
+            .await
+            .expect("ensure_fresh_token must wait out the boundary and succeed");
+
+        let token = cfg.active_tokens().expect("token entry");
+        assert_eq!(token.access_token.as_deref(), Some("fresh-epoch-access"));
+        assert!(
+            !token.is_expired_or_near(),
+            "the returned token must clear the deploy margin"
+        );
+    }
+
+    /// A token that is comfortably fresh on the first refresh must not
+    /// trigger any wait — `ensure_fresh_token` returns after one round trip.
+    #[tokio::test]
+    async fn fresh_refresh_does_not_wait() {
+        let _guard = ConfigDirGuard::new();
+        let server = MockServer::start().await;
+        mount_auth_config(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let cfg = config_with_near_expiry(&server.uri(), 60);
+        let started = std::time::Instant::now();
+        let cfg = ensure_fresh_token(cfg)
+            .await
+            .expect("ensure_fresh_token must succeed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a single fresh refresh must not wait"
+        );
+
+        let token = cfg.active_tokens().expect("token entry");
+        assert_eq!(token.access_token.as_deref(), Some("fresh-access"));
+    }
 }

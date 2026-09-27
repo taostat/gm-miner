@@ -101,6 +101,17 @@ impl TokenEntry {
         let cutoff = chrono::Utc::now() + chrono::Duration::seconds(TOKEN_EXPIRY_MARGIN_SECS);
         expiry.with_timezone(&chrono::Utc) <= cutoff
     }
+
+    /// Seconds from now until `token_expires_at`, clamped to zero for an
+    /// already-past expiry. `None` when there is no stored expiry or it is
+    /// unparseable — the caller has no boundary to wait for in that case.
+    #[must_use]
+    pub fn seconds_until_expiry(&self) -> Option<i64> {
+        let raw = self.token_expires_at.as_deref()?;
+        let expiry = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+        let remaining = expiry.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        Some(remaining.num_seconds().max(0))
+    }
 }
 
 /// The hotkey the miner registers and serves under, recorded by
