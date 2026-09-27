@@ -433,48 +433,11 @@ pub(crate) fn remove_provisional_worker(network: &str, id: &str) -> Result<()> {
 )]
 mod tests {
     use super::*;
+    use crate::test_support::ConfigDirGuard;
     use gm_miner_cli::config::{NetworkEntry, TokenEntry};
     use std::collections::HashMap;
-    use std::sync::MutexGuard;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// `GMCLI_CONFIG_DIR` is process-global, so tests that mutate it must not
-    /// run concurrently. Serialise them on a local mutex, and clear the
-    /// override on drop even if the test panics. Mirrors the identical
-    /// pattern in `commands::wizard`'s test module (each bin-crate test
-    /// module needs its own copy — the lib crate's equivalent helper is
-    /// `#[cfg(test)]`-gated to the lib's own test build and invisible here,
-    /// and this bin crate is `#![forbid(unsafe_code)]` so it cannot reuse
-    /// the lib's `unsafe { set_var(..) }` form either).
-    static CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct ConfigDirGuard {
-        /// Held to serialise env mutation; never read.
-        _lock: MutexGuard<'static, ()>,
-        /// Owns the tempdir so it outlives the test; never read.
-        _dir: tempfile::TempDir,
-    }
-
-    impl ConfigDirGuard {
-        fn new() -> Self {
-            let lock = CONFIG_DIR_ENV
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let dir = tempfile::tempdir().expect("tempdir");
-            std::env::set_var("GMCLI_CONFIG_DIR", dir.path());
-            Self {
-                _lock: lock,
-                _dir: dir,
-            }
-        }
-    }
-
-    impl Drop for ConfigDirGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("GMCLI_CONFIG_DIR");
-        }
-    }
 
     fn config_with_near_expiry(api_url: &str, expires_in_secs: i64) -> Config {
         let mut networks = HashMap::new();

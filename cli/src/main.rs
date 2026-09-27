@@ -39,6 +39,8 @@
 #![forbid(unsafe_code)]
 
 mod commands;
+#[cfg(test)]
+mod test_support;
 
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};

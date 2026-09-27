@@ -698,42 +698,7 @@ mod tests {
     // `assume_yes` stands in for a non-interactive stdin throughout — both
     // short-circuit the same prompts — so nothing here blocks on input.
 
-    /// `GMCLI_CONFIG_DIR` is process-global, so tests that mutate it must not
-    /// run concurrently. Serialise them on a local mutex, and clear the
-    /// override on drop even if the test panics.
-    static CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct ConfigDirGuard {
-        /// Held to serialise env mutation; never read.
-        _lock: std::sync::MutexGuard<'static, ()>,
-        /// Owns the tempdir so it outlives the test; never read.
-        _dir: tempfile::TempDir,
-    }
-
-    impl ConfigDirGuard {
-        fn new() -> Self {
-            let lock = CONFIG_DIR_ENV
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let dir = tempfile::tempdir().expect("tempdir");
-            // The held lock serialises this against every other env mutation in
-            // this test binary. No `unsafe` block: the bin crate is
-            // `#![forbid(unsafe_code)]`, and on edition 2021 `set_var` is
-            // still callable directly.
-            std::env::set_var("GMCLI_CONFIG_DIR", dir.path());
-            Self {
-                _lock: lock,
-                _dir: dir,
-            }
-        }
-    }
-
-    impl Drop for ConfigDirGuard {
-        fn drop(&mut self) {
-            // Still holding the lock until after this returns.
-            std::env::remove_var("GMCLI_CONFIG_DIR");
-        }
-    }
+    use crate::test_support::ConfigDirGuard;
 
     /// A miner at the very start: no hotkey, no token, no keys, no worker.
     fn fresh_config() -> Config {
