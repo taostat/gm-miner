@@ -264,6 +264,8 @@ enum Chat {
     StalledModelList,
     /// The chat sends its first event, then nothing more.
     FirstEventOnly,
+    /// The chat sends one event, then supplier and ordinary trailers.
+    Trailed,
 }
 
 #[derive(Clone, Copy)]
@@ -333,7 +335,7 @@ fn attestation_body(evidence: Evidence) -> Vec<u8> {
     serde_json::to_vec(&payload).unwrap()
 }
 
-type Reply = Response<Either<Full<Bytes>, Stalled>>;
+type Reply = Response<Either<Full<Bytes>, Frames>>;
 
 fn reply(status: u16, body: impl Into<Bytes>) -> Reply {
     Response::builder()
@@ -342,10 +344,35 @@ fn reply(status: u16, body: impl Into<Bytes>) -> Reply {
         .unwrap()
 }
 
-/// A body that sends its first bytes and then never another.
-struct Stalled(Option<Bytes>);
+/// A body that sends its frames in order, then ends or never sends another.
+struct Frames {
+    frames: std::collections::VecDeque<hyper::body::Frame<Bytes>>,
+    then_stall: bool,
+}
 
-impl hyper::body::Body for Stalled {
+impl Frames {
+    /// `first`, then nothing ever again.
+    fn stalling(first: impl Into<Bytes>) -> Self {
+        Self {
+            frames: [hyper::body::Frame::data(first.into())].into(),
+            then_stall: true,
+        }
+    }
+
+    /// `data`, then `trailers`, then the end.
+    fn trailed(data: &'static [u8], trailers: HeaderMap) -> Self {
+        Self {
+            frames: [
+                hyper::body::Frame::data(Bytes::from_static(data)),
+                hyper::body::Frame::trailers(trailers),
+            ]
+            .into(),
+            then_stall: false,
+        }
+    }
+}
+
+impl hyper::body::Body for Frames {
     type Data = Bytes;
     type Error = std::convert::Infallible;
 
@@ -353,9 +380,10 @@ impl hyper::body::Body for Stalled {
         mut self: std::pin::Pin<&mut Self>,
         _: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
-        match self.0.take() {
-            Some(first) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(first)))),
-            None => std::task::Poll::Pending,
+        match self.frames.pop_front() {
+            Some(frame) => std::task::Poll::Ready(Some(Ok(frame))),
+            None if self.then_stall => std::task::Poll::Pending,
+            None => std::task::Poll::Ready(None),
         }
     }
 }
@@ -365,9 +393,9 @@ fn stalled(body: &[u8]) -> Reply {
     Response::builder()
         .status(200)
         .header("content-length", body.len())
-        .body(Either::Right(Stalled(Some(Bytes::copy_from_slice(
+        .body(Either::Right(Frames::stalling(Bytes::copy_from_slice(
             &body[..body.len() / 2],
-        )))))
+        ))))
         .unwrap()
 }
 
@@ -380,9 +408,24 @@ async fn chat_reply(chat: Chat) -> Option<Reply> {
             let response = Response::builder()
                 .status(200)
                 .header("content-type", "text/event-stream")
-                .body(Either::Right(Stalled(Some(Bytes::from_static(
+                .body(Either::Right(Frames::stalling(Bytes::from_static(
                     FIRST_EVENT,
-                )))));
+                ))));
+            return Some(response.unwrap());
+        }
+        Chat::Trailed => {
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-kubetee-attestation-quote", HeaderValue::from_static("q"));
+            trailers.insert("x-litellm-key-spend", HeaderValue::from_static("0.14"));
+            trailers.insert("x-request-cost", HeaderValue::from_static("kept"));
+            let response = Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .header(
+                    "trailer",
+                    "x-kubetee-attestation-quote, x-litellm-key-spend, x-request-cost",
+                )
+                .body(Either::Right(Frames::trailed(FIRST_EVENT, trailers)));
             return Some(response.unwrap());
         }
         Chat::Served | Chat::StalledModelList => {}
@@ -763,6 +806,22 @@ async fn each_event_reaches_the_caller_as_it_arrives() {
 }
 
 #[tokio::test]
+async fn supplier_trailers_are_removed_on_the_forwarding_path() {
+    let (verifier, _) = serve(Evidence::Genuine, Chat::Trailed, limits()).await;
+    let mut request = chat(TARGETS[0]);
+    request
+        .headers_mut()
+        .insert("te", HeaderValue::from_static("trailers"));
+    let response = verifier.forward(request).await.unwrap();
+    let collected = response.into_body().collect().await.unwrap();
+    let trailers = collected.trailers().cloned().unwrap();
+    assert_eq!(trailers["x-request-cost"], "kept");
+    assert!(!trailers.contains_key("x-kubetee-attestation-quote"));
+    assert!(!trailers.contains_key("x-litellm-key-spend"));
+    assert_eq!(collected.to_bytes(), FIRST_EVENT);
+}
+
+#[tokio::test]
 async fn a_chat_body_that_stalls_is_refused_before_any_connection() {
     let slow_caller = Limits {
         request_read_timeout: Duration::from_millis(300),
@@ -770,7 +829,7 @@ async fn a_chat_body_that_stalls_is_refused_before_any_connection() {
     };
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, slow_caller).await;
     let mut request = chat(TARGETS[0]);
-    *request.body_mut() = Body::new(Stalled(Some(Bytes::from_static(b"{\"model\":"))));
+    *request.body_mut() = Body::new(Frames::stalling(Bytes::from_static(b"{\"model\":")));
     let result = tokio::time::timeout(Duration::from_secs(10), verifier.forward(request))
         .await
         .unwrap();

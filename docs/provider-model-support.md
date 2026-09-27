@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-09-24**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-09-28**. This is a miner setup matrix, not a buyer product
 catalog. It distinguishes transport capability from registry admission:
 
 * A direct/API-key source is declarable when the registry publishes the route
@@ -55,7 +55,8 @@ authority for which explicit routes that registry has published.
 | `claude-sonnet-5` | Anthropic API: `anthropic/claude-sonnet-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
 | `DeepSeek V3.2 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V3.2-TEE` (`--chutes`) |
 | `DeepSeek V4 Flash 0731` | Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`) |
-| `DeepSeek V4.1 Flash` | KubeTEE: `kubetee/deepseek/deepseek-v4.1-flash` (`--kubetee`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash` (`--deepinfra`); Engy: `engy/deepseek-v4.1-flash` (`--engy`) |
+| `DeepSeek V4.1 Flash` | DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash` (`--deepinfra`); Engy: `engy/deepseek-v4.1-flash` (`--engy`) |
+| `DeepSeek V4.1 Flash TEE` | KubeTEE: `kubetee/deepseek/deepseek-v4.1-flash` (`--kubetee`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`) |
 | `FLUX.2 klein 4B` | NEAR confidential inference: `near/black-forest-labs/FLUX.2-klein-4B` (`--near`); DeepInfra: `deepinfra/black-forest-labs/FLUX-2-klein-4b` (`--deepinfra`) |
 | `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`) |
@@ -64,10 +65,12 @@ authority for which explicit routes that registry has published.
 | `Gemini 3.1 Pro Preview` | Google: `gemini/gemini-3.1-pro-preview` (`--google`) |
 | `Gemini 3.5 Flash` | Google: `gemini/gemini-3.5-flash` (`--google`) |
 | `GLM-5.1 TEE` | Chutes: `chutes/zai-org/GLM-5.1-TEE` (`--chutes`) |
-| `GLM-5.2` | Z.ai API: `zai/glm-5.2` (`--zai`); DeepInfra: `deepinfra/zai-org/GLM-5.2` (`--deepinfra`); Engy: `engy/glm-5.2` (`--engy`); KubeTEE: `kubetee/z-ai/glm-5.2` (`--kubetee`); Moonmath ZRO: `moonmath/glm-5.2` (`--moonmath`) |
-| `GLM-5.2 TEE` | Chutes: `chutes/zai-org/GLM-5.2-TEE` (`--chutes`) |
-| `GLM-5.3` | Z.ai API: `zai/glm-5.3` (`--zai`); KubeTEE: `kubetee/z-ai/glm-5.3` (`--kubetee`); Engy: `engy/glm-5.3` (`--engy`) |
-| `GLM-5.3-Flash` | Z.ai API: `zai/glm-5.3-flash` (`--zai`); KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`); Engy: `engy/glm-5.3-flash` (`--engy`) |
+| `GLM-5.2` | Z.ai API: `zai/glm-5.2` (`--zai`); DeepInfra: `deepinfra/zai-org/GLM-5.2` (`--deepinfra`); Engy: `engy/glm-5.2` (`--engy`); Moonmath ZRO: `moonmath/glm-5.2` (`--moonmath`) |
+| `GLM-5.2 TEE` | Chutes: `chutes/zai-org/GLM-5.2-TEE` (`--chutes`); KubeTEE: `kubetee/z-ai/glm-5.2` (`--kubetee`) |
+| `GLM-5.3` | Z.ai API: `zai/glm-5.3` (`--zai`); Engy: `engy/glm-5.3` (`--engy`) |
+| `GLM-5.3 TEE` | KubeTEE: `kubetee/z-ai/glm-5.3` (`--kubetee`) |
+| `GLM-5.3-Flash` | Z.ai API: `zai/glm-5.3-flash` (`--zai`); Engy: `engy/glm-5.3-flash` (`--engy`) |
+| `GLM-5.3-Flash TEE` | KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`) |
 | `GPT-5.4` | OpenAI API: `openai/gpt-5.4` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `GPT-5.4 mini` | OpenAI API: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `GPT-5.4 nano` | OpenAI API: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
@@ -81,11 +84,13 @@ authority for which explicit routes that registry has published.
 | `Kimi K2.6 TEE` | Chutes: `chutes/moonshotai/Kimi-K2.6-TEE` (`--chutes`) |
 | `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`) |
 | `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
+| `MiMo V2.6 Pro Ultraspeed TEE` | KubeTEE: `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
 | `Mistral Nemo Instruct 2407 TEE` | Chutes: `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` (`--chutes`) |
 | `Nemotron 3 Nano Omni 30B TEE` | Chutes: `chutes/Nemotron-3-Nano-Omni-30B-TEE` (`--chutes`) |
 | `o3` | OpenAI API: `openai/o3` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `o4-mini` | OpenAI API: `openai/o4-mini` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `Ornith 1.5 397B` | KubeTEE: `kubetee/ornith/ornith-1.5-397b` (`--kubetee`); Engy: `engy/ornith-1.5-397b` (`--engy`) |
+| `Ornith 1.5 397B` | Engy: `engy/ornith-1.5-397b` (`--engy`) |
+| `Ornith 1.5 397B TEE` | KubeTEE: `kubetee/ornith/ornith-1.5-397b` (`--kubetee`) |
 | `Qwen3 235B A22B Thinking 2507 TEE` | Chutes: `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` (`--chutes`) |
 | `Qwen3 32B TEE` | Chutes: `chutes/Qwen/Qwen3-32B-TEE` (`--chutes`) |
 | `Qwen3.5 397B A17B TEE` | Chutes: `chutes/Qwen/Qwen3.5-397B-A17B-TEE` (`--chutes`) |
