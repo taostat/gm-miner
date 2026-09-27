@@ -765,6 +765,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cloud_identity_check_treats_reasoning_budget_exhaustion_as_inconclusive() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "message": "Could not finish the message because max_tokens or \
+                                 model output limit was reached. Please try again with \
+                                 higher max_tokens.",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": null,
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let check = cloud_identity_check(
+            &gm_miner_cli::client::build_http_client().expect("client"),
+            AzureProvider::OpenAi,
+            &server.uri(),
+            "azure-key",
+            "gpt-5.4-mini",
+        )
+        .await;
+
+        assert_eq!(check.status, Status::Info);
+        assert!(check.note.contains("inconclusive"), "{}", check.note);
+    }
+
+    #[tokio::test]
+    async fn cloud_identity_check_still_fails_other_400s() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "message": "Unrecognized request argument supplied: temperature",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": null,
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let check = cloud_identity_check(
+            &gm_miner_cli::client::build_http_client().expect("client"),
+            AzureProvider::OpenAi,
+            &server.uri(),
+            "azure-key",
+            "gpt-5.4-mini",
+        )
+        .await;
+
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.note.contains("400"), "{}", check.note);
+    }
+
+    #[tokio::test]
     async fn cloud_identity_check_rejects_duplicate_model_echo_keys() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

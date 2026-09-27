@@ -33,11 +33,18 @@ pub(super) async fn cloud_identity_check(
         Ok(response) => response,
         Err(error) => return Check::fail(label, format!("request failed: {error}")),
     };
-    if !response.status().is_success() {
-        return Check::fail(
-            label,
-            format!("cloud endpoint returned {}", response.status()),
-        );
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_default();
+        if status == reqwest::StatusCode::BAD_REQUEST && is_reasoning_budget_exhausted(&body) {
+            return Check::info(
+                label,
+                "probe budget exhausted on reasoning tokens before any output — \
+                 inconclusive, not a deployment failure"
+                    .to_owned(),
+            );
+        }
+        return Check::fail(label, format!("cloud endpoint returned {status}"));
     }
     let body = match response.bytes().await {
         Ok(body) => body,
@@ -54,6 +61,19 @@ pub(super) async fn cloud_identity_check(
         );
     }
     Check::pass(label, format!("deployment={deployment} echo={echo}"))
+}
+
+/// Detects Azure's "`max_tokens` or model output limit was reached" 400 — a
+/// reasoning model burned the whole probe budget on hidden reasoning tokens
+/// before any visible output. The body carries no `model` field, so it can
+/// prove neither a pass nor a genuine deployment failure.
+fn is_reasoning_budget_exhausted(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    value["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("max_tokens or model output limit was reached"))
 }
 
 fn parse_echo(body: &[u8]) -> Result<String> {
