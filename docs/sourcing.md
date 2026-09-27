@@ -48,15 +48,15 @@ explains the table and how to set each upstream up.
 | `ornith/ornith-1.5-397b` | `engy/ornith-1.5-397b` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.3` | `engy/glm-5.3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.3-flash` | `engy/glm-5.3-flash` | `api.engy.ai` | `--engy` |
-| `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
-| `zai/glm-5.3-flash` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
-| `zai/glm-5.3` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
+| `zai/glm-5.2-tee` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
+| `zai/glm-5.3-flash-tee` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
+| `zai/glm-5.3-tee` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
 | `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | `llm.kubetee.ai` | `--kubetee` |
-| `deepseek/deepseek-v4.1-flash` | `kubetee/deepseek/deepseek-v4.1-flash` | `llm.kubetee.ai` | `--kubetee` |
-| `ornith/ornith-1.5-397b` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
-| `xiaomi/mimo-v2.6-pro-ultraspeed` | `kubetee/xiaomi/mimo-v2.6-pro` | `llm.kubetee.ai` | `--kubetee` |
+| `deepseek/deepseek-v4.1-flash-tee` | `kubetee/deepseek/deepseek-v4.1-flash` | `llm.kubetee.ai` | `--kubetee` |
+| `ornith/ornith-1.5-397b-tee` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
+| `xiaomi/mimo-v2.6-pro-ultraspeed-tee` | `kubetee/xiaomi/mimo-v2.6-pro` | `llm.kubetee.ai` | `--kubetee` |
 | `bfl/flux.2-klein-4b` | `kubetee/black-forest-labs/flux.2-klein-4b` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
@@ -245,7 +245,7 @@ gmcli declare-product --provider deepinfra --model Qwen/Qwen3.8-27B --discount-p
 gmcli declare-product --provider deepinfra --model openai/gpt-oss-20b --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.3 --discount-pct 5
-gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
+gmcli declare-product --provider kubetee --model z-ai/glm-5.3-flash --discount-pct 5
 gmcli declare-product --provider kubetee --model deepseek/deepseek-v4.1-flash --discount-pct 5
 gmcli declare-product --provider kubetee --model black-forest-labs/flux.2-klein-4b --discount-pct 5
 gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
@@ -303,6 +303,38 @@ HTTPS path to `llm.chutes.ai`.
 The verifier's chute list and measurement references are compiled into the
 measured image, so a new Chutes model or VM release is admitted after a new
 image build and the normal image-approval process.
+
+### KubeTEE attestation verification
+
+With a KubeTEE key set, the image runs a co-located KubeTEE verifier, and every
+KubeTEE chat request is served through it; there is no direct KubeTEE chat
+route. The verifier keeps a small pool of keep-alive TLS 1.3 connections to
+`llm.kubetee.ai`. Each connection is attested before any request is sent on
+it: the verifier requests a quote for a fresh nonce on that connection and
+requires
+
+- the nonce echoed back exactly;
+- the Intel TDX quote verifying at `UpToDate` TCB with the debug bit clear;
+- the quote's `report_data` equal to SHA-512 of the nonce;
+- the CC event log replaying to the quote's RTMR0-3;
+- KubeTEE's TLS-possession proof naming this connection's certificate, with
+  that certificate's key signing the nonce.
+
+An attested connection carries one request at a time and is renewed after 10
+minutes or 100 requests; a connection that fails or closes is retired and the
+next request attests a new one. A connection whose attestation fails is never
+used, and the request gets a 502. A chat request is never sent twice.
+KubeTEE's `x-kubetee-*` response headers are removed before the response leaves
+the worker. The verifier logs the replica's pod name and measured registers
+(MRTD, MRCONFIGID, RTMR0-3) for each attested connection.
+
+The verifier serves only the chat models compiled into the image:
+`z-ai/glm-5.2`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`,
+`deepseek/deepseek-v4.1-flash`, `ornith/ornith-1.5-397b` and
+`xiaomi/mimo-v2.6-pro`. Envoy answers a chat request for any other KubeTEE model
+with 400. Its `GET /v1/models` answer is KubeTEE's own list narrowed to those
+models. Image generation keeps its direct route. Adding a KubeTEE chat model
+requires a new image build and the normal image-approval process.
 
 `gmcli sources` prints this line for you, pre-filled, for every undeclared route
 where declaring it would actually get you somewhere — one a worker already

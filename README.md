@@ -19,7 +19,7 @@ handles the full operator lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Chutes `-TEE` requests pass through an in-image verifier which admits the Chutes instance on verified TDX, GPU and measurement evidence and encrypts each request end to end to its attested key. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, the optional NEAR and Chutes verifiers, and the Envoy data plane. |
+| `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Chutes `-TEE` requests pass through an in-image verifier which admits the Chutes instance on verified TDX, GPU and measurement evidence and encrypts each request end to end to its attested key. KubeTEE chat requests pass through an in-image verifier which attests each upstream TLS connection before forwarding on it. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, the optional NEAR, Chutes and KubeTEE verifiers, and the Envoy data plane. |
 | `cli/` | `gmcli` CLI (Rust + clap). Operator commands handle login, image registration, products, and prices. The image also uses its hidden `slot-env` command to derive upstream key slots inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -159,6 +159,11 @@ routes and none of them is canonical. Setting one of those keys is what makes th
 available to you. A single worker can serve only one route per model, so run two workers to use
 two upstreams for the same model. Run `gmcli sources` to see the routes your registry currently
 publishes, and read [sourcing routes](docs/sourcing.md) for setup and settlement details.
+
+KubeTEE chat requests pass through an in-image verifier that attests each connection to
+`llm.kubetee.ai` before sending requests on it and serves only the chat models compiled into the
+image; see
+[KubeTEE attestation verification](docs/sourcing.md#kubetee-attestation-verification).
 
 The Gemini image-generation products `gemini-3.1-flash-lite-image` and
 `gemini-3.1-flash-image` use Google's native
