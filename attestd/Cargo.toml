@@ -45,6 +45,10 @@ path = "src/bin/near_verify_proxy.rs"
 name = "gm-chutes-verify-proxy"
 path = "src/bin/chutes_verify_proxy.rs"
 
+[[bin]]
+name = "gm-kubetee-verify-proxy"
+path = "src/bin/kubetee_verify_proxy.rs"
+
 [lib]
 name = "gm_miner_attestd"
 path = "src/lib.rs"
@@ -79,6 +83,7 @@ flate2 = { workspace = true }
 futures-util = { workspace = true }
 ml-kem = { workspace = true }
 ring = { workspace = true }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

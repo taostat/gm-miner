@@ -1,4 +1,4 @@
-//! Evidence checks shared by the NEAR and Chutes upstream verifiers: fresh
+//! Evidence checks shared by the NEAR, Chutes and `KubeTEE` upstream verifiers: fresh
 //! nonces, TLS key hashing, Intel DCAP appraisal and NVIDIA NRAS verdicts.
 
 pub mod nras;
@@ -11,7 +11,7 @@ use dcap_qvl::policy::{Policy as _, QuoteClaims};
 use dcap_qvl::quote::{Report, TDReport10};
 use dcap_qvl::tcb_info::TcbStatus;
 use dcap_qvl::verify::QuoteVerifier;
-use dcap_qvl::QuotePolicy;
+use dcap_qvl::{QuoteCollateralV3, QuotePolicy};
 use rand::Rng as _;
 use sha2::{Digest as _, Sha256};
 use x509_parser::parse_x509_certificate;
@@ -66,16 +66,42 @@ pub fn td_report(report: &Report) -> Result<&TDReport10> {
 /// Returns an error when collateral cannot be fetched, the quote signature
 /// chain fails, or the appraisal rejects the claims.
 pub async fn verify_quote(collateral: &CollateralClient, quote: &[u8]) -> Result<QuoteClaims> {
-    let bundle = collateral
-        .fetch(quote)
-        .await
-        .context("fetch Intel DCAP collateral")?;
+    let bundle = fetch_collateral(collateral, quote).await?;
     let now = unix_now()?;
-    let claims = QuoteVerifier::new_prod()
-        .verify_with_policy(quote, bundle, now, &QuotePolicy::claims_only(now))
-        .context("verify TDX quote signature chain")?;
+    let claims = verify_signature_chain(quote, bundle, now)?;
     appraise(&claims, now)?;
     Ok(claims)
+}
+
+/// Fetch the Intel collateral that appraises `quote`.
+///
+/// # Errors
+///
+/// Returns an error when the collateral service cannot supply it.
+pub async fn fetch_collateral(
+    collateral: &CollateralClient,
+    quote: &[u8],
+) -> Result<QuoteCollateralV3> {
+    collateral
+        .fetch(quote)
+        .await
+        .context("fetch Intel DCAP collateral")
+}
+
+/// Verify `quote`'s signature chain against `collateral` at `now` and return
+/// its claims. The claims are not yet appraised: pass them to [`appraise`].
+///
+/// # Errors
+///
+/// Returns an error when the quote or collateral fails Intel's chain of trust.
+pub fn verify_signature_chain(
+    quote: &[u8],
+    collateral: QuoteCollateralV3,
+    now: u64,
+) -> Result<QuoteClaims> {
+    QuoteVerifier::new_prod()
+        .verify_with_policy(quote, collateral, now, &QuotePolicy::claims_only(now))
+        .context("verify TDX quote signature chain")
 }
 
 /// Appraise verified quote claims: merged, platform and QE TCB all

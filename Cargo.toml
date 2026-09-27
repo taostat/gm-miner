@@ -45,6 +45,9 @@ flate2 = { version = "=1.1.10", default-features = false, features = ["rust_back
 futures-util = { version = "=0.3.32", default-features = false }
 ml-kem = { version = "=0.3.2", features = ["getrandom", "zeroize"] }
 ring = "=0.17.14"
+# Mozilla's root set for the KubeTEE verifier's WebPKI TLS; already in the
+# lockfile through reqwest's rustls-tls feature.
+webpki-roots = "1.0.7"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 # dstack-sdk's locked Alloy macros pull proc-macro-error2 2.0.1, which emits
 # future-incompatibility E0365 on proc_macro re-export. Keep this dependency

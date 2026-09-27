@@ -10,9 +10,11 @@
 //! registry's single attestation checker verifies both services.
 
 pub mod chutes_verify;
+pub mod eventlog;
 pub mod identity;
 pub mod info;
 pub mod keypair;
+pub mod kubetee_verify;
 pub mod near_verify;
 pub mod provider;
 pub mod ratls;
