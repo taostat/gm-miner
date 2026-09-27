@@ -131,7 +131,9 @@ pub(crate) async fn cmd_doctor(cfg: Config) -> Result<()> {
     let failures = checks.iter().filter(|c| c.is_failure()).count();
     println!();
     if failures == 0 {
-        println!("All checks passed — you're ready to `gmcli deploy`.");
+        println!(
+            "No blocking failures — review any informational checks above before `gmcli deploy`."
+        );
         Ok(())
     } else {
         bail!("{failures} check(s) need attention before deploying (see above).");
@@ -297,7 +299,7 @@ fn unqualified_checks(keys: Option<&ProviderKeys>) -> Vec<Check> {
     if keys.openai_upstream.as_deref() == Some("azure") {
         checks.push(Check::info(
             "Azure OpenAI Responses",
-            "skipped: surface is unqualified; the echo identifies the deployment name",
+            "skipped: surface is unqualified; a successful chat echo only identifies the deployment name",
         ));
     }
     if keys.anthropic_upstream.as_deref() == Some("bedrock") {
@@ -735,8 +737,10 @@ mod tests {
                 "stream": false,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "model": "gpt-5.5-2026-04-23"
+                "model": "gpt-5.5-2026-04-23",
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}]
             })))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -764,64 +768,91 @@ mod tests {
         assert_eq!(checks[1].status, Status::Info);
     }
 
-    #[tokio::test]
-    async fn cloud_identity_check_treats_reasoning_budget_exhaustion_as_inconclusive() {
+    const OUTPUT_LIMIT_MESSAGE: &str = "Could not finish the message because max_tokens or \
+        model output limit was reached.";
+
+    fn output_limit_error(message: &str) -> serde_json::Value {
+        json!({"error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": null,
+            "code": null,
+        }})
+    }
+
+    async fn probe_response(provider: AzureProvider, status: u16, body: &str) -> super::Check {
         let server = MockServer::start().await;
+        let (probe_path, _) = cloud_probe_body(provider, "gpt-5.4-mini");
         Mock::given(method("POST"))
-            .and(path("/openai/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "error": {
-                    "message": "Could not finish the message because max_tokens or \
-                                 model output limit was reached. Please try again with \
-                                 higher max_tokens.",
-                    "type": "invalid_request_error",
-                    "param": null,
-                    "code": null,
-                }
-            })))
+            .and(path(probe_path))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .expect(1)
             .mount(&server)
             .await;
-
-        let check = cloud_identity_check(
+        cloud_identity_check(
             &gm_miner_cli::client::build_http_client().expect("client"),
-            AzureProvider::OpenAi,
+            provider,
             &server.uri(),
             "azure-key",
             "gpt-5.4-mini",
         )
-        .await;
-
-        assert_eq!(check.status, Status::Info);
-        assert!(check.note.contains("inconclusive"), "{}", check.note);
+        .await
     }
 
     #[tokio::test]
-    async fn cloud_identity_check_still_fails_other_400s() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/openai/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "error": {
-                    "message": "Unrecognized request argument supplied: temperature",
-                    "type": "invalid_request_error",
-                    "param": null,
-                    "code": null,
-                }
-            })))
-            .mount(&server)
-            .await;
+    async fn cloud_identity_check_treats_reasoning_budget_exhaustion_as_inconclusive() {
+        for suffix in [
+            "",
+            " Please try again with higher max_tokens.",
+            " Please try again with a higher max_tokens.",
+        ] {
+            let body = output_limit_error(&format!("{OUTPUT_LIMIT_MESSAGE}{suffix}"));
+            // Exercise JSON escapes and message whitespace, not raw-body matching.
+            let body = body
+                .to_string()
+                .replace("max_tokens", "max_\\u0074okens")
+                .replace("model output", "model\\noutput");
+            let check = probe_response(AzureProvider::OpenAi, 400, &body).await;
+            assert_eq!(check.status, Status::Info, "{body}");
+            assert!(!check.is_failure());
+            assert!(check.note.contains("inconclusive"), "{}", check.note);
+            assert!(
+                check.note.contains("identity remains unverified"),
+                "{}",
+                check.note
+            );
+        }
+    }
 
-        let check = cloud_identity_check(
-            &gm_miner_cli::client::build_http_client().expect("client"),
-            AzureProvider::OpenAi,
-            &server.uri(),
-            "azure-key",
-            "gpt-5.4-mini",
-        )
-        .await;
-
+    #[tokio::test]
+    async fn cloud_identity_check_still_fails_other_errors() {
+        let known = output_limit_error(OUTPUT_LIMIT_MESSAGE);
+        for body in [
+            output_limit_error("Unrecognized request argument supplied: temperature").to_string(),
+            "not JSON".to_owned(),
+        ] {
+            let check = probe_response(AzureProvider::OpenAi, 400, &body).await;
+            assert_eq!(check.status, Status::Fail, "{body}");
+            assert!(check.note.contains("400"), "{}", check.note);
+        }
+        for status in [401, 403, 404, 429, 500, 503] {
+            let check = probe_response(AzureProvider::OpenAi, status, &known.to_string()).await;
+            assert_eq!(check.status, Status::Fail, "HTTP {status}");
+        }
+        let check = probe_response(AzureProvider::Foundry, 400, &known.to_string()).await;
         assert_eq!(check.status, Status::Fail);
-        assert!(check.note.contains("400"), "{}", check.note);
+    }
+
+    #[tokio::test]
+    async fn cloud_identity_check_still_requires_matching_echo_on_success() {
+        for body in [
+            output_limit_error(OUTPUT_LIMIT_MESSAGE),
+            json!({"choices": []}),
+            json!({"model": "gpt-5.4"}),
+        ] {
+            let check = probe_response(AzureProvider::OpenAi, 200, &body.to_string()).await;
+            assert_eq!(check.status, Status::Fail, "{body}");
+        }
     }
 
     #[tokio::test]

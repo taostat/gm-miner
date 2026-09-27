@@ -35,14 +35,17 @@ pub(super) async fn cloud_identity_check(
     };
     let status = response.status();
     if !status.is_success() {
-        let body = response.bytes().await.unwrap_or_default();
-        if status == reqwest::StatusCode::BAD_REQUEST && is_reasoning_budget_exhausted(&body) {
-            return Check::info(
-                label,
-                "probe budget exhausted on reasoning tokens before any output — \
-                 inconclusive, not a deployment failure"
-                    .to_owned(),
-            );
+        if provider == AzureProvider::OpenAi && status == reqwest::StatusCode::BAD_REQUEST {
+            if let Ok(body) = response.bytes().await {
+                if is_reasoning_budget_exhausted(&body) {
+                    return Check::info(
+                        label,
+                        "Azure reported an output limit (HTTP 400) — probe inconclusive; \
+                         model identity remains unverified. Retry the probe; if this persists, \
+                         investigate the deployment or probe token budget.",
+                    );
+                }
+            }
         }
         return Check::fail(label, format!("cloud endpoint returned {status}"));
     }
@@ -63,17 +66,57 @@ pub(super) async fn cloud_identity_check(
     Check::pass(label, format!("deployment={deployment} echo={echo}"))
 }
 
-/// Detects Azure's "`max_tokens` or model output limit was reached" 400 — a
-/// reasoning model burned the whole probe budget on hidden reasoning tokens
-/// before any visible output. The body carries no `model` field, so it can
-/// prove neither a pass nor a genuine deployment failure.
+/// Recognize the known Azure output-limit error, which can occur when reasoning
+/// consumes the probe budget. It does not establish the cause or model identity.
 fn is_reasoning_budget_exhausted(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+    #[derive(Deserialize)]
+    struct ErrorResponse {
+        error: ProbeError,
+    }
+
+    // Typed deserialization rejects ambiguous duplicate fields. An internally
+    // tagged error also requires an object and the expected error type.
+    #[derive(Deserialize)]
+    #[serde(tag = "type")]
+    enum ProbeError {
+        #[serde(rename = "invalid_request_error")]
+        InvalidRequest {
+            message: String,
+            code: Option<String>,
+            param: Option<String>,
+        },
+    }
+
+    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return false;
+    }
+    let Ok(ErrorResponse {
+        error:
+            ProbeError::InvalidRequest {
+                message,
+                code,
+                param,
+            },
+    }) = serde_json::from_slice(body)
+    else {
         return false;
     };
-    value["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("max_tokens or model output limit was reached"))
+    // A specific code/parameter can identify a different request error. Do not
+    // downgrade it just because its text mentions an output limit.
+    if code.is_some() || param.is_some() {
+        return false;
+    }
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(suffix) = message.strip_prefix(
+        "Could not finish the message because max_tokens or model output limit was reached.",
+    ) else {
+        return false;
+    };
+    matches!(
+        suffix,
+        "" | " Please try again with higher max_tokens."
+            | " Please try again with a higher max_tokens."
+    )
 }
 
 fn parse_echo(body: &[u8]) -> Result<String> {
@@ -133,7 +176,8 @@ pub(super) fn cloud_probe_body(
                 // Reasoning models burn part of this budget on hidden reasoning
                 // tokens before any visible output; 1 starves them into a 400
                 // ("max_tokens or model output limit was reached") even though
-                // the deployment is healthy. 256 clears every catalog model.
+                // the deployment is healthy. Keep the probe bounded; exhaustion
+                // at this budget is still inconclusive, not an identity pass.
                 "max_completion_tokens": 256,
                 "stream": false,
             }),
@@ -151,7 +195,88 @@ pub(super) fn cloud_probe_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{echo_matches, parse_echo};
+    use super::{echo_matches, is_reasoning_budget_exhausted, parse_echo};
+    use serde_json::json;
+
+    const OUTPUT_LIMIT_MESSAGE: &str = "Could not finish the message because max_tokens or \
+        model output limit was reached.";
+
+    fn output_limit_error(message: &str) -> serde_json::Value {
+        json!({"error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": null,
+            "code": null,
+        }})
+    }
+
+    #[test]
+    fn accepts_known_output_limit_errors() {
+        for suffix in [
+            "",
+            " Please try again with higher max_tokens.",
+            " Please try again with a higher max_tokens.",
+        ] {
+            let body = output_limit_error(&format!("{OUTPUT_LIMIT_MESSAGE}{suffix}"));
+            let body = body
+                .to_string()
+                .replace("max_tokens", "max_\\u0074okens")
+                .replace("model output", "model\\noutput");
+            assert!(is_reasoning_budget_exhausted(body.as_bytes()), "{body}");
+        }
+        let body = json!({"error": {
+            "message": OUTPUT_LIMIT_MESSAGE,
+            "type": "invalid_request_error"
+        }});
+        assert!(is_reasoning_budget_exhausted(body.to_string().as_bytes()));
+    }
+
+    #[test]
+    fn rejects_unrelated_and_ambiguous_output_limit_errors() {
+        let known = output_limit_error(OUTPUT_LIMIT_MESSAGE);
+        let mut cases = vec![
+            output_limit_error("Unrecognized request argument supplied: temperature").to_string(),
+            output_limit_error(&format!("Invalid deployment: {OUTPUT_LIMIT_MESSAGE}")).to_string(),
+            output_limit_error(&format!("{OUTPUT_LIMIT_MESSAGE} Deployment is disabled."))
+                .to_string(),
+            "not JSON".to_owned(),
+            "{}".to_owned(),
+            format!("{known} trailing"),
+            format!("[{known}]"),
+            format!(r#"{{"error":{{}},"error":{}}}"#, known["error"]),
+            known.to_string().replace(
+                r#""message":"#,
+                r#""message":"deployment missing","message":"#,
+            ),
+            known
+                .to_string()
+                .replace(r#""type":"#, r#""type":"authentication_error","type":"#),
+            known.to_string().replace(
+                r#""code":null"#,
+                r#""code":"DeploymentNotFound","code":null"#,
+            ),
+            known
+                .to_string()
+                .replace(r#""param":null"#, r#""param":"model","param":null"#),
+            json!({"error": [OUTPUT_LIMIT_MESSAGE, "invalid_request_error", null, null]})
+                .to_string(),
+        ];
+        for (field, value) in [
+            ("message", json!(null)),
+            ("message", json!(42)),
+            ("type", json!("authentication_error")),
+            ("type", json!(null)),
+            ("code", json!("DeploymentNotFound")),
+            ("param", json!("model")),
+        ] {
+            let mut body = known.clone();
+            body["error"][field] = value;
+            cases.push(body.to_string());
+        }
+        for body in cases {
+            assert!(!is_reasoning_budget_exhausted(body.as_bytes()), "{body}");
+        }
+    }
 
     #[test]
     fn rejects_missing_non_string_duplicate_and_non_object_echoes() {
