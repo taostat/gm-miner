@@ -205,7 +205,7 @@ impl HttpBody for Lease {
     }
 }
 
-/// Remove `x-kubetee-*` fields from a trailers frame; data frames pass unchanged.
+/// Remove supplier fields from a trailers frame; data frames pass unchanged.
 pub(crate) fn strip_supplier_trailers(frame: Frame<Bytes>) -> Frame<Bytes> {
     match frame.into_trailers() {
         Ok(mut trailers) => {
@@ -233,12 +233,14 @@ mod tests {
     fn supplier_trailers_are_removed_and_data_is_untouched() {
         let mut trailers = axum::http::HeaderMap::new();
         trailers.insert("x-kubetee-attestation-quote", "q".parse().unwrap());
-        trailers.insert("x-litellm-model-group", "m".parse().unwrap());
+        trailers.insert("x-litellm-key-spend", "0.14".parse().unwrap());
+        trailers.insert("x-request-id", "m".parse().unwrap());
         let stripped = strip_supplier_trailers(Frame::trailers(trailers))
             .into_trailers()
             .unwrap();
         assert!(!stripped.contains_key("x-kubetee-attestation-quote"));
-        assert!(stripped.contains_key("x-litellm-model-group"));
+        assert!(!stripped.contains_key("x-litellm-key-spend"));
+        assert!(stripped.contains_key("x-request-id"));
         let data = strip_supplier_trailers(Frame::data(Bytes::from_static(b"x-kubetee-")));
         assert_eq!(data.into_data().unwrap(), Bytes::from_static(b"x-kubetee-"));
     }

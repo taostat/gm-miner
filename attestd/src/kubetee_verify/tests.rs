@@ -235,6 +235,7 @@ fn the_upstream_request_carries_no_supplier_or_selector_header() {
         .header(SELECTOR_HEADER, TARGETS[0])
         .header("x-kubetee-nonce", "buyer-chosen")
         .header("x-kubetee-anything", "buyer")
+        .header("x-litellm-tags", "buyer")
         .header("connection", "keep-alive")
         .body(Body::empty())
         .unwrap();
@@ -242,7 +243,8 @@ fn the_upstream_request_carries_no_supplier_or_selector_header() {
     assert!(upstream
         .headers()
         .keys()
-        .all(|name| !name.as_str().starts_with("x-kubetee-")));
+        .all(|name| !name.as_str().starts_with("x-kubetee-")
+            && !name.as_str().starts_with("x-litellm-")));
     assert!(!upstream.headers().contains_key(SELECTOR_HEADER));
     assert!(!upstream.headers().contains_key("connection"));
     assert_eq!(upstream.headers()[HOST], HOST_NAME);
@@ -343,7 +345,9 @@ async fn chat_reply(chat: Chat) -> Option<Reply> {
         .status(200)
         .header("content-type", "text/event-stream")
         .header("x-litellm-model-group", "served")
-        .header("x-kubetee-backend", "served");
+        .header("x-litellm-key-spend", "0.1405700124280008")
+        .header("x-kubetee-backend", "served")
+        .header("x-request-id", "served");
     Some(
         response
             .body(Full::new(Bytes::from_static(SSE.as_bytes())))
@@ -489,11 +493,10 @@ async fn a_chat_streams_through_unchanged_without_supplier_headers() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
     let response = verifier.forward(chat(TARGETS[2])).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response
-        .headers()
-        .keys()
-        .all(|name| !name.as_str().starts_with("x-kubetee-")));
-    assert_eq!(response.headers()["x-litellm-model-group"], "served");
+    assert!(response.headers().keys().all(|name| {
+        !name.as_str().starts_with("x-kubetee-") && !name.as_str().starts_with("x-litellm-")
+    }));
+    assert_eq!(response.headers()["x-request-id"], "served");
     assert_eq!(response.headers()["content-type"], "text/event-stream");
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, SSE.as_bytes());

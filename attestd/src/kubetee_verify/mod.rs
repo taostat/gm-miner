@@ -59,7 +59,8 @@ pub const TARGETS: [&str; 6] = [
     "xiaomi/mimo-v2.6-pro",
 ];
 
-const SUPPLIER_HEADER_PREFIX: &str = "x-kubetee-";
+/// Header families the supplier sets that are removed in both directions.
+const SUPPLIER_HEADER_PREFIXES: [&str; 2] = ["x-kubetee-", "x-litellm-"];
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
 const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a pooled connection may take to accept its next request.
@@ -409,11 +410,15 @@ fn upstream_request(mut request: Request<Body>) -> Result<Request<Body>> {
     Ok(request)
 }
 
-/// Remove every `x-kubetee-*` header.
+/// Remove every `x-kubetee-*` and `x-litellm-*` header.
 pub(crate) fn strip_supplier_headers(headers: &mut HeaderMap) {
     let names = headers
         .keys()
-        .filter(|name| name.as_str().starts_with(SUPPLIER_HEADER_PREFIX))
+        .filter(|name| {
+            SUPPLIER_HEADER_PREFIXES
+                .iter()
+                .any(|prefix| name.as_str().starts_with(prefix))
+        })
         .cloned()
         .collect::<Vec<_>>();
     for name in names {
