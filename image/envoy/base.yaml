@@ -125,6 +125,10 @@ static_resources:
                                     - key: chutes_verifier
                                   value:
                                     bool_match: true
+                                ## The default (true) would match every request the Lua
+                                ## filter did not mark, turning any provider's upstream
+                                ## failure into this Chutes reply.
+                                match_if_key_not_found: false
                       status_code: 503
                       body_format_override:
                         json_format:
