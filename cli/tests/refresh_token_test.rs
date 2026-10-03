@@ -8,6 +8,8 @@
 //!     one, and an omitted one is replaced by the previously stored value
 //!   - a rejected refresh (4xx / 5xx) reports `Rejected` so the caller can
 //!     fall back to the full device flow rather than aborting
+//!   - a rate-limited (`429`) refresh or device poll is retried, and a refresh
+//!     that stays rate-limited is an error, never `Rejected`
 
 #![expect(
     clippy::expect_used,
@@ -307,4 +309,134 @@ async fn refresh_rejected_on_server_error() {
         matches!(outcome, RefreshOutcome::Rejected),
         "a 5xx must yield Rejected; got {outcome:?}"
     );
+}
+
+// ── Rate limiting (429) is not a rejection ───────────────────────────────────
+
+/// A `429` that clears within the retry budget. `Retry-After: 0` keeps the
+/// test fast; the header is still the path that sets the wait.
+fn rate_limited() -> ResponseTemplate {
+    ResponseTemplate::new(429)
+        .insert_header("retry-after", "0")
+        .set_body_json(serde_json::json!({
+            "error": "Too Many Requests",
+            "error_description": "Rate limit exceeded for this client",
+            "statusCode": 429,
+        }))
+}
+
+/// The auth-gateway throttles the shared OAuth client with `429`. That says
+/// nothing about the refresh token, so the refresh must be retried and succeed
+/// once the throttle clears — not reported as `Rejected`, which sends the
+/// operator through a needless browser login.
+#[tokio::test]
+async fn refresh_retries_through_rate_limit() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(rate_limited())
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "after-throttle",
+            "refresh_token": "rotated-after-throttle",
+            "expires_in": 3180,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let outcome = auth::refresh_token(
+        &format!("{}/token", server.uri()),
+        "gm-miner-cli",
+        "stored-refresh",
+    )
+    .await
+    .expect("a transient 429 must not fail the refresh");
+
+    assert_eq!(expect_refreshed(outcome).access_token, "after-throttle");
+}
+
+/// A gateway that never stops returning `429` must end in an error that says
+/// the login is still valid. `Rejected` would fall back to the device flow,
+/// which polls the same throttled endpoint. The request count pins the retry
+/// bound so the loop cannot spin forever.
+#[tokio::test]
+async fn refresh_persistently_rate_limited_is_an_error_not_rejected() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(rate_limited())
+        .expect(5)
+        .mount(&server)
+        .await;
+
+    let result = auth::refresh_token(
+        &format!("{}/token", server.uri()),
+        "gm-miner-cli",
+        "stored-refresh",
+    )
+    .await;
+
+    let err = match result {
+        Ok(outcome) => unreachable!("a persistent 429 must be an error; got {outcome:?}"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("rate-limiting") && err.contains("stored login is still valid"),
+        "the error must name the throttle and reassure the operator: {err}"
+    );
+}
+
+/// A device-code poll that is rate-limited must keep polling: the device code
+/// is still pending. Before the fix the poll bailed with
+/// `token endpoint error:  (429)` on the first throttled response.
+#[tokio::test]
+async fn device_flow_polls_through_rate_limit() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/device/code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-code-1",
+            "user_code": "WXYZ-1234",
+            "verification_uri": "https://auth.example.com/device",
+            "interval": 0,
+            "expires_in": 900,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(rate_limited())
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "access-after-throttle",
+            "expires_in": 3180,
+        })))
+        .mount(&server)
+        .await;
+
+    let token = auth::device_login(
+        &format!("{}/device/code", server.uri()),
+        &format!("{}/token", server.uri()),
+        "gm-miner-cli",
+        &["openid".to_owned()],
+        false,
+    )
+    .await
+    .expect("a rate-limited poll must not abort the device flow");
+
+    assert_eq!(token.access_token, "access-after-throttle");
 }

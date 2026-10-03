@@ -15,7 +15,8 @@
 //!
 //! When an access token expires, [`refresh_token`] mints a fresh one from the
 //! stored `refresh_token` without a browser round-trip. The full device flow
-//! is only re-run when no refresh token is stored or the refresh is rejected.
+//! is only re-run when no refresh token is stored or the refresh is rejected;
+//! a rate-limited (`429`) refresh is retried, never treated as a rejection.
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -56,6 +57,29 @@ fn default_interval() -> u64 {
 }
 fn default_expires_in() -> u64 {
     900
+}
+
+/// Longest `Retry-After` the CLI will honour before re-trying a rate-limited
+/// token request. The auth-gateway's per-client limit has been observed sending
+/// single-digit values; a far larger one is better surfaced than slept on.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Refresh attempts made against a `429` before giving up — enough to ride out
+/// a short per-client burst window without stalling a command for minutes.
+const MAX_RATE_LIMITED_REFRESH_ATTEMPTS: u32 = 5;
+
+/// How long to wait before re-trying a `429` from the token endpoint.
+///
+/// Reads `Retry-After` as delay-seconds (the only form the auth-gateway sends),
+/// falls back to the device flow's default poll interval when it is absent or
+/// unparseable, and caps the result at [`MAX_RETRY_AFTER`].
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
+    let secs = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(default_interval);
+    Duration::from_secs(secs).min(MAX_RETRY_AFTER)
 }
 
 /// Build an HTTP client with no idle connection pooling.
@@ -208,6 +232,14 @@ async fn poll_for_token(
             return Ok(token);
         }
 
+        // A rate-limited poll says nothing about the device code, which is
+        // still pending: back off as the gateway asks and keep polling.
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            eprint!(".");
+            interval = interval.max(retry_after(resp.headers()));
+            continue;
+        }
+
         // Parse the OAuth error code from the 400 body.
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let error = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
@@ -258,50 +290,78 @@ pub enum RefreshOutcome {
 /// [`TokenResponse`] is returned; the auth-gateway rotates the refresh token,
 /// so the response's `refresh_token` (when present) supersedes the stored one.
 ///
-/// A `4xx` response means the refresh token is no longer usable: the result is
-/// [`RefreshOutcome::Rejected`] so the caller can fall back to the device flow.
+/// Any other `4xx` or a `5xx` means the refresh token is no longer usable: the
+/// result is [`RefreshOutcome::Rejected`] so the caller can fall back to the
+/// device flow. A `429` is the gateway throttling the client, not rejecting the
+/// token: the request is retried after `Retry-After`, up to
+/// [`MAX_RATE_LIMITED_REFRESH_ATTEMPTS`] times.
 ///
 /// # Errors
-/// Returns an error only for transport-level failures (the request could not
-/// be sent or the success body could not be parsed) — not for an auth-gateway
-/// rejection, which is reported as [`RefreshOutcome::Rejected`].
+/// Returns an error for transport-level failures (the request could not be
+/// sent or the success body could not be parsed) and when the gateway is still
+/// returning `429` after every attempt — never for an auth-gateway rejection,
+/// which is reported as [`RefreshOutcome::Rejected`].
 pub async fn refresh_token(
     token_url: &str,
     client_id: &str,
     refresh_token: &str,
 ) -> Result<RefreshOutcome> {
-    let client = no_pool_client()?;
+    for attempt in 1..=MAX_RATE_LIMITED_REFRESH_ATTEMPTS {
+        let client = no_pool_client()?;
 
-    let resp = client
-        .post(token_url)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id),
-        ])
-        .send()
-        .await
-        .with_context(|| format!("POST {token_url}"))?;
+        let resp = client
+            .post(token_url)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", client_id),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("POST {token_url}"))?;
 
-    let status = resp.status();
+        let status = resp.status();
 
-    if status.is_success() {
-        let token: TokenResponse = resp.json().await.context("parse refresh token response")?;
-        return Ok(RefreshOutcome::Refreshed(token));
+        if status.is_success() {
+            let token: TokenResponse = resp.json().await.context("parse refresh token response")?;
+            return Ok(RefreshOutcome::Refreshed(token));
+        }
+
+        // A 429 is the auth-gateway throttling this OAuth client, not a verdict
+        // on the refresh token. Falling back to the device flow would only poll
+        // the same throttled endpoint, and ask the operator to log in again
+        // while their stored login is still valid.
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = retry_after(resp.headers());
+            if attempt < MAX_RATE_LIMITED_REFRESH_ATTEMPTS {
+                eprintln!(
+                    "Auth gateway is rate-limiting token requests — retrying the refresh in {}s.",
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
+            }
+            continue;
+        }
+
+        // Any other 4xx is the auth-gateway declining the refresh token
+        // (invalid_grant, unsupported_grant_type, …). That is a recoverable
+        // state — the caller re-runs the device flow. A 5xx is treated the same
+        // way: the device flow is the only remaining path to a valid token.
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.text().await.unwrap_or_default();
+            debug!("refresh token rejected ({status}): {body}");
+            return Ok(RefreshOutcome::Rejected);
+        }
+
+        // Any other status (1xx/3xx) is unexpected for an OAuth token endpoint.
+        bail!("unexpected status from token endpoint: {status}");
     }
 
-    // A 4xx is the auth-gateway declining the refresh token (invalid_grant,
-    // unsupported_grant_type, …). That is a recoverable state — the caller
-    // re-runs the device flow. A 5xx is treated the same way: the device
-    // flow is the only remaining path to a valid token.
-    if status.is_client_error() || status.is_server_error() {
-        let body = resp.text().await.unwrap_or_default();
-        debug!("refresh token rejected ({status}): {body}");
-        return Ok(RefreshOutcome::Rejected);
-    }
-
-    // Any other status (1xx/3xx) is unexpected for an OAuth token endpoint.
-    bail!("unexpected status from token endpoint: {status}");
+    bail!(
+        "the auth gateway at {token_url} is still rate-limiting token requests (429) after \
+         {MAX_RATE_LIMITED_REFRESH_ATTEMPTS} attempts — your stored login is still valid; \
+         wait a minute and re-run the command"
+    )
 }
 
 impl TokenResponse {
@@ -351,7 +411,46 @@ impl TokenResponse {
     reason = "tests intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::poll_for_token;
+    use super::{poll_for_token, retry_after, MAX_RETRY_AFTER};
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    use std::time::Duration;
+
+    fn headers_with_retry_after(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(value).expect("valid header"),
+        );
+        headers
+    }
+
+    #[test]
+    fn retry_after_honours_delay_seconds() {
+        assert_eq!(
+            retry_after(&headers_with_retry_after("7")),
+            Duration::from_secs(7)
+        );
+    }
+
+    /// No header, or the HTTP-date form the gateway does not send, falls back
+    /// to the device flow's default interval rather than a zero-wait hot loop.
+    #[test]
+    fn retry_after_defaults_when_absent_or_unparseable() {
+        assert_eq!(retry_after(&HeaderMap::new()), Duration::from_secs(5));
+        assert_eq!(
+            retry_after(&headers_with_retry_after("Wed, 21 Oct 2026 07:28:00 GMT")),
+            Duration::from_secs(5)
+        );
+    }
+
+    /// A huge `Retry-After` is capped so a command fails in bounded time.
+    #[test]
+    fn retry_after_is_capped() {
+        assert_eq!(
+            retry_after(&headers_with_retry_after("3600")),
+            MAX_RETRY_AFTER
+        );
+    }
 
     /// A transient transport failure (here: connection refused) must not abort
     /// the device-login poll. The loop swallows the send error, keeps polling,
