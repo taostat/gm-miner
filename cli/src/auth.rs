@@ -411,7 +411,7 @@ impl TokenResponse {
     reason = "tests intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{poll_for_token, retry_after, MAX_RETRY_AFTER};
+    use super::{poll_for_token, retry_after};
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use std::time::Duration;
 
@@ -448,7 +448,7 @@ mod tests {
     fn retry_after_is_capped() {
         assert_eq!(
             retry_after(&headers_with_retry_after("3600")),
-            MAX_RETRY_AFTER
+            Duration::from_secs(30)
         );
     }
 

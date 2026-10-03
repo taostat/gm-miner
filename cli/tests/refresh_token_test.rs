@@ -17,6 +17,7 @@
 )]
 
 use gm_miner_cli::auth::{self, RefreshOutcome, TokenResponse};
+use std::time::{Duration, Instant};
 use wiremock::{
     matchers::{body_string_contains, method, path},
     Mock, MockServer, ResponseTemplate,
@@ -313,11 +314,11 @@ async fn refresh_rejected_on_server_error() {
 
 // ── Rate limiting (429) is not a rejection ───────────────────────────────────
 
-/// A `429` that clears within the retry budget. `Retry-After: 0` keeps the
-/// test fast; the header is still the path that sets the wait.
+/// A `429` asking the client to wait one second. The tests time the call, so
+/// an implementation that ignores `Retry-After` fails rather than passing fast.
 fn rate_limited() -> ResponseTemplate {
     ResponseTemplate::new(429)
-        .insert_header("retry-after", "0")
+        .insert_header("retry-after", "1")
         .set_body_json(serde_json::json!({
             "error": "Too Many Requests",
             "error_description": "Rate limit exceeded for this client",
@@ -351,6 +352,7 @@ async fn refresh_retries_through_rate_limit() {
         .mount(&server)
         .await;
 
+    let started = Instant::now();
     let outcome = auth::refresh_token(
         &format!("{}/token", server.uri()),
         "gm-miner-cli",
@@ -360,6 +362,11 @@ async fn refresh_retries_through_rate_limit() {
     .expect("a transient 429 must not fail the refresh");
 
     assert_eq!(expect_refreshed(outcome).access_token, "after-throttle");
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "two 429s with Retry-After: 1 must be waited out, took {:?}",
+        started.elapsed()
+    );
 }
 
 /// A gateway that never stops returning `429` must end in an error that says
@@ -372,7 +379,7 @@ async fn refresh_persistently_rate_limited_is_an_error_not_rejected() {
 
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(rate_limited())
+        .respond_with(rate_limited().insert_header("retry-after", "0"))
         .expect(5)
         .mount(&server)
         .await;
@@ -428,6 +435,7 @@ async fn device_flow_polls_through_rate_limit() {
         .mount(&server)
         .await;
 
+    let started = Instant::now();
     let token = auth::device_login(
         &format!("{}/device/code", server.uri()),
         &format!("{}/token", server.uri()),
@@ -439,4 +447,9 @@ async fn device_flow_polls_through_rate_limit() {
     .expect("a rate-limited poll must not abort the device flow");
 
     assert_eq!(token.access_token, "access-after-throttle");
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the poll after a 429 with Retry-After: 1 must wait, took {:?}",
+        started.elapsed()
+    );
 }
