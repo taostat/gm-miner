@@ -362,10 +362,12 @@ async fn refresh_retries_through_rate_limit() {
     .expect("a transient 429 must not fail the refresh");
 
     assert_eq!(expect_refreshed(outcome).access_token, "after-throttle");
+    // Two 1s waits; the 5s default for a missing header would take 10s, so the
+    // upper bound fails an implementation that ignores `Retry-After`.
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() >= Duration::from_secs(2),
-        "two 429s with Retry-After: 1 must be waited out, took {:?}",
-        started.elapsed()
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(5),
+        "two 429s with Retry-After: 1 must each wait 1s, took {elapsed:?}"
     );
 }
 
@@ -447,9 +449,10 @@ async fn device_flow_polls_through_rate_limit() {
     .expect("a rate-limited poll must not abort the device flow");
 
     assert_eq!(token.access_token, "access-after-throttle");
+    // One 1s wait; the 5s default would fail the upper bound.
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() >= Duration::from_secs(1),
-        "the poll after a 429 with Retry-After: 1 must wait, took {:?}",
-        started.elapsed()
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(4),
+        "the poll after a 429 with Retry-After: 1 must wait 1s, took {elapsed:?}"
     );
 }
