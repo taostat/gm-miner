@@ -541,6 +541,9 @@ mod tests {
 
     #[test]
     fn nothing_set_reports_no_lines() {
-        assert!(summary_lines(&ProviderKeys::default()).is_empty());
+        assert_eq!(
+            summary_lines(&ProviderKeys::default()),
+            [] as [std::string::String; 0]
+        );
     }
 }

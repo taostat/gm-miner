@@ -2125,14 +2125,16 @@ mod tests {
         let mut retail_by_key: RetailByKey<'_> = std::collections::HashMap::new();
         retail_by_key.insert((Provider::Zai.as_str().to_owned(), "glm-5.2"), &dims);
 
-        assert!(extra_rate_lines(
-            &offers(serde_json::json!([{
-                "provider": "zai", "model": "glm-5.2",
-                "is_offered": true, "is_eligible": true, "discount_bp": 1050,
-            }])),
-            &retail_by_key,
-        )
-        .is_empty());
+        assert_eq!(
+            extra_rate_lines(
+                &offers(serde_json::json!([{
+                    "provider": "zai", "model": "glm-5.2",
+                    "is_offered": true, "is_eligible": true, "discount_bp": 1050,
+                }])),
+                &retail_by_key,
+            ),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -2304,7 +2306,10 @@ mod tests {
             "provider": "openai", "model": "gpt-5.6",
             "is_offered": true, "is_eligible": true, "discount_bp": 500,
         }]));
-        assert!(ineligible_detail_lines(&products).is_empty());
+        assert_eq!(
+            ineligible_detail_lines(&products),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -2446,7 +2451,7 @@ mod tests {
             err.to_string().contains("not model path segments"),
             "got: {err}"
         );
-        assert!(deleted_paths(&server).await.is_empty());
+        assert_eq!(deleted_paths(&server).await, [] as [std::string::String; 0]);
     }
 
     #[tokio::test]
@@ -2636,7 +2641,7 @@ mod tests {
             .expect_err("an empty target set is a failed command, not a silent no-op");
 
         assert!(err.to_string().contains("anthropic"), "got: {err}");
-        assert!(deleted_paths(&server).await.is_empty());
+        assert_eq!(deleted_paths(&server).await, [] as [std::string::String; 0]);
     }
 
     #[tokio::test]

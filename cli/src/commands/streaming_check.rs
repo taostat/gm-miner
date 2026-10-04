@@ -2030,7 +2030,10 @@ mod tests {
             provider_models: Some(HashMap::new()),
             worker_backends: HashMap::new(),
         };
-        assert!(providers_for_target(&[Provider::Engy], &target).is_empty());
+        assert_eq!(
+            providers_for_target(&[Provider::Engy], &target),
+            [] as [gm_miner_cli::types::Provider; 0]
+        );
     }
 
     #[test]
