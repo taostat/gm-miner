@@ -314,6 +314,14 @@ gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-
 
 `--discount-pct` accepts a value in `[0, 99.90]` with up to two decimal places (e.g. `10.5`).
 `0` means at retail; `99.90` is the cap (keeps per-request revenue strictly positive).
+
+When the registry delays a price increase, `declare-product` and
+`declare-products` print its activation deadline and finish successfully.
+Your current price stays active until then, and routing reliability resets
+when the higher price activates. Declaring another increase starts a new
+deadline; declaring the active price or a lower price cancels the pending
+increase. Older registries continue to accept declarations immediately.
+
 Use the registry-owned source model for every admitted route; do not override it with a deployment
 name. After the capability check, a cloud offer is declared exactly like its direct
 counterpart; the registry decides whether each worker is eligible. Azure Responses and Bedrock remain unqualified; legacy Bedrock ids remain
