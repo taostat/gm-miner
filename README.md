@@ -408,6 +408,10 @@ gmcli worker remove <worker_id>
 | `gmcli sources` | List [sourcing routes](docs/sourcing.md), separating transport capability from current registry admission |
 | `gmcli earnings` | Lifetime served earnings and recent finalized epochs from the registry |
 | `gmcli notifications list` | Registry notifications, newest first with UTC times; `--limit` (1-100, default 20) and `--before <id>`, or `--all` (up to 1000); no channel setup needed |
+| `gmcli notifications set <apprise-url>` | Set a channel and send a confirmation code; `--digest` opts in to future digests (delivery is not enabled in v1). Use `set -` to read the URL from stdin and keep it out of shell history; gmcli never prints or saves it |
+| `gmcli notifications confirm <code>` | Verify the channel with its six-digit code (expires after 15 minutes) |
+| `gmcli notifications status` | Channel fingerprint, verification/expiry state and delivery health, including auto-disable |
+| `gmcli notifications off` | Remove the notification channel |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |
 | `gmcli image-canary` | Testnet-only, funded native Gemini image preflight and two-SKU settlement reconciliation (paid; never part of health checks) |

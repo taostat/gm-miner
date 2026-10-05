@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result};
 
 use gm_miner_cli::{
     client::RegistryClient,
-    notifications::{fetch_inbox, render_inbox, Listing},
+    notifications::{channel, fetch_inbox, render_inbox, Listing},
 };
 
 pub(crate) async fn cmd_notifications_list(
@@ -25,4 +25,34 @@ pub(crate) async fn cmd_notifications_list(
         .lock()
         .write_all(render_inbox(&inbox, network, width).as_bytes())
         .context("write notifications to stdout")
+}
+
+pub(crate) async fn cmd_notifications_set(
+    client: &mut RegistryClient,
+    destination: &str,
+    digest: bool,
+) -> Result<()> {
+    print!(
+        "{}",
+        channel::set_channel(client, destination, digest).await?
+    );
+    Ok(())
+}
+
+pub(crate) async fn cmd_notifications_confirm(
+    client: &mut RegistryClient,
+    code: &str,
+) -> Result<()> {
+    print!("{}", channel::confirm_channel(client, code).await?);
+    Ok(())
+}
+
+pub(crate) async fn cmd_notifications_status(client: &mut RegistryClient) -> Result<()> {
+    print!("{}", channel::channel_status(client).await?);
+    Ok(())
+}
+
+pub(crate) async fn cmd_notifications_off(client: &mut RegistryClient) -> Result<()> {
+    print!("{}", channel::off_channel(client).await?);
+    Ok(())
 }

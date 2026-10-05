@@ -452,7 +452,7 @@ async fn invalid_pages_fail_without_looping_or_printing_partial_results() {
         .await
         .expect("invalid paging must terminate");
         assert!(!output.status.success(), "accepted {invalid}");
-        assert!(stdout(&output).is_empty());
+        assert_eq!(stdout(&output), "");
         assert!(
             stderr(&output).contains("invalid notifications page"),
             "{}",
@@ -472,7 +472,7 @@ async fn a_repeated_page_fails_instead_of_filling_the_cap_with_duplicates() {
         .await;
     let output = run(&server.uri(), Some("t"), &["--all"]).await;
     assert!(!output.status.success());
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "");
     assert!(
         stderr(&output).contains("invalid notifications page"),
         "{}",
@@ -544,7 +544,7 @@ async fn malformed_success_responses_and_later_page_errors_fail_cleanly() {
             .await;
         let output = run(&server.uri(), Some("t"), &["--all"]).await;
         assert!(!output.status.success());
-        assert!(stdout(&output).is_empty());
+        assert_eq!(stdout(&output), "");
         assert!(!stderr(&output).contains("panicked"), "{}", stderr(&output));
         assert_eq!(server.received_requests().await.expect("requests").len(), 2);
     }

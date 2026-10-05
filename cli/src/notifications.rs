@@ -8,9 +8,13 @@ use std::fmt::Write as _;
 
 use anyhow::{bail, Context as _, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
+use reqwest::Response;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{client::RegistryClient, network::Network};
+
+pub mod channel;
 
 pub const MESSAGES_PATH: &str = "/miners/me/notifications/messages";
 /// The registry's largest page.
@@ -62,24 +66,45 @@ fn page_path(limit: u32, before: Option<u64>) -> String {
     }
 }
 
-fn is_unreachable(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(<dyn std::error::Error>::is::<reqwest::Error>)
+fn registry_response(result: Result<Response>, client: &RegistryClient) -> Result<Response> {
+    result.map_err(|err| {
+        if err
+            .chain()
+            .any(<dyn std::error::Error>::is::<reqwest::Error>)
+        {
+            err.context(format!(
+                "could not reach the {} registry at {} — check your connection, \
+                 or pass --network / --api-url to target another registry",
+                client.config.resolved_network(),
+                client.config.api_url()
+            ))
+        } else {
+            err
+        }
+    })
 }
 
-async fn error_detail(resp: reqwest::Response) -> String {
-    let body = resp.text().await.unwrap_or_default();
-    let detail = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|json| {
-            json.get("detail").map(|detail| {
-                detail
-                    .as_str()
-                    .map_or_else(|| detail.to_string(), str::to_owned)
-            })
-        })
-        .unwrap_or(body);
+fn error_detail(body: &Value) -> String {
+    let detail = if body.get("error").and_then(Value::as_str).is_some() {
+        ["error", "reason", "message"]
+            .iter()
+            .filter_map(|field| body.get(field).and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(": ")
+    } else {
+        let detail = body.get("detail").unwrap_or(body);
+        detail
+            .as_str()
+            .map_or_else(|| detail.to_string(), str::to_owned)
+    };
     escape_controls(&detail)
+}
+
+fn timestamp(value: Option<DateTime<Utc>>) -> String {
+    value.map_or_else(
+        || "none".to_owned(),
+        |at| at.to_rfc3339_opts(SecondsFormat::Secs, true),
+    )
 }
 
 /// Fetch one page.
@@ -96,16 +121,7 @@ pub async fn fetch_page(
     let network = client.config.resolved_network();
     let api_url = client.config.api_url();
     let path = page_path(limit, before);
-    let resp = match client.get(&path).await {
-        Ok(resp) => resp,
-        Err(err) if is_unreachable(&err) => {
-            return Err(err.context(format!(
-                "could not reach the {network} registry at {api_url} — check your connection, \
-                 or pass --network / --api-url to target another registry"
-            )));
-        }
-        Err(err) => return Err(err),
-    };
+    let resp = registry_response(client.get(&path).await, client)?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         bail!(
@@ -114,7 +130,8 @@ pub async fn fetch_page(
         );
     }
     if !status.is_success() {
-        let detail = error_detail(resp).await;
+        let body = resp.text().await.unwrap_or_default();
+        let detail = error_detail(&serde_json::from_str(&body).unwrap_or(Value::String(body)));
         bail!("reading notifications from the {network} registry failed ({status}): {detail}");
     }
     let page = resp
@@ -215,9 +232,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn render_one(out: &mut String, notification: &Notification, width: usize) {
-    let at = notification
-        .occurred_at
-        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    let at = timestamp(Some(notification.occurred_at));
     let mut heading = format!("{at}  {}", notification.event_type);
     if let Some(reason) = &notification.reason_code {
         let _ = write!(heading, " ({reason})");

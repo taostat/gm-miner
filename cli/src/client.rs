@@ -7,7 +7,7 @@
 //! backstop and still surfaces as "authentication expired".
 
 use anyhow::{bail, Context, Result};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Method, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -201,57 +201,53 @@ impl RegistryClient {
         self.config.api_url()
     }
 
-    /// Issue an authenticated GET request to the registry.
-    ///
-    /// # Errors
-    /// Returns an error if the access token is missing, the request fails
-    /// at the network level, or the server returns 401.
-    pub async fn get(&mut self, path: &str) -> Result<Response> {
+    async fn send(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Response> {
         let url = format!("{}{path}", self.api_url());
         let token = self
             .access_token()
-            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gmcli login` first"))?
-            .to_owned();
-
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&token)
+            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gmcli login` first"))?;
+        let mut request = self.client.request(method.clone(), &url).bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        if method == Method::POST && path == "/miners/products" {
+            request = request.header(PRICE_INCREASE_SCHEDULING_HEADER, "1");
+        }
+        let response = request
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?;
-
-        if resp.status() == StatusCode::UNAUTHORIZED {
+            .with_context(|| format!("{method} {url}"))?;
+        if response.status() == StatusCode::UNAUTHORIZED {
             bail!("authentication expired — run `gmcli login` again");
         }
-        Ok(resp)
+        Ok(response)
+    }
+
+    /// Issue an authenticated GET request to the registry.
+    ///
+    /// # Errors
+    /// Returns an error if the access token is missing, the request fails,
+    /// or the server returns 401.
+    pub async fn get(&mut self, path: &str) -> Result<Response> {
+        self.send(Method::GET, path, None).await
     }
 
     /// Issue an authenticated POST request with a JSON body.
     ///
     /// # Errors
-    /// Returns an error if the access token is missing, the request fails, or
-    /// the server returns 401.
+    /// Returns an error if the access token is missing, the request fails,
+    /// or the server returns 401.
     pub async fn post(&mut self, path: &str, body: &Value) -> Result<Response> {
-        let url = format!("{}{path}", self.api_url());
-        let token = self
-            .access_token()
-            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gmcli login` first"))?
-            .to_owned();
+        self.send(Method::POST, path, Some(body)).await
+    }
 
-        let mut request = self.client.post(&url).bearer_auth(&token).json(body);
-        if path == "/miners/products" {
-            request = request.header(PRICE_INCREASE_SCHEDULING_HEADER, "1");
-        }
-        let resp = request
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            bail!("authentication expired — run `gmcli login` again");
-        }
-        Ok(resp)
+    /// Issue an authenticated PUT request with a JSON body.
+    ///
+    /// # Errors
+    /// Returns an error if the access token is missing, the request fails,
+    /// or the server returns 401. Request bodies are never included in errors.
+    pub async fn put(&mut self, path: &str, body: &Value) -> Result<Response> {
+        self.send(Method::PUT, path, Some(body)).await
     }
 
     /// Issue an authenticated DELETE request to the registry.
@@ -260,24 +256,7 @@ impl RegistryClient {
     /// Returns an error if the access token is missing, the request fails,
     /// or the server returns 401.
     pub async fn delete(&mut self, path: &str) -> Result<Response> {
-        let url = format!("{}{path}", self.api_url());
-        let token = self
-            .access_token()
-            .ok_or_else(|| anyhow::anyhow!("not logged in — run `gmcli login` first"))?
-            .to_owned();
-
-        let resp = self
-            .client
-            .delete(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .with_context(|| format!("DELETE {url}"))?;
-
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            bail!("authentication expired — run `gmcli login` again");
-        }
-        Ok(resp)
+        self.send(Method::DELETE, path, None).await
     }
 
     /// Cheap authenticated probe used by `gmcli deploy` before any
