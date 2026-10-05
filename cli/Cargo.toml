@@ -75,6 +75,10 @@ hmac         = "=0.13.0"
 strum        = { version = "0.28", features = ["derive"] }
 subxt        = "0.44.3"
 serde_yaml_ng = "0.10"
+# Reuse unicode-width 0.1; newer textwrap releases introduce a duplicate.
+textwrap     = { version = "=0.16.1", default-features = false, features = ["unicode-width"] }
+# textwrap 0.16.1's optional terminal_size 0.2 would duplicate rustix.
+terminal_size = "0.4"
 
 [dev-dependencies]
 gm-miner-attestd = { path = "../attestd" }

@@ -10,7 +10,7 @@ declaration, and price management.
 ## Layout
 
 - `cli/src/main.rs` — clap surface plus the `dispatch` / `dispatch_worker` routers; pure coordination, no logic
-- `cli/src/commands/` — one module per subcommand handler (`deploy`, `products`, `pricing`, `sources`, `hotkey`, `doctor`, `wizard`, `keys`, `earnings`, `fun`) plus `persist` (config/token persistence) and the shared `status_error`/`me_error` helpers in `commands/mod.rs`
+- `cli/src/commands/` — one module per subcommand handler (`deploy`, `products`, `pricing`, `sources`, `hotkey`, `doctor`, `wizard`, `keys`, `earnings`, `notifications`, `fun`) plus `persist` (config/token persistence) and the shared `status_error`/`me_error` helpers in `commands/mod.rs`
 - `cli/src/lib.rs` — module declarations; re-exports for binary and tests
 - `cli/src/auth.rs` — Taostats device-code OAuth2 flow
 - `cli/src/client.rs` — `RegistryClient`: typed HTTP wrappers for registry endpoints
@@ -23,6 +23,7 @@ declaration, and price management.
 - `cli/src/image.rs` — miner image build/push: `docker buildx --push` to a public registry, digest resolution
 - `cli/src/node_secret.rs` — per-worker node secret: a fresh secret per worker (CVM), reused across re-deploys of the same `--app-name`, persisted in the worker's config record, embedded in compose env so envoy enforces it
 - `cli/src/pricing.rs` — discount/price conversion, integer-only, no floats: `parse_discount_pct` (decimal-string → basis points), `PRICE_DIMENSIONS` (the one table of the ten price dimensions), `effective_dimensions` (percentage → absolute per-dimension vector), and the renderers `format_usd` (the one money formatter) / `effective_rate_summary` / `extra_dimension_lines`
+- `cli/src/notifications.rs` — the pull inbox: `fetch_inbox` (validates descending IDs/cursors; one page or `--all` up to `ALL_CAP`, with actionable unreachable/404 errors) and `render_inbox` (escapes terminal controls and wraps to terminal width, capped at 78 columns)
 - `cli/src/table.rs` — `render(headers, rows)`: the one text table, every column sized to its own widest cell. `status`, `pricing` and `sources` all go through it
 - `cli/src/types.rs` — shared types: `Provider`, `Product`, `RetailDimensions` (the full per-dimension price vector), `MinerStatus`, and the worker request/response shapes (`WorkerCreateRequest`, `WorkerEntry`, `WorkerListResponse`)
 - `azure-verify/` — `gm-azure-verify`: the Azure owner-capture checks, shared by `attestd` (fail-closed boot gate + periodic re-verification) and `gmcli doctor` (preflight). One crate on purpose: a doctor that promised a PASS the boot gate then refused would be worse than no preflight. `AzureVerifier::verify_target` is the gate's pass/fail; `audit_target` is the same sweep collecting every finding for doctor to print
@@ -68,6 +69,7 @@ cargo test -p gmcli
 | `pricing` | Rank each offer against the eligible field on the scalar the gateway routes on — your rank, the field's size, its best/median cost, and the products others serve and you do not |
 | `sources` | List the sourcing routes you can serve: a buyer product served from a cheaper upstream, with the buyer retail you settle on, how many of your workers currently serve it, and whether you already offer it |
 | `earnings` | Read the hotkey's neuron row from the subnet metagraph (via btcli) and report UID, stake, and per-tempo emission |
+| `notifications list` | Print the hotkey's notifications from `GET /miners/me/notifications/messages`, newest first with UTC times; `--limit` (1-100, default 20) and `--before <id>`, or `--all` (capped at the newest 1000). Needs no notification channel |
 | `update` | Replace this binary with the latest GitHub release via `axoupdater`, reading the install receipt cargo-dist's shell installer wrote. Takes no config and no token — a stale CLI is often a stale login too |
 | `worker add/list/remove` | Manage the data-plane workers (Phala CVMs) attached to the hotkey |
 | `publish-image-version` | Compute the release image's `compose_hash`/`os_image_hash` offline and upsert the approved `ImageVersion` to the registry (release pipeline; needs the registry admin key) |

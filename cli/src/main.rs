@@ -49,8 +49,12 @@ use anyhow::{Context as _, Result};
 use chrono::Timelike as _;
 use clap::{Parser, Subcommand};
 use gm_miner_cli::{
-    client::RegistryClient, deploy::DEFAULT_BOOT_TIMEOUT_SECS, network::Network,
-    pricing::parse_discount_pct, types::Provider,
+    client::RegistryClient,
+    deploy::DEFAULT_BOOT_TIMEOUT_SECS,
+    network::Network,
+    notifications::{Listing, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE},
+    pricing::parse_discount_pct,
+    types::Provider,
 };
 
 use crate::commands::deploy::{
@@ -63,6 +67,7 @@ use crate::commands::fun::{cmd_gm, cmd_moon};
 use crate::commands::hotkey::cmd_register_hotkey;
 use crate::commands::image_canary::cmd_image_canary;
 use crate::commands::keys::SetApiKeysArgs;
+use crate::commands::notifications::cmd_notifications_list;
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::pricing::cmd_pricing;
 use crate::commands::products::{
@@ -583,6 +588,15 @@ enum Command {
         #[command(subcommand)]
         command: WorkerCommand,
     },
+
+    /// Read the notifications the registry holds for your hotkey.
+    ///
+    /// The registry keeps recent events addressed to your hotkey or its
+    /// workers, so `notifications list` works without setting up a channel.
+    Notifications {
+        #[command(subcommand)]
+        command: NotificationsCommand,
+    },
 }
 
 /// Deploy flags shared by `gmcli deploy` (worker #1) and
@@ -726,6 +740,44 @@ enum WorkerCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum NotificationsCommand {
+    /// List your notifications, newest first, with times in UTC
+    /// (`GET /miners/me/notifications/messages`).
+    #[command(after_help = "Examples:\n  \
+        gmcli notifications list\n  \
+        gmcli notifications list --limit 50\n  \
+        gmcli notifications list --before 1234\n  \
+        gmcli notifications list --all")]
+    List {
+        /// How many to show, 1-100.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_PAGE_SIZE,
+            value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_PAGE_SIZE)),
+            conflicts_with = "all"
+        )]
+        limit: u32,
+        /// Show notifications older than this id (the cursor the previous
+        /// page printed).
+        // The registry cursor is a positive signed BIGINT.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..(1_u64 << 63)), conflicts_with = "all")]
+        before: Option<u64>,
+        /// Fetch every page, up to the newest 1000 notifications.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+impl NotificationsCommand {
+    fn listing(&self) -> Listing {
+        match *self {
+            Self::List { all: true, .. } => Listing::All,
+            Self::List { limit, before, .. } => Listing::Page { limit, before },
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -831,6 +883,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::ListProducts | Command::Status => cmd_status(&mut context.client().await?).await,
         Command::Pricing => cmd_pricing(&mut context.client().await?).await,
         Command::Sources => cmd_sources(&mut context.client().await?).await,
+        Command::Notifications { command } => {
+            cmd_notifications_list(&mut context.client().await?, command.listing()).await
+        }
         // Upgrades must work with expired tokens or a damaged config.
         Command::Update => cmd_update().await,
         Command::Earnings { .. } => cmd_earnings(&context.config()?).await,

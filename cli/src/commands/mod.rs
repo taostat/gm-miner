@@ -11,6 +11,7 @@ pub mod fun;
 pub mod hotkey;
 pub mod image_canary;
 pub mod keys;
+pub mod notifications;
 pub mod persist;
 pub mod pricing;
 pub mod products;

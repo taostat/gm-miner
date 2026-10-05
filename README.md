@@ -407,6 +407,7 @@ gmcli worker remove <worker_id>
 | `gmcli pricing` | Rank each offer against the eligible field on the scalar the gateway routes on |
 | `gmcli sources` | List [sourcing routes](docs/sourcing.md), separating transport capability from current registry admission |
 | `gmcli earnings` | Lifetime served earnings and recent finalized epochs from the registry |
+| `gmcli notifications list` | Registry notifications, newest first with UTC times; `--limit` (1-100, default 20) and `--before <id>`, or `--all` (up to 1000); no channel setup needed |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |
 | `gmcli image-canary` | Testnet-only, funded native Gemini image preflight and two-SKU settlement reconciliation (paid; never part of health checks) |

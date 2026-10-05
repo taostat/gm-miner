@@ -15,6 +15,7 @@ pub mod image;
 pub mod image_version;
 pub mod network;
 pub mod node_secret;
+pub mod notifications;
 pub mod phala;
 pub mod pricing;
 pub mod register_hotkey;
