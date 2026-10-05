@@ -121,7 +121,7 @@ pub(crate) async fn cmd_declare_product(
         return Ok(());
     }
 
-    post_declare_product(
+    let result = post_declare_product(
         client,
         provider.as_str(),
         model,
@@ -129,7 +129,7 @@ pub(crate) async fn cmd_declare_product(
         args.upstream_model,
     )
     .await?;
-    println!("  → ok");
+    println!("  → {}", result.message());
     println!("\nNext: gmcli status   (confirm the offer)");
     Ok(())
 }
@@ -352,6 +352,7 @@ pub(crate) async fn cmd_declare_products(
     }
 
     let mut ok_count = 0_usize;
+    let mut scheduled_count = 0_usize;
     let mut err_count = 0_usize;
     for product in &targets {
         match post_declare_product(
@@ -363,8 +364,16 @@ pub(crate) async fn cmd_declare_products(
         )
         .await
         {
-            Ok(()) => {
-                println!("  {}/{}: ok", product.provider, product.model);
+            Ok(result) => {
+                println!(
+                    "  {}/{}: {}",
+                    product.provider,
+                    product.model,
+                    result.message()
+                );
+                if matches!(result, DeclarationResult::Scheduled(_)) {
+                    scheduled_count += 1;
+                }
                 ok_count += 1;
             }
             Err(err) => {
@@ -374,6 +383,11 @@ pub(crate) async fn cmd_declare_products(
         }
     }
 
+    if scheduled_count > 0 {
+        println!(
+            "{scheduled_count} price increase(s) scheduled; their current prices remain active."
+        );
+    }
     if skipped_cloud == 0 {
         println!("\nSummary: {ok_count} ok, {err_count} failed.");
     } else {
@@ -535,15 +549,39 @@ fn fan_out_preview_lines(targets: &[&Product], discount_bp: u32) -> Vec<String> 
 }
 
 /// Issue one `POST /miners/products` and translate the result into a typed
-/// `Result<(), anyhow::Error>` so both `declare-product` and
+/// result so both `declare-product` and
 /// `declare-products` share the same wire-shape + error-detail logic.
+#[derive(Debug, PartialEq, Eq)]
+enum DeclarationResult {
+    Active,
+    Scheduled(String),
+}
+
+impl DeclarationResult {
+    fn message(&self) -> &str {
+        match self {
+            Self::Active => "ok",
+            Self::Scheduled(detail) => detail,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ScheduledPriceIncrease {
+    code: String,
+    detail: String,
+    active_discount_bp: u32,
+    pending_discount_bp: u32,
+    effective_at: chrono::DateTime<chrono::Utc>,
+}
+
 async fn post_declare_product(
     client: &mut RegistryClient,
     provider: &str,
     model: &str,
     discount_bp: u32,
     upstream_model: Option<&str>,
-) -> Result<()> {
+) -> Result<DeclarationResult> {
     let body = serde_json::to_value(ProductDeclarationRequest {
         provider,
         model,
@@ -558,11 +596,34 @@ async fn post_declare_product(
         .context("POST /miners/products")?;
 
     let status = resp.status();
+    if status == reqwest::StatusCode::ACCEPTED {
+        let scheduled = resp
+            .json::<ScheduledPriceIncrease>()
+            .await
+            .context("parse scheduled price increase response")?;
+        if scheduled.code != "price_increase_scheduled"
+            || scheduled.pending_discount_bp != discount_bp
+            || scheduled.active_discount_bp <= scheduled.pending_discount_bp
+            || scheduled.active_discount_bp > 9990
+            || scheduled.detail.trim().is_empty()
+        {
+            bail!("registry returned an invalid scheduled price increase response");
+        }
+        let deadline = scheduled.effective_at.to_rfc3339();
+        return Ok(DeclarationResult::Scheduled(format!(
+            "Price increase scheduled for {deadline}: {}% → {}% off retail. \
+             Current price remains active until then; reliability resets on activation. \
+             Another increase declaration restarts the deadline; declaring the active \
+             price or a lower price cancels it.",
+            format_discount_pct(scheduled.active_discount_bp),
+            format_discount_pct(scheduled.pending_discount_bp),
+        )));
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         return Err(status_error("declare-product", status, &body));
     }
-    Ok(())
+    Ok(DeclarationResult::Active)
 }
 
 /// What may appear in an offer path unescaped: RFC 3986's unreserved set plus
@@ -937,7 +998,7 @@ mod tests {
     use gm_miner_cli::config::{Config, NetworkEntry, ProviderKeys, TokenEntry, WorkerRecord};
     use gm_miner_cli::network::Network;
     use wiremock::{
-        matchers::{body_json, method, path},
+        matchers::{body_json, header, method, path},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -1075,6 +1136,78 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    fn scheduled_increase_payload() -> serde_json::Value {
+        serde_json::json!({
+            "code": "price_increase_scheduled",
+            "detail": "Price increase scheduled; current price remains active.",
+            "active_discount_bp": 5000,
+            "pending_discount_bp": 0,
+            "effective_at": "2026-10-04T12:00:00+00:00",
+        })
+    }
+
+    #[tokio::test]
+    async fn scheduled_price_increase_202_is_success_and_displays_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/miners/products"))
+            .and(header(
+                gm_miner_cli::client::PRICE_INCREASE_SCHEDULING_HEADER,
+                "1",
+            ))
+            .respond_with(ResponseTemplate::new(202).set_body_json(scheduled_increase_payload()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = RegistryClient::new(config_for(&server));
+        let result = post_declare_product(&mut client, "anthropic", "claude-sonnet-4-6", 0, None)
+            .await
+            .expect("a queued increase succeeds");
+        assert!(matches!(result, DeclarationResult::Scheduled(_)));
+        assert!(result.message().contains("2026-10-04T12:00:00+00:00"));
+        assert!(result.message().contains("Current price remains active"));
+        assert!(result.message().contains("50% → 0%"));
+        assert!(result.message().contains("restarts the deadline"));
+    }
+
+    #[tokio::test]
+    async fn declaration_409_preserves_registry_detail_and_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/miners/products"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(scheduled_increase_payload()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = RegistryClient::new(config_for(&server));
+        let error = post_declare_product(&mut client, "anthropic", "claude-sonnet-4-6", 0, None)
+            .await
+            .expect_err("409 must remain visible through the error path");
+        assert!(error.to_string().contains("409 Conflict"));
+        assert!(error.to_string().contains("Price increase scheduled"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_price_increase_rejects_malformed_202() {
+        let mut unknown_code = scheduled_increase_payload();
+        unknown_code["code"] = serde_json::json!("other");
+        for payload in [serde_json::json!({}), unknown_code] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/miners/products"))
+                .respond_with(ResponseTemplate::new(202).set_body_json(payload))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut client = RegistryClient::new(config_for(&server));
+            assert!(
+                post_declare_product(&mut client, "anthropic", "claude-sonnet-4-6", 0, None)
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     /// Every request the mock server saw against `path`.
@@ -1992,14 +2125,16 @@ mod tests {
         let mut retail_by_key: RetailByKey<'_> = std::collections::HashMap::new();
         retail_by_key.insert((Provider::Zai.as_str().to_owned(), "glm-5.2"), &dims);
 
-        assert!(extra_rate_lines(
-            &offers(serde_json::json!([{
-                "provider": "zai", "model": "glm-5.2",
-                "is_offered": true, "is_eligible": true, "discount_bp": 1050,
-            }])),
-            &retail_by_key,
-        )
-        .is_empty());
+        assert_eq!(
+            extra_rate_lines(
+                &offers(serde_json::json!([{
+                    "provider": "zai", "model": "glm-5.2",
+                    "is_offered": true, "is_eligible": true, "discount_bp": 1050,
+                }])),
+                &retail_by_key,
+            ),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -2171,7 +2306,10 @@ mod tests {
             "provider": "openai", "model": "gpt-5.6",
             "is_offered": true, "is_eligible": true, "discount_bp": 500,
         }]));
-        assert!(ineligible_detail_lines(&products).is_empty());
+        assert_eq!(
+            ineligible_detail_lines(&products),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -2313,7 +2451,7 @@ mod tests {
             err.to_string().contains("not model path segments"),
             "got: {err}"
         );
-        assert!(deleted_paths(&server).await.is_empty());
+        assert_eq!(deleted_paths(&server).await, [] as [std::string::String; 0]);
     }
 
     #[tokio::test]
@@ -2503,7 +2641,7 @@ mod tests {
             .expect_err("an empty target set is a failed command, not a silent no-op");
 
         assert!(err.to_string().contains("anthropic"), "got: {err}");
-        assert!(deleted_paths(&server).await.is_empty());
+        assert_eq!(deleted_paths(&server).await, [] as [std::string::String; 0]);
     }
 
     #[tokio::test]

@@ -1119,7 +1119,10 @@ mod tests {
             effective_rate_summary(&anchors_only, 1050),
             "$2.685 in / $13.425 out per Mtok"
         );
-        assert!(extra_dimension_lines(&anchors_only, 1050).is_empty());
+        assert_eq!(
+            extra_dimension_lines(&anchors_only, 1050),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

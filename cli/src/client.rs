@@ -142,6 +142,9 @@ pub const CAPABILITIES_FIELD: &str = "capabilities";
 /// Registry-side admission capability for model-echo-backed cloud bindings.
 pub const UPSTREAM_MODEL_ECHO_CAPABILITY: &str = "upstream-model-echo";
 
+/// Opt into successful, structured responses for queued price increases.
+pub const PRICE_INCREASE_SCHEDULING_HEADER: &str = "x-gm-price-increase-scheduling";
+
 /// Validate the registry capability payload and report whether it contains the
 /// requested capability. Every array member must be a string: accepting a
 /// mixed JSON array would make a malformed response look like an authoritative
@@ -236,11 +239,11 @@ impl RegistryClient {
             .ok_or_else(|| anyhow::anyhow!("not logged in — run `gmcli login` first"))?
             .to_owned();
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&token)
-            .json(body)
+        let mut request = self.client.post(&url).bearer_auth(&token).json(body);
+        if path == "/miners/products" {
+            request = request.header(PRICE_INCREASE_SCHEDULING_HEADER, "1");
+        }
+        let resp = request
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;

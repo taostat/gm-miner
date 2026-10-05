@@ -829,6 +829,6 @@ mod tests {
             record(StepOutcome::Done, &mut outstanding),
             WizardFlow::Continue
         );
-        assert!(outstanding.is_empty());
+        assert_eq!(outstanding, [] as [std::string::String; 0]);
     }
 }

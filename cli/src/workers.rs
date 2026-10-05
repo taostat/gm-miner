@@ -291,7 +291,10 @@ mod tests {
 
     #[test]
     fn healthy_worker_renders_no_health_block() {
-        assert!(worker_health_lines(&worker_entry("active"), 2, now()).is_empty());
+        assert_eq!(
+            worker_health_lines(&worker_entry("active"), 2, now()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -300,7 +303,7 @@ mod tests {
         worker.suspended_at = Some("2026-07-11T08:30:00+00:00".to_owned());
         worker.suspended_reprobe_attempt = 3;
 
-        assert!(worker_health_lines(&worker, 2, now()).is_empty());
+        assert_eq!(worker_health_lines(&worker, 2, now()), Vec::<String>::new());
     }
 
     #[test]
@@ -352,11 +355,14 @@ mod tests {
     /// that renders an empty explanation block.
     #[test]
     fn an_absent_or_blank_cause_renders_nothing_for_a_healthy_worker() {
-        assert!(worker_health_lines(&worker_entry("active"), 2, now()).is_empty());
+        assert_eq!(
+            worker_health_lines(&worker_entry("active"), 2, now()),
+            Vec::<String>::new()
+        );
 
         let mut blank = worker_entry("active");
         blank.attestation_error = Some("   ".to_owned());
-        assert!(worker_health_lines(&blank, 2, now()).is_empty());
+        assert_eq!(worker_health_lines(&blank, 2, now()), Vec::<String>::new());
     }
 
     #[test]

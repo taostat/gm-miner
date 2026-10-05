@@ -1214,7 +1214,7 @@ mod tests {
         let json = r#"{"networks":{"testnet":{"api_url":"https://x"}},"active_network":"testnet"}"#;
         let cfg: Config = serde_json::from_str(json).expect("parse legacy config");
         let entry = cfg.networks.get("testnet").expect("testnet entry");
-        assert!(entry.workers.is_empty());
+        assert_eq!(entry.workers.len(), 0);
     }
 
     #[test]
