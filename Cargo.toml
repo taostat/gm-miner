@@ -42,7 +42,7 @@ rustls = { version = "0.23.43", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 x509-parser = "0.18.1"
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
-futures-util = { version = "=0.3.32", default-features = false }
+futures-util = { version = "=0.3.34", default-features = false }
 ml-kem = { version = "=0.3.2", features = ["getrandom", "zeroize"] }
 ring = "=0.17.14"
 # Mozilla's root set for the KubeTEE verifier's WebPKI TLS; already in the
