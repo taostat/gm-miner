@@ -17,7 +17,6 @@
 //!                      (the hidden `list-products` alias runs the same code)
 //!   pricing          — rank your offers against the eligible field
 //!   sources          — list sourcing routes with capability vs admission status
-//!   image-canary     — testnet-only funded native Gemini image reconciliation
 //!   update           — upgrade gmcli in place to the latest release
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
 //!   worker list      — list the hotkey's live workers
@@ -65,7 +64,6 @@ use crate::commands::doctor::cmd_doctor;
 use crate::commands::earnings::cmd_earnings;
 use crate::commands::fun::{cmd_gm, cmd_moon};
 use crate::commands::hotkey::cmd_register_hotkey;
-use crate::commands::image_canary::cmd_image_canary;
 use crate::commands::keys::SetApiKeysArgs;
 use crate::commands::notifications::{
     cmd_notifications_confirm, cmd_notifications_list, cmd_notifications_off,
@@ -298,29 +296,6 @@ enum Command {
         gmcli check-streaming\n  \
         gmcli --network testnet check-streaming")]
     CheckStreaming,
-
-    /// Run the funded, native Gemini image canary against testnet.
-    ///
-    /// This command first checks that both Gemini image SKUs have a live
-    /// eligible route, then sends exactly one non-streaming
-    /// `generateContent` request per SKU at one 1K image and reconciles the
-    /// settled nUSD against the buyer balance when `/v1/credits` is available.
-    /// It is deliberately not part of `check-streaming`: image generation is
-    /// paid and must never run as a generic health probe.
-    #[command(after_help = "Examples:\n  \
-        GM_API_KEY=... gmcli --network testnet image-canary\n  \
-        gmcli --network testnet image-canary --buyer-api-key ...")]
-    ImageCanary {
-        /// Funded GM buyer key (not the Google provider key). Prefer
-        /// `GM_API_KEY` so the secret is not placed in shell history.
-        #[arg(long = "buyer-api-key", env = "GM_API_KEY", value_name = "KEY")]
-        buyer_api_key: Option<String>,
-
-        /// Override the testnet gateway URL for local/mock verification.
-        /// Production runs should use the network default.
-        #[arg(long, env = "GM_GATEWAY_URL")]
-        gateway_url: Option<String>,
-    },
 
     /// Record the hotkey your miner serves under.
     ///
@@ -868,18 +843,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Doctor => cmd_doctor(context.config()?).await,
         Command::CheckStreaming => cmd_check_streaming(context.authenticated_config().await?).await,
-        Command::ImageCanary {
-            buyer_api_key,
-            gateway_url,
-        } => {
-            // Let the handler reject mainnet before checking optional buyer credentials.
-            cmd_image_canary(
-                context.config()?.resolved_network(),
-                gateway_url.as_deref(),
-                buyer_api_key.as_deref().unwrap_or_default(),
-            )
-            .await
-        }
         Command::RegisterHotkey {
             hotkey_ss58,
             wallet,
@@ -1865,32 +1828,6 @@ mod tests {
                 discount_bp: 500,
                 ..
             }
-        ));
-    }
-
-    #[test]
-    fn clap_parses_testnet_image_canary_options() {
-        use super::Network;
-
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "gmcli",
-            "--network",
-            "testnet",
-            "image-canary",
-            "--buyer-api-key",
-            "buyer-secret",
-            "--gateway-url",
-            "http://127.0.0.1:8787",
-        ])
-        .unwrap();
-
-        assert_eq!(cli.explicit_network(), Some(Network::Testnet));
-        assert!(matches!(
-            cli.command,
-            Command::ImageCanary {
-                buyer_api_key: Some(ref key),
-                gateway_url: Some(ref url),
-            } if key == "buyer-secret" && url == "http://127.0.0.1:8787"
         ));
     }
 

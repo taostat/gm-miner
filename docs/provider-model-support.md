@@ -110,17 +110,7 @@ request image output, so a probe does not create a paid image.
 
 These definitions, publication, discovery, and declaration are supported on
 both networks. Pass `--network` explicitly when changing an image offer so the
-intended registry is unambiguous. A funded comparison is available only as the
-deliberate
-`gmcli --network testnet image-canary` command; it checks
-`/v1/models?api_shape=generateContent` for both live eligible SKUs, sends one
-non-streaming native request per SKU with `candidateCount=1`, `imageSize=1K`,
-`responseModalities=["IMAGE"]`, and no `tools`/grounding, then prints model,
-request id, usage dimensions, settled nUSD, and optional before/after balance.
-The canary captures only response and balance reconciliation evidence;
-validator, finalizer, and dashboard evidence belongs to a separate GM
-runbook check. It never prints its prompt, generated image, or either key.
-See [`image-canary.md`](image-canary.md).
+intended registry is unambiguous.
 
 `gmcli check-streaming` skips every offered product whose registry catalog
 entry publishes image generation because its streaming check targets the

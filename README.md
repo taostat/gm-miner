@@ -181,11 +181,7 @@ gmcli --network mainnet declare-product \
 ```
 
 Capability and health checks use a text-only Gemini request and do not generate
-a paid image. When you intentionally want to spend one small native image
-request per SKU on testnet, use the [Gemini image canary](docs/image-canary.md);
-it preflights both live eligible offers and prints only safe response/balance
-reconciliation evidence. Downstream validator, finalizer, and dashboard
-evidence is a separate GM runbook check. See the [provider support
+a paid image. See the [provider support
 matrix](docs/provider-model-support.md) for the provider-side setup.
 
 Azure OpenAI chat completions and Microsoft Foundry Messages forward the request body
@@ -414,7 +410,6 @@ gmcli worker remove <worker_id>
 | `gmcli notifications off` | Remove the notification channel |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |
-| `gmcli image-canary` | Testnet-only, funded native Gemini image preflight and two-SKU settlement reconciliation (paid; never part of health checks) |
 | `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
 | `gmcli worker list` | List workers with per-worker status and last attestation |
@@ -434,11 +429,6 @@ GMCLI_CONFIG_DIR=/path/to/dir gmcli login
 
 The `GM_REGISTRY_URL` env var overrides the registry API URL for a single run without
 persisting it.
-
-The paid image canary uses a buyer key, not a provider key. Set `GM_API_KEY` (or
-pass `--buyer-api-key`) and run it with `--network testnet`. It defaults to the
-testnet gateway; `GM_GATEWAY_URL` is available only as a per-run override for
-local/mock verification. See [docs/image-canary.md](docs/image-canary.md).
 
 ## Troubleshooting
 

@@ -101,13 +101,6 @@ when declaring either product. Their definitions are available on both
 networks so pricing, status, and catalog payloads can decode their image input
 and output dimensions.
 
-The provider key is not a buyer key. To deliberately verify the two native
-routes, use the paid [testnet image canary](image-canary.md), which requires a
-funded testnet GM buyer key and captures response/balance reconciliation
-evidence for the two settled charges. It is not a worker health probe and is
-never run by `gmcli check-streaming`; validator, finalizer, and dashboard
-evidence is a separate GM runbook concern.
-
 ### Cloud transport variants and admission
 
 The image retains three cloud transports. Azure OpenAI chat completions and

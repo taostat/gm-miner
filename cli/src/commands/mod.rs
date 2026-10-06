@@ -9,7 +9,6 @@ pub mod doctor;
 pub mod earnings;
 pub mod fun;
 pub mod hotkey;
-pub mod image_canary;
 pub mod keys;
 pub mod notifications;
 pub mod persist;
