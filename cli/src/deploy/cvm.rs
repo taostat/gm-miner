@@ -29,6 +29,9 @@ pub trait PhalaClient {
     /// same encrypted env so the CVM's pre-launch script can `docker login`
     /// and pull the (private) miner image. `boot_timeout_secs` controls
     /// how long to poll for the measured hashes before giving up.
+    /// `on_app_id` must save the CVM identity as soon as it is known,
+    /// before checking its hashes or endpoint. An error from this callback
+    /// stops the deploy; a boot timeout must not erase the saved identity.
     ///
     /// # Errors
     /// Returns an error if the deploy fails or the hashes/endpoint cannot
@@ -40,6 +43,7 @@ pub trait PhalaClient {
         node_secret: &str,
         registry_creds: Option<&RegistryCredentials>,
         boot_timeout_secs: u64,
+        on_app_id: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<DeployOutcome>;
 
     /// The Phala Cloud `app_id` of a CVM already deployed under this client's
@@ -126,12 +130,58 @@ pub fn phala_command(api_key: Option<&str>) -> std::process::Command {
 /// endpoint is `endpoints[0].app`. All three are read here.
 #[derive(Debug, Deserialize)]
 struct PhalaCvmDetail {
-    app_id: Option<String>,
     name: Option<String>,
     compose_hash: Option<String>,
     os: Option<PhalaCvmOs>,
-    #[serde(default)]
-    endpoints: Vec<PhalaCvmEndpoint>,
+    endpoints: Option<Vec<PhalaCvmEndpoint>>,
+}
+
+/// Read identity without requiring the CVM's readiness fields to deserialize.
+#[derive(Debug, Deserialize)]
+struct PhalaCvmIdentity {
+    app_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PhalaDeployIdentity {
+    success: bool,
+    name: String,
+    app_id: String,
+}
+
+#[derive(Deserialize)]
+struct PhalaCvmReadiness {
+    status: Option<String>,
+    in_progress: Option<bool>,
+}
+
+/// Phala may print a provisioning line before the deployment JSON and logs
+/// after it. Decode only JSON objects starting on a line, require a successful
+/// result for this name, and otherwise let the poller resolve identity by name.
+fn parse_phala_deploy_app_id(stdout: &[u8], app_name: &str) -> Option<String> {
+    let mut offset = 0;
+    for line in stdout.split_inclusive(|byte| *byte == b'\n') {
+        let trimmed = line.trim_ascii_start();
+        if trimmed.first() == Some(&b'{') {
+            let start = offset + line.len() - trimmed.len();
+            let mut objects = serde_json::Deserializer::from_slice(&stdout[start..])
+                .into_iter::<PhalaDeployIdentity>();
+            if let Some(Ok(identity)) = objects.next() {
+                let id = identity.app_id.trim();
+                if identity.success && identity.name == app_name && !id.is_empty() {
+                    return Some(id.to_owned());
+                }
+            }
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn save_phala_cvm_id(app_id: &str, on_app_id: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
+    on_app_id(app_id).with_context(|| {
+        format!("could not save the ID of CVM {app_id}; inspect it with `phala cvms get {app_id} --json` or delete it with `phala cvms delete {app_id}` if abandoning this deployment")
+    })
 }
 
 /// The `os` sub-object of [`PhalaCvmDetail`].
@@ -178,10 +228,13 @@ pub fn parse_phala_cvm_app_id(succeeded: bool, stdout: &[u8]) -> Result<Option<S
         return Ok(None);
     }
 
-    let detail: PhalaCvmDetail =
+    let detail: PhalaCvmIdentity =
         serde_json::from_slice(stdout).context("parse phala cvms get --json output")?;
 
-    Ok(detail.app_id.filter(|id| !id.is_empty()))
+    Ok(detail
+        .app_id
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty()))
 }
 
 /// The name lookup result and pagination metadata from one successful list
@@ -359,6 +412,7 @@ pub fn parse_phala_cvm_endpoint(succeeded: bool, stdout: &[u8]) -> Result<Option
 
     Ok(detail
         .endpoints
+        .unwrap_or_default()
         .into_iter()
         .next()
         .and_then(|e| e.app)
@@ -487,11 +541,10 @@ pub struct PhalaDeployArgs<'a> {
 /// instance type, disk size, compose file, env file, and the corrected
 /// pre-launch script, request a production OS image (`--image` plus
 /// `--no-dev-os` — never a `dstack-dev-*` image for an attested miner),
-/// and request JSON output plus `--wait` so the call returns only once the
-/// CVM is up. The deployed CVM's identity is *not* scraped from
-/// `phala deploy`'s stdout (its success output mixes a human-readable
-/// `Provisioning CVM ...` line with the JSON); it is resolved afterwards
-/// via `phala cvms get <name>`, keyed on the `--name` set here.
+/// and request JSON output without waiting for the CVM to boot. The
+/// deployed CVM's identity is read from its successful deployment JSON,
+/// tolerating the human-readable provisioning line. If the output format
+/// is unrecognized, resolve it via `phala cvms get <name>` instead.
 ///
 /// Extracted from [`RealPhalaClient::deploy`] so the wiring can be asserted
 /// without spawning a subprocess.
@@ -514,26 +567,20 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
         args.env_path.to_owned(),
         "--pre-launch-script".to_owned(),
         args.prelaunch_path.to_owned(),
-        "--wait".to_owned(),
         "--json".to_owned(),
     ]
 }
 
-/// Run `phala cvms get <cvm-id> --json` once and parse the full deploy
-/// outcome — measured `compose_hash` + `os.os_image_hash` + the public
-/// endpoint — from the single CVM-detail document.
+/// Run `phala cvms get <cvm-id> --json` once. Identity and readiness are
+/// parsed separately by the poller so a readiness error cannot hide the ID.
 ///
 /// `cvm_id` is any identifier `phala cvms get` accepts: an `app_id`, a
 /// UUID, or the CVM *name*. `gmcli deploy` passes the name it set with
 /// `phala deploy --name`.
 ///
-/// Returns `Ok(None)` when the command exited non-zero (the CVM is not
-/// ready) or when either hash or the endpoint is still absent/empty.
-///
 /// # Errors
-/// Returns an error only if `phala` cannot be spawned, or it exits
-/// successfully but emits output that is not valid `cvms get --json` JSON.
-fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<DeployOutcome>> {
+/// Returns an error if `phala` cannot be spawned.
+fn read_phala_cvm(cvm_id: &str, api_key: Option<&str>) -> Result<std::process::Output> {
     let out = phala_command(api_key)
         .args(["cvms", "get", cvm_id, "--json"])
         .output()
@@ -546,25 +593,7 @@ fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<
         );
     }
 
-    let succeeded = out.status.success();
-    let Some(hashes) = parse_phala_cvm_detail(succeeded, &out.stdout)? else {
-        return Ok(None);
-    };
-    let Some(endpoint) = parse_phala_cvm_endpoint(succeeded, &out.stdout)? else {
-        return Ok(None);
-    };
-    let Some(app_id) = parse_phala_cvm_app_id(succeeded, &out.stdout)? else {
-        return Ok(None);
-    };
-    // Register the TLS-passthrough form: the miner's RA-TLS cert is only
-    // presented to callers on the dstack `s`-suffix URL (see
-    // `to_ratls_passthrough_endpoint`).
-    let endpoint = to_ratls_passthrough_endpoint(&endpoint)?;
-    Ok(Some(DeployOutcome {
-        hashes,
-        endpoint,
-        app_id,
-    }))
+    Ok(out)
 }
 
 /// Run one paginated `phala cvms list --json` request and parse its collision
@@ -600,6 +629,7 @@ impl PhalaClient for RealPhalaClient {
         node_secret: &str,
         registry_creds: Option<&RegistryCredentials>,
         boot_timeout_secs: u64,
+        on_app_id: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<DeployOutcome> {
         use std::fs;
 
@@ -649,16 +679,16 @@ impl PhalaClient for RealPhalaClient {
             );
         }
 
-        // `phala deploy --json` succeeded. Its success-path stdout is not
-        // a clean JSON object (see `build_phala_deploy_args`), so the
-        // deployed CVM is resolved by name via the poll loop below rather
-        // than by scraping this output.
-        println!(
-            "phala deploy succeeded for CVM {}; waiting for the CVM to report hashes ...",
-            self.app_name
-        );
-
-        poll_phala_cvm_outcome(&self.app_name, self.api_key.as_deref(), boot_timeout_secs)
+        // Capture the creation response before any fallible lookup. Older
+        // or unrecognized CLI output can still use the name-lookup fallback.
+        let app_id = parse_phala_deploy_app_id(&out.stdout, &self.app_name);
+        poll_phala_cvm_outcome(
+            &self.app_name,
+            app_id.as_deref(),
+            boot_timeout_secs,
+            on_app_id,
+            |cvm_id| read_phala_cvm(cvm_id, self.api_key.as_deref()),
+        )
     }
 
     fn existing_cvm_app_id(&self) -> Result<Option<String>> {
@@ -669,39 +699,92 @@ impl PhalaClient for RealPhalaClient {
 }
 
 /// Poll `phala cvms get <cvm-id> --json` every [`POLL_INTERVAL_SECS`]
-/// seconds until the measured hashes and the public endpoint are all
-/// non-empty, or until `timeout_secs` elapses.
+/// seconds until the CVM is running with no operation in progress and its
+/// measured hashes and public endpoint are non-empty, or the timeout elapses.
 ///
 /// `cvm_id` is any identifier `phala cvms get` accepts — `gmcli deploy`
-/// passes the CVM name it set with `phala deploy --name`.
+/// saves `created_app_id` before the first lookup when the creation response
+/// provides it. Otherwise start with the CVM name and save the first reported
+/// ID. All subsequent polls use that immutable ID.
 ///
 /// # Errors
 /// Returns an error if `phala` cannot be spawned, emits unparseable JSON,
 /// or the outcome never appears before `timeout_secs` elapses.
 fn poll_phala_cvm_outcome(
     cvm_id: &str,
-    api_key: Option<&str>,
+    created_app_id: Option<&str>,
     timeout_secs: u64,
+    on_app_id: &mut dyn FnMut(&str) -> Result<()>,
+    mut read: impl FnMut(&str) -> Result<std::process::Output>,
 ) -> Result<DeployOutcome> {
     use std::time::{Duration, Instant};
 
+    if let Some(app_id) = created_app_id {
+        save_phala_cvm_id(app_id, on_app_id)?;
+    }
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let poll = Duration::from_secs(POLL_INTERVAL_SECS);
     let mut attempt: u32 = 0;
+    let mut saved_app_id = created_app_id.map(str::to_owned);
 
     loop {
         attempt += 1;
-        if let Some(outcome) = read_phala_cvm_outcome(cvm_id, api_key)? {
+        let query_id = saved_app_id.as_deref().unwrap_or(cvm_id).to_owned();
+        let outcome = (|| -> Result<Option<DeployOutcome>> {
+            let out = read(&query_id)?;
+            let succeeded = out.status.success();
+            let Some(app_id) = parse_phala_cvm_app_id(succeeded, &out.stdout)? else {
+                return Ok(None);
+            };
+            if let Some(saved) = &saved_app_id {
+                if saved != &app_id {
+                    bail!("CVM identity changed from {saved} to {app_id} while waiting for boot");
+                }
+            } else {
+                save_phala_cvm_id(&app_id, on_app_id)?;
+                saved_app_id = Some(app_id.clone());
+            }
+            // Save identity before parsing any readiness fields, including
+            // on the poll that reports a complete outcome or malformed data.
+            let readiness: PhalaCvmReadiness = serde_json::from_slice(&out.stdout)
+                .context("parse Phala CVM boot status")?;
+            // Keep the readiness guarantee of Phala's optional --wait:
+            // hashes and endpoint metadata alone can appear before boot.
+            if readiness.status.as_deref() != Some("running")
+                || readiness.in_progress == Some(true)
+            {
+                return Ok(None);
+            }
+            let Some(hashes) = parse_phala_cvm_detail(succeeded, &out.stdout)? else {
+                return Ok(None);
+            };
+            let Some(endpoint) = parse_phala_cvm_endpoint(succeeded, &out.stdout)? else {
+                return Ok(None);
+            };
+            Ok(Some(DeployOutcome {
+                hashes,
+                endpoint: to_ratls_passthrough_endpoint(&endpoint)?,
+                app_id,
+            }))
+        })()
+        .with_context(|| {
+            let id = saved_app_id.as_deref().unwrap_or(cvm_id);
+            format!("CVM {id} may still be running; inspect it with `phala cvms get {id} --json` or delete it with `phala cvms delete {id}` if abandoning this deployment")
+        })?;
+        if let Some(outcome) = outcome {
             return Ok(outcome);
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            let id = saved_app_id.as_deref().unwrap_or(cvm_id);
             bail!(
-                "timed out after {timeout_secs}s waiting for the CVM to report \
-                 its hashes and endpoint (compose_hash/os_image_hash/endpoint \
-                 never appeared in `phala cvms get {cvm_id} --json`); \
-                 increase --boot-timeout-secs or check the Phala Cloud dashboard"
+                "timed out after {timeout_secs}s waiting for CVM {id} to be running \
+                 with no operation in progress and report its hashes and endpoint; \
+                 increase --boot-timeout-secs or check the Phala Cloud dashboard. \
+                 The CVM may still be running. Inspect it with \
+                 `phala cvms get {id} --json`, or delete it with \
+                 `phala cvms delete {id}` if abandoning this deployment"
             );
         }
 
@@ -795,10 +878,10 @@ mod tests {
     }
 
     /// `phala deploy` must be invoked with the compose file, env file,
-    /// pre-launch script, instance type, disk size, OS image, `--wait`, and
+    /// pre-launch script, instance type, disk size, OS image, and
     /// `--json` — the env file is what carries the (client-side-encrypted)
-    /// provider keys, `--wait` blocks until the CVM is up, and `--json`
-    /// keeps the deploy's diagnostics machine-readable.
+    /// provider keys, and `--json` keeps the deploy's diagnostics
+    /// machine-readable.
     #[test]
     fn build_phala_deploy_args_wires_every_flag() {
         let args = build_phala_deploy_args(&deploy_args());
@@ -823,10 +906,6 @@ mod tests {
             );
         }
         assert!(
-            args.iter().any(|a| a == "--wait"),
-            "missing --wait in {args:?}"
-        );
-        assert!(
             args.iter().any(|a| a == "--json"),
             "missing --json in {args:?}"
         );
@@ -841,6 +920,370 @@ mod tests {
             args.iter().any(|a| a == "--no-dev-os"),
             "missing --no-dev-os in {args:?}"
         );
+    }
+
+    #[test]
+    fn deploy_returns_before_boot_so_the_cvm_id_can_be_saved() {
+        let args = build_phala_deploy_args(&deploy_args());
+        assert!(
+            !args.iter().any(|arg| arg == "--wait"),
+            "waiting inside phala deploy hides the CVM ID until boot completes"
+        );
+    }
+
+    #[test]
+    fn cvm_id_is_read_independently_of_readiness_fields() {
+        let stdout = br#"{"app_id":"app_created","os":"starting","endpoints":null}"#;
+        assert_eq!(
+            parse_phala_cvm_app_id(true, stdout).expect("read the created CVM identity"),
+            Some("app_created".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_null_endpoint_list_is_pending_readiness() {
+        assert!(parse_phala_cvm_endpoint(true, br#"{"endpoints":null}"#)
+            .expect("Phala permits a null endpoint list while booting")
+            .is_none());
+    }
+
+    #[test]
+    fn creation_identity_is_read_from_json_with_surrounding_logs() {
+        let stdout = br#"Provisioning CVM new-worker...
+        {
+          "success": true,
+          "name": "new-worker",
+          "app_id": "app_created",
+          "vm_uuid": "created-uuid"
+        }
+        Deployment submitted.
+        "#;
+        assert_eq!(
+            parse_phala_deploy_app_id(stdout, "new-worker"),
+            Some("app_created".to_owned())
+        );
+        assert_eq!(
+            parse_phala_deploy_app_id(
+                br#"{"success":true,"name":"new-worker","app_id":"app_created"}"#,
+                "new-worker"
+            ),
+            Some("app_created".to_owned())
+        );
+    }
+
+    #[test]
+    fn unrecognized_creation_output_falls_back_to_name_lookup() {
+        for stdout in [
+            b"not JSON".as_slice(),
+            br#"{"success":false,"name":"new-worker","app_id":"app_wrong"}"#,
+            br#"{"success":true,"name":"other-worker","app_id":"app_wrong"}"#,
+            br#"{"success":true,"name":"new-worker","app_id":"   "}"#,
+            br#"{"success":true,"name":"new-worker"}"#,
+        ] {
+            assert!(parse_phala_deploy_app_id(stdout, "new-worker").is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    mod polling {
+        use super::*;
+        use std::os::unix::process::ExitStatusExt as _;
+
+        const READY: &[u8] = br#"{
+            "app_id":"app_created",
+            "status":"running",
+            "in_progress":false,
+            "compose_hash":"aaa",
+            "os":{"os_image_hash":"bbb"},
+            "endpoints":[{"app":"https://app_created-8080.dstack-prod5.phala.network"}]
+        }"#;
+
+        fn output(stdout: &[u8]) -> std::process::Output {
+            std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn boot_timeout_keeps_the_created_cvm_id() {
+            let dir = tempfile::tempdir().expect("temporary recovery record");
+            let path = dir.path().join("cvm-id");
+            let err = poll_phala_cvm_outcome(
+                "new-worker",
+                None,
+                0,
+                &mut |id| Ok(std::fs::write(&path, id)?),
+                |_| Ok(output(br#"{"app_id":"app_created","status":"starting"}"#)),
+            )
+            .expect_err("hashes and endpoint never appeared");
+
+            assert_eq!(
+                std::fs::read_to_string(path).expect("saved ID"),
+                "app_created"
+            );
+            let message = err.to_string();
+            assert!(message.contains("timed out after 0s"), "{message}");
+            assert!(
+                message.contains("phala cvms delete app_created"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn creation_id_is_saved_even_when_the_first_lookup_fails() {
+            let dir = tempfile::tempdir().expect("temporary recovery record");
+            let path = dir.path().join("cvm-id");
+            let app_id = parse_phala_deploy_app_id(
+                b"Provisioning CVM new-worker...\n{\"success\":true,\"name\":\"new-worker\",\"app_id\":\"app_created\"}",
+                "new-worker",
+            );
+            assert_eq!(app_id.as_deref(), Some("app_created"));
+            let err = poll_phala_cvm_outcome(
+                "new-worker",
+                app_id.as_deref(),
+                0,
+                &mut |id| Ok(std::fs::write(&path, id)?),
+                |id| {
+                    assert_eq!(id, "app_created");
+                    assert_eq!(
+                        std::fs::read_to_string(&path).expect("ID saved before lookup"),
+                        id
+                    );
+                    anyhow::bail!("CVM lookup unavailable")
+                },
+            )
+            .expect_err("lookup fails after successful creation");
+            let message = format!("{err:#}");
+            assert!(message.contains("CVM lookup unavailable"), "{message}");
+            assert!(
+                message.contains("phala cvms delete app_created"),
+                "{message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(path).expect("saved ID"),
+                "app_created"
+            );
+        }
+
+        #[test]
+        fn a_creation_id_is_saved_only_once_even_when_the_cvm_is_ready() {
+            let mut saved = Vec::new();
+            let outcome = poll_phala_cvm_outcome(
+                "new-worker",
+                Some("app_created"),
+                0,
+                &mut |id| {
+                    saved.push(id.to_owned());
+                    Ok(())
+                },
+                |_| Ok(output(READY)),
+            )
+            .expect("ready outcome");
+            assert_eq!(saved, [outcome.app_id]);
+        }
+
+        #[test]
+        fn a_failed_creation_id_save_does_not_start_a_lookup() {
+            let mut lookups = 0;
+            let err = poll_phala_cvm_outcome(
+                "new-worker",
+                Some("app_created"),
+                0,
+                &mut |_| anyhow::bail!("local storage unavailable"),
+                |_| {
+                    lookups += 1;
+                    Ok(output(READY))
+                },
+            )
+            .expect_err("save must succeed before readiness lookup");
+            assert_eq!(lookups, 0);
+            assert!(format!("{err:#}").contains("phala cvms delete app_created"));
+        }
+
+        #[test]
+        fn a_null_endpoint_list_does_not_abort_boot_polling() {
+            let err = poll_phala_cvm_outcome(
+                "new-worker",
+                Some("app_created"),
+                0,
+                &mut |_| Ok(()),
+                |_| {
+                    Ok(output(
+                        br#"{
+                    "app_id":"app_created", "status":"running",
+                    "compose_hash":"aaa", "os":{"os_image_hash":"bbb"},
+                    "endpoints":null
+                }"#,
+                    ))
+                },
+            )
+            .expect_err("endpoint is still pending");
+            assert!(err.to_string().contains("timed out after 0s"), "{err:#}");
+        }
+
+        #[test]
+        fn malformed_readiness_cannot_hide_cvm_identity() {
+            let mut saved = None;
+            let result = poll_phala_cvm_outcome(
+                "new-worker",
+                None,
+                0,
+                &mut |id| {
+                    saved = Some(id.to_owned());
+                    Ok(())
+                },
+                |_| Ok(output(br#"{"app_id":"app_created","os":"invalid"}"#)),
+            );
+            assert!(result.is_err());
+            assert_eq!(saved.as_deref(), Some("app_created"));
+        }
+
+        #[test]
+        fn a_failed_local_save_stops_a_ready_deploy() {
+            let err = poll_phala_cvm_outcome(
+                "new-worker",
+                None,
+                0,
+                &mut |_| anyhow::bail!("local storage unavailable"),
+                |_| Ok(output(READY)),
+            )
+            .expect_err("a ready CVM must not bypass a failed local save");
+            let message = format!("{err:#}");
+            assert!(message.contains("local storage unavailable"), "{message}");
+            assert!(
+                message.contains("phala cvms delete app_created"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn a_ready_cvm_is_saved_before_its_outcome_is_returned() {
+            let mut saved = None;
+            let outcome = poll_phala_cvm_outcome(
+                "new-worker",
+                None,
+                0,
+                &mut |id| {
+                    saved = Some(id.to_owned());
+                    Ok(())
+                },
+                |_| Ok(output(READY)),
+            )
+            .expect("ready outcome");
+            assert_eq!(saved.as_deref(), Some(outcome.app_id.as_str()));
+            assert_eq!(outcome.hashes.compose_sha256, "aaa");
+            assert_eq!(outcome.hashes.os_image_hash, "bbb");
+            assert_eq!(
+                outcome.endpoint,
+                "https://app_created-8080s.dstack-prod5.phala.network"
+            );
+        }
+
+        #[test]
+        fn complete_metadata_does_not_finish_a_cvm_that_is_still_booting() {
+            for (status, in_progress) in [("starting", false), ("running", true)] {
+                let mut detail: serde_json::Value = serde_json::from_slice(READY).expect("fixture");
+                detail["status"] = serde_json::json!(status);
+                detail["in_progress"] = serde_json::json!(in_progress);
+                let stdout = serde_json::to_vec(&detail).expect("CVM detail");
+                let mut saved = None;
+                let result = poll_phala_cvm_outcome(
+                    "new-worker",
+                    None,
+                    0,
+                    &mut |id| {
+                        saved = Some(id.to_owned());
+                        Ok(())
+                    },
+                    |_| Ok(output(&stdout)),
+                );
+                assert!(
+                    result.is_err(),
+                    "CVM is not ready while {status}, in_progress={in_progress}"
+                );
+                assert_eq!(saved.as_deref(), Some("app_created"));
+            }
+        }
+
+        #[test]
+        fn missing_or_blank_ids_do_not_create_a_recovery_record() {
+            for stdout in [b"{}".as_slice(), br#"{"app_id":"   "}"#] {
+                let mut saved = None;
+                let result = poll_phala_cvm_outcome(
+                    "new-worker",
+                    None,
+                    0,
+                    &mut |id| {
+                        saved = Some(id.to_owned());
+                        Ok(())
+                    },
+                    |_| Ok(output(stdout)),
+                );
+                assert!(result.is_err());
+                assert!(saved.is_none());
+            }
+        }
+
+        #[test]
+        fn a_later_read_error_keeps_the_id_and_polls_the_identified_cvm() {
+            let mut saved = Vec::new();
+            let mut queries = Vec::new();
+            let err = poll_phala_cvm_outcome(
+                "new-worker",
+                None,
+                10,
+                &mut |id| {
+                    saved.push(id.to_owned());
+                    Ok(())
+                },
+                |id| {
+                    queries.push(id.to_owned());
+                    if queries.len() == 1 {
+                        Ok(output(br#"{"app_id":"app_created"}"#))
+                    } else {
+                        anyhow::bail!("CVM lookup failed")
+                    }
+                },
+            )
+            .expect_err("later lookup fails");
+            assert_eq!(saved, ["app_created"]);
+            assert_eq!(queries, ["new-worker", "app_created"]);
+            let message = format!("{err:#}");
+            assert!(message.contains("CVM lookup failed"), "{message}");
+            assert!(
+                message.contains("phala cvms delete app_created"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn a_changed_identity_does_not_replace_the_saved_cvm() {
+            let mut saved = Vec::new();
+            let mut reads = 0;
+            let err = poll_phala_cvm_outcome(
+                "new-worker",
+                None,
+                10,
+                &mut |id| {
+                    saved.push(id.to_owned());
+                    Ok(())
+                },
+                |_| {
+                    reads += 1;
+                    let id = if reads == 1 {
+                        "app_created"
+                    } else {
+                        "app_other"
+                    };
+                    Ok(output(format!(r#"{{"app_id":"{id}"}}"#).as_bytes()))
+                },
+            )
+            .expect_err("CVM identity must remain stable");
+            assert_eq!(saved, ["app_created"]);
+            assert!(format!("{err:#}").contains("CVM identity changed"));
+        }
     }
 
     // ── phala cvms get endpoint parsing ───────────────────────────────────────
@@ -1179,8 +1622,8 @@ mod tests {
 
     // ── phala cvms get detail parsing ─────────────────────────────────────────
 
-    /// Regression: the deployed CVM's identity is resolved via
-    /// `phala cvms get --json`, never by scraping `phala deploy`'s stdout.
+    /// The name-lookup fallback and readiness polls read the CVM detail
+    /// from `phala cvms get --json`.
     ///
     /// `phala deploy --json` mixes a human-readable `Provisioning CVM
     /// <name>...` line into its success-path stdout before the JSON

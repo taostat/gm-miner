@@ -1539,6 +1539,7 @@ mod tests {
                 _: &str,
                 _: Option<&RegistryCredentials>,
                 _: u64,
+                _: &mut dyn FnMut(&str) -> anyhow::Result<()>,
             ) -> anyhow::Result<DeployOutcome> {
                 anyhow::bail!("unexpected CVM creation attempt");
             }
@@ -1631,6 +1632,7 @@ mod tests {
                 _node_secret: &str,
                 _registry_creds: Option<&RegistryCredentials>,
                 _boot_timeout_secs: u64,
+                _on_app_id: &mut dyn FnMut(&str) -> anyhow::Result<()>,
             ) -> anyhow::Result<DeployOutcome> {
                 anyhow::bail!("the worker-#1 guard must bail before any CVM work")
             }

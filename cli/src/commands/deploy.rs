@@ -632,16 +632,18 @@ pub(crate) async fn cmd_deploy(
         "Deploying to Phala Cloud (boot timeout: {}s) ...",
         args.boot_timeout_secs
     );
+    let node_secret = record.node_secret.clone();
     let actual = phala.deploy(
         &target.rendered_compose,
         keys,
-        &record.node_secret,
+        &node_secret,
         registry_creds.as_ref(),
         args.boot_timeout_secs,
+        &mut |app_id| {
+            app_id.clone_into(&mut record.app_id);
+            persist_worker_record(cfg.active_network(), record.clone())
+        },
     )?;
-    // Persist the app id before fallible hash checks so failed deploys remain recoverable.
-    record.app_id.clone_from(&actual.app_id);
-    persist_worker_record(cfg.active_network(), record.clone())?;
     println!("Verifying hashes against registry approval ...");
     let verified = verify_hashes(&actual.hashes, approved)?;
     println!("  compose_hash  : OK ({})", verified.compose_sha256);
@@ -1327,6 +1329,112 @@ mod tests {
         }
     }
 
+    struct TimeoutAfterCreation;
+
+    impl PhalaClient for TimeoutAfterCreation {
+        fn deploy(
+            &self,
+            _compose_yaml: &str,
+            _env_vars: &ProviderKeys,
+            _node_secret: &str,
+            _registry_creds: Option<&gm_miner_cli::deploy::RegistryCredentials>,
+            _boot_timeout_secs: u64,
+            on_app_id: &mut dyn FnMut(&str) -> Result<()>,
+        ) -> Result<gm_miner_cli::deploy::DeployOutcome> {
+            on_app_id("app_created")?;
+            anyhow::bail!("timed out waiting for CVM readiness")
+        }
+
+        fn existing_cvm_app_id(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_boot_timeout_persists_the_worker_identity_for_recovery_and_cleanup() {
+        let _guard = crate::test_support::ConfigDirGuard::new();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/miners/me"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        // Docker Hub refs skip the external registry-visibility probe.
+        let image_ref = format!("docker.io/test/miner@sha256:{}", "a".repeat(64));
+        let compose_hash = gm_miner_cli::compose_hash::compute_compose_hash(
+            &image_ref,
+            registry_cfg(&server).resolved_network(),
+        )
+        .expect("approved test compose");
+        Mock::given(method("GET"))
+            .and(path("/image-versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "versions": [{
+                    "git_tag": concat!("v", env!("CARGO_PKG_VERSION")),
+                    "status": "supported", "created_at": "2026-09-09T00:00:00Z",
+                    "compose_hash": compose_hash,
+                    "os_image_hash": gm_miner_cli::compose_hash::PINNED_OS_IMAGE_HASH,
+                    "image_ref": image_ref,
+                    "features": ["upstream-key-slots"]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        for registration in [
+            WorkerRegistration::First,
+            WorkerRegistration::Add {
+                hotkey: "test-hotkey".to_owned(),
+            },
+        ] {
+            let mut cfg = registry_cfg(&server);
+            cfg.provider_keys = Some(ProviderKeys {
+                anthropic: Some("test-provider-key".to_owned()),
+                ..Default::default()
+            });
+            config::save(&cfg).expect("save test config");
+            let mut flags = default_deploy_flags();
+            flags.app_name = "new-worker".to_owned();
+            flags.image_ref = Some(image_ref.clone());
+            flags.accept_terms = true;
+            let args = deploy_args_from_flags(flags);
+            let mut client = RegistryClient::new(cfg.clone());
+
+            let err = cmd_deploy(
+                &cfg,
+                &mut client,
+                &TimeoutAfterCreation,
+                &args,
+                &registration,
+            )
+            .await
+            .expect_err("boot timeout must fail deployment");
+            assert!(err.to_string().contains("timed out"), "{err:#}");
+            let saved = config::load().expect("reload the persisted config");
+            let worker = saved
+                .active_network_entry()
+                .and_then(|entry| entry.worker_by_app_id("app_created"))
+                .expect("the created CVM must remain recoverable by ID");
+            assert_eq!(worker.app_name, "new-worker");
+            assert_eq!(worker.worker_id, "");
+            assert_ne!(worker.node_secret, "");
+            assert_eq!(worker.backends, Some(std::collections::BTreeMap::new()));
+            assert!(worker.provider_slots.is_some());
+            assert_eq!(
+                worker.provisional_secondary,
+                registration != WorkerRegistration::First
+            );
+            let mut entry = saved.active_network_entry().expect("network entry").clone();
+            assert!(entry.remove_provisional_worker("app_created").is_some());
+        }
+        assert!(server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .all(|request| request.method == "GET"));
+    }
+
     #[tokio::test]
     async fn cloud_worker_registration_requires_registry_model_echo_capability() {
         let server = MockServer::start().await;
@@ -1535,6 +1643,7 @@ mod tests {
             _node_secret: &str,
             _registry_creds: Option<&gm_miner_cli::deploy::RegistryCredentials>,
             _boot_timeout_secs: u64,
+            _on_app_id: &mut dyn FnMut(&str) -> anyhow::Result<()>,
         ) -> Result<gm_miner_cli::deploy::DeployOutcome> {
             anyhow::bail!("the name-collision preflight must bail before `phala deploy`")
         }
@@ -1555,6 +1664,7 @@ mod tests {
             _node_secret: &str,
             _registry_creds: Option<&gm_miner_cli::deploy::RegistryCredentials>,
             _boot_timeout_secs: u64,
+            _on_app_id: &mut dyn FnMut(&str) -> anyhow::Result<()>,
         ) -> Result<gm_miner_cli::deploy::DeployOutcome> {
             anyhow::bail!("not exercised")
         }
