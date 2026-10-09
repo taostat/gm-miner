@@ -19,7 +19,7 @@ handles the full operator lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Chutes `-TEE` requests pass through an in-image verifier which admits the Chutes instance on verified TDX, GPU and measurement evidence and encrypts each request end to end to its attested key. KubeTEE chat requests pass through an in-image verifier which attests each upstream TLS connection before forwarding on it. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, the optional NEAR, Chutes and KubeTEE verifiers, and the Envoy data plane. |
+| `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Chutes `-TEE` requests pass through an in-image verifier which admits the Chutes instance on verified TDX, GPU and measurement evidence and encrypts each request end to end to its attested key. KubeTEE chat forwarding is disabled until workload/model authorization and serving-key binding can be verified. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, the optional NEAR, Chutes and KubeTEE verifiers, and the Envoy data plane. |
 | `cli/` | `gmcli` CLI (Rust + clap). Operator commands handle login, image registration, products, and prices. The image also uses its hidden `slot-env` command to derive upstream key slots inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -150,7 +150,7 @@ DeepInfra, Engy's GLM/Kimi routes, Moonmath, NEAR and KubeTEE are *sourcing*
 upstreams: they serve buyer products under existing names rather than appearing
 in the catalog under their own names. Engy's Qwen3.6 35B-A3B and Qwen3.8 27B are
 instead buyer-visible products. Engy's `deepseek-v4.1-flash` is a source route for
-the canonical `deepseek-v4.1-flash` buyer product. KubeTEE's chat routes serve the
+the canonical `deepseek-v4.1-flash` buyer product. KubeTEE's catalog chat routes name the
 `-tee` buyer products `zai/glm-5.2-tee`, `zai/glm-5.3-tee`, `zai/glm-5.3-flash-tee`,
 `deepseek/deepseek-v4.1-flash-tee`, `ornith/ornith-1.5-397b-tee` and
 `xiaomi/mimo-v2.6-pro-ultraspeed-tee`. The precise model ids are listed in the
@@ -160,9 +160,11 @@ available to you. A single worker can serve only one route per model, so run two
 two upstreams for the same model. Run `gmcli sources` to see the routes your registry currently
 publishes, and read [sourcing routes](docs/sourcing.md) for setup and settlement details.
 
-KubeTEE chat requests pass through an in-image verifier that attests each connection to
-`llm.kubetee.ai` before sending requests on it and serves only the chat models compiled into the
-image; see
+KubeTEE chat forwarding is disabled in this image because the current
+attestation protocol does not verify an approved workload/model or bind the serving key to it.
+Chat requests receive 502 and `--verify-once` fails. Model discovery is answered locally
+with only the image models served by the separate direct image route. Other providers and
+that image route retain their existing behavior; see
 [KubeTEE attestation verification](docs/sourcing.md#kubetee-attestation-verification).
 
 The Gemini image-generation products `gemini-3.1-flash-lite-image` and

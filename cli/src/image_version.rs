@@ -77,12 +77,11 @@ pub struct AdminImageVersionRequest {
 
 /// Features this release's image supports. Stamped verbatim onto every
 /// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 6] = [
+pub const IMAGE_FEATURES: [&str; 5] = [
     "upstream-key-slots",
     "upstream-model-hop",
     "deepinfra-native-images",
     "chutes-verified-chat",
-    "kubetee-attested-chat",
     "kubetee-no-retry-images",
 ];
 
@@ -444,7 +443,6 @@ mod tests {
                 "upstream-model-hop",
                 "deepinfra-native-images",
                 "chutes-verified-chat",
-                "kubetee-attested-chat",
                 "kubetee-no-retry-images"
             ]),
         );

@@ -10,12 +10,15 @@
 //!
 //! The end-to-end tests serve that quote from a local TLS server whose
 //! certificate chains to a test root, and which signs the TLS-possession
-//! proof with its own test key.
+//! proof with its own test key. Tests using `serve_platform_evidence_only`
+//! inject platform checks to exercise transport in isolation. Production
+//! admission has no authorized verifier and is tested separately with `serve`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use axum::http::header::AUTHORIZATION;
 use dcap_qvl::policy::QuoteClaims;
 use dcap_qvl::quote::{EnclaveReport, Report, TDReport10};
 use dcap_qvl::tcb_info::TcbStatus;
@@ -24,11 +27,12 @@ use hyper::service::service_fn;
 use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use super::evidence::verify_attestation;
+use super::evidence::{verify_attestation, verify_platform_evidence};
 use super::*;
 
 const FIXTURE_NOW: u64 = 1_790_532_956;
@@ -70,7 +74,7 @@ fn td_mut(claims: &mut QuoteClaims) -> &mut TDReport10 {
 }
 
 fn standalone(payload: &AttestationPayload, nonce: &str, claims: &QuoteClaims) -> Result<()> {
-    verify_attestation(payload, nonce, SESSION_LEAF, claims, FIXTURE_NOW).map(|_| ())
+    verify_platform_evidence(payload, nonce, SESSION_LEAF, claims, FIXTURE_NOW).map(|_| ())
 }
 
 fn failure(result: Result<()>) -> String {
@@ -78,9 +82,9 @@ fn failure(result: Result<()>) -> String {
 }
 
 #[test]
-fn the_live_attestation_verifies_offline() {
+fn the_live_platform_evidence_verifies_offline() {
     let payload = payload();
-    let measurements = verify_attestation(
+    let measurements = verify_platform_evidence(
         &payload,
         &payload.nonce,
         SESSION_LEAF,
@@ -90,6 +94,43 @@ fn the_live_attestation_verifies_offline() {
     .unwrap();
     assert_eq!(measurements.rtmrs[3], [0; 48], "RTMR3 carries no events");
     assert_ne!(measurements.rtmrs[2], [0; 48]);
+}
+
+#[test]
+fn a_valid_platform_quote_without_a_workload_policy_is_not_authorized() {
+    let payload = payload();
+    let error = failure(
+        verify_attestation(
+            &payload,
+            &payload.nonce,
+            SESSION_LEAF,
+            &claims(),
+            FIXTURE_NOW,
+        )
+        .map(|_| ()),
+    );
+    assert!(
+        error.contains("no approved workload/model policy"),
+        "{error}"
+    );
+}
+
+#[test]
+fn arbitrary_measurements_without_a_workload_policy_are_not_authorized() {
+    let mut claims = claims();
+    let td = td_mut(&mut claims);
+    // Mutating decoded claims isolates authorization; this does not forge a quote.
+    td.mr_td = [0x41; 48];
+    td.mr_config_id = [0x42; 48];
+    let payload = payload();
+    let error = failure(
+        verify_attestation(&payload, &payload.nonce, SESSION_LEAF, &claims, FIXTURE_NOW)
+            .map(|_| ()),
+    );
+    assert!(
+        error.contains("no approved workload/model policy"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -182,7 +223,8 @@ fn an_rtmr3_extended_without_events_does_not_replay() {
 #[test]
 fn a_proof_for_another_certificate_fails_closed() {
     let payload = payload();
-    let result = verify_attestation(&payload, &payload.nonce, TEST_LEAF, &claims(), FIXTURE_NOW);
+    let result =
+        verify_platform_evidence(&payload, &payload.nonce, TEST_LEAF, &claims(), FIXTURE_NOW);
     assert!(format!("{:#}", result.unwrap_err()).contains("other than this connection's"));
 }
 
@@ -202,31 +244,6 @@ fn a_non_rs256_proof_fails_closed() {
     let mut payload = payload();
     payload.tls_possession.as_mut().unwrap().tls_signature_alg = "ES256".to_owned();
     assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("RS256"));
-}
-
-#[test]
-fn the_model_list_is_narrowed_to_the_chat_and_image_models() {
-    let list = serde_json::json!({"object": "list", "data": [
-        {"id": "z-ai/glm-5.3", "object": "model"},
-        {"id": "minimax/h3", "object": "model"},
-        {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
-        {"id": "all-proxy-models", "object": "model"},
-        {"id": "xiaomi/mimo-v2.6-pro", "object": "model"},
-        {"object": "model"},
-    ]});
-    let served = served_targets(&list);
-    assert_eq!(
-        served["data"],
-        serde_json::json!([
-            {"id": "z-ai/glm-5.3", "object": "model"},
-            {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
-            {"id": "xiaomi/mimo-v2.6-pro", "object": "model"},
-        ])
-    );
-    assert_eq!(
-        served_targets(&serde_json::json!({}))["data"],
-        serde_json::json!([])
-    );
 }
 
 #[test]
@@ -260,8 +277,6 @@ enum Chat {
     Slow,
     Unauthorized,
     Dropped,
-    /// The model list sends headers and half its body, then nothing.
-    StalledModelList,
     /// The chat sends its first event, then nothing more.
     FirstEventOnly,
     /// The chat sends one event, then supplier and ordinary trailers.
@@ -286,7 +301,6 @@ struct Upstream {
     accepts: AtomicUsize,
     attestations: AtomicUsize,
     chats: AtomicUsize,
-    model_lists: AtomicUsize,
     chat_headers: Mutex<Vec<HeaderMap>>,
     /// Every attestation request's query, headers and body length.
     attestation_requests: Mutex<Vec<(String, HeaderMap, usize)>>,
@@ -428,7 +442,7 @@ async fn chat_reply(chat: Chat) -> Option<Reply> {
                 .body(Either::Right(Frames::trailed(FIRST_EVENT, trailers)));
             return Some(response.unwrap());
         }
-        Chat::Served | Chat::StalledModelList => {}
+        Chat::Served => {}
     }
     let response = Response::builder()
         .status(200)
@@ -465,26 +479,6 @@ async fn handle(
             evidence => reply(200, attestation_body(evidence)),
         });
     }
-    if path == MODELS {
-        upstream.model_lists.fetch_add(1, Ordering::SeqCst);
-        let authorized = request
-            .headers()
-            .get(AUTHORIZATION)
-            .map(HeaderValue::as_bytes)
-            == Some(b"Bearer kt".as_slice());
-        let list = serde_json::json!({"object": "list", "data": [
-            {"id": "z-ai/glm-5.3", "object": "model"},
-            {"id": "minimax/h3", "object": "model"},
-            {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
-        ]});
-        return Ok(if matches!(upstream.chat, Chat::StalledModelList) {
-            stalled(list.to_string().as_bytes())
-        } else if authorized {
-            reply(200, list.to_string())
-        } else {
-            reply(401, "{\"error\":\"no key\"}")
-        });
-    }
     upstream.chats.fetch_add(1, Ordering::SeqCst);
     let (parts, body) = request.into_parts();
     upstream.chat_headers.lock().unwrap().push(parts.headers);
@@ -498,6 +492,16 @@ fn limits() -> Limits {
     Limits::default()
 }
 
+async fn serve_platform_evidence_only(
+    evidence: Evidence,
+    chat: Chat,
+    limits: Limits,
+) -> (KubeteeVerifier, Arc<Upstream>) {
+    let (mut verifier, upstream) = serve(evidence, chat, limits).await;
+    verifier.verify_attestation = Some(verify_platform_evidence);
+    (verifier, upstream)
+}
+
 async fn serve(evidence: Evidence, chat: Chat, limits: Limits) -> (KubeteeVerifier, Arc<Upstream>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let upstream = Arc::new(Upstream {
@@ -506,7 +510,6 @@ async fn serve(evidence: Evidence, chat: Chat, limits: Limits) -> (KubeteeVerifi
         accepts: AtomicUsize::new(0),
         attestations: AtomicUsize::new(0),
         chats: AtomicUsize::new(0),
-        model_lists: AtomicUsize::new(0),
         chat_headers: Mutex::new(Vec::new()),
         attestation_requests: Mutex::new(Vec::new()),
     });
@@ -559,7 +562,7 @@ fn chat(selector: &str) -> Request<Body> {
         .header(AUTHORIZATION, "Bearer kt")
         .header("x-buyer-sentinel", "buyer")
         .body(Body::from(
-            serde_json::json!({"model": selector, "stream": true}).to_string(),
+            serde_json::json!({"model": selector, "stream": true, "messages": [{"role": "user", "content": "buyer prompt sentinel"}]}).to_string(),
         ))
         .unwrap()
 }
@@ -583,8 +586,50 @@ fn counts(upstream: &Upstream) -> (usize, usize, usize) {
 }
 
 #[tokio::test]
-async fn a_chat_streams_through_unchanged_without_supplier_headers() {
+async fn a_chat_without_a_workload_policy_never_reaches_the_supplier() {
+    for target in TARGETS {
+        let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+        let error = verifier.forward(chat(target)).await.unwrap_err();
+        assert!(format!("{error:#}").contains("no approved workload/model policy"));
+        assert_eq!(error_response(&error).status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(counts(&upstream), (0, 0, 0));
+        assert_eq!(verifier.idle_connections(), 0);
+        assert!(upstream.attestation_requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn preflight_without_a_workload_policy_cannot_report_success() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    let error = verifier.preflight().await.unwrap_err();
+    assert!(format!("{error:#}").contains("no approved workload/model policy"));
+    assert_eq!(counts(&upstream), (0, 0, 0));
+    assert_eq!(verifier.idle_connections(), 0);
+}
+
+#[tokio::test]
+async fn a_chat_without_a_workload_policy_does_not_read_the_request_body() {
+    let (verifier, upstream) = serve(Evidence::Unavailable, Chat::Served, limits()).await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let body_polls = Arc::clone(&polls);
+    let body = futures_util::stream::poll_fn(move |_| {
+        body_polls.fetch_add(1, Ordering::SeqCst);
+        std::task::Poll::Ready(Some(Err::<Bytes, _>(std::io::Error::other(
+            "disabled admission must not poll the buyer body",
+        ))))
+    });
+    let mut request = chat(TARGETS[0]);
+    *request.body_mut() = Body::from_stream(body);
+    let error = verifier.forward(request).await.unwrap_err();
+    assert!(format!("{error:#}").contains("no approved workload/model policy"));
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(counts(&upstream), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_chat_streams_through_unchanged_without_supplier_headers() {
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, limits()).await;
     let response = verifier.forward(chat(TARGETS[2])).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().keys().all(|name| {
@@ -610,7 +655,8 @@ async fn a_chat_streams_through_unchanged_without_supplier_headers() {
 
 #[tokio::test]
 async fn an_attested_connection_is_reused_without_attesting_again() {
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, limits()).await;
     for selector in [TARGETS[0], TARGETS[1], TARGETS[5]] {
         assert_eq!(round_trip(&verifier, selector).await.1, SSE.as_bytes());
     }
@@ -620,7 +666,8 @@ async fn an_attested_connection_is_reused_without_attesting_again() {
 
 #[tokio::test]
 async fn a_connection_returns_once_its_body_reports_its_end() {
-    let (verifier, _) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    let (verifier, _) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, limits()).await;
     let response = verifier.forward(chat(TARGETS[0])).await.unwrap();
     let mut body = response.into_body();
     // A server writing the response stops polling once the body reports its end.
@@ -633,7 +680,8 @@ async fn a_connection_returns_once_its_body_reports_its_end() {
 
 #[tokio::test]
 async fn a_body_dropped_early_retires_its_connection() {
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, limits()).await;
     drop(verifier.forward(chat(TARGETS[0])).await.unwrap());
     assert_eq!(verifier.idle_connections(), 0);
     round_trip(&verifier, TARGETS[0]).await;
@@ -646,7 +694,8 @@ async fn a_connection_that_expires_while_idle_is_not_reused() {
         max_age: Duration::from_millis(300),
         ..Limits::default()
     };
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, short).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, short).await;
     round_trip(&verifier, TARGETS[0]).await;
     assert_eq!(verifier.idle_connections(), 1, "pooled while fresh");
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -660,7 +709,8 @@ async fn a_connection_is_renewed_after_its_request_limit() {
         max_requests: 2,
         ..Limits::default()
     };
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, two).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, two).await;
     for _ in 0..3 {
         round_trip(&verifier, TARGETS[0]).await;
     }
@@ -669,7 +719,8 @@ async fn a_connection_is_renewed_after_its_request_limit() {
 
 #[tokio::test]
 async fn the_idle_pool_is_capped() {
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Slow, limits()).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Slow, limits()).await;
     let verifier = Arc::new(verifier);
     let burst = |verifier: Arc<KubeteeVerifier>| async move {
         let requests = (0..pool::MAX_IDLE + 2).map(|_| {
@@ -694,7 +745,8 @@ async fn the_idle_pool_is_capped() {
 
 #[tokio::test]
 async fn off_list_requests_are_refused_before_any_connection() {
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, limits()).await;
     let mut wrong_path = chat(TARGETS[0]);
     *wrong_path.uri_mut() = Uri::from_static("/v1/completions");
     let mut wrong_method = chat(TARGETS[0]);
@@ -735,7 +787,8 @@ async fn a_connection_that_fails_attestation_never_carries_a_chat() {
         (Evidence::OtherCertificate, "other than this connection's"),
         (Evidence::Replayed, "echoed a different nonce"),
     ] {
-        let (verifier, upstream) = serve(evidence, Chat::Served, limits()).await;
+        let (verifier, upstream) =
+            serve_platform_evidence_only(evidence, Chat::Served, limits()).await;
         let error = verifier.forward(chat(TARGETS[0])).await.unwrap_err();
         assert!(format!("{error:#}").contains(expected), "{error:#}");
         assert_eq!(
@@ -761,7 +814,8 @@ fn quick_fetch() -> Limits {
 
 #[tokio::test]
 async fn an_attestation_body_that_stalls_times_out_and_is_retried() {
-    let (verifier, upstream) = serve(Evidence::Stalled, Chat::Served, quick_fetch()).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Stalled, Chat::Served, quick_fetch()).await;
     let result = tokio::time::timeout(Duration::from_secs(10), verifier.forward(chat(TARGETS[0])))
         .await
         .unwrap();
@@ -772,25 +826,9 @@ async fn an_attestation_body_that_stalls_times_out_and_is_retried() {
 }
 
 #[tokio::test]
-async fn a_model_list_body_that_stalls_times_out_and_retires_its_connection() {
-    let (verifier, upstream) =
-        serve(Evidence::Genuine, Chat::StalledModelList, quick_fetch()).await;
-    let request = Request::builder()
-        .uri(MODELS)
-        .header(AUTHORIZATION, "Bearer kt")
-        .body(Body::empty())
-        .unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(10), verifier.models(request))
-        .await
-        .unwrap();
-    assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
-    assert_eq!(verifier.idle_connections(), 0);
-    assert_eq!(upstream.model_lists.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
 async fn each_event_reaches_the_caller_as_it_arrives() {
-    let (verifier, _) = serve(Evidence::Genuine, Chat::FirstEventOnly, limits()).await;
+    let (verifier, _) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::FirstEventOnly, limits()).await;
     let response =
         tokio::time::timeout(Duration::from_secs(10), verifier.forward(chat(TARGETS[0])))
             .await
@@ -807,7 +845,8 @@ async fn each_event_reaches_the_caller_as_it_arrives() {
 
 #[tokio::test]
 async fn supplier_trailers_are_removed_on_the_forwarding_path() {
-    let (verifier, _) = serve(Evidence::Genuine, Chat::Trailed, limits()).await;
+    let (verifier, _) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Trailed, limits()).await;
     let mut request = chat(TARGETS[0]);
     request
         .headers_mut()
@@ -827,7 +866,8 @@ async fn a_chat_body_that_stalls_is_refused_before_any_connection() {
         request_read_timeout: Duration::from_millis(300),
         ..Limits::default()
     };
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, slow_caller).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, slow_caller).await;
     let mut request = chat(TARGETS[0]);
     *request.body_mut() = Body::new(Frames::stalling(Bytes::from_static(b"{\"model\":")));
     let result = tokio::time::timeout(Duration::from_secs(10), verifier.forward(request))
@@ -839,7 +879,8 @@ async fn a_chat_body_that_stalls_is_refused_before_any_connection() {
 
 #[tokio::test]
 async fn a_failed_chat_is_never_retried_and_its_connection_is_retired() {
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Dropped, limits()).await;
+    let (verifier, upstream) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Dropped, limits()).await;
     assert!(verifier.forward(chat(TARGETS[0])).await.is_err());
     assert_eq!(counts(&upstream), (1, 1, 1));
     assert_eq!(verifier.idle_connections(), 0);
@@ -847,54 +888,17 @@ async fn a_failed_chat_is_never_retried_and_its_connection_is_retired() {
 
 #[tokio::test]
 async fn an_upstream_error_status_passes_through() {
-    let (verifier, _) = serve(Evidence::Genuine, Chat::Unauthorized, limits()).await;
+    let (verifier, _) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Unauthorized, limits()).await;
     let (status, body) = round_trip(&verifier, TARGETS[1]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body, "{\"error\":\"unauthorized\"}".as_bytes());
 }
 
 #[tokio::test]
-async fn the_model_list_is_fetched_on_an_attested_connection_and_narrowed() {
-    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
-    let request = Request::builder()
-        .uri(MODELS)
-        .header(AUTHORIZATION, "Bearer kt")
-        .body(Body::empty())
-        .unwrap();
-    let response = verifier.models(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let list: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        list["data"],
-        serde_json::json!([
-            {"id": "z-ai/glm-5.3", "object": "model"},
-            {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
-        ])
-    );
-    let keyless = Request::builder().uri(MODELS).body(Body::empty()).unwrap();
-    let response = verifier.models(keyless).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    round_trip(&verifier, TARGETS[0]).await;
-    assert_eq!(
-        counts(&upstream),
-        (1, 1, 1),
-        "one attested connection serves all three"
-    );
-}
-
-#[tokio::test]
-async fn the_model_list_is_never_fetched_on_a_connection_that_failed_attestation() {
-    let (verifier, upstream) = serve(Evidence::OtherCertificate, Chat::Served, limits()).await;
-    let request = Request::builder().uri(MODELS).body(Body::empty()).unwrap();
-    assert!(verifier.models(request).await.is_err());
-    assert_eq!(counts(&upstream), (3, 3, 0));
-    assert_eq!(upstream.model_lists.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
 async fn preflight_reports_the_attested_replica() {
-    let (verifier, _) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    let (verifier, _) =
+        serve_platform_evidence_only(Evidence::Genuine, Chat::Served, limits()).await;
     let attested = verifier.preflight().await.unwrap();
     assert_eq!(attested.pod, "litellm-5959f596d-l4qkl");
     assert_eq!(attested.measurements.rtmrs[3], [0; 48]);

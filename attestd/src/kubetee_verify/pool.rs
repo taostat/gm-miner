@@ -21,7 +21,7 @@ pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
 pub const MAX_REQUESTS: usize = 100;
 /// How many idle attested connections are kept for reuse.
 pub const MAX_IDLE: usize = 8;
-/// How long fetching an attestation or the model list may take, body included.
+/// How long fetching an attestation may take, body included.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long reading a chat request body from the caller may take.
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);

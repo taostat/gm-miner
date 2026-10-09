@@ -1,12 +1,17 @@
 //! Attested forwarding of `KubeTEE` chat completions.
 //!
+//! Production chat admission rejects requests before reading their bodies or opening
+//! upstream connections. The retained platform/transport implementation below
+//! is exercised independently by private test fixtures.
+//!
 //! Each upstream connection to `llm.kubetee.ai` is attested before use and
 //! renewed every 10 minutes. On a new TLS 1.3 connection the proxy fetches a
 //! quote bound to a fresh nonce and verifies it: Intel DCAP chain and an
 //! `UpToDate` TCB, a TDX report with debug off, `report_data = SHA-512(nonce)`,
 //! the event log replaying to RTMR0-3, and the serving certificate's key
-//! signing the nonce. Chat requests are then sent on attested connections
-//! only, one at a time per connection.
+//! signing the nonce. These checks do not authorize a workload or bind its
+//! serving key. Admission therefore fails closed until an independently
+//! approved workload/model policy and key binding can be verified.
 
 pub mod evidence;
 pub mod pool;
@@ -19,14 +24,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
-use axum::http::header::{AUTHORIZATION, HOST};
+use axum::http::header::HOST;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use dcap_qvl::collateral::CollateralClient;
 use dcap_qvl::QuoteCollateralV3;
 use http_body_util::{BodyExt as _, Limited};
 use hyper::body::Incoming;
 use rustls::{ClientConfig, RootCertStore};
-use serde_json::Value;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
@@ -46,7 +50,6 @@ pub const HOST_NAME: &str = "llm.kubetee.ai";
 /// Header carrying the upstream model id Envoy selected for this request.
 pub const SELECTOR_HEADER: &str = "x-gm-upstream-model";
 pub const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
-pub const MODELS: &str = "/v1/models";
 
 /// Every `KubeTEE` chat model gm sources, by the upstream id its route
 /// names (`kubetee/<id>` in `docs/sourcing.md`).
@@ -108,6 +111,14 @@ pub struct Attestation {
     pub measurements: Measurements,
 }
 
+type VerifyAttestation = fn(
+    &AttestationPayload,
+    &str,
+    &[u8],
+    &dcap_qvl::policy::QuoteClaims,
+    u64,
+) -> Result<Measurements>;
+
 #[derive(Clone)]
 pub struct KubeteeVerifier {
     tls: TlsConnector,
@@ -115,6 +126,9 @@ pub struct KubeteeVerifier {
     collateral: Arc<dyn Collateral>,
     nonce: fn() -> [u8; 32],
     pool: Arc<Pool>,
+    // No production admission verifier is available. Only private transport
+    // tests install platform-only checks; they do not authorize workloads.
+    verify_attestation: Option<VerifyAttestation>,
 }
 
 impl fmt::Debug for KubeteeVerifier {
@@ -161,7 +175,13 @@ impl KubeteeVerifier {
             collateral,
             nonce,
             pool: Arc::new(Pool::new(limits)),
+            verify_attestation: None,
         }
+    }
+
+    fn admission_verifier(&self) -> Result<VerifyAttestation> {
+        self.verify_attestation
+            .context(evidence::ADMISSION_DISABLED)
     }
 
     /// Attest one new connection, sending no inference, and close it.
@@ -170,6 +190,7 @@ impl KubeteeVerifier {
     ///
     /// Returns an error when every attempt to connect and attest fails.
     pub async fn preflight(&self) -> Result<Attestation> {
+        self.admission_verifier()?;
         let (connection, attestation) = self.connect_and_attest().await?;
         drop(connection.sender);
         upstream_proxy::finish_connection(PROVIDER, connection.driver).await?;
@@ -185,6 +206,7 @@ impl KubeteeVerifier {
     /// attestation or upstream failure. A request is never sent on a
     /// connection whose attestation failed, and never sent twice.
     pub async fn forward(&self, request: Request<Body>) -> Result<Response<Body>> {
+        self.admission_verifier()?;
         let selector = validate_request(&request)?;
         let request = timeout(
             self.pool.limits().request_read_timeout,
@@ -212,41 +234,6 @@ impl KubeteeVerifier {
         strip_hop_by_hop(&mut parts.headers);
         let body = Lease::new(body, connection, Arc::clone(&self.pool));
         Ok(Response::from_parts(parts, Body::new(body)))
-    }
-
-    /// The upstream model list, narrowed to [`TARGETS`] and [`IMAGE_MODELS`], fetched on an
-    /// attested connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no attested connection is available or the list
-    /// cannot be read.
-    pub async fn models(&self, request: Request<Body>) -> Result<Response<Body>> {
-        let mut upstream = Request::builder()
-            .method(Method::GET)
-            .uri(MODELS)
-            .header(HOST, HOST_NAME);
-        if let Some(authorization) = request.headers().get(AUTHORIZATION) {
-            upstream = upstream.header(AUTHORIZATION, authorization);
-        }
-        let upstream = upstream
-            .body(Body::empty())
-            .context("build KubeTEE model list request")?;
-        let mut connection = self.checkout().await?;
-        connection.requests += 1;
-        let result = timeout(
-            self.pool.limits().fetch_timeout,
-            read_models(&mut connection.sender, upstream),
-        )
-        .await
-        .context("KubeTEE model list fetch timed out")
-        .and_then(|result| result);
-        if result.is_ok() {
-            self.pool.give_back(connection);
-        } else {
-            connection.retire();
-        }
-        result
     }
 
     /// How many idle attested connections are pooled.
@@ -334,7 +321,7 @@ impl KubeteeVerifier {
         let now = self.collateral.now()?;
         let claims = tee_evidence::verify_signature_chain(&quote, collateral, now)?;
         let measurements =
-            evidence::verify_attestation(&payload, &nonce, connection.leaf.as_ref(), &claims, now)?;
+            (self.admission_verifier()?)(&payload, &nonce, connection.leaf.as_ref(), &claims, now)?;
         evidence::log_attested(&payload.pod, &measurements);
         Ok(Attestation {
             pod: payload.pod,
@@ -350,50 +337,6 @@ async fn read_body(body: Incoming) -> Result<Bytes> {
         .await
         .map_err(|error| anyhow::anyhow!("read KubeTEE response: {error}"))?
         .to_bytes())
-}
-
-async fn read_models(
-    sender: &mut hyper::client::conn::http1::SendRequest<Body>,
-    request: Request<Body>,
-) -> Result<Response<Body>> {
-    let response = sender
-        .send_request(request)
-        .await
-        .context("send KubeTEE model list request")?;
-    let (mut parts, body) = response.into_parts();
-    let body = read_body(body).await?;
-    strip_supplier_headers(&mut parts.headers);
-    strip_hop_by_hop(&mut parts.headers);
-    if parts.status != StatusCode::OK {
-        return Ok(Response::from_parts(parts, Body::from(body)));
-    }
-    let list: Value = serde_json::from_slice(&body).context("decode KubeTEE model list")?;
-    let served = serde_json::to_vec(&served_targets(&list)).context("encode model list")?;
-    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    Ok(Response::from_parts(parts, Body::from(served)))
-}
-
-/// The upstream model list with every entry outside [`TARGETS`] and
-/// [`IMAGE_MODELS`] removed.
-#[must_use]
-pub fn served_targets(list: &Value) -> Value {
-    let data = list
-        .get("data")
-        .and_then(Value::as_array)
-        .map(|models| {
-            models
-                .iter()
-                .filter(|model| {
-                    model
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| TARGETS.contains(&id) || IMAGE_MODELS.contains(&id))
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    serde_json::json!({"object": "list", "data": data})
 }
 
 /// Refuse anything but a chat completion for a target model. Runs before

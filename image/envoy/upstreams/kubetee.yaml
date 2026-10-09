@@ -19,10 +19,10 @@ routes:
       host_rewrite_literal: llm.kubetee.ai
       timeout: 1800s
   ##  Chat and the model list terminate only at the co-located
-  ##  measured kubetee-verify-proxy. It owns the closed selector
-  ##  allowlist and sends chat requests only on upstream TLS
-  ##  connections it has attested. No retry: a retry would mask a
-  ##  local failure. There is no direct KubeTEE chat route.
+  ##  measured kubetee-verify-proxy. Chat admission fails closed;
+  ##  model discovery answers locally with only the direct image
+  ##  route's models. No retry: a retry would mask a local failure.
+  ##  There is no direct KubeTEE chat route.
   - match:
       path: "/v1/models"
       headers:

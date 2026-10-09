@@ -7,9 +7,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, Response, StatusCode};
 use axum::routing::{any, get};
-use axum::Router;
+use axum::{Json, Router};
 use gm_miner_attestd::kubetee_verify::{
-    error_response, KubeteeVerifier, BIND_ADDR, HOST_NAME, TARGETS,
+    error_response, KubeteeVerifier, BIND_ADDR, HOST_NAME, IMAGE_MODELS, TARGETS,
 };
 use gm_miner_attestd::upstream_proxy::option_value;
 use tracing::info;
@@ -84,14 +84,18 @@ async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn models(
-    State(verifier): State<Arc<KubeteeVerifier>>,
-    request: Request<Body>,
-) -> Response<Body> {
-    verifier
-        .models(request)
-        .await
-        .unwrap_or_else(|error| error_response(&error))
+// Envoy authenticates the caller and selects a configured key slot before
+// reaching this loopback route. Discovery neither reads that key/body nor
+// contacts the supplier; only the direct image route remains available.
+async fn models(_request: Request<Body>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "object": "list",
+        "data": IMAGE_MODELS.map(|model| serde_json::json!({
+            "id": model,
+            "object": "model",
+            "owned_by": "kubetee",
+        })),
+    }))
 }
 
 async fn proxy(
@@ -102,4 +106,55 @@ async fn proxy(
         .forward(request)
         .await
         .unwrap_or_else(|error| error_response(&error))
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test failures report invalid responses")]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::body::Bytes;
+    use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+    use axum::response::IntoResponse as _;
+    use http_body_util::BodyExt as _;
+
+    #[tokio::test]
+    async fn image_discovery_is_local_and_never_reads_the_caller_body() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let body_polls = Arc::clone(&polls);
+        let body = futures_util::stream::poll_fn(move |_| {
+            body_polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(Some(Err::<Bytes, _>(std::io::Error::other(
+                "local discovery must not poll the caller body",
+            ))))
+        });
+        let request = Request::builder()
+            .uri("/v1/models")
+            .header(AUTHORIZATION, "Bearer supplier-key-sentinel")
+            .body(Body::from_stream(body))
+            .unwrap();
+        let response = models(request).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let catalog: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            catalog,
+            serde_json::json!({
+                "object": "list",
+                "data": IMAGE_MODELS.map(|model| serde_json::json!({
+                    "id": model,
+                    "object": "model",
+                    "owned_by": "kubetee",
+                })),
+            })
+        );
+        assert!(catalog["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| !TARGETS.contains(&model["id"].as_str().unwrap())));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
 }
