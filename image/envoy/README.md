@@ -108,12 +108,18 @@ These apply to every provider route unless its file says otherwise.
   is the legacy open data plane.
 - **Load shedding.** A process-wide token bucket (500 requests per second)
   returns a JSON 429, the saturation signal the gateway and registry act on.
-  `/attestation/info` is exempt. The overload manager's 8192-connection cap
+  `/attestation/info` is exempt from this rate limit. Upstream circuit-breaker
+  overflow (`UO`) also returns JSON 429 with
+  `{"error":"miner saturated: concurrent request limit reached"}`, including
+  on verifier routes. This covers long-running requests that exhaust a
+  cluster's capacity below the request-rate limit; circuit-breaker limits
+  are unchanged. The overload manager's 8192-connection cap
   guards against file-descriptor exhaustion and is sized to fire only in a
   flood. Past it, connections are refused at accept time with no status
   code.
 - **Error bodies.** Local replies are JSON: 401 for the node key, 421 for an
-  unavailable key slot, 429 when rate limited, 501 for an unknown provider,
+  unavailable key slot, 429 when rate limited or a circuit breaker overflows,
+  501 for an unknown provider,
   and 502 for an upstream that failed before responding. Provider error
   responses pass through byte for byte. The 502 body must never contain a
   provider-drain phrase (quota, credit, billing, account, api key), because

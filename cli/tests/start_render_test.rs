@@ -1671,6 +1671,33 @@ fn chutes_tee_with_an_empty_key_is_unavailable() {
 }
 
 #[test]
+fn circuit_breaker_overflow_has_priority_over_upstream_failure_replies() {
+    let rendered = chutes_config();
+    let parsed = config(&rendered);
+    let mappers = ingress(&parsed)["local_reply_config"]["mappers"]
+        .as_array()
+        .expect("local reply mappers");
+    // UO can accompany other failure flags. The overflow classification must
+    // win for both ordinary provider and Chutes-verifier routes.
+    let overflow = &mappers[0];
+    assert_eq!(
+        overflow["filter"]["response_flag_filter"]["flags"],
+        json!(["UO"])
+    );
+    assert_eq!(overflow["status_code"], 429);
+    assert_eq!(
+        overflow["body_format_override"]["json_format"],
+        json!({"error": "miner saturated: concurrent request limit reached"})
+    );
+    // The existing rate limiter still has its own JSON 429 response.
+    assert!(mappers.iter().any(|mapper| {
+        mapper["filter"]["status_code_filter"]["comparison"]["value"]["default_value"] == 429
+            && mapper["body_format_override"]["json_format"]["error"]
+                == "miner saturated — request rate limited"
+    }));
+}
+
+#[test]
 fn an_unreachable_chutes_verifier_answers_503() {
     let rendered = chutes_config();
     let lua = run_request(
@@ -1702,13 +1729,17 @@ fn an_unreachable_chutes_verifier_answers_503() {
         .iter()
         .find(|mapper| {
             let filter = &mapper["filter"];
-            filter["response_flag_filter"].is_object()
+            filter["response_flag_filter"]["flags"]
+                .as_array()
+                .is_some_and(|flags| flags.iter().any(|flag| flag == "UF"))
                 || filter["and_filter"]["filters"]
                     .as_array()
                     .is_some_and(|filters| {
-                        filters
-                            .iter()
-                            .any(|f| f["response_flag_filter"].is_object())
+                        filters.iter().any(|f| {
+                            f["response_flag_filter"]["flags"]
+                                .as_array()
+                                .is_some_and(|flags| flags.iter().any(|flag| flag == "UF"))
+                        })
                     })
         })
         .expect("connection-failure mapper");

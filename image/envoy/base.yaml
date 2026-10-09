@@ -10,8 +10,8 @@ admin:
       address: 127.0.0.1
       port_value: 9901
 
-## Connection cap: a file-descriptor backstop, not the saturation signal (that is
-## the rate limit below). Refuses at accept time with no status code, and is
+## Connection cap: a file-descriptor backstop. Rate limits and upstream circuit
+## breakers signal saturation with 429; this cap refuses at accept time and is
 ## sized to fire only in a flood. 8192 is under half the container's 65536 fd
 ## soft limit (dstack/docker-compose.yaml), per Envoy's sizing guidance.
 overload_manager:
@@ -97,10 +97,21 @@ static_resources:
                   ## Advertised in SETTINGS; matches the gateway-side cap (Envoy's default is
                   ## effectively unbounded).
                   max_concurrent_streams: 1024
-                ## Rewrite the rate limit's plain-text 429 to JSON. Matched on status, not the
-                ## RL flag, which only the router sets; nothing else here produces a 429.
+                ## Classify Envoy-generated saturation and upstream failures as JSON.
+                ## Provider responses pass through unchanged.
                 local_reply_config:
                   mappers:
+                    ## Long requests can exhaust a cluster's circuit breakers below the
+                    ## request-rate limit. UO is local saturation, including on verifier
+                    ## routes, so match it before other upstream-failure flags.
+                    - filter:
+                        response_flag_filter:
+                          flags: ["UO"]
+                      status_code: 429
+                      body_format_override:
+                        json_format:
+                          error: "miner saturated: concurrent request limit reached"
+                    ## Match the rate limit on status: its filter does not set the RL flag.
                     - filter:
                         status_code_filter:
                           comparison:
@@ -484,7 +495,7 @@ static_resources:
                             end
                             strip_internal_headers(headers, provider)
                           end
-                  ## The saturation signal: 429 when the process-wide bucket of 500
+                  ## Rate-based saturation: 429 when the process-wide bucket of 500
                   ## requests/s is empty (JSON body via local_reply_config above). Tunable
                   ## until per-CVM benchmarking refines it; /attestation/info is exempt.
                   - name: envoy.filters.http.local_ratelimit
