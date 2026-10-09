@@ -1389,7 +1389,7 @@ mod tests {
             ),
             catalog_row(
                 "wan-ai",
-                "wan-2.6-t2v-1080p",
+                "wan-2.6-t2v",
                 serde_json::json!({"video_generation": true, "api": "openai_videos"}),
             ),
             catalog_row("zai", "glm-5.3", Value::Null),
@@ -1397,19 +1397,14 @@ mod tests {
         let routes = [
             route("kubetee", "minimax/h3", "minimax", "h3"),
             route("deepinfra", "google/veo-3.1-fast", "google", "veo-3.1-fast"),
-            route(
-                "deepinfra",
-                "Wan-AI/Wan2.6-T2V",
-                "wan-ai",
-                "wan-2.6-t2v-1080p",
-            ),
+            route("deepinfra", "Wan-AI/Wan2.6-T2V", "wan-ai", "wan-2.6-t2v"),
             route("kubetee", "z-ai/glm-5.3", "zai", "glm-5.3"),
         ];
         let excluded = non_chat_probe_exclusions(&catalog, &routes);
         let expected = [
             ("minimax", "h3"),
             ("google", "veo-3.1-fast"),
-            ("wan-ai", "wan-2.6-t2v-1080p"),
+            ("wan-ai", "wan-2.6-t2v"),
             ("kubetee", "minimax/h3"),
             ("deepinfra", "google/veo-3.1-fast"),
             ("deepinfra", "Wan-AI/Wan2.6-T2V"),

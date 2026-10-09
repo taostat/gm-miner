@@ -41,7 +41,7 @@ explains the table and how to set each upstream up.
 | `qwen/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
 | `openai/gpt-oss-20b` | `deepinfra/openai/gpt-oss-20b` | `api.deepinfra.com` | `--deepinfra` |
 | `google/veo-3.1-fast` | `deepinfra/google/veo-3.1-fast` | `api.deepinfra.com` | `--deepinfra` |
-| `wan-ai/wan-2.6-t2v-1080p` | `deepinfra/Wan-AI/Wan2.6-T2V` | `api.deepinfra.com` | `--deepinfra` |
+| `wan-ai/wan-2.6-t2v` | `deepinfra/Wan-AI/Wan2.6-T2V` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4.1-flash` | `engy/deepseek-v4.1-flash` | `api.engy.ai` | `--engy` |

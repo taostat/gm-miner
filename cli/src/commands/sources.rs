@@ -629,7 +629,7 @@ mod tests {
             "provider": "deepinfra",
             "model": "Wan-AI/Wan2.6-T2V",
             "buyer_provider": "wan-ai",
-            "buyer_model": "wan-2.6-t2v-1080p",
+            "buyer_model": "wan-2.6-t2v",
             "retail_price": {"dimensions": {
                 "input_per_mtok_ndollars": 0,
                 "output_per_mtok_ndollars": 0,
