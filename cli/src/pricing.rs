@@ -3,7 +3,7 @@
 //! never a float.
 //!
 //! Prices are a *vector*, not a pair: a product prices input and output plus
-//! up to ten further dimensions (prompt cache, audio, image, long context). A
+//! up to twelve further dimensions (prompt cache, audio, image, video, long context). A
 //! percent discount is the ergonomic way to express an offer, and
 //! [`effective_dimensions`] resolves it into the absolute per-dimension
 //! figures the miner is shown before declaring. Shown, not agreed: the wire
@@ -135,7 +135,7 @@ struct PriceDimension {
 /// `long_context_threshold_tokens` is deliberately absent: it is a token
 /// count, not a price, so discounting it would be nonsense — it rides through
 /// [`effective_dimensions`] untouched.
-const PRICE_DIMENSIONS: [PriceDimension; 13] = [
+const PRICE_DIMENSIONS: [PriceDimension; 14] = [
     PriceDimension {
         label: "input",
         anchor: true,
@@ -195,6 +195,12 @@ const PRICE_DIMENSIONS: [PriceDimension; 13] = [
         anchor: false,
         get: |d| d.output_per_image_ndollars,
         set: |d, v| d.output_per_image_ndollars = Some(v),
+    },
+    PriceDimension {
+        label: "per video second",
+        anchor: false,
+        get: |d| d.output_per_video_second_ndollars,
+        set: |d, v| d.output_per_video_second_ndollars = Some(v),
     },
     PriceDimension {
         label: "cache storage/hr",
@@ -275,29 +281,26 @@ pub fn format_usd(ndollars: u64) -> String {
     format!("${dollars}.{fraction}")
 }
 
-/// One-line summary of the per-Mtok rate the miner will receive on a
-/// product, given retail dimensions and a discount. Shared between
-/// the single-product declaration output and the fan-out summary so
-/// every site renders the same shape.
-///
-/// The two anchors only: they are what routing is decided on, and they are the
-/// pair every product prices. When the product prices more, the count of the
-/// rest is appended so the miner knows to look for
-/// [`extra_dimension_lines`] rather than reading the line as the whole deal.
+/// Shared by declaration and status output so discounted rates use consistent units.
+/// The count of prices not shown points the miner to [`extra_dimension_lines`]
+/// rather than presenting the summary as the whole price vector.
 #[must_use]
 pub fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> String {
     let effective = effective_dimensions(retail, discount_bp);
-    let summary = format!(
+    let mut summary = format!(
         "{} in / {} out per Mtok",
         format_usd(effective.input_per_mtok_ndollars),
         format_usd(effective.output_per_mtok_ndollars)
     );
-    let summary = effective.output_per_image_ndollars.map_or_else(
-        || summary.clone(),
-        |price| format!("{} per image; {summary}", format_usd(price)),
-    );
-    let shown_image = usize::from(effective.output_per_image_ndollars.is_some());
-    match extra_dimension_count(retail) - shown_image {
+    if let Some(price) = effective.output_per_image_ndollars {
+        summary = format!("{} per image; {summary}", format_usd(price));
+    }
+    if let Some(price) = effective.output_per_video_second_ndollars {
+        summary = format!("{} per video second; {summary}", format_usd(price));
+    }
+    let shown_unit_prices = usize::from(effective.output_per_image_ndollars.is_some())
+        + usize::from(effective.output_per_video_second_ndollars.is_some());
+    match extra_dimension_count(retail) - shown_unit_prices {
         0 => summary,
         n => format!("{summary} (+{n} more)"),
     }
@@ -544,9 +547,7 @@ mod tests {
     };
     use crate::types::RetailDimensions;
 
-    /// A vector that prices every dimension, so a test can assert on all thirteen at
-    /// once. The audio prices are deliberately not multiples of 10 000 — the
-    /// floor has to bite somewhere.
+    // Non-divisible audio prices exercise the integer discount floor.
     fn full_vector() -> RetailDimensions {
         RetailDimensions {
             input_per_mtok_ndollars: 3_000_000_000,
@@ -559,6 +560,7 @@ mod tests {
             image_input_per_mtok_ndollars: Some(500_000_007),
             image_output_per_mtok_ndollars: Some(60_000_000_000),
             output_per_image_ndollars: Some(15_000_007),
+            output_per_video_second_ndollars: Some(150_000_000),
             cache_storage_per_mtok_hour_ndollars: Some(50_000_000),
             long_context_threshold_tokens: Some(200_000),
             long_context_input_per_mtok_ndollars: Some(6_000_000_000),
@@ -584,6 +586,7 @@ mod tests {
             ("image_input", dims.image_input_per_mtok_ndollars),
             ("image_output", dims.image_output_per_mtok_ndollars),
             ("per_image", dims.output_per_image_ndollars),
+            ("per_video_second", dims.output_per_video_second_ndollars),
             ("cache_storage", dims.cache_storage_per_mtok_hour_ndollars),
             (
                 "long_context_input",
@@ -1108,7 +1111,8 @@ mod tests {
         // offer and never looks for the rest.
         assert_eq!(
             effective_rate_summary(&full_vector(), 1050),
-            "$0.013425006 per image; $2.685 in / $13.425 out per Mtok (+10 more)"
+            "$0.13425 per video second; $0.013425006 per image; \
+             $2.685 in / $13.425 out per Mtok (+10 more)"
         );
         let anchors_only = RetailDimensions {
             input_per_mtok_ndollars: 3_000_000_000,
@@ -1178,5 +1182,20 @@ mod tests {
         let lines = extra_dimension_lines(&retail, 1050).join("\n");
         assert!(lines.contains("per image"), "{lines}");
         assert!(lines.contains("$0.015000007 → $0.013425006"), "{lines}");
+    }
+
+    #[test]
+    fn per_video_second_catalog_price_is_discounted_and_shown_with_its_unit() {
+        let retail: RetailDimensions = serde_json::from_value(serde_json::json!({
+            "input_per_mtok_ndollars": 1_000_000_000_u64,
+            "output_per_mtok_ndollars": 1_000_000_000_u64,
+            "output_per_video_second_ndollars": 150_000_000_u64
+        }))
+        .unwrap();
+        let summary = effective_rate_summary(&retail, 1050);
+        assert!(summary.contains("$0.13425 per video second"), "{summary}");
+        let lines = extra_dimension_lines(&retail, 1050).join("\n");
+        assert!(lines.contains("per video second"), "{lines}");
+        assert!(lines.contains("$0.150 → $0.13425"), "{lines}");
     }
 }

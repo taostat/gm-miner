@@ -18,6 +18,27 @@ routes:
       cluster: kubetee
       host_rewrite_literal: llm.kubetee.ai
       timeout: 1800s
+  ## Video uses ordinary supply, so it bypasses the chat verifier.
+  - match:
+      path: "/v1/videos"
+      headers:
+        - name: "x-gm-provider"
+          string_match:
+            exact: "kubetee"
+    route:
+      cluster: kubetee
+      host_rewrite_literal: llm.kubetee.ai
+      timeout: 1800s
+  - match:
+      prefix: "/v1/videos/"
+      headers:
+        - name: "x-gm-provider"
+          string_match:
+            exact: "kubetee"
+    route:
+      cluster: kubetee
+      host_rewrite_literal: llm.kubetee.ai
+      timeout: 1800s
   ##  Chat and the model list terminate only at the co-located
   ##  measured kubetee-verify-proxy. It owns the closed selector
   ##  allowlist and sends chat requests only on upstream TLS

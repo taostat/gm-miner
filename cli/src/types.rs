@@ -144,6 +144,16 @@ impl Product {
             .as_ref()
             .is_some_and(ProductCapabilities::generates_images)
     }
+
+    /// Image and video generation products are excluded from chat-only probes.
+    #[must_use]
+    pub fn has_no_chat_surface(&self) -> bool {
+        self.capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities.generates_images()
+                || capabilities.video_generation
+                || capabilities.api.as_deref() == Some("openai_videos")
+        })
+    }
 }
 
 /// The subset of `GET /products` `capabilities` the CLI reads. `api` is a
@@ -153,6 +163,8 @@ impl Product {
 pub struct ProductCapabilities {
     #[serde(default)]
     pub image_generation: bool,
+    #[serde(default)]
+    pub video_generation: bool,
     #[serde(default)]
     pub api: Option<String>,
 }
@@ -212,6 +224,9 @@ pub struct RetailDimensions {
     pub image_output_per_mtok_ndollars: Option<u64>,
     #[serde(default)]
     pub output_per_image_ndollars: Option<u64>,
+    /// Flat price for each requested second of generated video.
+    #[serde(default)]
+    pub output_per_video_second_ndollars: Option<u64>,
     #[serde(default)]
     pub cache_storage_per_mtok_hour_ndollars: Option<u64>,
     /// Input-token count above which the long-context tier applies. Not a

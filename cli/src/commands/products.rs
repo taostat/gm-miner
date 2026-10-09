@@ -215,19 +215,9 @@ fn source_declaration_lines(
     lines
 }
 
-/// Find the product among the miner's sourcing routes, or reject it.
-///
-/// Reached only after the catalog missed, so failing here means the product
-/// exists nowhere and no POST is issued.
-/// The declaration preview: retail, the declared discount, and the absolute
-/// per-Mtok rate the miner receives on every dimension the product prices.
-///
 /// `retail_label` names *which* retail the numbers are. A sourcing route
 /// settles on the buyer product's retail, not the upstream's, and the miner
 /// has to be able to tell the two apart on sight.
-///
-/// The dimensions beyond input/output are listed only when the product prices
-/// them, so a two-dimension product renders in three lines exactly as before.
 ///
 /// Ends with [`sent_as_lines`]: every figure here is resolved locally, and the
 /// block must not read as though those figures are what crosses the wire.
@@ -243,9 +233,7 @@ fn declaration_lines(
     let retail_out = format_usd(retail.output_per_mtok_ndollars);
     let eff_in = format_usd(effective.input_per_mtok_ndollars);
     let eff_out = format_usd(effective.output_per_mtok_ndollars);
-    // What the miner keeps per token, as a percentage of retail. With
-    // discount_bp = 0 this reads "100%"; at the 99.90% cap this is
-    // "0.1% of retail" — the minimum positive payout.
+    // The 99.90% discount cap leaves at least 0.1% of retail.
     let kept_pct = format_discount_pct(10_000_u32.saturating_sub(discount_bp));
 
     let mut lines = vec![
@@ -263,10 +251,14 @@ fn declaration_lines(
     ];
     let extras = extra_dimension_lines(retail, discount_bp);
     if !extras.is_empty() {
-        let units = if retail.output_per_image_ndollars.is_some() {
-            "per Mtok unless labelled per image"
-        } else {
-            "per Mtok"
+        let units = match (
+            retail.output_per_image_ndollars.is_some(),
+            retail.output_per_video_second_ndollars.is_some(),
+        ) {
+            (true, true) => "per Mtok unless labelled per image or per video second",
+            (true, false) => "per Mtok unless labelled per image",
+            (false, true) => "per Mtok unless labelled per video second",
+            (false, false) => "per Mtok",
         };
         lines.push(format!(
             "  {:<width$}: {retail_label} → you receive, {units}",
@@ -842,7 +834,7 @@ const STATUS_HEADERS: [&str; 6] = [
     "PROVIDER",
     "MODEL",
     "DISCOUNT",
-    "YOU RECEIVE / MTOK",
+    "YOU RECEIVE",
     "OFFERED",
     "ELIGIBLE",
 ];
@@ -947,7 +939,8 @@ fn extra_rate_lines(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'
     }
     let mut out = vec![
         String::new(),
-        "Priced beyond input/output — retail → you receive, per Mtok unless labelled per image:"
+        "Priced beyond input/output — retail → you receive, \
+         per Mtok unless labelled per image or per video second:"
             .to_owned(),
     ];
     out.extend(lines);
@@ -1060,6 +1053,40 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn video_catalog_discovery_includes_the_per_second_price() {
+        let server = MockServer::start().await;
+        mount_catalog(&server, serde_json::json!([])).await;
+        let mut price = retail(0, 0);
+        price["dimensions"]["output_per_video_second_ndollars"] = 80_000_000.into();
+        Mock::given(method("GET"))
+            .and(path("/products"))
+            .and(header("x-gm-video-jobs", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "products": [{
+                    "provider": "minimax", "model": "h3", "status": "active",
+                    "capabilities": {"api": "openai_videos", "video_generation": true},
+                    "retail_price": price
+                }],
+                "generated_at": "2026-10-09T10:00:00Z"
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let catalog = fetch_catalog(&mut RegistryClient::new(config_for(&server)))
+            .await
+            .expect("video catalog");
+        assert_eq!(catalog.products.len(), 1);
+        assert!(catalog.products[0].has_no_chat_surface());
+        assert_eq!(
+            catalog.products[0]
+                .retail_price
+                .dimensions
+                .output_per_video_second_ndollars,
+            Some(80_000_000)
+        );
     }
 
     async fn mount_sources(server: &MockServer, sources: serde_json::Value) {
@@ -1970,6 +1997,7 @@ mod tests {
             image_input_per_mtok_ndollars: Some(500),
             image_output_per_mtok_ndollars: Some(500),
             output_per_image_ndollars: None,
+            output_per_video_second_ndollars: None,
             cache_storage_per_mtok_hour_ndollars: Some(500),
             long_context_threshold_tokens: Some(200_000),
             long_context_input_per_mtok_ndollars: Some(500),
@@ -2116,6 +2144,51 @@ mod tests {
     }
 
     #[test]
+    fn a_video_status_table_labels_the_per_second_rate() {
+        let dims = RetailDimensions {
+            output_per_video_second_ndollars: Some(100_000_000),
+            ..Default::default()
+        };
+        let retail_by_key = [(("minimax".to_owned(), "h3"), &dims)]
+            .into_iter()
+            .collect();
+        let offers = offers(serde_json::json!([{
+            "provider": "minimax", "model": "h3",
+            "is_offered": true, "is_eligible": true, "discount_bp": 1500,
+        }]));
+        let rows = status_rows(&offers, &retail_by_key);
+        assert_eq!(
+            rows[0][3],
+            "$0.085 per video second; $0.000 in / $0.000 out per Mtok"
+        );
+        assert_eq!(STATUS_HEADERS[3], "YOU RECEIVE");
+    }
+
+    #[test]
+    fn a_video_status_detail_labels_the_per_second_price() {
+        let dims = RetailDimensions {
+            output_per_video_second_ndollars: Some(100_000_000),
+            ..Default::default()
+        };
+        let retail_by_key = [(("minimax".to_owned(), "h3"), &dims)]
+            .into_iter()
+            .collect();
+        let lines = extra_rate_lines(
+            &offers(serde_json::json!([{
+                "provider": "minimax", "model": "h3",
+                "is_offered": true, "is_eligible": true, "discount_bp": 1500,
+            }])),
+            &retail_by_key,
+        );
+        assert_eq!(lines[4], "      per video second  $0.100 → $0.085");
+        assert_eq!(
+            lines[1],
+            "Priced beyond input/output — retail → you receive, \
+             per Mtok unless labelled per image or per video second:"
+        );
+    }
+
+    #[test]
     fn an_all_anchors_status_prints_no_detail_block() {
         let dims = RetailDimensions {
             input_per_mtok_ndollars: 1_400_000_000,
@@ -2219,6 +2292,20 @@ mod tests {
                 "                 The registry resolves them against its own retail.",
             ]
         );
+    }
+
+    #[test]
+    fn a_video_declaration_labels_the_per_second_price() {
+        let dims = RetailDimensions {
+            output_per_video_second_ndollars: Some(190_000_000),
+            ..Default::default()
+        };
+        let lines = declaration_lines("deepinfra/Wan-AI/Wan2.6-T2V", "Retail", &dims, 2000);
+        assert_eq!(
+            lines[4],
+            "  Also priced  : Retail → you receive, per Mtok unless labelled per video second"
+        );
+        assert_eq!(lines[5], "      per video second  $0.190 → $0.152");
     }
 
     #[test]
