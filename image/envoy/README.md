@@ -78,17 +78,22 @@ These apply to every provider route unless its file says otherwise.
 - **One retry, before response headers only:**
   `retry_on: reset,connect-failure,refused-stream,5xx`. Envoy retries only
   before headers reach the caller, so a retry never duplicates a stream the
-  gateway has started billing.
+  gateway has started billing. This does not prove the first attempt was
+  unprocessed or unbilled upstream.
   - 429 is not retried. The gateway's cooldown logic reads the 429, and
     retrying would hide quota exhaustion while hammering the upstream.
   - There is no `per_try_timeout`, because it would cut long generations.
   - A body larger than the connection buffer cannot be replayed, so Envoy
     skips that retry.
-- **No retry** on non-idempotent paths (DeepInfra `/v1/inference/`, KubeTEE
-  image generation), on the loopback NEAR, Chutes-verifier, KubeTEE-verifier
+- **No retry** on ordinary Chutes `-TEE` requests (`x-gm-ordinary: 1`), on
+  non-idempotent image paths (DeepInfra `/v1/inference/`, KubeTEE image
+  generation), on the loopback NEAR, Chutes-verifier, KubeTEE-verifier
   and attestation routes (a retry would mask a local failure), or on
-  benchmark (it would distort the measurement). The Lua filter also strips caller-supplied `x-envoy-retry-*`
-  headers on the two non-idempotent paths.
+  benchmark (it would distort the measurement). The Lua filter strips
+  caller-supplied retry and hedge controls on ordinary
+  Chutes `-TEE` requests and the two image paths before routing. Chutes can
+  process paid inference before returning a reset or 5xx; without a
+  provider-enforced idempotency guarantee, a replay can incur another charge.
 - **Keyless probes see a 401.** A direct route stays in place when its key is
   unset. Lua then sends an empty key, the upstream answers 401, and the
   registry reads "no key" the same way it reads "key revoked".

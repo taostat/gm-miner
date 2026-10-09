@@ -372,9 +372,22 @@ static_resources:
                                 reject(handle, "503", "Chutes verifier unavailable")
                                 return false
                               end
-                              -- Lets the local reply mapper answer 503 if the verifier
-                              -- cannot be reached; an ordinary request goes direct.
-                              if headers:get("x-gm-ordinary") ~= "1" then
+                              if headers:get("x-gm-ordinary") == "1" then
+                                -- Ordinary -TEE inference is paid and has no retry
+                                -- policy. Strip overrides before the router sees them.
+                                headers:remove("x-envoy-retry-on")
+                                headers:remove("x-envoy-retry-grpc-on")
+                                headers:remove("x-envoy-max-retries")
+                                headers:remove("x-envoy-retriable-status-codes")
+                                headers:remove("x-envoy-retriable-header-names")
+                                headers:remove("x-envoy-upstream-rq-per-try-timeout-ms")
+                                headers:remove("x-envoy-hedge-on-per-try-timeout")
+                              else
+                                -- Envoy may match repeated values individually. Drop
+                                -- non-ordinary markers before matching the direct route.
+                                headers:remove("x-gm-ordinary")
+                                -- Lets the local reply mapper answer 503 if the
+                                -- verifier cannot be reached.
                                 handle:streamInfo():dynamicMetadata():set(
                                   "gm.route", "chutes_verifier", true)
                               end

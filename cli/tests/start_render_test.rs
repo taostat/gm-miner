@@ -1485,6 +1485,131 @@ fn chutes_ordinary_tee_selectors_go_direct_without_gm_headers() {
 }
 
 #[test]
+fn chutes_ordinary_tee_routes_disable_automatic_replay() {
+    for (network, keys) in [
+        ("testnet", "chutes-key"),
+        ("mainnet", "chutes-key"),
+        ("testnet", "chutes-key;second-key"),
+    ] {
+        let (status, _, stderr, rendered) =
+            render_envoy([("GM_NETWORK", network), ("CHUTES_API_KEY", keys)]);
+        assert!(status.success(), "render failed: {stderr}");
+        let parsed = config(&rendered);
+        let virtual_host = &ingress(&parsed)["route_config"]["virtual_hosts"][0];
+        for field in ["retry_policy", "retry_policy_typed_config", "hedge_policy"] {
+            assert!(virtual_host.get(field).is_none(), "inherited {field}");
+        }
+        for selector in ["zai-org/GLM-5.2-TEE", "moonshotai/kimi-k3-tee"] {
+            for path in [
+                "/v1/chat/completions",
+                "/v1/chat/completions?x=1",
+                "/v1/models",
+            ] {
+                let selected = matching_route(
+                    &parsed,
+                    path,
+                    &[
+                        ("x-gm-provider".into(), "chutes".into()),
+                        ("x-gm-upstream-model".into(), selector.into()),
+                        ("x-gm-ordinary".into(), "1".into()),
+                    ],
+                );
+                assert_eq!(selected["route"]["cluster"], "chutes");
+                assert_eq!(selected["route"]["host_rewrite_literal"], "llm.chutes.ai");
+                assert_eq!(selected["route"]["timeout"], "1800s");
+                for field in ["retry_policy", "retry_policy_typed_config", "hedge_policy"] {
+                    assert!(
+                        selected["route"].get(field).is_none(),
+                        "{network} {path} {selector}: automatic replay via {field}"
+                    );
+                }
+            }
+        }
+        // Keep the existing policy for requests outside the ordinary -TEE route.
+        assert_eq!(
+            route(&parsed, "chutes", "/v1/chat/completions")["route"]["retry_policy"],
+            json!({
+                "retry_on": "reset,connect-failure,refused-stream,5xx",
+                "num_retries": 1,
+            })
+        );
+    }
+}
+
+#[test]
+fn chutes_ordinary_tee_strips_retry_controls_before_routing() {
+    let rendered = chutes_config();
+    for selector in ["zai-org/GLM-5.2-TEE", "moonshotai/kimi-k3-tee"] {
+        for path in [
+            "/v1/chat/completions",
+            "/v1/chat/completions?x=1",
+            "/v1/models",
+        ] {
+            let lua = run_request(
+                &rendered,
+                &[
+                    (":path", path),
+                    ("x-gm-provider", "chutes"),
+                    ("x-gm-node-key", "test-node-secret-0001"),
+                    ("x-gm-upstream-model", selector),
+                    ("x-gm-ordinary", "1"),
+                    ("x-envoy-retry-on", "5xx"),
+                    ("X-Envoy-Retry-On", "reset"),
+                    ("x-envoy-retry-grpc-on", "unavailable"),
+                    ("x-envoy-max-retries", "4"),
+                    ("x-envoy-retriable-status-codes", "500"),
+                    ("x-envoy-retriable-header-names", "x-retry-me"),
+                    ("x-envoy-upstream-rq-per-try-timeout-ms", "1"),
+                    ("x-envoy-hedge-on-per-try-timeout", "true"),
+                ],
+                &[
+                    ("CHUTES_API_KEY", "chutes-key"),
+                    ("GM_CHUTES_KEY_SLOT_1", "chutes-key"),
+                ],
+            );
+            assert_eq!(
+                lua.globals()
+                    .get::<Option<String>>("response_status")
+                    .expect("status"),
+                None
+            );
+            let headers = lua
+                .globals()
+                .get::<mlua::Table>("input_headers")
+                .expect("headers after Lua");
+            assert_eq!(
+                headers.get::<String>("authorization").expect("auth"),
+                "Bearer chutes-key"
+            );
+            assert_eq!(
+                headers
+                    .get::<String>("x-gm-upstream-model")
+                    .expect("selector"),
+                selector
+            );
+            assert_eq!(headers.get::<String>("x-gm-ordinary").expect("marker"), "1");
+            for name in [
+                "x-envoy-retry-on",
+                "x-envoy-retry-grpc-on",
+                "x-envoy-max-retries",
+                "x-envoy-retriable-status-codes",
+                "x-envoy-retriable-header-names",
+                "x-envoy-upstream-rq-per-try-timeout-ms",
+                "x-envoy-hedge-on-per-try-timeout",
+            ] {
+                assert!(
+                    headers
+                        .get::<Option<mlua::Value>>(name)
+                        .expect("retry control")
+                        .is_none(),
+                    "{path} {selector}: {name} survived Lua"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn chutes_chat_without_a_selector_is_refused() {
     let rendered = chutes_config();
     let forwarded = forward_chutes(&rendered, "/v1/chat/completions?x=1", &[]);
@@ -1601,6 +1726,67 @@ fn chutes_only_a_single_ordinary_marker_of_exactly_one_goes_direct() {
         let forwarded = forward_chutes(&rendered, "/v1/chat/completions", &headers);
         assert_eq!(forwarded.cluster, "chutes_verify_proxy", "{markers:?}");
         assert!(forwarded_header(&forwarded, "x-gm-ordinary").is_none());
+    }
+}
+
+#[test]
+fn chutes_ambiguous_ordinary_markers_cannot_match_the_direct_route() {
+    let rendered = chutes_config();
+    let selector = "zai-org/GLM-5.2-TEE";
+    for markers in [
+        vec![("x-gm-ordinary", "1"), ("x-gm-ordinary", "1")],
+        vec![("x-gm-ordinary", "1"), ("x-gm-ordinary", "0")],
+        vec![("x-gm-ordinary", "0"), ("X-GM-Ordinary", "1")],
+        vec![("x-gm-ordinary", ""), ("x-gm-ordinary", "1")],
+        vec![("x-gm-ordinary", "1"), ("x-gm-ordinary", "")],
+        vec![("x-gm-ordinary", "1,0")],
+        vec![("x-gm-ordinary", "0")],
+        vec![("x-gm-ordinary", "true")],
+    ] {
+        let mut headers = vec![
+            (":path", "/v1/chat/completions"),
+            ("x-gm-provider", "chutes"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-gm-upstream-model", selector),
+        ];
+        headers.extend(markers.iter().copied());
+        let lua = run_request(
+            &rendered,
+            &headers,
+            &[
+                ("CHUTES_API_KEY", "chutes-key"),
+                ("GM_CHUTES_KEY_SLOT_1", "chutes-key"),
+            ],
+        );
+        let after_lua = lua
+            .globals()
+            .get::<mlua::Table>("input_headers")
+            .expect("headers after Lua");
+        assert!(
+            after_lua
+                .get::<Option<mlua::Value>>("x-gm-ordinary")
+                .expect("ordinary marker")
+                .is_none(),
+            "{markers:?}: a repeated value could match an ordinary route"
+        );
+        assert_eq!(
+            after_lua
+                .get::<String>("x-gm-upstream-model")
+                .expect("selector"),
+            selector
+        );
+        assert_eq!(
+            after_lua.get::<String>("authorization").expect("auth"),
+            "Bearer chutes-key"
+        );
+        assert_eq!(
+            lua.globals()
+                .get::<mlua::Table>("route_metadata")
+                .expect("route metadata")
+                .get::<Option<bool>>("chutes_verifier")
+                .expect("verifier marker"),
+            Some(true)
+        );
     }
 }
 
