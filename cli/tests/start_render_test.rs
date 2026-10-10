@@ -1307,12 +1307,13 @@ fn deepinfra_native_inference_preserves_path_and_disables_replay() {
 }
 
 #[test]
-fn video_creation_strips_retry_headers() {
+fn video_posts_strip_retry_headers_on_every_video_route() {
     let (status, _, stderr, rendered) = render_envoy([
         ("DEEPINFRA_API_KEY", "di-key"),
         ("KUBETEE_API_KEY", "kt-key"),
     ]);
     assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
     let retry_headers = [
         "x-envoy-retry-on",
         "x-envoy-retry-grpc-on",
@@ -1325,40 +1326,48 @@ fn video_creation_strips_retry_headers() {
     ] {
         let slot = gm_miner_cli::slots::derive_slot_id(provider, key, "test-node-secret-0001")
             .expect("video provider slot");
-        let lua = run_request(
-            &rendered,
-            &[
-                (":method", "POST"),
-                (":path", "/v1/videos?client=test"),
-                ("x-gm-provider", provider),
-                ("x-gm-node-key", "test-node-secret-0001"),
-                ("x-gm-upstream-slot", &slot),
-                ("x-envoy-retry-on", "5xx"),
-                ("x-envoy-retry-grpc-on", "unavailable"),
-                ("x-envoy-max-retries", "4"),
-                ("x-envoy-hedge-on-per-try-timeout", "true"),
-            ],
-            &[(env_name, key)],
-        );
-        assert_eq!(
-            lua.globals()
-                .get::<Option<String>>("response_status")
-                .expect("status"),
-            None,
-            "{provider} request should reach its route"
-        );
-        let headers = lua
-            .globals()
-            .get::<mlua::Table>("input_headers")
-            .expect("headers");
-        for name in retry_headers {
-            assert!(
-                headers
-                    .get::<Option<String>>(name)
-                    .expect("retry header")
-                    .is_none(),
-                "{provider} retained {name}"
+        for path in [
+            "/v1/videos?client=test",
+            "/v1/videos/?client=test",
+            "/v1/videos/video-id/remix?client=test",
+        ] {
+            let selected = route(&parsed, provider, path);
+            assert_eq!(selected["route"]["cluster"], provider, "{path}");
+            let lua = run_request(
+                &rendered,
+                &[
+                    (":method", "POST"),
+                    (":path", path),
+                    ("x-gm-provider", provider),
+                    ("x-gm-node-key", "test-node-secret-0001"),
+                    ("x-gm-upstream-slot", &slot),
+                    ("x-envoy-retry-on", "5xx"),
+                    ("x-envoy-retry-grpc-on", "unavailable"),
+                    ("x-envoy-max-retries", "4"),
+                    ("x-envoy-hedge-on-per-try-timeout", "true"),
+                ],
+                &[(env_name, key)],
             );
+            assert_eq!(
+                lua.globals()
+                    .get::<Option<String>>("response_status")
+                    .expect("status"),
+                None,
+                "{provider} {path} request should reach its route"
+            );
+            let headers = lua
+                .globals()
+                .get::<mlua::Table>("input_headers")
+                .expect("headers");
+            for name in retry_headers {
+                assert!(
+                    headers
+                        .get::<Option<String>>(name)
+                        .expect("retry header")
+                        .is_none(),
+                    "{provider} {path} retained {name}"
+                );
+            }
         }
     }
 }

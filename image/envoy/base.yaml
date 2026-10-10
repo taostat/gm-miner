@@ -414,7 +414,7 @@ static_resources:
                             if provider ~= "deepinfra" and provider ~= "kubetee" then
                               return false
                             end
-                            if bare == "/v1/videos" then
+                            if bare == "/v1/videos" or bare:sub(1, 11) == "/v1/videos/" then
                               return headers:get(":method") == "POST"
                             end
                             if provider == "deepinfra" then

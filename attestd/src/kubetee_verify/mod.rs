@@ -216,8 +216,8 @@ impl KubeteeVerifier {
         Ok(Response::from_parts(parts, Body::new(body)))
     }
 
-    /// The upstream model list, narrowed to [`TARGETS`] and [`IMAGE_MODELS`], fetched on an
-    /// attested connection.
+    /// The upstream model list, narrowed to [`TARGETS`], [`IMAGE_MODELS`] and
+    /// [`VIDEO_MODELS`], fetched on an attested connection.
     ///
     /// # Errors
     ///
