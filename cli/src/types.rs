@@ -136,15 +136,6 @@ pub struct Product {
 }
 
 impl Product {
-    /// The registry's capability block is the only signal that a product
-    /// generates images; model names are not.
-    #[must_use]
-    pub fn generates_images(&self) -> bool {
-        self.capabilities
-            .as_ref()
-            .is_some_and(ProductCapabilities::generates_images)
-    }
-
     /// Image and video generation products are excluded from chat-only probes.
     #[must_use]
     pub fn has_no_chat_surface(&self) -> bool {

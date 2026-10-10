@@ -1464,7 +1464,7 @@ mod tests {
             "retail_price": {"dimensions": {"input_per_mtok_ndollars": 1, "output_per_mtok_ndollars": 2}},
         }))
         .expect("older registry row");
-        assert!(!product.generates_images());
+        assert!(!product.has_no_chat_surface());
     }
 
     #[test]
