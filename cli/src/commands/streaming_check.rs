@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{bail, Context as _, Result};
 use gm_miner_cli::{
-    client::{build_data_plane_probe_client, build_http_client, RegistryClient, ME_PATH},
+    client::{
+        build_data_plane_probe_client, build_http_client, RegistryClient, ME_PATH,
+        VIDEO_JOBS_HEADER,
+    },
     cloud_policy::normalize_bedrock_upstream_model,
     config::{Config, ProviderKeys, WorkerRecord},
     types::{
@@ -181,88 +184,114 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
     let providers = providers_for_target(&configured, target);
 
     let declared = fetch_declared_offers(cfg).await;
-    if target.provider_models.is_none() {
-        if let Some(declared) = declared.as_ref() {
-            for provider in offered_providers_missing_local(declared, &configured) {
-                println!(
-                    "  [--] {provider}: registry has offered routes but no local key is configured; supply was not probed"
-                );
-            }
-        }
-    }
-
+    warn_missing_provider_keys(target, &configured, declared.as_ref());
     if providers.is_empty() {
-        if target.provider_models.is_some() {
-            println!(
-                "  [--] selected worker has no verified provider/model coverage; supply probe is inconclusive"
-            );
-        } else if configured.is_empty() {
-            println!("  [--] no configured providers to check; run `gmcli set-api-keys` first");
-        } else {
-            println!("  [--] selected worker advertises no locally configured provider slots");
-        }
+        report_empty_provider_coverage(target, &configured);
         return;
     }
-
     if declared.is_none() {
-        for provider in sourcing_providers() {
-            if providers.contains(&provider) {
-                println!(
-                    "  [--] {provider}: could not read declared offers; probing fallback only (offered-route coverage unknown)"
-                );
-            }
-        }
+        warn_unreadable_declarations(&providers);
     }
 
     let empty_declared = std::collections::HashMap::new();
     let catalog = fetch_catalog(cfg).await;
     let canonical = canonical_models(&catalog, &providers);
     let routes = fetch_routes(cfg).await;
-    let excluded = image_probe_exclusions(&catalog, &routes);
+    let excluded = non_chat_probe_exclusions(&catalog, &routes);
     let model_catalog = resolve_probe_models(
         &providers,
         &canonical,
         declared.as_ref().unwrap_or(&empty_declared),
     );
     for provider in providers {
-        let Some(models) =
-            models_for_target(target, &provider, model_catalog.models_for(&provider))
-        else {
+        check_provider_streaming(target, provider, &model_catalog, &excluded).await;
+    }
+}
+
+fn warn_missing_provider_keys(
+    target: &StreamingTarget,
+    configured: &[Provider],
+    declared: Option<&HashMap<(Provider, String), DeclaredOffer>>,
+) {
+    if target.provider_models.is_some() {
+        return;
+    }
+    if let Some(declared) = declared {
+        for provider in offered_providers_missing_local(declared, configured) {
             println!(
-                "  [--] {provider}: selected worker's exact model coverage or declared upstream deployment is unknown; supply probe is inconclusive"
+                "  [--] {provider}: registry has offered routes but no local key is configured; \
+                 supply was not probed"
+            );
+        }
+    }
+}
+
+fn report_empty_provider_coverage(target: &StreamingTarget, configured: &[Provider]) {
+    if target.provider_models.is_some() {
+        println!(
+            "  [--] selected worker has no verified provider/model coverage; \
+             supply probe is inconclusive"
+        );
+    } else if configured.is_empty() {
+        println!("  [--] no configured providers to check; run `gmcli set-api-keys` first");
+    } else {
+        println!("  [--] selected worker advertises no locally configured provider slots");
+    }
+}
+
+fn warn_unreadable_declarations(providers: &[Provider]) {
+    for provider in sourcing_providers() {
+        if providers.contains(&provider) {
+            println!(
+                "  [--] {provider}: could not read declared offers; \
+                 probing fallback only (offered-route coverage unknown)"
+            );
+        }
+    }
+}
+
+async fn check_provider_streaming(
+    target: &StreamingTarget,
+    provider: Provider,
+    model_catalog: &ProbeModels,
+    excluded: &BTreeSet<(String, String)>,
+) {
+    let Some(models) = models_for_target(target, &provider, model_catalog.models_for(&provider))
+    else {
+        println!(
+            "  [--] {provider}: selected worker's exact model coverage or declared upstream \
+             deployment is unknown; supply probe is inconclusive"
+        );
+        return;
+    };
+    if models.is_empty() {
+        if let Some(backend) = target.worker_backends.get(&provider) {
+            println!(
+                "  [--] {provider}: selected worker's {backend} model binding is \
+                 unavailable/unverified; no streaming probe sent"
+            );
+        } else {
+            println!(
+                "  [--] {provider}: no probe model overlaps the selected worker's verified \
+                 coverage; supply probe is inconclusive"
+            );
+        }
+        return;
+    }
+    for selected in models {
+        if excluded.contains(&(
+            provider.as_str().to_owned(),
+            selected.model.canonical.clone(),
+        )) {
+            println!(
+                "  [--] {provider}/{}: generation product skipped by streaming self-test",
+                selected.model.canonical
             );
             continue;
-        };
-        if models.is_empty() {
-            if let Some(backend) = target.worker_backends.get(&provider) {
-                println!(
-                    "  [--] {provider}: selected worker's {backend} model binding is unavailable/unverified; no streaming probe sent"
-                );
-            } else {
-                println!(
-                    "  [--] {provider}: no probe model overlaps the selected worker's verified coverage; supply probe is inconclusive"
-                );
-            }
-            continue;
         }
-        for selected in models {
-            if excluded.contains(&(
-                provider.as_str().to_owned(),
-                selected.model.canonical.clone(),
-            )) {
-                // Image products are not OpenAI-compatible SSE models. Do not
-                // send a streaming probe to them: even a text-looking prompt
-                // could select image output and charge the miner's upstream.
-                println!(
-                    "  [--] {provider}/{}: image-generation SKU skipped by streaming self-test (no image request sent)",
-                    selected.model.canonical
-                );
-                continue;
-            }
-            let probe = build_probe(provider.clone(), &selected.model, selected.slot);
-            let result = run_provider_probe(target, &probe).await;
-            print_probe_result(&probe, result);
-        }
+        let probe = build_probe(provider.clone(), &selected.model, selected.slot);
+        let result = run_provider_probe(target, &probe).await;
+        print_probe_result(&probe, result);
     }
 }
 
@@ -651,7 +680,7 @@ async fn fetch_catalog(cfg: &Config) -> Vec<Product> {
     let Ok(client) = build_http_client() else {
         return Vec::new();
     };
-    match client.get(&url).send().await {
+    match client.get(&url).header(VIDEO_JOBS_HEADER, "1").send().await {
         Ok(resp) if resp.status().is_success() => resp
             .json::<ProductCatalogResponse>()
             .await
@@ -690,22 +719,16 @@ async fn fetch_routes(cfg: &Config) -> Vec<SourceProduct> {
 }
 
 /// Declared `(provider, model)` pairs the text-only probe must skip: every
-/// buyer product whose catalog capabilities publish image generation, and
+/// buyer product whose catalog capabilities publish image or video generation, and
 /// every source route that serves one. Source pairs are absent from
 /// `GET /products`, so the route is the only link to the capability block.
-///
-/// A registry outage yields an empty set and the probe still goes out, the
-/// same policy `catalog_outage_still_checks_every_declared_kubetee_route`
-/// pins: a text probe on an image product is a false FAIL line, never an
-/// image charge, while silencing every sourcing route would hide the outage
-/// the check exists to surface.
-fn image_probe_exclusions(
+fn non_chat_probe_exclusions(
     catalog: &[Product],
     routes: &[SourceProduct],
 ) -> BTreeSet<(String, String)> {
     let mut excluded: BTreeSet<_> = catalog
         .iter()
-        .filter(|product| product.generates_images())
+        .filter(|product| product.has_no_chat_surface())
         .map(|product| (product.provider.clone(), product.model.clone()))
         .collect();
     for route in routes {
@@ -1326,7 +1349,7 @@ mod tests {
                 "gemini-3.1-flash-image",
             ),
         ];
-        let excluded = image_probe_exclusions(&catalog, &routes);
+        let excluded = non_chat_probe_exclusions(&catalog, &routes);
         for (provider, model) in [
             ("near", "black-forest-labs/FLUX.2-klein-4B"),
             ("deepinfra", "black-forest-labs/FLUX-2-klein-4b"),
@@ -1352,6 +1375,87 @@ mod tests {
     }
 
     #[test]
+    fn video_products_and_their_sources_are_excluded_from_streaming_probes() {
+        let catalog = [
+            catalog_row(
+                "minimax",
+                "h3",
+                serde_json::json!({"video_generation": true}),
+            ),
+            catalog_row(
+                "google",
+                "veo-3.1-fast",
+                serde_json::json!({"api": "openai_videos"}),
+            ),
+            catalog_row(
+                "wan-ai",
+                "wan-2.6-t2v",
+                serde_json::json!({"video_generation": true, "api": "openai_videos"}),
+            ),
+            catalog_row("zai", "glm-5.3", Value::Null),
+        ];
+        let routes = [
+            route("kubetee", "minimax/h3", "minimax", "h3"),
+            route("deepinfra", "google/veo-3.1-fast", "google", "veo-3.1-fast"),
+            route("deepinfra", "Wan-AI/Wan2.6-T2V", "wan-ai", "wan-2.6-t2v"),
+            route("kubetee", "z-ai/glm-5.3", "zai", "glm-5.3"),
+        ];
+        let excluded = non_chat_probe_exclusions(&catalog, &routes);
+        let expected = [
+            ("minimax", "h3"),
+            ("google", "veo-3.1-fast"),
+            ("wan-ai", "wan-2.6-t2v"),
+            ("kubetee", "minimax/h3"),
+            ("deepinfra", "google/veo-3.1-fast"),
+            ("deepinfra", "Wan-AI/Wan2.6-T2V"),
+        ]
+        .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
+        .into_iter()
+        .collect();
+        assert_eq!(excluded, expected);
+    }
+
+    #[tokio::test]
+    async fn video_catalog_discovery_excludes_generation_sources_from_probes() {
+        use gm_miner_cli::config::NetworkEntry;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/products"))
+            .and(header("x-gm-video-jobs", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "products": [{
+                    "provider": "minimax", "model": "h3", "status": "active",
+                    "capabilities": {"api": "openai_videos", "video_generation": true},
+                    "retail_price": {"dimensions": {
+                        "input_per_mtok_ndollars": 0, "output_per_mtok_ndollars": 0,
+                        "output_per_video_second_ndollars": 80_000_000
+                    }}
+                }],
+                "generated_at": "2026-10-09T10:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+        let cfg = Config {
+            active_network: Some("testnet".to_owned()),
+            networks: HashMap::from([(
+                "testnet".to_owned(),
+                NetworkEntry {
+                    api_url: Some(server.uri()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let catalog = fetch_catalog(&cfg).await;
+        let routes = [route("kubetee", "minimax/h3", "minimax", "h3")];
+        let excluded = non_chat_probe_exclusions(&catalog, &routes);
+        assert!(excluded.contains(&("kubetee".to_owned(), "minimax/h3".to_owned())));
+    }
+
+    #[test]
     fn a_catalog_row_without_capabilities_still_decodes_as_a_text_product() {
         let product: Product = serde_json::from_value(serde_json::json!({
             "provider": "qwen",
@@ -1360,7 +1464,7 @@ mod tests {
             "retail_price": {"dimensions": {"input_per_mtok_ndollars": 1, "output_per_mtok_ndollars": 2}},
         }))
         .expect("older registry row");
-        assert!(!product.generates_images());
+        assert!(!product.has_no_chat_surface());
     }
 
     #[test]

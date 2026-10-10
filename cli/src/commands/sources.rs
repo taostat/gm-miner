@@ -106,7 +106,7 @@ pub(crate) async fn fetch_sources(client: &mut RegistryClient) -> Result<SourceL
 const SOURCE_HEADERS: [&str; 6] = [
     "ROUTE",
     "SERVES",
-    "BUYER RETAIL / MTOK",
+    "BUYER RETAIL",
     "YOU SERVE",
     "OFFERED",
     "ADMISSION",
@@ -232,21 +232,24 @@ fn admission_cell(source: &SourceProduct, config: Option<&Config>) -> String {
     }
 }
 
-/// The buyer product's retail anchors, plus a count of the dimensions it
-/// prices beyond them.
+/// The buyer product's video unit price, or its retail token anchors plus a
+/// count of the dimensions it prices beyond them.
 ///
 /// Settlement is on the buyer product's whole price vector, not just input and
 /// output, so a route whose buyer product prices a prompt cache has to say so —
 /// `gmcli declare-product` then prints every dimension in full.
 fn buyer_retail_cell(retail: &RetailDimensions) -> String {
+    if let Some(price) = retail.output_per_video_second_ndollars {
+        return format!("{} per video second", format_usd(price));
+    }
     let anchors = format!(
         "{} in / {} out",
         format_usd(retail.input_per_mtok_ndollars),
         format_usd(retail.output_per_mtok_ndollars),
     );
     match extra_dimension_count(retail) {
-        0 => anchors,
-        n => format!("{anchors} +{n}"),
+        0 => format!("{anchors} per Mtok"),
+        n => format!("{anchors} +{n} per Mtok"),
     }
 }
 
@@ -449,7 +452,10 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
-    use super::{fetch_sources, render_sources, render_sources_with_config, Network, SourceLookup};
+    use super::{
+        fetch_sources, render_sources, render_sources_with_config, route_row, Network,
+        SourceLookup, SourceProduct, SOURCE_HEADERS,
+    };
 
     fn sources(value: serde_json::Value) -> SourceLookup {
         SourceLookup::Routes(serde_json::from_value(value).expect("decode sourcing routes"))
@@ -615,6 +621,26 @@ mod tests {
             "{}",
             table.join("\n")
         );
+    }
+
+    #[test]
+    fn a_video_source_shows_its_per_second_retail_price() {
+        let source: SourceProduct = serde_json::from_value(serde_json::json!({
+            "provider": "deepinfra",
+            "model": "Wan-AI/Wan2.6-T2V",
+            "buyer_provider": "wan-ai",
+            "buyer_model": "wan-2.6-t2v",
+            "retail_price": {"dimensions": {
+                "input_per_mtok_ndollars": 0,
+                "output_per_mtok_ndollars": 0,
+                "output_per_video_second_ndollars": 190_000_000
+            }},
+            "capable_worker_count": 1,
+            "already_offered": true
+        }))
+        .expect("video source");
+        assert_eq!(route_row(&source, None)[2], "$0.190 per video second");
+        assert_eq!(SOURCE_HEADERS[2], "BUYER RETAIL");
     }
 
     #[test]

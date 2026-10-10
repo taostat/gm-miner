@@ -715,6 +715,28 @@ fn kubetee_chat_and_models_reach_only_the_measured_verifier() {
     assert_eq!(endpoint["port_value"], bind.port());
 }
 
+#[test]
+fn kubetee_video_routes_use_the_direct_cluster_without_retries() {
+    let (status, _, stderr, rendered) = render_envoy([("KUBETEE_API_KEY", "kt-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    for path in [
+        "/v1/videos",
+        "/v1/videos/video-id",
+        "/v1/videos/video-id/content?variant=video",
+    ] {
+        let selected = route(&parsed, "kubetee", path);
+        assert_eq!(selected["route"]["cluster"], "kubetee", "{path}");
+        assert_eq!(
+            selected["route"]["host_rewrite_literal"], "llm.kubetee.ai",
+            "{path}"
+        );
+        assert_eq!(selected["route"]["timeout"], "1800s", "{path}");
+        assert!(selected["route"].get("retry_policy").is_none(), "{path}");
+        assert!(selected["route"].get("regex_rewrite").is_none(), "{path}");
+    }
+}
+
 fn kubetee_request(rendered: &str, path: &str, selector: Option<&str>) -> Lua {
     let mut headers = vec![
         (":path", path),
@@ -1108,6 +1130,49 @@ fn deepinfra_keeps_http1_and_its_native_path_rewrite() {
 }
 
 #[test]
+fn deepinfra_video_routes_precede_the_openai_rewrite_catch_all() {
+    let (status, _, stderr, rendered) = render_envoy([("DEEPINFRA_API_KEY", "di-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    let routes = ingress(&parsed)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes");
+    let catch_all = routes
+        .iter()
+        .position(|route| {
+            route["match"]["prefix"] == "/" && route["route"].get("regex_rewrite").is_some()
+        })
+        .expect("OpenAI rewrite catch-all");
+    for path in [
+        "/v1/videos",
+        "/v1/videos/video-id",
+        "/v1/videos/video-id/content?variant=video",
+    ] {
+        let selected = route(&parsed, "deepinfra", path);
+        let selected_index = routes
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, selected))
+            .expect("selected route index");
+        assert!(selected_index < catch_all, "{path} follows the catch-all");
+        assert_eq!(selected["route"]["cluster"], "deepinfra", "{path}");
+        assert_eq!(
+            selected["route"]["host_rewrite_literal"], "api.deepinfra.com",
+            "{path}"
+        );
+        assert_eq!(selected["route"]["timeout"], "1800s", "{path}");
+        assert!(selected["route"].get("retry_policy").is_none(), "{path}");
+        assert!(selected["route"].get("regex_rewrite").is_none(), "{path}");
+        assert!(selected["route"].get("prefix_rewrite").is_none(), "{path}");
+    }
+
+    let models = route(&parsed, "deepinfra", "/v1/models");
+    assert_eq!(
+        models["route"]["regex_rewrite"]["substitution"],
+        r"/v1/openai/\1"
+    );
+}
+
+#[test]
 fn access_log_uses_only_authenticated_sanitized_correlation_metadata() {
     let rendered = cloud_config("openai");
     let parsed = config(&rendered);
@@ -1239,6 +1304,192 @@ fn deepinfra_native_inference_preserves_path_and_disables_replay() {
             }
         }
     }
+}
+
+#[test]
+fn video_posts_strip_retry_headers_on_every_video_route() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("DEEPINFRA_API_KEY", "di-key"),
+        ("KUBETEE_API_KEY", "kt-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    let retry_headers = [
+        "x-envoy-retry-on",
+        "x-envoy-retry-grpc-on",
+        "x-envoy-max-retries",
+        "x-envoy-hedge-on-per-try-timeout",
+    ];
+    for (provider, key, env_name) in [
+        ("deepinfra", "di-key", "GM_DEEPINFRA_KEY_SLOT_1"),
+        ("kubetee", "kt-key", "GM_KUBETEE_KEY_SLOT_1"),
+    ] {
+        let slot = gm_miner_cli::slots::derive_slot_id(provider, key, "test-node-secret-0001")
+            .expect("video provider slot");
+        for path in [
+            "/v1/videos?client=test",
+            "/v1/videos/?client=test",
+            "/v1/videos/video-id/remix?client=test",
+        ] {
+            let selected = route(&parsed, provider, path);
+            assert_eq!(selected["route"]["cluster"], provider, "{path}");
+            let lua = run_request(
+                &rendered,
+                &[
+                    (":method", "POST"),
+                    (":path", path),
+                    ("x-gm-provider", provider),
+                    ("x-gm-node-key", "test-node-secret-0001"),
+                    ("x-gm-upstream-slot", &slot),
+                    ("x-envoy-retry-on", "5xx"),
+                    ("x-envoy-retry-grpc-on", "unavailable"),
+                    ("x-envoy-max-retries", "4"),
+                    ("x-envoy-hedge-on-per-try-timeout", "true"),
+                ],
+                &[(env_name, key)],
+            );
+            assert_eq!(
+                lua.globals()
+                    .get::<Option<String>>("response_status")
+                    .expect("status"),
+                None,
+                "{provider} {path} request should reach its route"
+            );
+            let headers = lua
+                .globals()
+                .get::<mlua::Table>("input_headers")
+                .expect("headers");
+            for name in retry_headers {
+                assert!(
+                    headers
+                        .get::<Option<String>>(name)
+                        .expect("retry header")
+                        .is_none(),
+                    "{provider} {path} retained {name}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn video_requests_use_the_pinned_account_for_create_poll_and_content() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("DEEPINFRA_API_KEY", "first-key;second-key"),
+        ("KUBETEE_API_KEY", "first-key;second-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    for provider in ["deepinfra", "kubetee"] {
+        let slot =
+            gm_miner_cli::slots::derive_slot_id(provider, "second-key", "test-node-secret-0001")
+                .expect("second account slot");
+        for (method, path) in [
+            ("POST", "/v1/videos"),
+            ("GET", "/v1/videos/video-id"),
+            ("GET", "/v1/videos/video-id/content?variant=video"),
+        ] {
+            let lua = run_request(
+                &rendered,
+                &[
+                    (":method", method),
+                    (":path", path),
+                    ("x-gm-provider", provider),
+                    ("x-gm-node-key", "test-node-secret-0001"),
+                    ("x-gm-upstream-slot", &slot),
+                    ("authorization", "Bearer caller-key"),
+                    ("x-gm-upstream-model", "unused-selector"),
+                ],
+                &[
+                    ("GM_DEEPINFRA_KEY_SLOT_1", "first-key"),
+                    ("GM_DEEPINFRA_KEY_SLOT_2", "second-key"),
+                    ("GM_KUBETEE_KEY_SLOT_1", "first-key"),
+                    ("GM_KUBETEE_KEY_SLOT_2", "second-key"),
+                ],
+            );
+            assert_eq!(
+                lua.globals()
+                    .get::<Option<String>>("response_status")
+                    .expect("status"),
+                None
+            );
+            let headers = lua
+                .globals()
+                .get::<mlua::Table>("input_headers")
+                .expect("headers");
+            assert_eq!(
+                headers.get::<String>("authorization").expect("auth"),
+                "Bearer second-key"
+            );
+            for name in ["x-gm-node-key", "x-gm-upstream-slot", "x-gm-upstream-model"] {
+                assert_eq!(
+                    headers.get::<Option<String>>(name).expect("header"),
+                    None,
+                    "{name}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn video_requests_reject_unknown_or_unavailable_pinned_slots() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("DEEPINFRA_API_KEY", "first-key;second-key"),
+        ("KUBETEE_API_KEY", "first-key;second-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    for provider in ["deepinfra", "kubetee"] {
+        let missing_key_slot =
+            gm_miner_cli::slots::derive_slot_id(provider, "second-key", "test-node-secret-0001")
+                .expect("second account slot");
+        for slot in ["unknown-slot", &missing_key_slot] {
+            for (method, path) in [
+                ("POST", "/v1/videos"),
+                ("GET", "/v1/videos/video-id"),
+                ("GET", "/v1/videos/video-id/content?variant=video"),
+            ] {
+                assert_video_slot_unavailable(&rendered, provider, method, path, slot);
+            }
+        }
+    }
+}
+
+fn assert_video_slot_unavailable(
+    rendered: &str,
+    provider: &str,
+    method: &str,
+    path: &str,
+    slot: &str,
+) {
+    let lua = run_request(
+        rendered,
+        &[
+            (":method", method),
+            (":path", path),
+            ("x-gm-provider", provider),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-gm-upstream-slot", slot),
+        ],
+        &[
+            ("GM_DEEPINFRA_KEY_SLOT_1", "first-key"),
+            ("GM_KUBETEE_KEY_SLOT_1", "first-key"),
+        ],
+    );
+    assert_eq!(
+        lua.globals()
+            .get::<Option<String>>("response_status")
+            .expect("status")
+            .as_deref(),
+        Some("421"),
+        "{provider} must not select the default slot"
+    );
+    let body: Value = serde_json::from_str(
+        &lua.globals()
+            .get::<String>("response_body_text")
+            .expect("response body"),
+    )
+    .expect("JSON error");
+    assert_eq!(body["error"]["type"], "gm_slot_unavailable");
 }
 
 /// The route Envoy selects for a request: the first whose path and every

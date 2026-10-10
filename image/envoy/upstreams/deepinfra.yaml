@@ -16,6 +16,28 @@ routes:
       host_rewrite_literal: api.deepinfra.com
       timeout: 1800s
 
+  ## Video requests must bypass the /v1/openai path rewrite.
+  - match:
+      path: "/v1/videos"
+      headers:
+        - name: "x-gm-provider"
+          string_match:
+            exact: "deepinfra"
+    route:
+      cluster: deepinfra
+      host_rewrite_literal: api.deepinfra.com
+      timeout: 1800s
+  - match:
+      prefix: "/v1/videos/"
+      headers:
+        - name: "x-gm-provider"
+          string_match:
+            exact: "deepinfra"
+    route:
+      cluster: deepinfra
+      host_rewrite_literal: api.deepinfra.com
+      timeout: 1800s
+
   ##  DeepInfra's OpenAI-compatible surface lives under
   ##  /v1/openai (not /v1), so the inbound /v1/... path is
   ##  rewritten to /v1/openai/... before it leaves.

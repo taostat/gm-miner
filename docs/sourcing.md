@@ -40,6 +40,8 @@ explains the table and how to set each upstream up.
 | `qwen/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
 | `qwen/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
 | `openai/gpt-oss-20b` | `deepinfra/openai/gpt-oss-20b` | `api.deepinfra.com` | `--deepinfra` |
+| `google/veo-3.1-fast` | `deepinfra/google/veo-3.1-fast` | `api.deepinfra.com` | `--deepinfra` |
+| `wan-ai/wan-2.6-t2v` | `deepinfra/Wan-AI/Wan2.6-T2V` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4.1-flash` | `engy/deepseek-v4.1-flash` | `api.engy.ai` | `--engy` |
@@ -51,6 +53,7 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.2-tee` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-flash-tee` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-tee` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
+| `minimax/h3` | `kubetee/minimax/h3` | `llm.kubetee.ai` | `--kubetee` |
 | `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | retired by KubeTEE | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | retired by KubeTEE (2026-09-24) | `--kubetee` |
@@ -75,6 +78,11 @@ they are dispatch targets, not products a buyer can request by name. The
 `gmcli sources` uses `GET /miners/products/routes` and lists every explicit
 route, including self routes. It falls back to the older cross-product-only
 endpoint while reporting a registry that predates the complete route catalog.
+
+Video routes serve ordinary supply and require a worker image with `video-jobs-v1`.
+Wan 2.6 serves 1920x1080 video; Veo 3.1-fast serves eight-second 1280x720 video.
+Video suppliers may charge the miner when a job is accepted. If an accepted
+job later fails, the buyer is not charged and the miner carries any upstream job cost.
 
 ### FLUX.2 Klein image generation
 

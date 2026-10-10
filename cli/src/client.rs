@@ -13,6 +13,22 @@ use serde_json::Value;
 
 use crate::config::Config;
 
+pub const VIDEO_JOBS_HEADER: &str = "x-gm-video-jobs";
+
+fn advertise_capabilities(
+    request: reqwest::RequestBuilder,
+    method: &Method,
+    path: &str,
+) -> reqwest::RequestBuilder {
+    match (method, path) {
+        (&Method::GET, "/products") => request.header(VIDEO_JOBS_HEADER, "1"),
+        (&Method::POST, "/miners/products") => {
+            request.header(PRICE_INCREASE_SCHEDULING_HEADER, "1")
+        }
+        _ => request,
+    }
+}
+
 /// Auth configuration returned by `GET /auth/config`.
 ///
 /// The CLI fetches this before running the device-code flow so all OAuth
@@ -210,10 +226,7 @@ impl RegistryClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        if method == Method::POST && path == "/miners/products" {
-            request = request.header(PRICE_INCREASE_SCHEDULING_HEADER, "1");
-        }
-        let response = request
+        let response = advertise_capabilities(request, &method, path)
             .send()
             .await
             .with_context(|| format!("{method} {url}"))?;

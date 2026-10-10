@@ -241,6 +241,13 @@ static_resources:
                             headers:remove("api-key")
                           end
 
+                          local function strip_retry_headers(headers)
+                            headers:remove("x-envoy-retry-on")
+                            headers:remove("x-envoy-retry-grpc-on")
+                            headers:remove("x-envoy-max-retries")
+                            headers:remove("x-envoy-hedge-on-per-try-timeout")
+                          end
+
                           local function strip_internal_headers(headers, provider)
                             -- Envoy forbids header mutation during iteration. Keep the
                             -- route discriminator until route actions remove it,
@@ -382,102 +389,100 @@ static_resources:
                             return true
                           end
 
+                          local function node_key_accepted(handle, headers)
+                            if expected ~= "" and headers:get("x-gm-node-key") ~= expected then
+                              reject(handle, "401", "missing or invalid x-gm-node-key")
+                              return false
+                            end
+                            return true
+                          end
+
+                          -- Access logs need correlation after header cleanup, but may only
+                          -- retain authenticated, non-secret values from the caller.
+                          local function record_access_metadata(handle, headers)
+                            local metadata = handle:streamInfo():dynamicMetadata()
+                            metadata:set("gm.access_log", "request_id",
+                              headers:get("x-gm-request-id") or "")
+                            metadata:set("gm.access_log", "product",
+                              headers:get("x-gm-product") or "")
+                            metadata:set("gm.access_log", "provider",
+                              headers:get("x-gm-provider") or "")
+                            metadata:set("gm.access_log", "authenticated", true)
+                          end
+
+                          local function non_replayable_request(headers, provider, bare)
+                            if provider ~= "deepinfra" and provider ~= "kubetee" then
+                              return false
+                            end
+                            if bare == "/v1/videos" or bare:sub(1, 11) == "/v1/videos/" then
+                              return headers:get(":method") == "POST"
+                            end
+                            if provider == "deepinfra" then
+                              return bare:sub(1, 14) == "/v1/inference/"
+                            end
+                            return bare == "/v1/images/generations"
+                          end
+
+                          -- These selectors must agree with each verifier's closed model list.
+                          local verified_models = {
+                            near = {
+                              ["Qwen/Qwen3.8-27B"] = true,
+                              ["black-forest-labs/FLUX.2-klein-4B"] = true,
+                            },
+                            kubetee = {
+                              ["z-ai/glm-5.2"] = true,
+                              ["z-ai/glm-5.3"] = true,
+                              ["z-ai/glm-5.3-flash"] = true,
+                              ["deepseek/deepseek-v4.1-flash"] = true,
+                              ["ornith/ornith-1.5-397b"] = true,
+                              ["xiaomi/mimo-v2.6-pro"] = true,
+                            },
+                          }
+
+                          local function verified_selector_accepted(handle, headers, provider)
+                            local model = headers:get("x-gm-upstream-model")
+                            if verified_models[provider][model] then
+                              return true
+                            end
+                            local names = {near = "NEAR", kubetee = "KubeTEE"}
+                            reject(handle, "400",
+                              "missing or unsupported " .. names[provider] .. " source model")
+                            return false
+                          end
+
+                          local function upstream_selector_accepted(handle, headers, provider, bare)
+                            if provider == "chutes" then
+                              return chutes_selector_accepted(handle, headers, bare)
+                            end
+                            local needs_verified_selector = provider == "near"
+                              and bare ~= "/v1/models"
+                              or provider == "kubetee" and bare == "/v1/chat/completions"
+                            if needs_verified_selector then
+                              return verified_selector_accepted(handle, headers, provider)
+                            end
+                            headers:remove("x-gm-upstream-model")
+                            return true
+                          end
+
                           function envoy_on_request(handle)
-                            -- The attestation surface is public by
-                            -- contract: the registry's control loop
-                            -- probes GET /attestation/info WITHOUT the
-                            -- node secret, and auditors curl it. Skip
-                            -- the inbound node-secret check for that
-                            -- path; every other path on the data plane
-                            -- still requires x-gm-node-key. The :path
-                            -- pseudo-header carries the query string
-                            -- (?nonce=...), so strip it before matching.
                             local headers = handle:headers()
                             local path = headers:get(":path") or ""
                             local bare = path:match("^[^?]*")
+                            -- Registry probes and auditors read attestation without a node key.
                             if bare == "/attestation/info" then
                               return
                             end
-                            if expected ~= "" then
-                              local presented = headers:get("x-gm-node-key")
-                              if presented ~= expected then
-                                handle:respond(
-                                  {[":status"] = "401",
-                                   ["content-type"] = "application/json"},
-                                  "{\"error\":\"missing or invalid x-gm-node-key\"}")
-                                return
-                              end
-                            end
-                            -- Header cleanup removes gm metadata before the
-                            -- upstream request leaves the CVM. Only after the
-                            -- node key has authenticated the caller, snapshot
-                            -- the three non-secret correlation values into
-                            -- stream-local metadata so teardown can still join
-                            -- this record to the gateway. Never copy node keys,
-                            -- provider auth, paths, or bodies. The authenticated
-                            -- marker lets auditors reject pre-auth local replies.
-                            local access_metadata = handle:streamInfo():dynamicMetadata()
-                            access_metadata:set(
-                              "gm.access_log", "request_id",
-                              headers:get("x-gm-request-id") or "")
-                            access_metadata:set(
-                              "gm.access_log", "product",
-                              headers:get("x-gm-product") or "")
-                            access_metadata:set(
-                              "gm.access_log", "provider",
-                              headers:get("x-gm-provider") or "")
-                            access_metadata:set(
-                              "gm.access_log", "authenticated", true)
-                            strip_inbound_auth(headers)
-                            local provider = headers:get("x-gm-provider")
-                            if provider == "deepinfra" and bare:sub(1, 14) == "/v1/inference/" then
-                              headers:remove("x-envoy-retry-on")
-                              headers:remove("x-envoy-retry-grpc-on")
-                              headers:remove("x-envoy-max-retries")
-                              headers:remove("x-envoy-hedge-on-per-try-timeout")
-                            end
-                            if provider == "kubetee" and bare == "/v1/images/generations" then
-                              headers:remove("x-envoy-retry-on")
-                              headers:remove("x-envoy-retry-grpc-on")
-                              headers:remove("x-envoy-max-retries")
-                              headers:remove("x-envoy-hedge-on-per-try-timeout")
-                            end
-                            local kubetee_chat = provider == "kubetee"
-                              and bare == "/v1/chat/completions"
-                            if (provider ~= "near" and provider ~= "chutes" and not kubetee_chat)
-                              or (provider == "near" and bare == "/v1/models") then
-                              headers:remove("x-gm-upstream-model")
-                            end
-                            if provider == "chutes" and not chutes_selector_accepted(handle, headers, bare) then
+                            if not node_key_accepted(handle, headers) then
                               return
                             end
-                            if provider == "near" and bare ~= "/v1/models" then
-                              local model = headers:get("x-gm-upstream-model")
-                              if model ~= "Qwen/Qwen3.8-27B"
-                                and model ~= "black-forest-labs/FLUX.2-klein-4B" then
-                                handle:respond(
-                                  {[":status"] = "400",
-                                   ["content-type"] = "application/json"},
-                                  "{\"error\":\"missing or unsupported NEAR source model\"}")
-                                return
-                              end
+                            record_access_metadata(handle, headers)
+                            strip_inbound_auth(headers)
+                            local provider = headers:get("x-gm-provider")
+                            if non_replayable_request(headers, provider, bare) then
+                              strip_retry_headers(headers)
                             end
-                            -- The closed list gm-kubetee-verify-proxy attests
-                            -- (attestd/src/kubetee_verify/mod.rs TARGETS).
-                            if kubetee_chat then
-                              local model = headers:get("x-gm-upstream-model")
-                              if model ~= "z-ai/glm-5.2"
-                                and model ~= "z-ai/glm-5.3"
-                                and model ~= "z-ai/glm-5.3-flash"
-                                and model ~= "deepseek/deepseek-v4.1-flash"
-                                and model ~= "ornith/ornith-1.5-397b"
-                                and model ~= "xiaomi/mimo-v2.6-pro" then
-                                handle:respond(
-                                  {[":status"] = "400",
-                                   ["content-type"] = "application/json"},
-                                  "{\"error\":\"missing or unsupported KubeTEE source model\"}")
-                                return
-                              end
+                            if not upstream_selector_accepted(handle, headers, provider, bare) then
+                              return
                             end
                             if not select_upstream_slot(handle, headers, provider) then
                               return
