@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::header::HOST;
 use axum::http::{Method, Request, Response, StatusCode, Uri};
 use dcap_qvl::collateral::CollateralClient;
@@ -314,18 +314,7 @@ impl NearVerifier {
             .header(HOST, target.host)
             .body(Body::empty())
             .context("build NEAR attestation request")?;
-        let response = timeout(ATTESTATION_TIMEOUT, sender.send_request(request))
-            .await
-            .context("NEAR attestation request timed out")?
-            .context("send NEAR attestation request")?;
-        if response.status() != StatusCode::OK {
-            bail!("NEAR attestation endpoint returned {}", response.status());
-        }
-        let body = Limited::new(response.into_body(), ATTESTATION_LIMIT)
-            .collect()
-            .await
-            .map_err(|error| anyhow::anyhow!("read NEAR attestation response: {error}"))?
-            .to_bytes();
+        let body = fetch_attestation(sender, request).await?;
         let attestation: NearAttestation =
             serde_json::from_slice(&body).context("decode NEAR attestation response")?;
         let raw_quote = hex::decode(&attestation.intel_quote).context("decode NEAR TDX quote")?;
@@ -365,6 +354,30 @@ impl NearVerifier {
             .context("decode NVIDIA NRAS verdict")?;
         verify_nras_response(&response)
     }
+}
+
+async fn fetch_attestation(
+    sender: &mut SendRequest<Body>,
+    request: Request<Body>,
+) -> Result<Bytes> {
+    // One deadline covers the complete HTTP response. Receiving headers or
+    // another body chunk must not reset the attestation budget.
+    timeout(ATTESTATION_TIMEOUT, async {
+        let response = sender
+            .send_request(request)
+            .await
+            .context("send NEAR attestation request")?;
+        if response.status() != StatusCode::OK {
+            bail!("NEAR attestation endpoint returned {}", response.status());
+        }
+        Ok(Limited::new(response.into_body(), ATTESTATION_LIMIT)
+            .collect()
+            .await
+            .map_err(|error| anyhow::anyhow!("read NEAR attestation response: {error}"))?
+            .to_bytes())
+    })
+    .await
+    .context("NEAR attestation request timed out")?
 }
 
 fn verify_nras_response(response: &Value) -> Result<()> {
@@ -791,5 +804,121 @@ mod tests {
                 .count(),
             upstream_proxy::ATTESTATION_ATTEMPTS
         );
+    }
+
+    // Exercise real HTTP headers and a split body while Tokio advances time.
+    async fn attestation_response(
+        header_delay: Duration,
+        body_delay: Duration,
+        status: StatusCode,
+        tail: Bytes,
+    ) -> Result<Bytes> {
+        use futures_util::{stream, StreamExt as _};
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let service = service_fn(move |_request: Request<hyper::body::Incoming>| {
+            let tail = tail.clone();
+            async move {
+                tokio::time::sleep(header_delay).await;
+                let chunks = stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"{")) })
+                    .chain(stream::once(async move {
+                        tokio::time::sleep(body_delay).await;
+                        Ok::<_, Infallible>(tail)
+                    }));
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .body(Body::from_stream(chunks))
+                        .unwrap(),
+                )
+            }
+        });
+        let server = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server), service)
+                .await
+        });
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        let request = Request::builder()
+            .uri("/v1/attestation/report")
+            .header(HOST, TARGETS[0].host)
+            .body(Body::empty())
+            .unwrap();
+        // Bound the test itself so the original unbounded body read fails
+        // promptly, rather than hanging the suite.
+        let result = timeout(
+            Duration::from_secs(121),
+            fetch_attestation(&mut sender, request),
+        )
+        .await;
+        connection.abort();
+        server.abort();
+        result.context("test watchdog expired before attestation deadline")?
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attestation_deadline_covers_headers_and_partial_body_together() {
+        // Missing headers, stalled partial body, and individually short phases
+        // whose combined duration exceeds 120 seconds must all time out.
+        for (header_secs, body_secs) in [(121, 0), (0, 121), (90, 31)] {
+            let started = tokio::time::Instant::now();
+            let error = attestation_response(
+                Duration::from_secs(header_secs),
+                Duration::from_secs(body_secs),
+                StatusCode::OK,
+                Bytes::from_static(b"}"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), "NEAR attestation request timed out");
+            assert_eq!(started.elapsed(), Duration::from_secs(120));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attestation_collects_split_body_within_shared_deadline() {
+        let body = attestation_response(
+            Duration::from_secs(90),
+            Duration::from_secs(20),
+            StatusCode::OK,
+            Bytes::from_static(b"\"ok\":true}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, "{\"ok\":true}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attestation_rejects_error_status_without_waiting_for_body() {
+        let error = attestation_response(
+            Duration::ZERO,
+            Duration::from_secs(121),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Bytes::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("attestation endpoint returned 503"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attestation_response_still_has_a_size_limit() {
+        let error = attestation_response(
+            Duration::ZERO,
+            Duration::ZERO,
+            StatusCode::OK,
+            Bytes::from(vec![b' '; ATTESTATION_LIMIT]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("read NEAR attestation response"));
     }
 }
