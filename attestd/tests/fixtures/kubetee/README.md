@@ -12,3 +12,8 @@
 `test_ca.der`, `test_leaf.der` and `test_leaf_key.pk8` are a throwaway PKI for
 the tests' local TLS upstream: a root trusted only by those tests and an RSA
 leaf for `llm.kubetee.ai` it signed. The key protects nothing.
+
+The recorded response proves the platform checks at the fixture time, not an
+approved workload/model identity or quote-bound serving key. Production
+admission rejects it. Transport tests explicitly inject platform checks to
+exercise connection pooling and streaming without treating it as authorization.

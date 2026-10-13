@@ -2,7 +2,7 @@
 //! it: the DCAP appraisal, the nonce binding, the event log replay and the
 //! TLS-possession proof.
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use dcap_qvl::policy::QuoteClaims;
@@ -18,6 +18,8 @@ use crate::eventlog::{self, Register};
 use crate::tee_evidence;
 
 const SIGNATURE_ALGORITHM: &str = "RS256";
+pub(super) const ADMISSION_DISABLED: &str =
+    "KubeTEE forwarding disabled: no approved workload/model policy or quote-bound serving key";
 
 /// The `GET /v1/attestation` response body.
 #[derive(Debug, Deserialize)]
@@ -56,17 +58,31 @@ impl Measurements {
     }
 }
 
-/// Check a verified attestation against the nonce this proxy
-/// sent and the certificate of the connection it arrived on.
+/// Appraise platform evidence, then authorize the serving workload.
 ///
 /// `claims` must come from Intel's chain of trust for `payload.quote`.
 ///
 /// # Errors
 ///
-/// Returns an error naming the first check that fails: the echoed nonce,
-/// the DCAP appraisal, the nonce binding in `report_data`, the event log
-/// replay, or the TLS-possession proof.
+/// Always fails closed: no independently approved workload/model policy or
+/// quote-bound serving key is available for the current provider protocol.
 pub fn verify_attestation(
+    payload: &AttestationPayload,
+    nonce: &str,
+    leaf: &[u8],
+    claims: &QuoteClaims,
+    now: u64,
+) -> Result<Measurements> {
+    verify_platform_evidence(payload, nonce, leaf, claims, now)?;
+    // A self-consistent event log and a separate nonce signature cannot
+    // authorize a workload or prove that it owns the serving TLS key.
+    bail!(ADMISSION_DISABLED)
+}
+
+/// Check evidence consistency using claims already verified against Intel's
+/// signature chain for `payload.quote`. This does not authorize a workload or
+/// model, or establish that the quoted workload owns the serving TLS key.
+pub(super) fn verify_platform_evidence(
     payload: &AttestationPayload,
     nonce: &str,
     leaf: &[u8],
