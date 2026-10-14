@@ -32,9 +32,7 @@ routes:
       cluster: chutes
       host_rewrite_literal: llm.chutes.ai
       timeout: 1800s
-      retry_policy:
-        retry_on: "reset,connect-failure,refused-stream,5xx"
-        num_retries: 1
+      ## Paid inference can complete before a reset or 5xx: never replay it.
   - match:
       prefix: "/"
       headers:
