@@ -34,6 +34,7 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.1-tee` | `chutes/zai-org/GLM-5.1-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2-tee` | `chutes/zai-org/GLM-5.2-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
+| `zai/glm-5.3` | `deepinfra/zai-org/GLM-5.3` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.3-flash` | `deepinfra/zai-org/GLM-5.3-Flash` | `api.deepinfra.com` | `--deepinfra` |
 | `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
 | `deepseek/deepseek-v4-flash-0731` | `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` | `api.deepinfra.com` | `--deepinfra` |
@@ -242,6 +243,7 @@ gmcli declare-product --provider engy --model glm-5.3 --discount-pct 5
 gmcli declare-product --provider engy --model glm-5.3-flash --discount-pct 5
 gmcli declare-product --provider engy --model ornith-1.5-397b --discount-pct 5
 gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5
+gmcli declare-product --provider deepinfra --model zai-org/GLM-5.3 --discount-pct 5
 gmcli declare-product --provider deepinfra --model zai-org/GLM-5.3-Flash --discount-pct 5
 gmcli declare-product --provider deepinfra --model moonshotai/Kimi-K3 --discount-pct 5
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash-0731 --discount-pct 5
@@ -448,3 +450,22 @@ not change GM retail or settlement. At a 30% miner discount the promotional
 cost leaves 28.6% gross margin before operating costs; undiscounted supplier
 rates would lose money at that discount. Recheck the promotion or negotiated
 rates before declaring an offer and when supplier prices change.
+
+### DeepInfra GLM-5.3
+
+The `deepinfra/zai-org/GLM-5.3` route serves ordinary `zai/glm-5.3`, not its
+confidential sibling. This is a text-only model with function calling and JSON
+output, FP4 weights and a published 1,048,576-token context. The host output
+cap is unpublished. DeepInfra documents `reasoning_effort` as `low`, `high` or
+`max` (default `max`) and a `clear_thinking` option. Authenticated checks must
+cover those controls, streaming, tool calls, model identity and usage before
+activating supply; catalog metadata alone does not prove their compatibility.
+
+[DeepInfra's model page](https://deepinfra.com/zai-org/GLM-5.3) and public model
+metadata, reviewed 2026-10-15, list promotional supplier rates of $0.5625 input,
+$2.50 output and $0.125 cached input per million tokens. Undiscounted rates are
+$0.90/$4.00/$0.20. Buyer retail remains $1.40/$4.40/$0.26. At a 30% miner
+discount, promotional per-dimension gross margins before operating costs are
+42.6% input, 18.8% output and 31.3% cached input; the combined margin depends on
+the workload. At undiscounted supplier rates the output and cache dimensions
+lose money at that discount, so recheck effective prices before offering it.
