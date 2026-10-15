@@ -34,6 +34,7 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.1-tee` | `chutes/zai-org/GLM-5.1-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2-tee` | `chutes/zai-org/GLM-5.2-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
+| `zai/glm-5.3-flash` | `deepinfra/zai-org/GLM-5.3-Flash` | `api.deepinfra.com` | `--deepinfra` |
 | `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
 | `deepseek/deepseek-v4-flash-0731` | `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` | `api.deepinfra.com` | `--deepinfra` |
 | `deepseek/deepseek-v4.1-flash` | `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash` | `api.deepinfra.com` | `--deepinfra` |
@@ -241,6 +242,7 @@ gmcli declare-product --provider engy --model glm-5.3 --discount-pct 5
 gmcli declare-product --provider engy --model glm-5.3-flash --discount-pct 5
 gmcli declare-product --provider engy --model ornith-1.5-397b --discount-pct 5
 gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5
+gmcli declare-product --provider deepinfra --model zai-org/GLM-5.3-Flash --discount-pct 5
 gmcli declare-product --provider deepinfra --model moonshotai/Kimi-K3 --discount-pct 5
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash-0731 --discount-pct 5
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4.1-Flash --discount-pct 5
@@ -427,3 +429,22 @@ selection, request/response adaptation and pricing; the miner forwards the body
 unchanged using the selected credential slot. Native image offers require a
 newly built and approved image carrying this feature. Historical approved images
 are not relabelled. Ordinary DeepInfra chat retains the OpenAI path rewrite.
+
+### DeepInfra GLM-5.3-Flash
+
+The `deepinfra/zai-org/GLM-5.3-Flash` route serves ordinary
+`zai/glm-5.3-flash`, not its confidential sibling. The exact upstream ID is
+case-sensitive. DeepInfra advertises FP4 weights, a 1,048,576-token context,
+vision, function calling and JSON output; a host output cap is not published.
+Authenticated streaming, tool, vision and usage compatibility probes remain
+an activation check. Existing DeepInfra transport supports the route; an
+operator still needs a DeepInfra key, a capable worker and an explicit offer.
+
+[DeepInfra's model page](https://deepinfra.com/zai-org/GLM-5.3-Flash), reviewed
+2026-10-15, advertises a temporary 50% promotion: $0.075 input, $0.25 output and
+$0.015 cached input per million tokens. Listed undiscounted rates are
+$0.15/$0.50/$0.03, matching the buyer retail ceiling. These supplier costs do
+not change GM retail or settlement. At a 30% miner discount the promotional
+cost leaves 28.6% gross margin before operating costs; undiscounted supplier
+rates would lose money at that discount. Recheck the promotion or negotiated
+rates before declaring an offer and when supplier prices change.
