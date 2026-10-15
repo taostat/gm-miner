@@ -432,40 +432,11 @@ unchanged using the selected credential slot. Native image offers require a
 newly built and approved image carrying this feature. Historical approved images
 are not relabelled. Ordinary DeepInfra chat retains the OpenAI path rewrite.
 
-### DeepInfra GLM-5.3-Flash
+### DeepInfra GLM-5.3 and Flash
 
-The `deepinfra/zai-org/GLM-5.3-Flash` route serves ordinary
-`zai/glm-5.3-flash`, not its confidential sibling. The exact upstream ID is
-case-sensitive. DeepInfra advertises FP4 weights, a 1,048,576-token context,
-vision, function calling and JSON output; a host output cap is not published.
-Authenticated streaming, tool, vision and usage compatibility probes remain
-an activation check. Existing DeepInfra transport supports the route; an
-operator still needs a DeepInfra key, a capable worker and an explicit offer.
+`deepinfra/zai-org/GLM-5.3` serves `zai/glm-5.3` (text only).
+`deepinfra/zai-org/GLM-5.3-Flash` serves `zai/glm-5.3-flash` (text and images).
+These case-sensitive source IDs serve the ordinary buyer products.
 
-[DeepInfra's model page](https://deepinfra.com/zai-org/GLM-5.3-Flash), reviewed
-2026-10-15, advertises a temporary 50% promotion: $0.075 input, $0.25 output and
-$0.015 cached input per million tokens. Listed undiscounted rates are
-$0.15/$0.50/$0.03, matching the buyer retail ceiling. These supplier costs do
-not change GM retail or settlement. At a 30% miner discount the promotional
-cost leaves 28.6% gross margin before operating costs; undiscounted supplier
-rates would lose money at that discount. Recheck the promotion or negotiated
-rates before declaring an offer and when supplier prices change.
-
-### DeepInfra GLM-5.3
-
-The `deepinfra/zai-org/GLM-5.3` route serves ordinary `zai/glm-5.3`, not its
-confidential sibling. This is a text-only model with function calling and JSON
-output, FP4 weights and a published 1,048,576-token context. The host output
-cap is unpublished. DeepInfra documents `reasoning_effort` as `low`, `high` or
-`max` (default `max`) and a `clear_thinking` option. Authenticated checks must
-cover those controls, streaming, tool calls, model identity and usage before
-activating supply; catalog metadata alone does not prove their compatibility.
-
-[DeepInfra's model page](https://deepinfra.com/zai-org/GLM-5.3) and public model
-metadata, reviewed 2026-10-15, list promotional supplier rates of $0.5625 input,
-$2.50 output and $0.125 cached input per million tokens. Undiscounted rates are
-$0.90/$4.00/$0.20. Buyer retail remains $1.40/$4.40/$0.26. At a 30% miner
-discount, promotional per-dimension gross margins before operating costs are
-42.6% input, 18.8% output and 31.3% cached input; the combined margin depends on
-the workload. At undiscounted supplier rates the output and cache dimensions
-lose money at that discount, so recheck effective prices before offering it.
+Configure a DeepInfra key with `gmcli set-api-keys --deepinfra <key>`, deploy
+the worker, then declare each offer using the commands above.
