@@ -95,14 +95,15 @@ for config in "${WORK}"/configs/*.yaml; do
 done
 # Runtime checks of the Chutes and KubeTEE routes in the pinned Envoy image,
 # with no verifier listening on 127.0.0.1:8083 or 127.0.0.1:8084.
-# serve <config> <key env> <key> starts the named rendered config.
+# serve <config> <key env> <key> [Envoy args...] starts the named rendered config.
 serve() {
   local config="$1" key_env="$2" key="$3" container
+  shift 3
   container="$(docker run -d --rm -e ENVOY_UID=0 -e "${key_env}=${key}" \
     -v "${WORK}/configs:/configs:ro" \
     -v "${WORK}/ratls:/tmp/gm-ratls:ro" \
     -p 127.0.0.1::8080 \
-    "${ENVOY_IMAGE}" -c "/configs/${config}.yaml")"
+    "${ENVOY_IMAGE}" -c "/configs/${config}.yaml" "$@")"
   echo "${container}"
 }
 
@@ -113,7 +114,7 @@ request() {
   shift 3
   local body status
   body="$(mktemp)"
-  status="$(curl -sk -o "${body}" -X "${method}" -w '%{http_code}' \
+  status="$(curl -sk --max-time 5 -o "${body}" -X "${method}" -w '%{http_code}' \
     -H "x-gm-provider: ${PROVIDER:-chutes}" "$@" "https://127.0.0.1:${port}${path}" || true)"
   echo "${status:-000} $(tr '\n' ' ' <"${body}")"
   rm "${body}"
@@ -148,19 +149,25 @@ expect_log() {
   echo "ok: ${PROVIDER:-chutes}-runtime ${id} access log"
 }
 
+# An unknown provider gets a local 501, so readiness never waits on an upstream.
+await_listener() {
+  local port="$1"
+  for _ in $(seq 50); do
+    [[ "$(PROVIDER=unconfigured request "${port}" GET /v1/models)" == 501* ]] && return 0
+    sleep 0.2
+  done
+  echo "FAIL: listener on port ${port} did not become ready" >&2
+  return 1
+}
+
 chutes_runtime() {
   local keyed empty port empty_port got ok=0 tee='x-gm-upstream-model: zai-org/GLM-5.2-TEE'
   keyed="$(serve chutes-runtime CHUTES_API_KEY c)"
   empty="$(serve chutes-runtime CHUTES_API_KEY '')"
   port="$(docker port "${keyed}" 8080/tcp | head -n 1 | sed 's/.*://')"
   empty_port="$(docker port "${empty}" 8080/tcp | head -n 1 | sed 's/.*://')"
-  for _ in $(seq 50); do
-    if [[ "$(request "${port}" GET /v1/models)" != 000* ]] &&
-      [[ "$(request "${empty_port}" GET /v1/models)" != 000* ]]; then
-      break
-    fi
-    sleep 0.2
-  done
+  await_listener "${port}" || ok=1
+  await_listener "${empty_port}" || ok=1
   expect "empty selector" 400 "empty Chutes source model" \
     "$(request "${port}" POST /v1/chat/completions -H 'x-gm-upstream-model;')" || ok=1
   expect "repeated selector" 400 "ambiguous Chutes source model" \
@@ -194,20 +201,11 @@ chutes_runtime() {
 }
 chutes_runtime || failed=1
 
-# Wait until the served config answers on its port.
-await_listener() {
-  local port="$1"
-  for _ in $(seq 50); do
-    [[ "$(request "${port}" GET /v1/models)" != 000* ]] && return 0
-    sleep 0.2
-  done
-}
-
 kubetee_runtime() {
   local container port ok=0 target='x-gm-upstream-model: z-ai/glm-5.3'
   container="$(serve kubetee-runtime KUBETEE_API_KEY k)"
   port="$(docker port "${container}" 8080/tcp | head -n 1 | sed 's/.*://')"
-  await_listener "${port}"
+  await_listener "${port}" || ok=1
   expect "off-list selector" 400 "missing or unsupported KubeTEE source model" \
     "$(request "${port}" POST /v1/chat/completions -H 'x-gm-upstream-model: minimax/h3')" || ok=1
   expect "missing selector" 400 "missing or unsupported KubeTEE source model" \
@@ -223,5 +221,34 @@ kubetee_runtime() {
   return "${ok}"
 }
 PROVIDER=kubetee kubetee_runtime || failed=1
+
+# Force the existing pending-request breaker to overflow immediately, without
+# depending on timing, external providers, or a running verifier. These are
+# test-only runtime limits; production keeps its normal circuit-breaker limits.
+overflow_runtime() {
+  local config="$1" key_env="$2" cluster="$3" model="$4"
+  local container port ok=0 body='{"error":"miner saturated: concurrent request limit reached"}'
+  container="$(serve "${config}" "${key_env}" test-key --config-yaml "
+layered_runtime:
+  layers:
+  - name: overflow_test
+    static_layer:
+      circuit_breakers.${cluster}.default.max_pending_requests: 0
+")"
+  port="$(docker port "${container}" 8080/tcp | head -n 1 | sed 's/.*://')"
+  await_listener "${port}" || ok=1
+  expect "verifier overflow" 429 "${body}" \
+    "$(request "${port}" POST /v1/chat/completions \
+      -H "x-gm-upstream-model: ${model}" \
+      -H 'x-gm-request-id: verifier-overflow')" || ok=1
+  expect_log "${container}" verifier-overflow \
+    "\"upstream_cluster\":\"${cluster}\"" '"response_flags":"UO"' || ok=1
+  docker stop "${container}" >/dev/null
+  return "${ok}"
+}
+# Chutes has a special unavailable-verifier reply; KubeTEE uses the generic
+# upstream-failure reply. Overflow must take precedence over both.
+overflow_runtime chutes-runtime CHUTES_API_KEY chutes_verify_proxy zai-org/GLM-5.2-TEE || failed=1
+PROVIDER=kubetee overflow_runtime kubetee-runtime KUBETEE_API_KEY kubetee_verify_proxy z-ai/glm-5.3 || failed=1
 
 exit "${failed}"
