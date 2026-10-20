@@ -1,0 +1,54 @@
+slots:
+  direct_env: TOGETHER_API_KEY
+  auth_header: authorization
+  auth_prefix: "Bearer "
+
+routes:
+  ## Speech synthesis is non-replayable generation. Keep the public path
+  ## intact for Together's OpenAI-compatible endpoint.
+  - match:
+      path: "/v1/audio/speech"
+      headers:
+        - name: ":method"
+          string_match:
+            exact: "POST"
+        - name: "x-gm-provider"
+          string_match:
+            exact: "together"
+    route:
+      cluster: together
+      host_rewrite_literal: api.together.xyz
+      timeout: 1800s
+
+clusters:
+  - name: together
+    type: LOGICAL_DNS
+    connect_timeout: 10s
+    dns_lookup_family: V4_ONLY
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    load_assignment:
+      cluster_name: together
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: api.together.xyz
+                    port_value: 443
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: api.together.xyz
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: /etc/ssl/certs/ca-certificates.crt
+            match_typed_subject_alt_names:
+              - san_type: DNS
+                matcher:
+                  exact: api.together.xyz

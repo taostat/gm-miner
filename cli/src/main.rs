@@ -242,7 +242,7 @@ enum Command {
     /// Render upstream key slot exports for the container entrypoint.
     #[command(hide = true)]
     SlotEnv {
-        /// Provider id: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, engy, or moonmath.
+        /// Provider id: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, together, kubetee, engy, or moonmath.
         #[arg(long)]
         provider: Provider,
 
@@ -347,7 +347,7 @@ enum Command {
         gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5\n  \
         gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5   # a sourcing route; see `gmcli sources`")]
     DeclareProduct {
-        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, engy, or moonmath.
+        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, together, kubetee, engy, or moonmath.
         #[arg(long)]
         provider: Provider,
 
@@ -431,7 +431,7 @@ enum Command {
         gmcli undeclare-product --provider anthropic --model claude-sonnet-4-6\n  \
         gmcli undeclare-product --provider deepinfra --model zai-org/GLM-5.2   # a sourcing route")]
     UndeclareProduct {
-        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, engy, or moonmath.
+        /// Provider: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, together, kubetee, engy, or moonmath.
         #[arg(long)]
         provider: Provider,
 

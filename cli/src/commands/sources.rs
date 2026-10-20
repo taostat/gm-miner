@@ -9,7 +9,7 @@ use gm_miner_cli::{
     cloud_policy::configured_cloud_backend,
     config::Config,
     network::Network,
-    pricing::{extra_dimension_count, format_usd},
+    pricing::{extra_dimension_count, flat_or_character_price_summary, format_usd},
     table,
     types::{RetailDimensions, SourceProduct, SourceProductsResponse, SupplierRoutesResponse},
 };
@@ -232,15 +232,15 @@ fn admission_cell(source: &SourceProduct, config: Option<&Config>) -> String {
     }
 }
 
-/// The buyer product's video unit price, or its retail token anchors plus a
-/// count of the dimensions it prices beyond them.
+/// The buyer product's character/image/video unit price, or its retail token
+/// anchors plus a count of the dimensions it prices beyond them.
 ///
 /// Settlement is on the buyer product's whole price vector, not just input and
 /// output, so a route whose buyer product prices a prompt cache has to say so —
 /// `gmcli declare-product` then prints every dimension in full.
 fn buyer_retail_cell(retail: &RetailDimensions) -> String {
-    if let Some(price) = retail.output_per_video_second_ndollars {
-        return format!("{} per video second", format_usd(price));
+    if let Some(unit_prices) = flat_or_character_price_summary(retail) {
+        return unit_prices;
     }
     let anchors = format!(
         "{} in / {} out",
@@ -641,6 +641,58 @@ mod tests {
         .expect("video source");
         assert_eq!(route_row(&source, None)[2], "$0.190 per video second");
         assert_eq!(SOURCE_HEADERS[2], "BUYER RETAIL");
+    }
+
+    #[test]
+    fn a_character_priced_source_shows_the_kokoro_unit_without_token_mislabeling() {
+        let source: SourceProduct = serde_json::from_value(serde_json::json!({
+            "provider": "deepinfra",
+            "model": "hexgrad/Kokoro-82M",
+            "buyer_provider": "hexgrad",
+            "buyer_model": "kokoro-82m",
+            "retail_price": {"dimensions": {
+                "input_per_mtok_ndollars": 0,
+                "output_per_mtok_ndollars": 0,
+                "input_per_mchar_ndollars": 990_000_000_u64
+            }},
+            "capable_worker_count": 1,
+            "already_offered": true
+        }))
+        .expect("Kokoro source");
+
+        let retail = route_row(&source, None)[2].clone();
+        assert!(retail.contains("$0.990 per Mchar"), "{retail}");
+        assert!(!retail.contains("$0.990 per Mtok"), "{retail}");
+    }
+
+    #[test]
+    fn a_token_priced_gemini_route_keeps_its_anchors_with_cache_storage() {
+        let source: SourceProduct = serde_json::from_value(serde_json::json!({
+            "provider": "gemini",
+            "model": "gemini-2.5-pro",
+            "buyer_provider": "gemini",
+            "buyer_model": "gemini-2.5-pro",
+            "retail_price": {
+                "dimensions": {
+                    "input_per_mtok_ndollars": 1_250_000_000_u64,
+                    "output_per_mtok_ndollars": 5_000_000_000_u64,
+                    "long_context_threshold_tokens": 200_000_u64,
+                    "long_context_input_per_mtok_ndollars": 2_500_000_000_u64,
+                    "long_context_output_per_mtok_ndollars": 7_500_000_000_u64,
+                    "cache_storage_per_mtok_hour_ndollars": 375_000_000_u64
+                },
+                "modifiers": {"batch_multiplier_bps": 5000},
+                "surcharges": {}
+            },
+            "capable_worker_count": 1,
+            "already_offered": true
+        }))
+        .expect("Gemini Pro source with token and storage prices");
+
+        assert_eq!(
+            route_row(&source, None)[2],
+            "$1.250 in / $5.000 out +3 per Mtok"
+        );
     }
 
     #[test]

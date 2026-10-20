@@ -427,6 +427,7 @@ fn wizard_has_provider_key(keys: &ProviderKeys) -> bool {
         || keys.zai.is_some()
         || keys.moonshot.is_some()
         || keys.deepinfra.is_some()
+        || keys.together.is_some()
         || keys.kubetee.is_some()
         || keys.engy.is_some()
         || keys.moonmath.is_some()
@@ -461,6 +462,7 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         zai: prompt_line("Z.ai API key (blank to skip):", assume_yes)?,
         moonshot: prompt_line("Moonshot API key (blank to skip):", assume_yes)?,
         deepinfra: prompt_line("DeepInfra API key (blank to skip):", assume_yes)?,
+        together: prompt_line("Together API key (blank to skip):", assume_yes)?,
         kubetee: prompt_line("KubeTEE API key (blank to skip):", assume_yes)?,
         engy: prompt_line("Engy API key (blank to skip):", assume_yes)?,
         moonmath: prompt_line("Moonmath ZRO API key (blank to skip):", assume_yes)?,
@@ -504,6 +506,9 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     }
     if keys.deepinfra.is_some() {
         cmd.push_str(" --deepinfra <key>");
+    }
+    if keys.together.is_some() {
+        cmd.push_str(" --together <key>");
     }
     if keys.kubetee.is_some() {
         cmd.push_str(" --kubetee <key>");
@@ -582,9 +587,9 @@ fn prompt_discount(assume_yes: bool) -> Result<Option<u32>> {
 )]
 mod tests {
     use super::{
-        closing_lines, record, run_steps, wizard_declare_products, wizard_deploy,
-        wizard_has_provider_key, wizard_login, wizard_provider_keys, wizard_register_hotkey,
-        Config, ProviderKeys, StepOutcome, WizardFlow,
+        closing_lines, describe_keys_command, record, run_steps, wizard_declare_products,
+        wizard_deploy, wizard_has_provider_key, wizard_login, wizard_provider_keys,
+        wizard_register_hotkey, Config, ProviderKeys, StepOutcome, WizardFlow,
     };
 
     /// The banner that must appear if and only if onboarding actually finished.
@@ -739,6 +744,19 @@ mod tests {
             ..ProviderKeys::default()
         };
         assert!(wizard_has_provider_key(&keys));
+    }
+
+    #[test]
+    fn a_together_only_key_is_not_treated_as_empty() {
+        let keys = ProviderKeys {
+            together: Some("together-key".to_owned()),
+            ..ProviderKeys::default()
+        };
+        assert!(wizard_has_provider_key(&keys));
+        assert_eq!(
+            describe_keys_command(&keys),
+            "gmcli set-api-keys --together <key>"
+        );
     }
 
     #[tokio::test]

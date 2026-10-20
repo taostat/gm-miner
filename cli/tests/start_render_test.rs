@@ -842,6 +842,8 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
     ]);
     assert!(status.success(), "render failed: {stderr}");
     let parsed = config(&rendered);
+    // Together is intentionally excluded: it is a speech-only upstream and
+    // has its own exact-path tests below.
     for provider in [
         "anthropic",
         "openai",
@@ -1277,6 +1279,7 @@ fn deepinfra_native_inference_preserves_path_and_disables_replay() {
         let lua = run_request(
             &rendered,
             &[
+                (":method", "POST"),
                 (":path", path),
                 ("x-gm-provider", "deepinfra"),
                 ("x-gm-node-key", node_key),
@@ -1589,6 +1592,7 @@ fn forward_chutes_with(
     env: &[(&str, &str)],
 ) -> Forwarded {
     let mut input = vec![
+        (":method", "POST"),
         (":path", path),
         ("x-gm-provider", "chutes"),
         ("x-gm-node-key", "test-node-secret-0001"),
@@ -2033,4 +2037,534 @@ fn ordinary_requests_are_not_marked_for_the_verifier() {
         .get::<Option<bool>>("chutes_verifier")
         .expect("marker")
         .is_none());
+}
+
+fn assert_post_route(route: &Value) {
+    let headers = route["match"]["headers"]
+        .as_array()
+        .expect("speech route must constrain its method");
+    assert!(headers.iter().any(|header| {
+        header["name"] == ":method" && header["string_match"]["exact"] == "POST"
+    }));
+}
+
+fn assert_no_retry(route: &Value, description: &str) {
+    assert!(
+        route["route"].get("retry_policy").is_none(),
+        "{description} must not transparently replay generation"
+    );
+}
+
+const RETRY_OVERRIDE_HEADERS: [(&str, &str); 4] = [
+    ("x-envoy-retry-on", "5xx"),
+    ("x-envoy-retry-grpc-on", "cancelled"),
+    ("x-envoy-max-retries", "5"),
+    ("x-envoy-hedge-on-per-try-timeout", "true"),
+];
+
+fn assert_retry_overrides_stripped(lua: &Lua) {
+    let headers = lua
+        .globals()
+        .get::<mlua::Table>("input_headers")
+        .expect("headers");
+    for (name, _) in RETRY_OVERRIDE_HEADERS {
+        assert_eq!(
+            headers.get::<Option<String>>(name).expect("retry header"),
+            None,
+            "{name} must not override the non-replayable speech route"
+        );
+    }
+}
+
+#[test]
+fn deepinfra_audio_speech_uses_the_openai_path_without_generation_retry() {
+    let (status, _, stderr, rendered) = render_envoy([("DEEPINFRA_API_KEY", "deepinfra-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    let selected = matching_route(
+        &parsed,
+        "/v1/audio/speech",
+        &[
+            (":method".to_owned(), "POST".to_owned()),
+            ("x-gm-provider".to_owned(), "deepinfra".to_owned()),
+        ],
+    );
+    assert_eq!(selected["route"]["cluster"], "deepinfra");
+    assert_eq!(
+        selected["route"]["host_rewrite_literal"],
+        "api.deepinfra.com"
+    );
+    assert_eq!(
+        selected["route"]["regex_rewrite"]["substitution"],
+        r"/v1/openai/\1"
+    );
+    assert_eq!(selected["route"]["timeout"], "1800s");
+    assert_no_retry(selected, "DeepInfra speech");
+    assert_post_route(selected);
+
+    let lua = run_request(
+        &rendered,
+        &[
+            (":method", "POST"),
+            (":path", "/v1/audio/speech"),
+            ("x-gm-provider", "deepinfra"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("authorization", "caller-secret"),
+            ("x-envoy-retry-on", "5xx"),
+            ("x-envoy-retry-grpc-on", "cancelled"),
+            ("x-envoy-max-retries", "5"),
+            ("x-envoy-hedge-on-per-try-timeout", "true"),
+        ],
+        &[("GM_DEEPINFRA_KEY_SLOT_1", "deepinfra-key")],
+    );
+    assert_eq!(
+        lua.globals()
+            .get::<Option<String>>("response_status")
+            .expect("status"),
+        None
+    );
+    let headers = lua
+        .globals()
+        .get::<mlua::Table>("input_headers")
+        .expect("headers");
+    assert_eq!(
+        headers.get::<String>("authorization").expect("auth"),
+        "Bearer deepinfra-key"
+    );
+    assert_eq!(
+        headers
+            .get::<Option<String>>("x-gm-provider")
+            .expect("provider header"),
+        Some("deepinfra".to_owned()),
+        "the route discriminator remains until Envoy applies route-level removal"
+    );
+    assert!(selected["request_headers_to_remove"]
+        .as_array()
+        .expect("route removes internal headers")
+        .contains(&json!("x-gm-provider")));
+    assert_retry_overrides_stripped(&lua);
+}
+
+#[test]
+fn together_audio_speech_uses_a_keyed_non_replaying_route() {
+    let (status, _, stderr, rendered) = render_envoy([("TOGETHER_API_KEY", "together-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    assert!(
+        parsed["static_resources"]["clusters"]
+            .as_array()
+            .expect("clusters")
+            .iter()
+            .any(|cluster| cluster["name"] == "together"),
+        "Together speech transport cluster is missing"
+    );
+    let selected = matching_route(
+        &parsed,
+        "/v1/audio/speech",
+        &[
+            (":method".to_owned(), "POST".to_owned()),
+            ("x-gm-provider".to_owned(), "together".to_owned()),
+        ],
+    );
+    assert_eq!(selected["route"]["cluster"], "together");
+    assert_eq!(
+        selected["route"]["host_rewrite_literal"],
+        "api.together.xyz"
+    );
+    assert_eq!(selected["route"]["timeout"], "1800s");
+    assert!(selected["route"].get("regex_rewrite").is_none());
+    assert_post_route(selected);
+    assert_no_retry(selected, "Together speech");
+    assert_tls(&parsed, "together", "api.together.xyz");
+
+    let lua = run_request(
+        &rendered,
+        &[
+            (":method", "POST"),
+            (":path", "/v1/audio/speech"),
+            ("x-gm-provider", "together"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("authorization", "caller-secret"),
+            ("x-envoy-retry-on", "5xx"),
+            ("x-envoy-retry-grpc-on", "cancelled"),
+            ("x-envoy-max-retries", "5"),
+            ("x-envoy-hedge-on-per-try-timeout", "true"),
+        ],
+        &[("GM_TOGETHER_KEY_SLOT_1", "together-key")],
+    );
+    assert_eq!(
+        lua.globals()
+            .get::<Option<String>>("response_status")
+            .expect("status"),
+        None
+    );
+    let headers = lua
+        .globals()
+        .get::<mlua::Table>("input_headers")
+        .expect("headers");
+    assert_eq!(
+        headers.get::<String>("authorization").expect("auth"),
+        "Bearer together-key"
+    );
+    assert_retry_overrides_stripped(&lua);
+}
+
+#[test]
+fn together_rejects_non_speech_paths_and_methods() {
+    let (status, _, stderr, rendered) = render_envoy([("TOGETHER_API_KEY", "together-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    for (method, path) in [
+        ("POST", "/v1/chat/completions"),
+        ("GET", "/v1/audio/speech"),
+        ("POST", "/v1/audio/speech/extra"),
+    ] {
+        let selected = matching_route(
+            &parsed,
+            path,
+            &[
+                (":method".to_owned(), method.to_owned()),
+                ("x-gm-provider".to_owned(), "together".to_owned()),
+            ],
+        );
+        assert_eq!(
+            selected["direct_response"]["status"], 501,
+            "Together must reject {method} {path} instead of forwarding it"
+        );
+    }
+}
+
+#[test]
+fn gemini_flash_tts_keeps_native_generate_content_and_does_not_retry() {
+    let (status, _, stderr, rendered) = render_envoy([("GOOGLE_API_KEY", "google-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    let selected = matching_route(
+        &parsed,
+        "/v1beta/models/gemini-3.8-flash-tts:generateContent",
+        &[
+            (":method".to_owned(), "POST".to_owned()),
+            ("x-gm-provider".to_owned(), "gemini".to_owned()),
+        ],
+    );
+    assert_eq!(selected["route"]["cluster"], "gemini");
+    assert_eq!(
+        selected["route"]["host_rewrite_literal"],
+        "generativelanguage.googleapis.com"
+    );
+    assert!(selected["route"].get("regex_rewrite").is_none());
+    assert_eq!(
+        selected["match"]["safe_regex"]["regex"],
+        "^/v1beta/models/[^/]+-tts:generateContent$"
+    );
+    assert_eq!(selected["route"]["timeout"], "1800s");
+    assert_no_retry(selected, "Gemini TTS");
+    assert_post_route(selected);
+    assert!(
+        route(
+            &parsed,
+            "gemini",
+            "/v1beta/models/gemini-2.5-flash:generateContent"
+        )["route"]
+            .get("retry_policy")
+            .is_some(),
+        "ordinary Gemini traffic keeps its existing retry behavior"
+    );
+    let another_tts_route = matching_route(
+        &parsed,
+        "/v1beta/models/gemini-4-flash-preview-tts:generateContent",
+        &[
+            (":method".to_owned(), "POST".to_owned()),
+            ("x-gm-provider".to_owned(), "gemini".to_owned()),
+        ],
+    );
+    assert_no_retry(another_tts_route, "Gemini TTS model routes");
+
+    let lua = run_request(
+        &rendered,
+        &[
+            (":method", "POST"),
+            (
+                ":path",
+                "/v1beta/models/gemini-3.8-flash-tts:generateContent",
+            ),
+            ("x-gm-provider", "gemini"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-goog-api-key", "caller-secret"),
+            ("x-envoy-retry-on", "5xx"),
+            ("x-envoy-retry-grpc-on", "cancelled"),
+            ("x-envoy-max-retries", "5"),
+            ("x-envoy-hedge-on-per-try-timeout", "true"),
+        ],
+        &[("GM_GEMINI_KEY_SLOT_1", "google-key")],
+    );
+    assert_eq!(
+        lua.globals()
+            .get::<Option<String>>("response_status")
+            .expect("status"),
+        None
+    );
+    let headers = lua
+        .globals()
+        .get::<mlua::Table>("input_headers")
+        .expect("headers");
+    assert_eq!(
+        headers
+            .get::<String>("x-goog-api-key")
+            .expect("Google auth"),
+        "google-key"
+    );
+    assert_retry_overrides_stripped(&lua);
+}
+
+#[test]
+fn chutes_audiodojo_uses_its_separate_host_and_paths_without_retries() {
+    let rendered = chutes_config();
+    let parsed = config(&rendered);
+    for (path, source_model) in [
+        ("/tts/kokoro", "hexgrad/Kokoro-82M"),
+        ("/tts/qwen3custom", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+    ] {
+        let selected = matching_route(
+            &parsed,
+            path,
+            &[
+                (":method".to_owned(), "POST".to_owned()),
+                ("x-gm-provider".to_owned(), "chutes".to_owned()),
+                ("x-gm-upstream-model".to_owned(), source_model.to_owned()),
+            ],
+        );
+        assert_eq!(selected["route"]["cluster"], "chutes_audiodojo", "{path}");
+        assert_eq!(
+            selected["route"]["host_rewrite_literal"], "vonkaiser-audiodojo.chutes.ai",
+            "{path}"
+        );
+        assert_eq!(selected["route"]["timeout"], "1800s", "{path}");
+        assert!(selected["route"].get("regex_rewrite").is_none(), "{path}");
+        assert_post_route(selected);
+        assert_no_retry(selected, "Chutes AudioDojo speech");
+
+        let mut extra = vec![("x-gm-upstream-model", source_model)];
+        extra.extend(RETRY_OVERRIDE_HEADERS);
+        let forwarded = forward_chutes(&rendered, path, &extra);
+        assert_eq!(forwarded.status, None, "{path}");
+        assert_eq!(forwarded.cluster, "chutes_audiodojo", "{path}");
+        assert_eq!(
+            forwarded_header(&forwarded, "authorization"),
+            Some("Bearer chutes-key"),
+            "{path}"
+        );
+        assert_eq!(
+            forwarded_header(&forwarded, "x-gm-upstream-model"),
+            None,
+            "source selector must not reach AudioDojo"
+        );
+        for (name, _) in RETRY_OVERRIDE_HEADERS {
+            assert_eq!(
+                forwarded_header(&forwarded, name),
+                None,
+                "{name} must not override the non-replayable speech route"
+            );
+        }
+    }
+
+    assert_tls(&parsed, "chutes_audiodojo", "vonkaiser-audiodojo.chutes.ai");
+    assert_eq!(
+        route(&parsed, "chutes", "/v1/chat/completions")["route"]["host_rewrite_literal"],
+        "llm.chutes.ai",
+        "ordinary Chutes traffic keeps its existing host"
+    );
+}
+
+#[test]
+fn chutes_audiodojo_rejects_confidential_model_selectors_without_verifier_support() {
+    let rendered = chutes_config();
+    let forwarded = forward_chutes(
+        &rendered,
+        "/tts/qwen3custom",
+        &[(
+            "x-gm-upstream-model",
+            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice-TEE",
+        )],
+    );
+    assert_eq!(
+        forwarded.status.as_deref(),
+        Some("400"),
+        "AudioDojo must not be silently treated as a Chutes TEE target"
+    );
+    assert_eq!(forwarded.cluster, "");
+}
+
+#[test]
+fn speech_provider_credentials_are_isolated_by_selected_upstream() {
+    let (status, _, stderr, rendered) = render_envoy([
+        ("DEEPINFRA_API_KEY", "deepinfra-key"),
+        ("TOGETHER_API_KEY", "together-key"),
+        ("GOOGLE_API_KEY", "google-key"),
+        ("CHUTES_API_KEY", "chutes-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    let env = [
+        ("GM_DEEPINFRA_KEY_SLOT_1", "deepinfra-key"),
+        ("GM_TOGETHER_KEY_SLOT_1", "together-key"),
+        ("GM_GEMINI_KEY_SLOT_1", "google-key"),
+        ("GM_CHUTES_KEY_SLOT_1", "chutes-key"),
+    ];
+    for case in SPEECH_ROUTE_CASES {
+        assert_speech_provider_case(&rendered, &parsed, &env, case);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SpeechRouteCase {
+    provider: &'static str,
+    path: &'static str,
+    selector: Option<&'static str>,
+    credential_header: &'static str,
+    credential_value: &'static str,
+    cluster: &'static str,
+    host: &'static str,
+}
+
+const SPEECH_ROUTE_CASES: [SpeechRouteCase; 4] = [
+    SpeechRouteCase {
+        provider: "deepinfra",
+        path: "/v1/audio/speech",
+        selector: None,
+        credential_header: "authorization",
+        credential_value: "Bearer deepinfra-key",
+        cluster: "deepinfra",
+        host: "api.deepinfra.com",
+    },
+    SpeechRouteCase {
+        provider: "together",
+        path: "/v1/audio/speech",
+        selector: None,
+        credential_header: "authorization",
+        credential_value: "Bearer together-key",
+        cluster: "together",
+        host: "api.together.xyz",
+    },
+    SpeechRouteCase {
+        provider: "gemini",
+        path: "/v1beta/models/gemini-3.8-flash-tts:generateContent",
+        selector: None,
+        credential_header: "x-goog-api-key",
+        credential_value: "google-key",
+        cluster: "gemini",
+        host: "generativelanguage.googleapis.com",
+    },
+    SpeechRouteCase {
+        provider: "chutes",
+        path: "/tts/kokoro",
+        selector: Some("hexgrad/Kokoro-82M"),
+        credential_header: "authorization",
+        credential_value: "Bearer chutes-key",
+        cluster: "chutes_audiodojo",
+        host: "vonkaiser-audiodojo.chutes.ai",
+    },
+];
+
+fn assert_speech_provider_case(
+    rendered: &str,
+    parsed: &Value,
+    env: &[(&str, &str)],
+    case: SpeechRouteCase,
+) {
+    let lua = run_request(rendered, &speech_request_headers(case), env);
+    assert_eq!(
+        lua.globals()
+            .get::<Option<String>>("response_status")
+            .expect("status"),
+        None,
+        "{} must be accepted",
+        case.provider
+    );
+    assert_speech_request_credentials(&lua, case);
+    assert_speech_selected_route(parsed, case);
+}
+
+fn speech_request_headers(case: SpeechRouteCase) -> Vec<(&'static str, &'static str)> {
+    let mut request = vec![
+        (":method", "POST"),
+        (":path", case.path),
+        ("x-gm-provider", case.provider),
+        ("x-gm-node-key", "test-node-secret-0001"),
+        ("authorization", "caller-secret"),
+    ];
+    if let Some(selector) = case.selector {
+        request.push(("x-gm-upstream-model", selector));
+    }
+    request
+}
+
+fn assert_speech_request_credentials(lua: &Lua, case: SpeechRouteCase) {
+    let headers = lua
+        .globals()
+        .get::<mlua::Table>("input_headers")
+        .expect("headers");
+    assert_eq!(
+        headers
+            .get::<String>(case.credential_header)
+            .expect("provider credential"),
+        case.credential_value,
+        "{} must receive its own credential",
+        case.provider
+    );
+    let other_auth_header = if case.credential_header == "authorization" {
+        "x-goog-api-key"
+    } else {
+        "authorization"
+    };
+    assert_eq!(
+        headers
+            .get::<Option<String>>(other_auth_header)
+            .expect("other provider auth header"),
+        None,
+        "{} must not receive the other authentication scheme",
+        case.provider
+    );
+    for other_credential in [
+        "Bearer deepinfra-key",
+        "Bearer together-key",
+        "Bearer chutes-key",
+        "google-key",
+    ] {
+        if other_credential == case.credential_value {
+            continue;
+        }
+        for name in ["authorization", "x-goog-api-key"] {
+            assert_ne!(
+                headers
+                    .get::<Option<String>>(name)
+                    .expect("credential header")
+                    .as_deref(),
+                Some(other_credential),
+                "{} must not receive another provider's credential",
+                case.provider
+            );
+        }
+    }
+}
+
+fn assert_speech_selected_route(parsed: &Value, case: SpeechRouteCase) {
+    let mut route_headers = vec![
+        (":method".to_owned(), "POST".to_owned()),
+        ("x-gm-provider".to_owned(), case.provider.to_owned()),
+    ];
+    if let Some(selector) = case.selector {
+        route_headers.push(("x-gm-upstream-model".to_owned(), selector.to_owned()));
+    }
+    let selected = matching_route(parsed, case.path, &route_headers);
+    assert_eq!(
+        selected["route"]["cluster"], case.cluster,
+        "{}",
+        case.provider
+    );
+    assert_eq!(
+        selected["route"]["host_rewrite_literal"], case.host,
+        "{}",
+        case.provider
+    );
 }

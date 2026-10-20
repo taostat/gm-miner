@@ -3,6 +3,23 @@ slots:
   auth_header: x-goog-api-key
 
 routes:
+  ## TTS is native generateContent but synthesis must not be transparently replayed.
+  - match:
+      safe_regex:
+        google_re2: {}
+        regex: "^/v1beta/models/[^/]+-tts:generateContent$"
+      headers:
+        - name: ":method"
+          string_match:
+            exact: "POST"
+        - name: "x-gm-provider"
+          string_match:
+            exact: "gemini"
+    route:
+      cluster: gemini
+      host_rewrite_literal: generativelanguage.googleapis.com
+      timeout: 1800s
+
   - match:
       prefix: "/"
       headers:

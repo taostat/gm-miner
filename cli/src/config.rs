@@ -377,6 +377,8 @@ pub struct ProviderKeys {
     pub moonshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deepinfra: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub together: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kubetee: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -540,6 +542,7 @@ impl ProviderKeys {
             Provider::Zai => Some(("ZAI_API_KEY", self.zai.as_deref())),
             Provider::Moonshot => Some(("MOONSHOT_API_KEY", self.moonshot.as_deref())),
             Provider::DeepInfra => Some(("DEEPINFRA_API_KEY", self.deepinfra.as_deref())),
+            Provider::Together => Some(("TOGETHER_API_KEY", self.together.as_deref())),
             Provider::Kubetee => Some(("KUBETEE_API_KEY", self.kubetee.as_deref())),
             Provider::Engy => Some(("ENGY_API_KEY", self.engy.as_deref())),
             Provider::Moonmath => Some(("MOONMATH_API_KEY", self.moonmath.as_deref())),
@@ -1098,6 +1101,7 @@ mod tests {
             zai: Some("zai".to_owned()),
             moonshot: Some("moo".to_owned()),
             deepinfra: Some("dif".to_owned()),
+            together: Some("tog".to_owned()),
             kubetee: Some("kube".to_owned()),
             engy: Some("eng".to_owned()),
             moonmath: Some("moon".to_owned()),
@@ -1132,6 +1136,7 @@ mod tests {
                 "ZAI_API_KEY",
                 "MOONSHOT_API_KEY",
                 "DEEPINFRA_API_KEY",
+                "TOGETHER_API_KEY",
                 "KUBETEE_API_KEY",
                 "ENGY_API_KEY",
                 "MOONMATH_API_KEY",

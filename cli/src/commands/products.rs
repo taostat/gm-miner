@@ -10,8 +10,8 @@ use gm_miner_cli::{
     cloud_policy::{configured_cloud_backend, declaration_policy, CloudDeclarationPolicy},
     dependency::confirm,
     pricing::{
-        effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
-        format_usd,
+        effective_dimensions, effective_rate_summary, extra_dimension_lines,
+        extra_dimension_unit_note, format_discount_pct, format_usd,
     },
     table,
     types::{
@@ -251,15 +251,7 @@ fn declaration_lines(
     ];
     let extras = extra_dimension_lines(retail, discount_bp);
     if !extras.is_empty() {
-        let units = match (
-            retail.output_per_image_ndollars.is_some(),
-            retail.output_per_video_second_ndollars.is_some(),
-        ) {
-            (true, true) => "per Mtok unless labelled per image or per video second",
-            (true, false) => "per Mtok unless labelled per image",
-            (false, true) => "per Mtok unless labelled per video second",
-            (false, false) => "per Mtok",
-        };
+        let units = extra_dimension_unit_note(std::iter::once(retail));
         lines.push(format!(
             "  {:<width$}: {retail_label} → you receive, {units}",
             "Also priced"
@@ -919,6 +911,7 @@ fn status_rows(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -
 /// prices only input and output contributes nothing.
 fn extra_rate_lines(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -> Vec<String> {
     let mut lines = Vec::new();
+    let mut priced_retails = Vec::new();
     for offer in offers {
         let Some(bp) = offer.discount_bp else {
             continue;
@@ -930,6 +923,7 @@ fn extra_rate_lines(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'
         if extras.is_empty() {
             continue;
         }
+        priced_retails.push(*dims);
         lines.push(String::new());
         lines.push(format!("  {}/{}", offer.provider, offer.model));
         lines.extend(extras);
@@ -937,11 +931,10 @@ fn extra_rate_lines(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'
     if lines.is_empty() {
         return lines;
     }
+    let units = extra_dimension_unit_note(priced_retails);
     let mut out = vec![
         String::new(),
-        "Priced beyond input/output — retail → you receive, \
-         per Mtok unless labelled per image or per video second:"
-            .to_owned(),
+        format!("Priced beyond input/output — retail → you receive, {units}:"),
     ];
     out.extend(lines);
     out
@@ -1989,6 +1982,7 @@ mod tests {
         let tiny = RetailDimensions {
             input_per_mtok_ndollars: 999_999,
             output_per_mtok_ndollars: 999,
+            input_per_mchar_ndollars: None,
             cache_read_per_mtok_ndollars: Some(500),
             cache_write_5m_per_mtok_ndollars: Some(500),
             cache_write_1h_per_mtok_ndollars: Some(500),
@@ -2049,7 +2043,7 @@ mod tests {
         // columns after it must still start where the header's do.
         let rendered = lines.join("\n");
         assert!(
-            rendered.contains("$0.000894999 in / $0.000000894 out per Mtok (+10 more)"),
+            rendered.contains("$0.000894999 in / $0.000000894 out per Mtok (+9 more)"),
             "{rendered}"
         );
         let eligible_at = lines[0]
@@ -2184,7 +2178,65 @@ mod tests {
         assert_eq!(
             lines[1],
             "Priced beyond input/output — retail → you receive, \
-             per Mtok unless labelled per image or per video second:"
+             per Mtok unless labelled per video second:"
+        );
+    }
+
+    #[test]
+    fn character_priced_catalog_product_renders_discounted_rates_in_declaration_and_status() {
+        let catalog: ProductCatalogResponse = serde_json::from_value(serde_json::json!({
+            "products": [{
+                "provider": "hexgrad",
+                "model": "kokoro-82m",
+                "status": "active",
+                "capabilities": {"speech": {"protocol": "openai_audio_speech_v1"}},
+                "retail_price": {
+                    "dimensions": {
+                        "input_per_mtok_ndollars": 0,
+                        "output_per_mtok_ndollars": 0,
+                        "input_per_mchar_ndollars": 990_000_000_u64
+                    },
+                    "modifiers": {},
+                    "surcharges": {}
+                }
+            }],
+            "generated_at": "2026-10-18T10:00:00Z"
+        }))
+        .expect("decode character-priced catalog product");
+        let product = &catalog.products[0];
+        let dimensions = &product.retail_price.dimensions;
+        let declaration =
+            declaration_lines("hexgrad/kokoro-82m", "Retail", dimensions, 1500).join("\n");
+        assert!(
+            declaration.contains("input per Mchar  $0.990 → $0.8415"),
+            "{declaration}"
+        );
+        assert!(!declaration.contains("$0.8415 per Mtok"), "{declaration}");
+        assert!(
+            declaration.contains("per Mtok unless labelled per Mchar"),
+            "{declaration}"
+        );
+
+        let catalog_key = (product.provider.clone(), product.model.as_str());
+        let retail_by_key = [(catalog_key, dimensions)].into_iter().collect();
+        let offers = offers(serde_json::json!([{
+            "provider": "hexgrad",
+            "model": "kokoro-82m",
+            "is_offered": true,
+            "is_eligible": true,
+            "discount_bp": 1500
+        }]));
+        let rows = status_rows(&offers, &retail_by_key);
+        assert!(rows[0][3].contains("$0.8415 per Mchar"), "{:?}", rows[0]);
+        assert!(!rows[0][3].contains("$0.8415 per Mtok"), "{:?}", rows[0]);
+        let details = extra_rate_lines(&offers, &retail_by_key).join("\n");
+        assert!(
+            details.contains("input per Mchar  $0.990 → $0.8415"),
+            "{details}"
+        );
+        assert!(
+            details.contains("per Mtok unless labelled per Mchar"),
+            "{details}"
         );
     }
 

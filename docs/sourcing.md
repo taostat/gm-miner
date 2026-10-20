@@ -16,6 +16,25 @@ Run `gmcli sources` to see the routes available to you now, whether any of your
 workers can serve them, and the exact command to declare each. This document
 explains the table and how to set each upstream up.
 
+## Speech transports awaiting route admission
+
+The candidate image implements the following speech transports. These are not
+live route declarations; `gmcli sources` remains the source of current registry
+admission and worker readiness.
+
+| Buyer model family | Transport | Host | Key flag |
+|---|---|---|---|
+| Gemini TTS | Native `generateContent` | `generativelanguage.googleapis.com` | `--google` |
+| Kokoro | OpenAI-compatible speech | `api.deepinfra.com` | `--deepinfra` |
+| Kokoro | OpenAI-compatible speech | `api.together.xyz` | `--together` |
+| Kokoro / Qwen3 custom voice | AudioDojo | `vonkaiser-audiodojo.chutes.ai` | `--chutes` |
+
+Speech generation uses dedicated routes without transparent retries. AudioDojo
+has a separate TLS host and does not use the Chutes TEE verifier. Transport
+support alone does not establish source equivalence, voice coverage, credentials,
+pricing eligibility, or live supply. Reviewed registry profiles and worker
+admission are required before these sources can serve a buyer product.
+
 ## The routes
 
 | Buyer product | Route | Upstream host | Key flag |

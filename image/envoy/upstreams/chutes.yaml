@@ -12,6 +12,47 @@ slots:
 ##    3. every other request goes to Chutes directly.
 ##  The Lua filter answers a chat request without a selector with 400.
 routes:
+  ## AudioDojo is a separate Chutes deployment, with its own host, path and
+  ## TLS identity. It is not part of the current Chutes verifier target set.
+  - match:
+      path: "/tts/kokoro"
+      headers:
+        - name: ":method"
+          string_match:
+            exact: "POST"
+        - name: "x-gm-provider"
+          string_match:
+            exact: "chutes"
+        - name: "x-gm-upstream-model"
+          string_match:
+            exact: "hexgrad/Kokoro-82M"
+    request_headers_to_remove:
+      - x-gm-upstream-model
+      - x-gm-ordinary
+    route:
+      cluster: chutes_audiodojo
+      host_rewrite_literal: vonkaiser-audiodojo.chutes.ai
+      timeout: 1800s
+  - match:
+      path: "/tts/qwen3custom"
+      headers:
+        - name: ":method"
+          string_match:
+            exact: "POST"
+        - name: "x-gm-provider"
+          string_match:
+            exact: "chutes"
+        - name: "x-gm-upstream-model"
+          string_match:
+            exact: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    request_headers_to_remove:
+      - x-gm-upstream-model
+      - x-gm-ordinary
+    route:
+      cluster: chutes_audiodojo
+      host_rewrite_literal: vonkaiser-audiodojo.chutes.ai
+      timeout: 1800s
+
   - match:
       prefix: "/"
       headers:
@@ -115,3 +156,34 @@ clusters:
                   socket_address:
                     address: 127.0.0.1
                     port_value: 8083
+  - name: chutes_audiodojo
+    type: LOGICAL_DNS
+    connect_timeout: 10s
+    dns_lookup_family: V4_ONLY
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    load_assignment:
+      cluster_name: chutes_audiodojo
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: vonkaiser-audiodojo.chutes.ai
+                    port_value: 443
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: vonkaiser-audiodojo.chutes.ai
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: /etc/ssl/certs/ca-certificates.crt
+            match_typed_subject_alt_names:
+              - san_type: DNS
+                matcher:
+                  exact: vonkaiser-audiodojo.chutes.ai

@@ -89,6 +89,10 @@ pub(crate) struct SetApiKeysArgs {
     #[arg(long)]
     deepinfra: Option<String>,
 
+    /// Together API key.
+    #[arg(long)]
+    together: Option<String>,
+
     /// `KubeTEE` API key.
     #[arg(long)]
     kubetee: Option<String>,
@@ -127,6 +131,7 @@ impl SetApiKeysArgs {
             zai: self.zai,
             moonshot: self.moonshot,
             deepinfra: self.deepinfra,
+            together: self.together,
             kubetee: self.kubetee,
             engy: self.engy,
             moonmath: self.moonmath,
@@ -276,6 +281,7 @@ fn summary_lines(keys: &ProviderKeys) -> Vec<String> {
     group("zai", &[keys.zai.as_ref()]);
     group("moonshot", &[keys.moonshot.as_ref()]);
     group("deepinfra", &[keys.deepinfra.as_ref()]);
+    group("together", &[keys.together.as_ref()]);
     group("kubetee", &[keys.kubetee.as_ref()]);
     group("engy", &[keys.engy.as_ref()]);
     group("moonmath", &[keys.moonmath.as_ref()]);
@@ -374,6 +380,7 @@ fn validate_update(keys: &ProviderKeys) -> Result<()> {
         ("zai", keys.zai.as_deref()),
         ("moonshot", keys.moonshot.as_deref()),
         ("deepinfra", keys.deepinfra.as_deref()),
+        ("together", keys.together.as_deref()),
         ("kubetee", keys.kubetee.as_deref()),
         ("engy", keys.engy.as_deref()),
         ("moonmath", keys.moonmath.as_deref()),
@@ -422,6 +429,7 @@ fn merge_update(keys: &mut ProviderKeys, update: ProviderKeys) {
         (&mut keys.zai, update.zai),
         (&mut keys.moonshot, update.moonshot),
         (&mut keys.deepinfra, update.deepinfra),
+        (&mut keys.together, update.together),
         (&mut keys.kubetee, update.kubetee),
         (&mut keys.engy, update.engy),
         (&mut keys.moonmath, update.moonmath),
@@ -511,6 +519,16 @@ mod tests {
         keys.azure_foundry_client_id = None;
 
         assert_eq!(summary_lines(&keys), ["  azure-foundry: set"]);
+    }
+
+    #[test]
+    fn together_key_is_acknowledged_without_printing_its_value() {
+        let keys = ProviderKeys {
+            together: Some("private-together-key".to_owned()),
+            ..ProviderKeys::default()
+        };
+
+        assert_eq!(summary_lines(&keys), ["  together: set"]);
     }
 
     #[test]

@@ -401,17 +401,19 @@ mod tests {
             google: Some("AIza".to_owned()),
             zai: Some("zai-key".to_owned()),
             deepinfra: Some("di-a;di-b".to_owned()),
+            together: Some("together-key".to_owned()),
             ..ProviderKeys::default()
         };
         let slots = provider_slots_for_keys(&keys, SECRET).expect("slots");
         assert_eq!(
             slots.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["anthropic", "deepinfra", "gemini", "zai"]
+            vec!["anthropic", "deepinfra", "gemini", "together", "zai"]
         );
         assert_eq!(slots["anthropic"].len(), 2);
         assert_eq!(slots["gemini"].len(), 1);
         assert_eq!(slots["zai"].len(), 1);
         assert_eq!(slots["deepinfra"].len(), 2);
+        assert_eq!(slots["together"].len(), 1);
         assert!(!slots.contains_key("openai"));
     }
 

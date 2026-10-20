@@ -256,6 +256,10 @@ async fn check_provider_streaming(
     model_catalog: &ProbeModels,
     excluded: &BTreeSet<(String, String)>,
 ) {
+    if provider == Provider::Together {
+        println!("  [--] together: speech-only provider; chat streaming probe skipped");
+        return;
+    }
     let Some(models) = models_for_target(target, &provider, model_catalog.models_for(&provider))
     else {
         println!(
@@ -618,12 +622,16 @@ struct ProbeModels {
 impl ProbeModels {
     fn models_for(&self, provider: &Provider) -> Vec<ProbeModel> {
         match self.models.get(provider) {
-            Some(models) if !models.is_empty() => models.clone(),
-            _ => vec![ProbeModel {
-                canonical: fallback_model(provider).to_owned(),
-                upstream: None,
-                fallback: true,
-            }],
+            Some(models) if !models.is_empty() && provider != &Provider::Together => models.clone(),
+            _ => fallback_model(provider)
+                .map(|canonical| {
+                    vec![ProbeModel {
+                        canonical: canonical.to_owned(),
+                        upstream: None,
+                        fallback: true,
+                    }]
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -809,21 +817,22 @@ fn declared_models_for_provider(
         .collect()
 }
 
-fn fallback_model(provider: &Provider) -> &'static str {
+fn fallback_model(provider: &Provider) -> Option<&'static str> {
     match provider {
-        Provider::Anthropic => "claude-sonnet-4-6",
-        Provider::OpenAI => "gpt-5.5",
-        Provider::Gemini => "gemini-2.5-pro",
-        Provider::Chutes => "deepseek-ai/DeepSeek-V3-0324",
+        Provider::Anthropic => Some("claude-sonnet-4-6"),
+        Provider::OpenAI => Some("gpt-5.5"),
+        Provider::Gemini => Some("gemini-2.5-pro"),
+        Provider::Chutes => Some("deepseek-ai/DeepSeek-V3-0324"),
         // Engy and Moonmath serve the same open GLM weights under this model id.
-        Provider::Zai | Provider::Engy | Provider::Moonmath => "glm-5.2",
-        Provider::Moonshot => "kimi-k3",
-        Provider::DeepInfra => "zai-org/GLM-5.2",
+        Provider::Zai | Provider::Engy | Provider::Moonmath => Some("glm-5.2"),
+        Provider::Moonshot => Some("kimi-k3"),
+        Provider::DeepInfra => Some("zai-org/GLM-5.2"),
+        Provider::Together => None,
         // Last resort only when `/miners/me` has no kubetee offer. Prefer GLM
         // over kimi; flash is probed once declared (see #185 / sources).
-        Provider::Kubetee => "z-ai/glm-5.2",
-        Provider::Near => "Qwen/Qwen3.8-27B",
-        Provider::Benchmark => "benchmark",
+        Provider::Kubetee => Some("z-ai/glm-5.2"),
+        Provider::Near => Some("Qwen/Qwen3.8-27B"),
+        Provider::Benchmark => Some("benchmark"),
     }
 }
 
@@ -846,6 +855,7 @@ fn build_probe(provider: Provider, model: &ProbeModel, slot: Option<String>) -> 
             openai_compatible_probe(provider, model, slot, "/v1beta/openai/chat/completions")
         }
         Provider::OpenAI
+        | Provider::Together
         | Provider::Chutes
         | Provider::Zai
         | Provider::Moonshot
@@ -1253,7 +1263,9 @@ mod tests {
     #[test]
     fn zai_probe_uses_openai_compatible_route_and_model() {
         let model = ProbeModel {
-            canonical: fallback_model(&Provider::Zai).to_owned(),
+            canonical: fallback_model(&Provider::Zai)
+                .unwrap_or_default()
+                .to_owned(),
             upstream: None,
             fallback: true,
         };
@@ -1266,7 +1278,9 @@ mod tests {
     #[test]
     fn kubetee_probe_uses_openai_compatible_route_and_model() {
         let model = ProbeModel {
-            canonical: fallback_model(&Provider::Kubetee).to_owned(),
+            canonical: fallback_model(&Provider::Kubetee)
+                .unwrap_or_default()
+                .to_owned(),
             upstream: None,
             fallback: true,
         };
@@ -1727,9 +1741,28 @@ mod tests {
     }
 
     #[test]
+    fn together_catalog_coverage_never_becomes_a_chat_streaming_probe() {
+        let models = ProbeModels {
+            models: HashMap::from([(
+                Provider::Together,
+                vec![ProbeModel {
+                    canonical: "hexgrad/kokoro-82m".to_owned(),
+                    upstream: Some("hexgrad/Kokoro-82M".to_owned()),
+                    fallback: false,
+                }],
+            )]),
+        };
+
+        assert!(models.models_for(&Provider::Together).is_empty());
+        assert_eq!(fallback_model(&Provider::Together), None);
+    }
+
+    #[test]
     fn deepinfra_probe_uses_openai_compatible_route_and_model() {
         let model = ProbeModel {
-            canonical: fallback_model(&Provider::DeepInfra).to_owned(),
+            canonical: fallback_model(&Provider::DeepInfra)
+                .unwrap_or_default()
+                .to_owned(),
             upstream: None,
             fallback: true,
         };
@@ -1745,7 +1778,9 @@ mod tests {
     #[test]
     fn moonmath_probe_uses_openai_compatible_route_and_model() {
         let model = ProbeModel {
-            canonical: fallback_model(&Provider::Moonmath).to_owned(),
+            canonical: fallback_model(&Provider::Moonmath)
+                .unwrap_or_default()
+                .to_owned(),
             upstream: None,
             fallback: true,
         };

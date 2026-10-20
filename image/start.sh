@@ -323,6 +323,10 @@ if [[ -n "${DEEPINFRA_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "DEEPINFRA_API_KEY set"
 fi
+if [[ -n "${TOGETHER_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "TOGETHER_API_KEY set"
+fi
 if [[ -n "${KUBETEE_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "KUBETEE_API_KEY set"
@@ -342,7 +346,7 @@ fi
 
 if [[ "${HAS_KEY}" -eq 0 ]]; then
   if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && "${OPENAI_UPSTREAM}" == "direct" ]]; then
-    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY / NEAR_API_KEY must be set"
+    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / TOGETHER_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY / NEAR_API_KEY must be set"
   else
     log "error: at least one usable provider key must be set"
   fi
@@ -375,6 +379,9 @@ if [[ -n "${MOONSHOT_API_KEY:-}" ]]; then
 fi
 if [[ -n "${DEEPINFRA_API_KEY:-}" ]]; then
   fan_out_slots deepinfra DEEPINFRA_API_KEY
+fi
+if [[ -n "${TOGETHER_API_KEY:-}" ]]; then
+  fan_out_slots together TOGETHER_API_KEY
 fi
 if [[ -n "${KUBETEE_API_KEY:-}" ]]; then
   fan_out_slots kubetee KUBETEE_API_KEY

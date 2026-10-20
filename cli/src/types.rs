@@ -44,6 +44,7 @@ pub enum Provider {
     Zai,
     Moonshot,
     DeepInfra,
+    Together,
     Kubetee,
     Engy,
     Moonmath,
@@ -62,6 +63,7 @@ impl Provider {
             Self::Zai => "zai",
             Self::Moonshot => "moonshot",
             Self::DeepInfra => "deepinfra",
+            Self::Together => "together",
             Self::Kubetee => "kubetee",
             Self::Engy => "engy",
             Self::Moonmath => "moonmath",
@@ -96,6 +98,7 @@ impl std::str::FromStr for Provider {
             "zai" => Ok(Self::Zai),
             "moonshot" => Ok(Self::Moonshot),
             "deepinfra" => Ok(Self::DeepInfra),
+            "together" => Ok(Self::Together),
             "kubetee" => Ok(Self::Kubetee),
             "engy" => Ok(Self::Engy),
             "moonmath" => Ok(Self::Moonmath),
@@ -105,7 +108,7 @@ impl std::str::FromStr for Provider {
                  the benchmark pool automatically; see docs/plans/admission-benchmark.md"
             ),
             other => anyhow::bail!(
-                "unknown provider {other:?} — must be one of: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, kubetee, engy, moonmath, near"
+                "unknown provider {other:?} — must be one of: anthropic, openai, gemini, chutes, zai, moonshot, deepinfra, together, kubetee, engy, moonmath, near"
             ),
         }
     }
@@ -114,8 +117,8 @@ impl std::str::FromStr for Provider {
 /// One entry in the registry product catalog (`GET /products`).
 ///
 /// `retail_price` carries the per-dimension price vector the CLI needs to
-/// show the miner the effective per-Mtok rate they'll receive after applying
-/// their declared discount. Other retail fields are intentionally
+/// show the miner the effective rates they'll receive after applying their
+/// declared discount. Other retail fields are intentionally
 /// ignored — the CLI doesn't bill, the gateway does.
 ///
 /// `provider` is decoded as a `String`, not [`Provider`], so a product whose
@@ -143,6 +146,7 @@ impl Product {
             capabilities.generates_images()
                 || capabilities.video_generation
                 || capabilities.api.as_deref() == Some("openai_videos")
+                || capabilities.speech.is_some()
         })
     }
 }
@@ -158,6 +162,9 @@ pub struct ProductCapabilities {
     pub video_generation: bool,
     #[serde(default)]
     pub api: Option<String>,
+    /// Opaque speech profile. Speech-only products must not be sent to chat probes.
+    #[serde(default)]
+    pub speech: Option<serde_json::Value>,
 }
 
 impl ProductCapabilities {
@@ -178,8 +185,8 @@ pub struct RetailPrice {
 /// A product's full per-dimension price vector, mirroring
 /// `$defs/PriceDimensions` in the gm repo's `shared/schemas/product.json`.
 ///
-/// Input and output are required there — every product prices both. Every
-/// other dimension is nullable, and null means the model does not price it:
+/// Input and output per Mtok are required there — every product prices both.
+/// Every other dimension is nullable, and null means the model does not price it:
 /// a model with no prompt cache carries no `cache_read`, and rendering `$0.000`
 /// for it would read as "free" rather than "not offered".
 ///
@@ -196,6 +203,10 @@ pub struct RetailPrice {
 pub struct RetailDimensions {
     pub input_per_mtok_ndollars: u64,
     pub output_per_mtok_ndollars: u64,
+    /// Input-character price for character-billed speech products. It is a
+    /// separate billing unit from text/audio token prices.
+    #[serde(default)]
+    pub input_per_mchar_ndollars: Option<u64>,
     #[serde(default)]
     pub cache_read_per_mtok_ndollars: Option<u64>,
     #[serde(default)]
@@ -486,4 +497,37 @@ pub struct WorkerListResponse {
     /// control-loop config, not per-worker state.
     #[serde(default)]
     pub consecutive_ok_required: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Product, Provider};
+
+    #[test]
+    fn provider_parses_together_as_a_distinct_route_identity() -> anyhow::Result<()> {
+        let provider = "together".parse::<Provider>()?;
+        anyhow::ensure!(provider.as_str() == "together", "provider identity changed");
+        Ok(())
+    }
+
+    #[test]
+    fn speech_capability_excludes_a_product_from_chat_only_probes() -> anyhow::Result<()> {
+        let product: Product = serde_json::from_value(serde_json::json!({
+            "provider": "gemini",
+            "model": "gemini-3.8-flash-tts",
+            "status": "active",
+            "retail_price": {
+                "dimensions": {
+                    "input_per_mtok_ndollars": 1,
+                    "output_per_mtok_ndollars": 1
+                }
+            },
+            "capabilities": {"speech": {"voices": []}}
+        }))?;
+        anyhow::ensure!(
+            product.has_no_chat_surface(),
+            "speech-only catalog product appeared on the chat surface"
+        );
+        Ok(())
+    }
 }

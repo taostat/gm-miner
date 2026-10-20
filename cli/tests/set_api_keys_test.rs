@@ -55,6 +55,7 @@ fn cli_persists_every_key_group_and_preserves_omitted_values() {
         ("zai", "zai-key"),
         ("moonshot", "moonshot-key"),
         ("deepinfra", "deepinfra-key"),
+        ("together", "together-key"),
         ("kubetee", "kubetee-key"),
         ("engy", "engy-key"),
         ("moonmath", "moonmath-key"),
@@ -282,6 +283,15 @@ fn any_set_true_when_deepinfra_set() {
         google: None,
         chutes: None,
         deepinfra: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(keys.any_set());
+}
+
+#[test]
+fn any_set_true_when_together_set() {
+    let keys = ProviderKeys {
+        together: Some("k".to_owned()),
         ..ProviderKeys::default()
     };
     assert!(keys.any_set());

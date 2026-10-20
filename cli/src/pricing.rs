@@ -3,7 +3,8 @@
 //! never a float.
 //!
 //! Prices are a *vector*, not a pair: a product prices input and output plus
-//! up to twelve further dimensions (prompt cache, audio, image, video, long context). A
+//! up to thirteen further dimensions (characters, prompt cache, audio, image,
+//! video, long context). A
 //! percent discount is the ergonomic way to express an offer, and
 //! [`effective_dimensions`] resolves it into the absolute per-dimension
 //! figures the miner is shown before declaring. Shown, not agreed: the wire
@@ -102,13 +103,11 @@ pub fn format_discount_pct(discount_bp: u32) -> String {
         .to_owned()
 }
 
-/// Effective per-Mtok ndollars the miner receives for one dimension:
-/// `floor(retail × (10_000 − discount_bp) / 10_000)`. Matches the
-/// gateway's per-dimension floor in `gateway/src/money/settle.rs::
-/// effective_per_mtok_prices`, so what we display here is byte-for-byte
-/// the number the miner is paid.
+/// Effective ndollars the miner receives for one dimension:
+/// `floor(retail × (10_000 − discount_bp) / 10_000)`. Every unit uses the same
+/// integer floor without floating-point rounding.
 #[must_use]
-pub fn effective_per_mtok_ndollars(retail_ndollars: u64, discount_bp: u32) -> u64 {
+pub fn effective_price_ndollars(retail_ndollars: u64, discount_bp: u32) -> u64 {
     let bp = u128::from(discount_bp.min(MAX_DISCOUNT_BP));
     let total = u128::from(retail_ndollars);
     let effective = (total * (10_000 - bp)) / 10_000;
@@ -121,11 +120,49 @@ pub fn effective_per_mtok_ndollars(retail_ndollars: u64, discount_bp: u32) -> u6
 ///
 /// [`PRICE_DIMENSIONS`] is the single list of dimensions the CLI knows about,
 /// so the vector arithmetic and every rendering of it cannot drift apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PriceUnit {
+    Mtok,
+    Mchar,
+    Image,
+    VideoSecond,
+    MtokHour,
+}
+
+impl PriceUnit {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Mtok => "per Mtok",
+            Self::Mchar => "per Mchar",
+            Self::Image => "per image",
+            Self::VideoSecond => "per video second",
+            Self::MtokHour => "per Mtok-hour",
+        }
+    }
+
+    /// Units that earn a compact headline in addition to the anchor summary.
+    const fn summary_label(self) -> Option<&'static str> {
+        match self {
+            Self::Mtok => None,
+            Self::Mchar | Self::Image | Self::VideoSecond | Self::MtokHour => Some(self.label()),
+        }
+    }
+
+    /// Units for source products whose price is not anchored to token input
+    /// and output. Token rates and resource-time rates need the anchor summary
+    /// so the sourcing table does not replace a token-priced product's rates
+    /// with only one of its other dimensions.
+    const fn is_flat_or_character(self) -> bool {
+        matches!(self, Self::Mchar | Self::Image | Self::VideoSecond)
+    }
+}
+
 struct PriceDimension {
     label: &'static str,
     /// True for input and output — the two dimensions every product prices and
     /// the pair the summary line carries. The rest render only when priced.
     anchor: bool,
+    unit: PriceUnit,
     get: fn(&RetailDimensions) -> Option<u64>,
     set: fn(&mut RetailDimensions, u64),
 }
@@ -135,88 +172,109 @@ struct PriceDimension {
 /// `long_context_threshold_tokens` is deliberately absent: it is a token
 /// count, not a price, so discounting it would be nonsense — it rides through
 /// [`effective_dimensions`] untouched.
-const PRICE_DIMENSIONS: [PriceDimension; 14] = [
+const PRICE_DIMENSIONS: [PriceDimension; 15] = [
     PriceDimension {
         label: "input",
         anchor: true,
+        unit: PriceUnit::Mtok,
         get: |d| Some(d.input_per_mtok_ndollars),
         set: |d, v| d.input_per_mtok_ndollars = v,
     },
     PriceDimension {
         label: "output",
         anchor: true,
+        unit: PriceUnit::Mtok,
         get: |d| Some(d.output_per_mtok_ndollars),
         set: |d, v| d.output_per_mtok_ndollars = v,
     },
     PriceDimension {
+        label: "input per Mchar",
+        anchor: false,
+        unit: PriceUnit::Mchar,
+        get: |d| d.input_per_mchar_ndollars,
+        set: |d, v| d.input_per_mchar_ndollars = Some(v),
+    },
+    PriceDimension {
         label: "cache read",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.cache_read_per_mtok_ndollars,
         set: |d, v| d.cache_read_per_mtok_ndollars = Some(v),
     },
     PriceDimension {
         label: "cache write 5m",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.cache_write_5m_per_mtok_ndollars,
         set: |d, v| d.cache_write_5m_per_mtok_ndollars = Some(v),
     },
     PriceDimension {
         label: "cache write 1h",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.cache_write_1h_per_mtok_ndollars,
         set: |d, v| d.cache_write_1h_per_mtok_ndollars = Some(v),
     },
     PriceDimension {
         label: "audio input",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.audio_input_per_mtok_ndollars,
         set: |d, v| d.audio_input_per_mtok_ndollars = Some(v),
     },
     PriceDimension {
         label: "audio output",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.audio_output_per_mtok_ndollars,
         set: |d, v| d.audio_output_per_mtok_ndollars = Some(v),
     },
     PriceDimension {
         label: "image input",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.image_input_per_mtok_ndollars,
         set: |d, v| d.image_input_per_mtok_ndollars = Some(v),
     },
     PriceDimension {
         label: "image output",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.image_output_per_mtok_ndollars,
         set: |d, v| d.image_output_per_mtok_ndollars = Some(v),
     },
     PriceDimension {
         label: "per image",
         anchor: false,
+        unit: PriceUnit::Image,
         get: |d| d.output_per_image_ndollars,
         set: |d, v| d.output_per_image_ndollars = Some(v),
     },
     PriceDimension {
         label: "per video second",
         anchor: false,
+        unit: PriceUnit::VideoSecond,
         get: |d| d.output_per_video_second_ndollars,
         set: |d, v| d.output_per_video_second_ndollars = Some(v),
     },
     PriceDimension {
         label: "cache storage/hr",
         anchor: false,
+        unit: PriceUnit::MtokHour,
         get: |d| d.cache_storage_per_mtok_hour_ndollars,
         set: |d, v| d.cache_storage_per_mtok_hour_ndollars = Some(v),
     },
     PriceDimension {
         label: "long-ctx input",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.long_context_input_per_mtok_ndollars,
         set: |d, v| d.long_context_input_per_mtok_ndollars = Some(v),
     },
     PriceDimension {
         label: "long-ctx output",
         anchor: false,
+        unit: PriceUnit::Mtok,
         get: |d| d.long_context_output_per_mtok_ndollars,
         set: |d, v| d.long_context_output_per_mtok_ndollars = Some(v),
     },
@@ -225,8 +283,7 @@ const PRICE_DIMENSIONS: [PriceDimension; 14] = [
 /// Resolve a percentage discount into the absolute per-dimension vector the
 /// miner is actually paid on.
 ///
-/// Every priced dimension gets the same
-/// [`effective_per_mtok_ndollars`] floor; a dimension the product does not
+/// Every priced dimension gets the same integer floor; a dimension the product does not
 /// price stays unpriced rather than becoming a zero, and
 /// `long_context_threshold_tokens` is copied verbatim because it is a token
 /// count and not money.
@@ -242,10 +299,7 @@ pub fn effective_dimensions(retail: &RetailDimensions, discount_bp: u32) -> Reta
     let mut effective = retail.clone();
     for dim in &PRICE_DIMENSIONS {
         if let Some(value) = (dim.get)(retail) {
-            (dim.set)(
-                &mut effective,
-                effective_per_mtok_ndollars(value, discount_bp),
-            );
+            (dim.set)(&mut effective, effective_price_ndollars(value, discount_bp));
         }
     }
     effective
@@ -281,25 +335,106 @@ pub fn format_usd(ndollars: u64) -> String {
     format!("${dollars}.{fraction}")
 }
 
+/// Render prices whose units are distinct from the default token rate.
+///
+/// The dimension table owns each unit label, keeping character, image, video,
+/// and storage prices from acquiring a token label in any caller display.
+#[must_use]
+pub fn unit_price_summary(retail: &RetailDimensions) -> Option<String> {
+    let mut prices: Vec<_> = PRICE_DIMENSIONS
+        .iter()
+        .filter(|dimension| !dimension.anchor)
+        .filter_map(|dimension| {
+            let unit = dimension.unit.summary_label()?;
+            let price = (dimension.get)(retail)?;
+            Some(format!("{} {unit}", format_usd(price)))
+        })
+        .collect();
+    // Preserve the established headline order: later dimensions in the
+    // catalogue table appear before earlier unit prices.
+    prices.reverse();
+    (!prices.is_empty()).then(|| prices.join("; "))
+}
+
+/// Render a headline for products priced only by character, image, or video
+/// unit. A product with token anchors or any token/resource-time dimensions
+/// retains the ordinary anchor-and-extras source summary instead.
+#[must_use]
+pub fn flat_or_character_price_summary(retail: &RetailDimensions) -> Option<String> {
+    if retail.input_per_mtok_ndollars != 0 || retail.output_per_mtok_ndollars != 0 {
+        return None;
+    }
+
+    let mut has_flat_or_character_price = false;
+    for dimension in PRICE_DIMENSIONS
+        .iter()
+        .filter(|dimension| !dimension.anchor && (dimension.get)(retail).is_some())
+    {
+        if !dimension.unit.is_flat_or_character() {
+            return None;
+        }
+        has_flat_or_character_price = true;
+    }
+
+    has_flat_or_character_price
+        .then(|| unit_price_summary(retail))
+        .flatten()
+}
+
+/// Explain which units a set of detail rows uses. Mtok remains the default for
+/// dimensions not given a distinct unit label in their row.
+#[must_use]
+pub fn extra_dimension_unit_note<'a>(
+    retails: impl IntoIterator<Item = &'a RetailDimensions>,
+) -> String {
+    let mut units = Vec::new();
+    for retail in retails {
+        for dimension in PRICE_DIMENSIONS.iter().filter(|dimension| {
+            !dimension.anchor
+                && dimension.unit != PriceUnit::Mtok
+                && (dimension.get)(retail).is_some()
+        }) {
+            let unit = dimension.unit.label();
+            if !units.contains(&unit) {
+                units.push(unit);
+            }
+        }
+    }
+    match units.as_slice() {
+        [] => "per Mtok".to_owned(),
+        [unit] => format!("per Mtok unless labelled {unit}"),
+        [first, second] => format!("per Mtok unless labelled {first} or {second}"),
+        _ => {
+            let last_index = units.len() - 1;
+            format!(
+                "per Mtok unless labelled {}, or {}",
+                units[..last_index].join(", "),
+                units[last_index]
+            )
+        }
+    }
+}
+
 /// Shared by declaration and status output so discounted rates use consistent units.
 /// The count of prices not shown points the miner to [`extra_dimension_lines`]
 /// rather than presenting the summary as the whole price vector.
 #[must_use]
 pub fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> String {
     let effective = effective_dimensions(retail, discount_bp);
-    let mut summary = format!(
+    let anchors = format!(
         "{} in / {} out per Mtok",
         format_usd(effective.input_per_mtok_ndollars),
         format_usd(effective.output_per_mtok_ndollars)
     );
-    if let Some(price) = effective.output_per_image_ndollars {
-        summary = format!("{} per image; {summary}", format_usd(price));
-    }
-    if let Some(price) = effective.output_per_video_second_ndollars {
-        summary = format!("{} per video second; {summary}", format_usd(price));
-    }
-    let shown_unit_prices = usize::from(effective.output_per_image_ndollars.is_some())
-        + usize::from(effective.output_per_video_second_ndollars.is_some());
+    let summary = unit_price_summary(&effective).map_or_else(
+        || anchors.clone(),
+        |unit_prices| format!("{unit_prices}; {anchors}"),
+    );
+    let shown_unit_prices = PRICE_DIMENSIONS
+        .iter()
+        .filter(|dimension| !dimension.anchor && dimension.unit.summary_label().is_some())
+        .filter(|dimension| (dimension.get)(&effective).is_some())
+        .count();
     match extra_dimension_count(retail) - shown_unit_prices {
         0 => summary,
         n => format!("{summary} (+{n} more)"),
@@ -540,10 +675,10 @@ fn advice_lines(yours: &[&ProductCompetitiveness]) -> Vec<String> {
 )]
 mod tests {
     use super::{
-        effective_dimensions, effective_per_mtok_ndollars, effective_rate_summary,
-        extra_dimension_count, extra_dimension_lines, format_discount_pct, format_usd,
-        parse_discount_pct, rank_table, render_pricing, Network, ProductCompetitiveness,
-        MAX_DISCOUNT_BP, PRICE_DIMENSIONS,
+        effective_dimensions, effective_price_ndollars, effective_rate_summary,
+        extra_dimension_count, extra_dimension_lines, extra_dimension_unit_note,
+        format_discount_pct, format_usd, parse_discount_pct, rank_table, render_pricing, Network,
+        ProductCompetitiveness, MAX_DISCOUNT_BP, PRICE_DIMENSIONS,
     };
     use crate::types::RetailDimensions;
 
@@ -552,6 +687,7 @@ mod tests {
         RetailDimensions {
             input_per_mtok_ndollars: 3_000_000_000,
             output_per_mtok_ndollars: 15_000_000_000,
+            input_per_mchar_ndollars: Some(20_000_003),
             cache_read_per_mtok_ndollars: Some(300_000_000),
             cache_write_5m_per_mtok_ndollars: Some(3_750_000_000),
             cache_write_1h_per_mtok_ndollars: Some(6_000_000_000),
@@ -578,6 +714,7 @@ mod tests {
         vec![
             ("input", Some(dims.input_per_mtok_ndollars)),
             ("output", Some(dims.output_per_mtok_ndollars)),
+            ("input_per_mchar", dims.input_per_mchar_ndollars),
             ("cache_read", dims.cache_read_per_mtok_ndollars),
             ("cache_write_5m", dims.cache_write_5m_per_mtok_ndollars),
             ("cache_write_1h", dims.cache_write_1h_per_mtok_ndollars),
@@ -656,25 +793,16 @@ mod tests {
     }
 
     #[test]
-    fn effective_per_mtok_matches_gateway_floor() {
-        // 6% discount on $3/Mtok retail → $2.82/Mtok per gateway settle.rs.
-        assert_eq!(
-            effective_per_mtok_ndollars(3_000_000_000, 600),
-            2_820_000_000
-        );
+    fn effective_price_matches_integer_floor() {
+        // 6% discount on $3/Mtok retail → $2.82/Mtok.
+        assert_eq!(effective_price_ndollars(3_000_000_000, 600), 2_820_000_000);
         // 10.5% discount on $3/Mtok input → $2.685/Mtok.
-        assert_eq!(
-            effective_per_mtok_ndollars(3_000_000_000, 1050),
-            2_685_000_000
-        );
+        assert_eq!(effective_price_ndollars(3_000_000_000, 1050), 2_685_000_000);
         // Discount = 0 returns retail verbatim.
-        assert_eq!(
-            effective_per_mtok_ndollars(15_000_000_000, 0),
-            15_000_000_000
-        );
+        assert_eq!(effective_price_ndollars(15_000_000_000, 0), 15_000_000_000);
         // Discount = 99.90% leaves 0.10% of retail.
         assert_eq!(
-            effective_per_mtok_ndollars(15_000_000_000, MAX_DISCOUNT_BP),
+            effective_price_ndollars(15_000_000_000, MAX_DISCOUNT_BP),
             15_000_000
         );
     }
@@ -929,6 +1057,7 @@ mod tests {
         let effective = effective_dimensions(&full_vector(), 1050);
         assert_eq!(effective.input_per_mtok_ndollars, 2_685_000_000);
         assert_eq!(effective.output_per_mtok_ndollars, 13_425_000_000);
+        assert_eq!(effective.input_per_mchar_ndollars, Some(17_900_002));
         assert_eq!(effective.cache_read_per_mtok_ndollars, Some(268_500_000));
         assert_eq!(
             effective.cache_write_5m_per_mtok_ndollars,
@@ -1042,6 +1171,7 @@ mod tests {
         .expect("a partial vector carrying an unknown field still decodes");
 
         assert_eq!(dims.input_per_mtok_ndollars, 1_400_000_000);
+        assert_eq!(dims.input_per_mchar_ndollars, None);
         assert_eq!(dims.cache_read_per_mtok_ndollars, None);
         assert_eq!(dims.cache_write_1h_per_mtok_ndollars, None);
         assert_eq!(extra_dimension_count(&dims), 0);
@@ -1111,8 +1241,9 @@ mod tests {
         // offer and never looks for the rest.
         assert_eq!(
             effective_rate_summary(&full_vector(), 1050),
-            "$0.13425 per video second; $0.013425006 per image; \
-             $2.685 in / $13.425 out per Mtok (+10 more)"
+            "$0.04475 per Mtok-hour; $0.13425 per video second; \
+             $0.013425006 per image; $0.017900002 per Mchar; \
+             $2.685 in / $13.425 out per Mtok (+9 more)"
         );
         let anchors_only = RetailDimensions {
             input_per_mtok_ndollars: 3_000_000_000,
@@ -1126,6 +1257,23 @@ mod tests {
         assert_eq!(
             extra_dimension_lines(&anchors_only, 1050),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn distinct_dimension_units_come_from_the_shared_price_metadata() {
+        let retail = full_vector();
+        assert_eq!(
+            extra_dimension_unit_note(std::iter::once(&retail)),
+            "per Mtok unless labelled per Mchar, per image, per video second, or per Mtok-hour"
+        );
+        assert_eq!(
+            extra_dimension_unit_note(std::iter::once(&RetailDimensions {
+                input_per_mtok_ndollars: 1,
+                output_per_mtok_ndollars: 2,
+                ..Default::default()
+            })),
+            "per Mtok"
         );
     }
 

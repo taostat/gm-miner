@@ -75,9 +75,11 @@ pub struct AdminImageVersionRequest {
     pub image_ref: Option<String>,
 }
 
-/// Features this release's image supports. Stamped verbatim onto every
-/// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 8] = [
+/// Transport implementations compiled into this release's image. These
+/// static flags do not prove live credentials, route admission, supplier
+/// availability, or confidential assurance; the registry checks those
+/// separately against reviewed profiles and readiness.
+pub const IMAGE_FEATURES: [&str; 11] = [
     "upstream-key-slots",
     "upstream-model-hop",
     "deepinfra-native-images",
@@ -86,6 +88,9 @@ pub const IMAGE_FEATURES: [&str; 8] = [
     "kubetee-no-retry-images",
     "video-jobs-v1",
     "engy-video-v2",
+    "speech-openai-v1",
+    "speech-gemini-v1",
+    "speech-chutes-audiodojo-v1",
 ];
 
 /// The git provenance stamped onto a published version.
@@ -449,7 +454,10 @@ mod tests {
                 "kubetee-attested-chat",
                 "kubetee-no-retry-images",
                 "video-jobs-v1",
-                "engy-video-v2"
+                "engy-video-v2",
+                "speech-openai-v1",
+                "speech-gemini-v1",
+                "speech-chutes-audiodojo-v1"
             ]),
         );
     }

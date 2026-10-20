@@ -4,6 +4,27 @@ slots:
   auth_prefix: "Bearer "
 
 routes:
+  ## Speech synthesis is a generation side effect; never let Envoy replay it.
+  ## DeepInfra exposes its OpenAI-compatible API below /v1/openai.
+  - match:
+      path: "/v1/audio/speech"
+      headers:
+        - name: ":method"
+          string_match:
+            exact: "POST"
+        - name: "x-gm-provider"
+          string_match:
+            exact: "deepinfra"
+    route:
+      cluster: deepinfra
+      host_rewrite_literal: api.deepinfra.com
+      regex_rewrite:
+        pattern:
+          google_re2: {}
+          regex: "^/v1/(.*)$"
+        substitution: "/v1/openai/\\1"
+      timeout: 1800s
+
   ## Native inference preserves its path and never replays a generation.
   - match:
       prefix: "/v1/inference/"

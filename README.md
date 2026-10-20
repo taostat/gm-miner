@@ -7,7 +7,7 @@ inside an Intel TDX TEE so neither operators nor host machines see buyer content
 upstream keys.
 
 You bring your own provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot,
-DeepInfra, KubeTEE, Engy, Moonmath, NEAR AI Cloud, or Bedrock/Foundry/Azure transport backends
+DeepInfra, Together, KubeTEE, Engy, Moonmath, NEAR AI Cloud, or Bedrock/Foundry/Azure transport backends
 behind the existing Anthropic/OpenAI routes) and your own funded
 [Phala Cloud](https://cloud.phala.network) account. Transport capability is not registry
 admission: Azure OpenAI chat completions and Foundry Messages are qualified only when the
@@ -17,9 +17,17 @@ Bedrock inference is disabled: requests return 421 with a slot header and 400 wi
 Anthropic/OpenAI routes use verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 
+The image includes TTS transport implementations for Gemini native `generateContent`, the
+OpenAI-compatible DeepInfra/Together speech endpoint, and Chutes AudioDojo. Their image features
+(`speech-gemini-v1`, `speech-openai-v1`, and `speech-chutes-audiodojo-v1`) indicate only that these
+transports are present. Live serving still requires a reviewed registry speech profile, product
+capability, valid credentials/readiness, and eligible supply. AudioDojo uses a separate host and
+is rejected for `-TEE` selectors until a matching verifier exists; these transports do not prove
+confidential assurance or live admission.
+
 | Path | Description |
 |---|---|
-| `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Chutes `-TEE` requests pass through an in-image verifier which admits the Chutes instance on verified TDX, GPU and measurement evidence and encrypts each request end to end to its attested key. KubeTEE chat requests pass through an in-image verifier which attests each upstream TLS connection before forwarding on it. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, the optional NEAR, Chutes and KubeTEE verifiers, and the Envoy data plane. |
+| `image/` | Miner container image with twelve provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / Together / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Chutes `-TEE` requests pass through an in-image verifier which admits the Chutes instance on verified TDX, GPU and measurement evidence and encrypts each request end to end to its attested key. KubeTEE chat requests pass through an in-image verifier which attests each upstream TLS connection before forwarding on it. TTS uses separate no-replay paths, including Chutes AudioDojo on its own TLS-pinned host; AudioDojo is not TEE-verified. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, the optional NEAR, Chutes and KubeTEE verifiers, and the Envoy data plane. |
 | `cli/` | `gmcli` CLI (Rust + clap). Operator commands handle login, image registration, products, and prices. The image also uses its hidden `slot-env` command to derive upstream key slots inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -116,7 +124,7 @@ Credentials are stored in `~/.gmcli/config.json`.
 
 ### 3. Set your provider API keys
 
-Your provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE,
+Your provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, Together, KubeTEE,
 Engy, Moonmath, NEAR) are baked into the miner container at
 deploy time and stay inside the TEE — gm never sees them. Set the keys for whichever providers you
 intend to serve:
@@ -128,6 +136,7 @@ gmcli set-api-keys --chutes cpk-...
 gmcli set-api-keys --zai zai-...
 gmcli set-api-keys --moonshot sk-...
 gmcli set-api-keys --deepinfra ...
+gmcli set-api-keys --together ...
 gmcli set-api-keys --kubetee sk-...
 gmcli set-api-keys --engy sk-...
 gmcli set-api-keys --moonmath sk-...
@@ -397,7 +406,7 @@ gmcli worker remove <worker_id>
 | `gmcli login` | Device-code OAuth login; stores credentials in `~/.gmcli/config.json` |
 | `gmcli register-hotkey` | Record the serving hotkey (`--hotkey-ss58` or assisted via btcli) |
 | `gmcli deploy` | Full deploy: fetch approved image, launch Phala CVM, verify hashes, register worker |
-| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, KubeTEE, Engy, Moonmath, NEAR) |
+| `gmcli set-api-keys` | Persist provider API keys (Anthropic, OpenAI, Google, Chutes, Z.ai, Moonshot, DeepInfra, Together, KubeTEE, Engy, Moonmath, NEAR) |
 | `gmcli declare-product` | Declare a single model offer with a discount |
 | `gmcli declare-products` | Fan one discount across the catalog or one provider's slice |
 | `gmcli undeclare-product` | Withdraw a single offer; re-declaring re-offers it |
