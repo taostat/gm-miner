@@ -29,6 +29,9 @@ pub const SELECTOR_HEADER: &str = "x-gm-upstream-model";
 const PROVIDER: &str = "NEAR";
 const ATTESTATION_LIMIT: usize = 2 * 1024 * 1024;
 const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(120);
+// Match the Envoy route timeout: non-streaming inference may not return
+// response headers until generation completes.
+const INFERENCE_TIMEOUT: Duration = Duration::from_secs(1800);
 const NRAS_TIMEOUT: Duration = Duration::from_secs(60);
 const NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
@@ -216,10 +219,7 @@ impl NearVerifier {
         let (mut sender, connection, _, _) = self.connect_and_attest(target).await?;
 
         let upstream_request = upstream_request(request, target)?;
-        let response = timeout(ATTESTATION_TIMEOUT, sender.send_request(upstream_request))
-            .await
-            .context("NEAR inference timed out")?
-            .context("send NEAR inference on attested TLS connection")?;
+        let response = send_inference(&mut sender, upstream_request).await?;
         let (parts, body) = response.into_parts();
         tokio::spawn(async move {
             if let Err(error) = connection.await {
@@ -469,6 +469,17 @@ pub fn error_response(error: &anyhow::Error) -> Response<Body> {
     upstream_proxy::error_response(PROVIDER, error)
 }
 
+// Inference is sent exactly once, after attestation, on the same connection.
+async fn send_inference(
+    sender: &mut SendRequest<Body>,
+    request: Request<Body>,
+) -> Result<Response<hyper::body::Incoming>> {
+    timeout(INFERENCE_TIMEOUT, sender.send_request(request))
+        .await
+        .context("NEAR inference timed out")?
+        .context("send NEAR inference on attested TLS connection")
+}
+
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -483,6 +494,77 @@ mod tests {
 
     const FLUX_KLEIN_MODEL: &str = "black-forest-labs/FLUX.2-klein-4B";
     const FLUX_KLEIN_HOST: &str = "flux2-klein.completions.near.ai";
+
+    // Real HTTP over an in-memory connection lets Tokio advance simulated
+    // time without live TLS/attestation services or wall-clock sleeps.
+    async fn delayed_inference(
+        target: NearTarget,
+        delay: Duration,
+    ) -> Result<Response<hyper::body::Incoming>> {
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let service = service_fn(move |request: Request<hyper::body::Incoming>| async move {
+            assert_eq!(request.uri().path(), target.path);
+            assert_eq!(request.headers()[HOST], target.host);
+            assert!(!request.headers().contains_key(SELECTOR_HEADER));
+            assert_eq!(
+                request.into_body().collect().await.unwrap().to_bytes(),
+                "request body"
+            );
+            tokio::time::sleep(delay).await;
+            Ok::<_, std::convert::Infallible>(Response::new(Body::from("completion")))
+        });
+        let server = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server), service)
+                .await
+        });
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(target.path)
+            .header(SELECTOR_HEADER, target.model)
+            .body(Body::from("request body"))
+            .unwrap();
+        let result = send_inference(&mut sender, upstream_request(request, target).unwrap()).await;
+        // These tests use a complete small body; stop both drivers on error.
+        if result.is_err() {
+            connection.abort();
+            server.abort();
+        }
+        result
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inference_can_wait_longer_than_the_attestation_deadline() {
+        for target in TARGETS {
+            let started = tokio::time::Instant::now();
+            let response = delayed_inference(target, Duration::from_secs(121))
+                .await
+                .unwrap();
+            assert!(started.elapsed() >= Duration::from_secs(121));
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "completion"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inference_still_times_out_at_the_route_deadline() {
+        let started = tokio::time::Instant::now();
+        let error = delayed_inference(TARGETS[0], Duration::from_secs(1801))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "NEAR inference timed out");
+        assert_eq!(started.elapsed(), Duration::from_secs(1800));
+    }
 
     fn attestation(nonce: [u8; 32], spki: [u8; 32], model: &str) -> NearAttestation {
         let signing_key = [7_u8; 32];
