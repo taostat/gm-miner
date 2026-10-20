@@ -28,9 +28,9 @@
 //!   6. Submit the compose stack to Phala Cloud (via the [`PhalaClient`]
 //!      trait for testability) — with a production OS image (`--image` +
 //!      `--no-dev-os`), the corrected digest-aware pre-launch script, and
-//!      the registry pull credentials in the encrypted env — wait for the
-//!      CVM to boot, and read back the measured `compose_hash` +
-//!      `os_image_hash` and the CVM's public endpoint.
+//!      the registry pull credentials in the encrypted env — persist the
+//!      CVM ID as soon as it appears, then wait for boot and read back the
+//!      measured `compose_hash` + `os_image_hash` and the CVM's public endpoint.
 //!   7. **Verify** both hashes match the registry's approved version —
 //!      refuse and exit 1 if they don't.
 //!   8. Call `register_image` with the verified hashes and the endpoint.

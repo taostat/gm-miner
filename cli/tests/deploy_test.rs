@@ -56,8 +56,10 @@ impl PhalaClient for StubPhala {
         _node_secret: &str,
         _registry_creds: Option<&RegistryCredentials>,
         _boot_timeout_secs: u64,
+        on_app_id: &mut dyn FnMut(&str) -> anyhow::Result<()>,
     ) -> anyhow::Result<DeployOutcome> {
         self.deploy_called.set(true);
+        on_app_id("app_x")?;
         Ok(DeployOutcome {
             hashes: DstackDeployResult {
                 compose_sha256: self.compose_sha256.clone(),
@@ -84,7 +86,9 @@ impl PhalaClient for TimedOutPhala {
         _node_secret: &str,
         _registry_creds: Option<&RegistryCredentials>,
         _boot_timeout_secs: u64,
+        on_app_id: &mut dyn FnMut(&str) -> anyhow::Result<()>,
     ) -> anyhow::Result<DeployOutcome> {
+        on_app_id("app_x")?;
         anyhow::bail!(
             "timed out after 0s waiting for the CVM to report hashes \
              (compose_hash/os_image_hash never appeared in \
@@ -109,6 +113,7 @@ impl PhalaClient for FailingPhala {
         _node_secret: &str,
         _registry_creds: Option<&RegistryCredentials>,
         _boot_timeout_secs: u64,
+        _on_app_id: &mut dyn FnMut(&str) -> anyhow::Result<()>,
     ) -> anyhow::Result<DeployOutcome> {
         anyhow::bail!("phala deploy exited with status 1");
     }
@@ -283,7 +288,14 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            &rendered,
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+            &mut |_| Ok(()),
+        )
         .unwrap();
 
     assert!(stub.deploy_called.get(), "deploy must have been called");
@@ -320,7 +332,14 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            &rendered,
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+            &mut |_| Ok(()),
+        )
         .unwrap();
 
     let err = verify_hashes(&actual.hashes, approved)
@@ -428,7 +447,14 @@ fn phala_failure_surfaces_as_error() {
         ..ProviderKeys::default()
     };
     let err = FailingPhala
-        .deploy("compose-content", &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            "compose-content",
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+            &mut |_| Ok(()),
+        )
         .expect_err("failing phala must produce an error");
     assert!(err.to_string().contains("phala deploy exited"));
 }
@@ -447,7 +473,14 @@ fn timeout_error_is_actionable() {
         ..ProviderKeys::default()
     };
     let err = TimedOutPhala
-        .deploy("compose", &keys, "test-node-secret-1234", None, 0)
+        .deploy(
+            "compose",
+            &keys,
+            "test-node-secret-1234",
+            None,
+            0,
+            &mut |_| Ok(()),
+        )
         .expect_err("timed-out deploy must produce an error");
     let msg = err.to_string();
     assert!(
