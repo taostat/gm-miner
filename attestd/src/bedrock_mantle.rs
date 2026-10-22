@@ -1368,6 +1368,12 @@ fn guard_stream(source: BoxBodyStream) -> BoxBodyStream {
                         let start = consumed;
                         let frame_end = base + frame_end;
                         let after_frame = base + separator_end;
+                        if frame_end - start > MAX_STREAM_FRAME {
+                            return Some((
+                                Err(StreamEnd::FrameLimit.into_error()),
+                                (source, pending, total, started, terminal, true),
+                            ));
+                        }
                         match parse_stream_event(&pending[start..frame_end]) {
                             Ok(StreamEvent::Empty | StreamEvent::Ping) if !terminal => {}
                             Ok(StreamEvent::MessageStart) if !started && !terminal => {
@@ -2327,9 +2333,51 @@ mod tests {
         }
     }
 
+    /// A signature frame whose event bytes, separator excluded, are `length`.
+    fn frame_of_length(length: usize) -> Vec<u8> {
+        let overhead = signature_delta_frame(0).len() - b"\n\n".len();
+        let frame = signature_delta_frame(length - overhead);
+        assert_eq!(frame.len() - 2, length);
+        frame
+    }
+
+    async fn guard_result(body: &[u8], chunk_bytes: usize) -> Result<Vec<u8>, io::Error> {
+        let mut forwarded = Vec::new();
+        for chunk in guard_stream(in_chunks(body, chunk_bytes))
+            .collect::<Vec<_>>()
+            .await
+        {
+            forwarded.extend_from_slice(&chunk?);
+        }
+        Ok(forwarded)
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_applies_the_frame_bound_to_complete_frames() {
+        let over = stream_with_frame(&frame_of_length(MAX_STREAM_FRAME + 1));
+        for chunk_bytes in [over.len(), 8 * 1024] {
+            let error = guard_result(&over, chunk_bytes)
+                .await
+                .expect_err("a frame over the bound must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{chunk_bytes}");
+            assert_eq!(
+                error.to_string(),
+                "oversized Bedrock Mantle event frame",
+                "{chunk_bytes}"
+            );
+        }
+        let at_bound = stream_with_frame(&frame_of_length(MAX_STREAM_FRAME));
+        assert_eq!(
+            guard_result(&at_bound, at_bound.len())
+                .await
+                .expect("a frame at the bound must pass"),
+            at_bound
+        );
+    }
+
     #[tokio::test]
     async fn guarded_stream_holds_exactly_the_frame_bound_of_a_partial_frame() {
-        let body = stream_with_frame(&signature_delta_frame(MAX_STREAM_FRAME));
+        let body = stream_with_frame(&frame_of_length(MAX_STREAM_FRAME));
         let frame_start = body
             .windows(2)
             .position(|window| window == b"\n\n")
