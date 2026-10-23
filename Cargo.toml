@@ -3,7 +3,7 @@ resolver = "2"
 members = ["attestd", "azure-verify", "cli"]
 
 [workspace.package]
-version = "0.5.10-dev"
+version = "0.5.10"
 edition = "2021"
 # 1.88 is the workspace floor for the attestation crates: the dstack-sdk ->
 # alloy chain (pulled in by attestd) requires rustc 1.88+ transitively

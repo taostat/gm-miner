@@ -2873,7 +2873,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gm-azure-verify"
-version = "0.5.10-dev"
+version = "0.5.10"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -2887,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "gm-miner-attestd"
-version = "0.5.10-dev"
+version = "0.5.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2923,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "gmcli"
-version = "0.5.10-dev"
+version = "0.5.10"
 dependencies = [
  "anyhow",
  "axoupdater",
