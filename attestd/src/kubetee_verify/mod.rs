@@ -8,6 +8,7 @@
 //! signing the nonce. Chat requests are then sent on attested connections
 //! only, one at a time per connection.
 
+pub mod binding;
 pub mod evidence;
 pub mod pool;
 
@@ -328,6 +329,8 @@ impl KubeteeVerifier {
         })
         .await
         .context("KubeTEE attestation fetch timed out")??;
+        let binding = evidence::BindingGuard::run(&body, &nonce, connection.leaf.as_ref())
+            .context("kubetee.attestation.v1 binding")?;
         let payload: AttestationPayload =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
         let quote =
@@ -336,8 +339,14 @@ impl KubeteeVerifier {
         let collateral = self.collateral.fetch(&quote).await?;
         let now = self.collateral.now()?;
         let claims = tee_evidence::verify_signature_chain(&quote, collateral, now)?;
-        let measurements =
-            evidence::verify_attestation(&payload, &nonce, connection.leaf.as_ref(), &claims, now)?;
+        let measurements = evidence::verify_attestation_bound(
+            &payload,
+            &nonce,
+            connection.leaf.as_ref(),
+            &claims,
+            now,
+            binding,
+        )?;
         evidence::log_attested(&payload.pod, &measurements);
         Ok(Attestation {
             pod: payload.pod,

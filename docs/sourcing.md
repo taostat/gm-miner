@@ -334,7 +334,11 @@ requires
 
 - the nonce echoed back exactly;
 - the Intel TDX quote verifying at `UpToDate` TCB with the debug bit clear;
-- the quote's `report_data` equal to SHA-512 of the nonce;
+- the quote's `report_data` equal to SHA-512 of the nonce (the live gateway
+  construction; the v1 `kubetee.attestation.v1` JCS-statement binding replaces
+  it at the gateway flip — see the `kubetee.attestation.v1` specification §4,
+  incl. the pinned conformance vectors; `attestd/src/report_data.rs`'s
+  `sha512(pubkey || nonce)` is the separate gm-side attestation-info contract);
 - the CC event log replaying to the quote's RTMR0-3;
 - KubeTEE's TLS-possession proof naming this connection's certificate, with
   that certificate's key signing the nonce.

@@ -9,6 +9,11 @@
   same day from Phala's PCCS. Tests verify the quote offline at a fixed time
   inside its validity window.
 
+`ec_session_leaf.der` and `ec_session_leaf_key.pk8` are a throwaway P-256
+certificate/key pair (self-signed; the key protects nothing) for the
+`ES256` TLS-possession proof tests: a per-boot serving key is EC P-256, so
+the proof carries ECDSA over SHA-256 rather than RS256.
+
 `test_ca.der`, `test_leaf.der` and `test_leaf_key.pk8` are a throwaway PKI for
 the tests' local TLS upstream: a root trusted only by those tests and an RSA
 leaf for `llm.kubetee.ai` it signed. The key protects nothing.

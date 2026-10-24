@@ -198,10 +198,18 @@ fn a_bad_tls_signature_fails_closed() {
 }
 
 #[test]
-fn a_non_rs256_proof_fails_closed() {
+fn an_unnamed_signature_algorithm_fails_closed() {
+    let mut payload = payload();
+    payload.tls_possession.as_mut().unwrap().tls_signature_alg = "PS256".to_owned();
+    assert!(failure(standalone(&payload, &payload.nonce, &claims()))
+        .contains("expected ES256 or RS256"));
+}
+
+#[test]
+fn an_es256_proof_over_the_rsa_session_key_fails_closed() {
     let mut payload = payload();
     payload.tls_possession.as_mut().unwrap().tls_signature_alg = "ES256".to_owned();
-    assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("RS256"));
+    assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("not P-256"));
 }
 
 #[test]
