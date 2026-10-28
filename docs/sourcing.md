@@ -20,9 +20,9 @@ explains the table and how to set each upstream up.
 
 | Buyer product | Route | Upstream host | Key flag |
 |---|---|---|---|
-| `nvidia/nemotron-3-nano-omni-30b-tee` | `chutes/Nemotron-3-Nano-Omni-30B-TEE` | `llm.chutes.ai` | `--chutes` |
-| `qwen/qwen3-235b-a22b-thinking-2507-tee` | `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` | `llm.chutes.ai` | `--chutes` |
-| `qwen/qwen3-32b-tee` | `chutes/Qwen/Qwen3-32B-TEE` | `llm.chutes.ai` | `--chutes` |
+| `nvidia/nemotron-3-nano-omni-30b-tee` | `chutes/Nemotron-3-Nano-Omni-30B-TEE` | retired by Chutes (2026-10-28) | `--chutes` |
+| `qwen/qwen3-235b-a22b-thinking-2507-tee` | `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` | retired by Chutes (2026-10-28) | `--chutes` |
+| `qwen/qwen3-32b-tee` | `chutes/Qwen/Qwen3-32B-TEE` | retired by Chutes (2026-10-28) | `--chutes` |
 | `qwen/qwen3.5-397b-a17b-tee` | `chutes/Qwen/Qwen3.5-397B-A17B-TEE` | `llm.chutes.ai` | `--chutes` |
 | `qwen/qwen3.6-27b-tee` | `chutes/Qwen/Qwen3.6-27B-TEE` | `llm.chutes.ai` | `--chutes` |
 | `deepseek/deepseek-v3.2-tee` | `chutes/deepseek-ai/DeepSeek-V3.2-TEE` | `llm.chutes.ai` | `--chutes` |
@@ -30,7 +30,7 @@ explains the table and how to set each upstream up.
 | `google/gemma-4-31b-turbo-tee` | `chutes/google/gemma-4-31B-turbo-TEE` | `llm.chutes.ai` | `--chutes` |
 | `moonshot/kimi-k2.6-tee` | `chutes/moonshotai/Kimi-K2.6-TEE` | `llm.chutes.ai` | `--chutes` |
 | `moonshot/kimi-k3-tee` | `chutes/moonshotai/Kimi-K3-TEE` | `llm.chutes.ai` | `--chutes` |
-| `mistral/mistral-nemo-instruct-2407-tee` | `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` | `llm.chutes.ai` | `--chutes` |
+| `mistral/mistral-nemo-instruct-2407-tee` | `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` | retired by Chutes (2026-10-28) | `--chutes` |
 | `zai/glm-5.1-tee` | `chutes/zai-org/GLM-5.1-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2-tee` | `chutes/zai-org/GLM-5.2-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
@@ -39,6 +39,7 @@ explains the table and how to set each upstream up.
 | `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
 | `deepseek/deepseek-v4-flash-0731` | `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` | `api.deepinfra.com` | `--deepinfra` |
 | `deepseek/deepseek-v4.1-flash` | `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash` | `api.deepinfra.com` | `--deepinfra` |
+| `deepseek/deepseek-v4.1-flash-1017` | `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017` | `api.deepinfra.com` | `--deepinfra` |
 | `qwen/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
 | `qwen/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
 | `openai/gpt-oss-20b` | `deepinfra/openai/gpt-oss-20b` | `api.deepinfra.com` | `--deepinfra` |
@@ -47,6 +48,7 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4.1-flash` | `engy/deepseek-v4.1-flash` | `api.engy.ai` | `--engy` |
+| `deepseek/deepseek-v4.1-flash-1017` | `engy/deepseek-v4.1-flash-1017` | `api.engy.ai` | `--engy` |
 | `qwen/qwen3.6-35b-a3b` | `engy/qwen3.6-35b-a3b` | `api.engy.ai` | `--engy` |
 | `qwen/qwen3.8-27b` | `engy/qwen3.8-27b` | `api.engy.ai` | `--engy` |
 | `ornith/ornith-1.5-397b` | `engy/ornith-1.5-397b` | `api.engy.ai` | `--engy` |
