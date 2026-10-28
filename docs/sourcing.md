@@ -49,7 +49,7 @@ explains the table and how to set each upstream up.
 | `deepseek/deepseek-v4.1-flash` | `engy/deepseek-v4.1-flash` | `api.engy.ai` | `--engy` |
 | `qwen/qwen3.6-35b-a3b` | `engy/qwen3.6-35b-a3b` | `api.engy.ai` | `--engy` |
 | `qwen/qwen3.8-27b` | `engy/qwen3.8-27b` | `api.engy.ai` | `--engy` |
-| `ornith/ornith-1.5-397b` | `engy/ornith-1.5-397b` | `api.engy.ai` | `--engy` |
+| `ornith/ornith-1.5-397b` | `engy/ornith-1.5-397b` | retired by Engy | `--engy` |
 | `zai/glm-5.3` | `engy/glm-5.3` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.3-flash` | `engy/glm-5.3-flash` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2-tee` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
