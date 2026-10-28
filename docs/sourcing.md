@@ -288,6 +288,46 @@ checks cover `POST /v1/chat/completions` for `near/Qwen/Qwen3.8-27B` and
 `near/z-ai/glm-5.3-flash`, plus `POST /v1/images/generations` for
 `near/black-forest-labs/FLUX.2-klein-4B`; the verifier never reads the body.
 
+The verifier matches MRTD and RTMR0-2 to the compiled reference keyed by the
+quoted `os-image-hash`, with the VM shape implicit in that measured tuple. It
+requires dstack's event type `0x08000001` for every imr-3 event, validates each
+payload against its digest, and replays the complete imr-3 log—including
+post-boot events—to the quote's RTMR3. It requires exactly one boot-ordered
+`app-id`, `compose-hash`, `mr-kms`, `os-image-hash`, and `key-provider` event.
+The app id and KMS root public key (`key-provider`) are pinned. The
+compose event must match the compose hash already bound to `mr_config_id`, but
+the deployment's compose hash is not pinned because NEAR redeploys it.
+
+Replay binds the events to the quote; the OS pin establishes which code emitted
+the boot events. That OS records the KMS identity after obtaining application
+keys over authenticated TLS. Together these checks establish that NEAR's
+dstack KMS released NEAR's app keys to this CVM, which booted NEAR's approved OS
+image and approved compose. The required, unique `mr-kms` event proves the guest
+attested its KMS; its value is not pinned because `mr_aggregated` changes with
+KMS image upgrades and may differ between KMS instances. The root-key pin
+establishes KMS identity. Runtime events after `system-ready` are replayed and
+checked but cannot replace or duplicate a required boot identity event.
+
+NEAR OS references are a closed compiled policy. A new image or VM profile
+fails closed until its measurements are reviewed and added. Pin mismatch errors
+point to this procedure; OS reference mismatch errors and rejection logs include
+the quoted measurements and the report's `info.vm_config`, labelled as
+self-reported. This config is diagnostic only and never used for acceptance.
+To add a reference, obtain a collateral-verified NEAR report and take the exact
+`vm_config` from that report's `info.vm_config`. Download
+`mr_<os-image-hash>.tar.gz` from NEAR's
+[dstack-images `os-image-mr` release](https://github.com/nearai/dstack-images/releases/tag/os-image-mr),
+verify the tarball SHA-256 against the release asset's published digest, then
+verify the bundled files against `sha256sum.txt` and its SHA-256 against
+`digest.txt` (the OS image hash). Recompute MRTD and RTMR0-2 with `dstack-mr` for
+that VM config. Confirm the recomputed tuple
+matches quotes from the live deployment, review the app id and KMS root-key pin,
+and add the OS hash and tuple to `NEAR_OS_REFERENCES` in
+`attestd/src/near_verify.rs`, recording the tarball URL, SHA-256, tool
+revision, and VM config beside the constant. Confirm NEAR's dstack KMS
+contract has approved the image and the applicable compose hash on chain. Add a
+real report fixture that covers the new reference before deployment.
+
 The registry's `GET /v1/models` capability check is answered locally from that
 same compiled allowlist. It does not contact an unattested catalog endpoint;
 the registry's follow-up one-token balance check still takes the fully attested

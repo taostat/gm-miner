@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use axum::body::Body;
 use axum::http::header::HOST;
 use axum::http::{Method, Request, Response, StatusCode, Uri};
@@ -16,12 +16,13 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha384};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::warn;
 
+use crate::eventlog;
 use crate::tee_evidence::{self, nras};
 use crate::upstream_proxy::{self, retry_attestation, strip_hop_by_hop};
 
@@ -33,6 +34,12 @@ const NRAS_TIMEOUT: Duration = Duration::from_secs(60);
 const NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 const IMAGES_GENERATIONS: &str = "/v1/images/generations";
+const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
+const NEAR_PIN_REVIEW: &str = "NEAR identity pin mismatch; review the provider upgrade using \
+    docs/sourcing.md (NEAR attestation enforcement) and deploy a miner with reviewed pins";
+const NEAR_APP_ID: &str = "2c0a0c96cb6dbd659bf1446e2f3fce58172ff91b";
+const NEAR_OS_IMAGE_HASH: &str = "91fd5d69ccee3e5ea4f2aeb8c9b632c4358c4ecfc29ba1aa6fb1e402af209829";
+const NEAR_KEY_PROVIDER_INFO: &str = r#"{"name":"kms","id":"3059301306072a8648ce3d020106082a8648ce3d03010703420004394aaed2c745e6a457cb835f7f47423f57ff3ead71b92abff6bdc14d905b319f2e13961b42c50740dae4498d9c51dd7a2e227660c9e5c504083cda06b6c11682"}"#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NearTarget {
@@ -79,7 +86,45 @@ struct NearAttestation {
 #[derive(Debug, Deserialize)]
 struct AttestationInfo {
     tcb_info: Value,
+    // Self-reported diagnostic only: neither its presence nor its contents affect acceptance.
+    #[serde(default)]
+    vm_config: Value,
 }
+
+#[derive(Debug, Deserialize)]
+struct NearLogEvent {
+    imr: usize,
+    event_type: u32,
+    digest: String,
+    event: String,
+    event_payload: String,
+}
+
+#[derive(Clone, Copy)]
+struct NearOsReference {
+    os_image_hash: &'static str,
+    mrtd: &'static str,
+    rtmr0: &'static str,
+    rtmr1: &'static str,
+    rtmr2: &'static str,
+}
+
+// Derive this closed boot reference from the published bundle so its provenance is independently
+// reproducible. References are keyed by OS image hash; the measured tuple implicitly covers VM shape.
+// The recomputation config comes from the report's self-reported info.vm_config, never a trust input.
+// Recomputed from metadata version 0.5.12 with dstack-mr 0.6.1 at Dstack-TEE/dstack
+// commit b307d5f85784222789952f72ca2d518e31706921. VM config: 64 vCPUs,
+// 2199023255552 bytes RAM, QEMU 9.2.1, pci_hole64_size 1125899906842624, 8 GPUs, 4 NVSwitches,
+// hugepages false, hotplug_off true, host_share_mode 9p, OVMF pre202505.
+// Bundle: https://github.com/nearai/dstack-images/releases/download/os-image-mr/mr_91fd5d69ccee3e5ea4f2aeb8c9b632c4358c4ecfc29ba1aa6fb1e402af209829.tar.gz
+// SHA-256(bundle): 9174506ea67da89187f1dbc917dae7582e3bb268e02b151b7f15bc8df1c3a083
+const NEAR_OS_REFERENCES: &[NearOsReference] = &[NearOsReference {
+    os_image_hash: NEAR_OS_IMAGE_HASH,
+    mrtd: "df4d77c857de652bd0fafa343a2026b51071ee03773d076d283abf1a7d36ff91ffa279ee4a617ac664f7e2a2c8d5891b",
+    rtmr0: "bc122d143ab768565ba5c3774ff5f03a63c89a4df7c1f5ea38d3bd173409d14f8cbdcc36d40e703cccb996a9d9687590",
+    rtmr1: "4ae609807c765916a31d724786ed74bcb97e168a9d937b04936aeef2015c907eba5ac352c6bcd749c246fd62ffb659ec",
+    rtmr2: "bd67ab7554dc27ab03a077bc1447a1a67d0624ff547c4c809a8626f12d6a89712f8ec60e781e99b98208574065d21a71",
+}];
 
 #[derive(Debug, Deserialize)]
 struct AppCompose {
@@ -87,9 +132,11 @@ struct AppCompose {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct AttestedFields<'a> {
-    report_data: &'a [u8; 64],
-    mr_config_id: &'a [u8; 48],
+struct AttestedFields {
+    report_data: [u8; 64],
+    mr_config_id: [u8; 48],
+    mrtd: [u8; 48],
+    rtmrs: [eventlog::Register; 4],
 }
 
 #[derive(Debug)]
@@ -210,14 +257,7 @@ impl NearVerifier {
     /// Returns an error for unsupported requests or any attestation/upstream
     /// failure. No inference is sent when attestation fails.
     pub async fn forward(&self, request: Request<Body>) -> Result<Response<Body>> {
-        let selector = request
-            .headers()
-            .get(SELECTOR_HEADER)
-            .context("missing NEAR model selector")?
-            .to_str()
-            .context("NEAR model selector is not valid ASCII")?;
-        let target = target_for_model(selector).context("unsupported NEAR model selector")?;
-        validate_request(&request, target)?;
+        let target = request_target(&request)?;
         let (mut sender, connection, _, _) = self.connect_and_attest(target).await?;
 
         let upstream_request = upstream_request(request, target)?;
@@ -307,42 +347,19 @@ impl NearVerifier {
         live_spki: &[u8; 32],
     ) -> Result<()> {
         let nonce = tee_evidence::random_nonce();
-        let uri: Uri = format!(
-            "/v1/attestation/report?include_tls_fingerprint=true&signing_algo=ed25519&nonce={}",
-            hex::encode(nonce)
-        )
-        .parse()
-        .context("build NEAR attestation URI")?;
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .header(HOST, target.host)
-            .body(Body::empty())
-            .context("build NEAR attestation request")?;
-        let response = timeout(ATTESTATION_TIMEOUT, sender.send_request(request))
-            .await
-            .context("NEAR attestation request timed out")?
-            .context("send NEAR attestation request")?;
-        if response.status() != StatusCode::OK {
-            bail!("NEAR attestation endpoint returned {}", response.status());
-        }
-        let body = Limited::new(response.into_body(), ATTESTATION_LIMIT)
-            .collect()
-            .await
-            .map_err(|error| anyhow::anyhow!("read NEAR attestation response: {error}"))?
-            .to_bytes();
-        let attestation: NearAttestation =
-            serde_json::from_slice(&body).context("decode NEAR attestation response")?;
+        let attestation = fetch_attestation(sender, target, &nonce).await?;
         let raw_quote = hex::decode(&attestation.intel_quote).context("decode NEAR TDX quote")?;
         let claims = tee_evidence::verify_quote(&self.collateral, &raw_quote)
             .await
             .context("verify NEAR TDX quote against Intel collateral")?;
         let td = tee_evidence::td_report(&claims.report).context("NEAR attestation")?;
         let fields = AttestedFields {
-            report_data: &td.report_data,
-            mr_config_id: &td.mr_config_id,
+            report_data: td.report_data,
+            mr_config_id: td.mr_config_id,
+            mrtd: td.mr_td,
+            rtmrs: [td.rt_mr0, td.rt_mr1, td.rt_mr2, td.rt_mr3],
         };
-        verify_identity(&attestation, target, &nonce, live_spki, fields)?;
+        verify_identity(&attestation, target, &nonce, live_spki, &fields)?;
         self.verify_gpu(&attestation, &nonce).await
     }
 
@@ -372,9 +389,53 @@ impl NearVerifier {
     }
 }
 
+async fn fetch_attestation(
+    sender: &mut SendRequest<Body>,
+    target: NearTarget,
+    nonce: &[u8; 32],
+) -> Result<NearAttestation> {
+    let uri: Uri = format!(
+        "/v1/attestation/report?include_tls_fingerprint=true&signing_algo=ed25519&nonce={}",
+        hex::encode(nonce)
+    )
+    .parse()
+    .context("build NEAR attestation URI")?;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(HOST, target.host)
+        .body(Body::empty())
+        .context("build NEAR attestation request")?;
+    let response = timeout(ATTESTATION_TIMEOUT, sender.send_request(request))
+        .await
+        .context("NEAR attestation request timed out")?
+        .context("send NEAR attestation request")?;
+    if response.status() != StatusCode::OK {
+        bail!("NEAR attestation endpoint returned {}", response.status());
+    }
+    let body = Limited::new(response.into_body(), ATTESTATION_LIMIT)
+        .collect()
+        .await
+        .map_err(|error| anyhow::anyhow!("read NEAR attestation response: {error}"))?
+        .to_bytes();
+    serde_json::from_slice(&body).context("decode NEAR attestation response")
+}
+
 fn verify_nras_response(response: &Value) -> Result<()> {
     let verdict = nras::unverified_claims(nras::aggregate_token(response)?)?;
     nras::require_overall_success(&verdict)
+}
+
+fn request_target(request: &Request<Body>) -> Result<NearTarget> {
+    let selector = request
+        .headers()
+        .get(SELECTOR_HEADER)
+        .context("missing NEAR model selector")?
+        .to_str()
+        .context("NEAR model selector is not valid ASCII")?;
+    let target = target_for_model(selector).context("unsupported NEAR model selector")?;
+    validate_request(request, target)?;
+    Ok(target)
 }
 
 // Runs before the attested connect: a selector on the wrong path must not spend
@@ -412,7 +473,7 @@ fn verify_identity(
     target: NearTarget,
     nonce: &[u8; 32],
     live_spki: &[u8; 32],
-    fields: AttestedFields<'_>,
+    fields: &AttestedFields,
 ) -> Result<()> {
     if attestation.model_name != target.model {
         bail!("attested model does not match the selected NEAR model");
@@ -426,6 +487,23 @@ fn verify_identity(
     {
         bail!("NEAR attestation response nonce is stale or mismatched");
     }
+    verify_tls_report_binding(attestation, nonce, live_spki, &fields.report_data)?;
+    let tcb_info = decode_tcb_info(attestation)?;
+    let compose_hash = verify_compose_binding(&tcb_info, &fields.mr_config_id)?;
+    verify_near_application_identity(
+        &tcb_info,
+        fields,
+        &compose_hash,
+        &attestation.info.vm_config,
+    )
+}
+
+fn verify_tls_report_binding(
+    attestation: &NearAttestation,
+    nonce: &[u8; 32],
+    live_spki: &[u8; 32],
+    report_data: &[u8; 64],
+) -> Result<()> {
     let attested_spki: [u8; 32] = hex::decode(&attestation.tls_cert_fingerprint)
         .context("decode attested TLS fingerprint")?
         .try_into()
@@ -441,18 +519,21 @@ fn verify_identity(
     binding.update(signing_key);
     binding.update(live_spki);
     let expected_binding: [u8; 32] = binding.finalize().into();
-    if fields.report_data[..32] != expected_binding || fields.report_data[32..] != *nonce {
+    if report_data[..32] != expected_binding || report_data[32..] != *nonce {
         bail!("TDX report_data does not bind the signing key, live TLS key, and fresh nonce");
     }
-    verify_compose_binding(attestation, fields.mr_config_id)
+    Ok(())
 }
 
-fn verify_compose_binding(attestation: &NearAttestation, mr_config_id: &[u8; 48]) -> Result<()> {
-    let tcb_info = match &attestation.info.tcb_info {
-        Value::Object(_) => attestation.info.tcb_info.clone(),
-        Value::String(encoded) => serde_json::from_str(encoded).context("decode TCB info")?,
+fn decode_tcb_info(attestation: &NearAttestation) -> Result<Value> {
+    match &attestation.info.tcb_info {
+        Value::Object(_) => Ok(attestation.info.tcb_info.clone()),
+        Value::String(encoded) => serde_json::from_str(encoded).context("decode TCB info"),
         _ => bail!("NEAR attestation TCB info has an invalid shape"),
-    };
+    }
+}
+
+fn verify_compose_binding(tcb_info: &Value, mr_config_id: &[u8; 48]) -> Result<[u8; 32]> {
     let app_compose = tcb_info
         .get("app_compose")
         .and_then(Value::as_str)
@@ -465,7 +546,219 @@ fn verify_compose_binding(attestation: &NearAttestation, mr_config_id: &[u8; 48]
     if mr_config_id[0] != 1 || mr_config_id[1..33] != compose_hash {
         bail!("NEAR app_compose does not match the verified TDX mr_config_id");
     }
+    Ok(compose_hash)
+}
+
+// These pins establish that NEAR's dstack KMS released NEAR's app keys to this CVM,
+// which booted NEAR's approved OS image and compose.
+fn verify_near_application_identity(
+    tcb_info: &Value,
+    fields: &AttestedFields,
+    compose_hash: &[u8; 32],
+    self_reported_vm_config: &Value,
+) -> Result<()> {
+    let imr3_events = verified_imr3_events(tcb_info, &fields.rtmrs[3])?;
+    let [app_id, compose, os_image, key_provider] = identity_events(&imr3_events)?;
+
+    ensure!(
+        hex::encode(event_payload(app_id)?) == NEAR_APP_ID,
+        "NEAR app-id event does not identify the pinned inference application; {NEAR_PIN_REVIEW}"
+    );
+    // No NEAR_PIN_REVIEW here: conflicting quote-bound compose identities signal forgery,
+    // not a provider upgrade requiring a new pin.
+    ensure!(
+        event_payload(compose)?.as_slice() == compose_hash,
+        "NEAR compose-hash event does not match the verified TDX mr_config_id"
+    );
+    let os_image_hash = hex::encode(event_payload(os_image)?);
+    verify_near_os_reference(&os_image_hash, fields, self_reported_vm_config)?;
+    verify_kms_identity(key_provider)
+}
+
+fn verify_kms_identity(key_provider: &NearLogEvent) -> Result<()> {
+    let key_provider: Value = serde_json::from_slice(&event_payload(key_provider)?)
+        .context("decode NEAR key-provider event payload")?;
+    let expected_key_provider: Value = serde_json::from_str(NEAR_KEY_PROVIDER_INFO)
+        .context("decode compiled NEAR KMS identity")?;
+    ensure!(
+        key_provider == expected_key_provider,
+        "NEAR key-provider event does not identify the pinned dstack KMS; {NEAR_PIN_REVIEW}"
+    );
     Ok(())
+}
+
+fn verified_imr3_events(
+    tcb_info: &Value,
+    quoted_rtmr3: &eventlog::Register,
+) -> Result<Vec<NearLogEvent>> {
+    let raw_log = tcb_info
+        .get("event_log")
+        .and_then(Value::as_array)
+        .context("NEAR TCB info has no event_log array")?;
+    let all_events: Vec<NearLogEvent> =
+        serde_json::from_value(Value::Array(raw_log.clone())).context("decode NEAR event log")?;
+    let imr3_events = all_events
+        .into_iter()
+        .filter(|event| event.imr == 3)
+        .collect::<Vec<_>>();
+    ensure!(
+        !imr3_events.is_empty(),
+        "NEAR event log has no imr-3 events"
+    );
+    let replay_events = imr3_events
+        .iter()
+        .map(verified_eventlog_record)
+        .collect::<Result<Vec<_>>>()?;
+    let replayed = eventlog::replay(&replay_events)[3];
+    ensure!(
+        replayed == *quoted_rtmr3,
+        "NEAR imr-3 event log does not replay to quote RTMR3 (replayed {}, quote {})",
+        hex::encode(replayed),
+        hex::encode(quoted_rtmr3)
+    );
+    Ok(imr3_events)
+}
+
+fn identity_events(events: &[NearLogEvent]) -> Result<[&NearLogEvent; 4]> {
+    let (app_id_index, app_id) = unique_event(events, "app-id")?;
+    let (compose_index, compose) = unique_event(events, "compose-hash")?;
+    let (boot_mr_index, _) = unique_event(events, "boot-mr-done")?;
+    // Presence proves the guest attested its KMS. Keep it unique and boot-ordered, but do not
+    // pin mr_aggregated: it varies with KMS images/instances. The root key pins KMS identity.
+    let (mr_kms_index, _) = unique_event(events, "mr-kms")?;
+    let (os_image_index, os_image) = unique_event(events, "os-image-hash")?;
+    let (key_provider_index, key_provider) = unique_event(events, "key-provider")?;
+    let (system_ready_index, _) = unique_event(events, "system-ready")?;
+    let indices = [
+        app_id_index,
+        compose_index,
+        boot_mr_index,
+        mr_kms_index,
+        os_image_index,
+        key_provider_index,
+        system_ready_index,
+    ];
+    ensure!(
+        indices.windows(2).all(|pair| pair[0] < pair[1]),
+        "NEAR identity events are not in the expected dstack boot order"
+    );
+    Ok([app_id, compose, os_image, key_provider])
+}
+
+fn verified_eventlog_record(event: &NearLogEvent) -> Result<eventlog::Event> {
+    ensure!(
+        event.event_type == DSTACK_RUNTIME_EVENT_TYPE,
+        "NEAR RTMR3 event {} has unsupported event type {:#x}",
+        event.event,
+        event.event_type
+    );
+    let data = event_payload(event)?;
+    let digest: eventlog::Register = hex::decode(&event.digest)
+        .with_context(|| format!("decode NEAR {} event digest", event.event))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("NEAR {} event digest is not 48 bytes", event.event))?;
+    let mut hasher = Sha384::new();
+    hasher.update(event.event_type.to_le_bytes());
+    hasher.update(b":");
+    hasher.update(event.event.as_bytes());
+    hasher.update(b":");
+    hasher.update(&data);
+    ensure!(
+        <[u8; 48]>::from(hasher.finalize()) == digest,
+        "NEAR RTMR3 event {} digest does not match its payload",
+        event.event
+    );
+    Ok(eventlog::Event {
+        rtmr: 3,
+        event_type: event.event_type,
+        digest,
+        data,
+    })
+}
+
+fn event_payload(event: &NearLogEvent) -> Result<Vec<u8>> {
+    hex::decode(&event.event_payload)
+        .with_context(|| format!("decode NEAR {} event payload", event.event))
+}
+
+fn unique_event<'a>(events: &'a [NearLogEvent], name: &str) -> Result<(usize, &'a NearLogEvent)> {
+    let mut matching = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.event == name);
+    let first = matching
+        .next()
+        .with_context(|| format!("NEAR event log is missing the required {name} event"))?;
+    ensure!(
+        matching.next().is_none(),
+        "NEAR event log has duplicate {name} events"
+    );
+    Ok(first)
+}
+
+fn verify_near_os_reference(
+    os_image_hash: &str,
+    fields: &AttestedFields,
+    self_reported_vm_config: &Value,
+) -> Result<()> {
+    let observed = [
+        fields.mrtd,
+        fields.rtmrs[0],
+        fields.rtmrs[1],
+        fields.rtmrs[2],
+    ];
+    let references = NEAR_OS_REFERENCES
+        .iter()
+        .filter(|reference| reference.os_image_hash == os_image_hash)
+        .collect::<Vec<_>>();
+    for reference in &references {
+        let expected = [
+            reference_register(reference.mrtd, "MRTD")?,
+            reference_register(reference.rtmr0, "RTMR0")?,
+            reference_register(reference.rtmr1, "RTMR1")?,
+            reference_register(reference.rtmr2, "RTMR2")?,
+        ];
+        if observed == expected {
+            return Ok(());
+        }
+    }
+    // Format diagnostics only after every reference failed to match. vm_config is self-reported
+    // and appears only in this error, which the proxy also logs when rejecting the request.
+    let observed_text = format!(
+        "MRTD={} RTMR0={} RTMR1={} RTMR2={}",
+        hex::encode(observed[0]),
+        hex::encode(observed[1]),
+        hex::encode(observed[2]),
+        hex::encode(observed[3])
+    );
+    if references.is_empty() {
+        bail!(
+            "NEAR reports unknown OS image hash {os_image_hash}; quoted boot measurements: \
+            {observed_text}; self-reported info.vm_config={self_reported_vm_config}; {NEAR_PIN_REVIEW}"
+        );
+    }
+    let expected_text = references
+        .iter()
+        .map(|reference| {
+            format!(
+                "MRTD={} RTMR0={} RTMR1={} RTMR2={}",
+                reference.mrtd, reference.rtmr0, reference.rtmr1, reference.rtmr2
+            )
+        })
+        .collect::<Vec<_>>();
+    bail!(
+        "NEAR OS image hash {os_image_hash} has no approved boot measurement tuple; \
+        observed {observed_text}; compiled references: {}; \
+        self-reported info.vm_config={self_reported_vm_config}; {NEAR_PIN_REVIEW}",
+        expected_text.join("; ")
+    )
+}
+
+fn reference_register(hex_value: &str, name: &str) -> Result<eventlog::Register> {
+    hex::decode(hex_value)
+        .with_context(|| format!("decode compiled NEAR {name} reference"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("compiled NEAR {name} reference is not 48 bytes"))
 }
 
 /// The 502 the NEAR proxy answers with when it refuses a request.
@@ -484,12 +777,118 @@ mod tests {
     use axum::http::header::CONNECTION;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
+    use sha2::Sha384;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const FLUX_KLEIN_MODEL: &str = "black-forest-labs/FLUX.2-klein-4B";
     const FLUX_KLEIN_HOST: &str = "flux2-klein.completions.near.ai";
     const GLM_53_FLASH_MODEL: &str = "z-ai/glm-5.3-flash";
     const GLM_53_FLASH_HOST: &str = "glm-5-3-flash.completions.near.ai";
+    const IDENTITY_EVENTS: [&str; 7] = [
+        "app-id",
+        "compose-hash",
+        "boot-mr-done",
+        "mr-kms",
+        "os-image-hash",
+        "key-provider",
+        "system-ready",
+    ];
+
+    fn near_fixture(name: &str) -> NearAttestation {
+        let bytes = match name {
+            "glm-5-3-flash" => {
+                include_bytes!("../tests/fixtures/near/glm-5-3-flash.json").as_slice()
+            }
+            "qwen3-8-27b" => include_bytes!("../tests/fixtures/near/qwen3-8-27b.json").as_slice(),
+            "flux2-klein" => include_bytes!("../tests/fixtures/near/flux2-klein.json").as_slice(),
+            _ => unreachable!(),
+        };
+        serde_json::from_slice(bytes).unwrap()
+    }
+
+    fn fixture_fields(attestation: &NearAttestation) -> AttestedFields {
+        let quote_bytes = hex::decode(&attestation.intel_quote).unwrap();
+        let quote = dcap_qvl::quote::Quote::parse(&quote_bytes).unwrap();
+        let td = tee_evidence::td_report(&quote.report).unwrap();
+        AttestedFields {
+            report_data: td.report_data,
+            mr_config_id: td.mr_config_id,
+            mrtd: td.mr_td,
+            rtmrs: [td.rt_mr0, td.rt_mr1, td.rt_mr2, td.rt_mr3],
+        }
+    }
+
+    fn verify_fixture(attestation: &NearAttestation, fields: &AttestedFields) -> Result<()> {
+        let nonce: [u8; 32] = hex::decode(&attestation.request_nonce)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let spki: [u8; 32] = hex::decode(&attestation.tls_cert_fingerprint)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let target = target_for_model(&attestation.model_name)
+            .context("fixture model is not an allowlisted NEAR target")?;
+        verify_identity(attestation, target, &nonce, &spki, fields)
+    }
+
+    fn verify_fixture_application_identity(
+        attestation: &NearAttestation,
+        fields: &AttestedFields,
+    ) -> Result<()> {
+        let tcb_info = decode_tcb_info(attestation)?;
+        let compose_hash = verify_compose_binding(&tcb_info, &fields.mr_config_id)?;
+        verify_near_application_identity(
+            &tcb_info,
+            fields,
+            &compose_hash,
+            &attestation.info.vm_config,
+        )
+    }
+
+    fn event_log_mut(attestation: &mut NearAttestation) -> &mut Vec<Value> {
+        attestation.info.tcb_info["event_log"]
+            .as_array_mut()
+            .unwrap()
+    }
+
+    fn rewrite_event_payload(attestation: &mut NearAttestation, name: &str, payload: &[u8]) {
+        let event = event_log_mut(attestation)
+            .iter_mut()
+            .find(|event| event["imr"].as_u64() == Some(3) && event["event"] == name)
+            .unwrap();
+        let event_type = u32::try_from(event["event_type"].as_u64().unwrap()).unwrap();
+        let mut preimage = event_type.to_le_bytes().to_vec();
+        preimage.extend_from_slice(b":");
+        preimage.extend_from_slice(name.as_bytes());
+        preimage.extend_from_slice(b":");
+        preimage.extend_from_slice(payload);
+        event["event_payload"] = Value::String(hex::encode(payload));
+        event["digest"] = Value::String(hex::encode(Sha384::digest(preimage)));
+    }
+
+    fn replay_fixture_rtmr3(attestation: &NearAttestation) -> eventlog::Register {
+        let events = attestation.info.tcb_info["event_log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["imr"].as_u64() == Some(3))
+            .map(|event| eventlog::Event {
+                rtmr: 3,
+                event_type: u32::try_from(event["event_type"].as_u64().unwrap()).unwrap(),
+                digest: hex::decode(event["digest"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                data: hex::decode(event["event_payload"].as_str().unwrap()).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        eventlog::replay(&events)[3]
+    }
+
+    fn align_fixture_quote_rtmr3(attestation: &NearAttestation, fields: &mut AttestedFields) {
+        fields.rtmrs[3] = replay_fixture_rtmr3(attestation);
+    }
 
     fn attestation(nonce: [u8; 32], spki: [u8; 32], model: &str) -> NearAttestation {
         let signing_key = [7_u8; 32];
@@ -504,6 +903,7 @@ mod tests {
             tls_cert_fingerprint: hex::encode(spki),
             info: AttestationInfo {
                 tcb_info: serde_json::json!({"app_compose": app_compose}),
+                vm_config: Value::Null,
             },
         }
     }
@@ -532,18 +932,408 @@ mod tests {
             TARGETS[0],
             &nonce,
             &spki,
-            AttestedFields {
-                report_data: &report_data,
-                mr_config_id: &mr_config_id,
+            &AttestedFields {
+                report_data,
+                mr_config_id,
+                mrtd: [0; 48],
+                rtmrs: [[0; 48]; 4],
             },
         )
     }
 
     #[test]
-    fn exact_attested_identity_passes() {
-        let nonce = [1_u8; 32];
-        let spki = [2_u8; 32];
-        verifies(&attestation(nonce, spki, TARGETS[0].model), nonce, spki).unwrap();
+    fn real_near_reports_pass_identity_checks() {
+        for name in ["glm-5-3-flash", "qwen3-8-27b", "flux2-klein"] {
+            let report = near_fixture(name);
+            let fields = fixture_fields(&report);
+            verify_fixture_application_identity(&report, &fields).unwrap();
+        }
+    }
+
+    #[test]
+    fn another_app_id_is_rejected_after_event_log_replay() {
+        let mut report = near_fixture("qwen3-8-27b");
+        rewrite_event_payload(&mut report, "app-id", &[0x99; 20]);
+        let mut fields = fixture_fields(&report);
+        align_fixture_quote_rtmr3(&report, &mut fields);
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(error.to_string().contains("app-id"), "{error:#}");
+    }
+
+    #[test]
+    fn another_kms_id_is_rejected_after_event_log_replay() {
+        let mut report = near_fixture("qwen3-8-27b");
+        let event = event_log_mut(&mut report)
+            .iter()
+            .find(|event| event["imr"].as_u64() == Some(3) && event["event"] == "key-provider")
+            .unwrap();
+        let mut key_provider: Value =
+            serde_json::from_slice(&hex::decode(event["event_payload"].as_str().unwrap()).unwrap())
+                .unwrap();
+        key_provider["id"] =
+            Value::String("3059301306072a8648ce3d020106082a8648ce3d0301070303420000".to_owned());
+        let payload = serde_json::to_vec(&key_provider).unwrap();
+        rewrite_event_payload(&mut report, "key-provider", &payload);
+        let mut fields = fixture_fields(&report);
+        align_fixture_quote_rtmr3(&report, &mut fields);
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(error.to_string().contains("key-provider"), "{error:#}");
+    }
+
+    #[test]
+    fn another_mr_kms_measurement_passes_after_event_log_replay() {
+        let mut report = near_fixture("qwen3-8-27b");
+        rewrite_event_payload(&mut report, "mr-kms", &[0x5A; 32]);
+        let mut fields = fixture_fields(&report);
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(error.to_string().contains("does not replay"), "{error:#}");
+        align_fixture_quote_rtmr3(&report, &mut fields);
+        verify_fixture(&report, &fields).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_os_hash_is_rejected_with_its_measurements() {
+        let mut report = near_fixture("qwen3-8-27b");
+        rewrite_event_payload(&mut report, "os-image-hash", &[0xA5; 32]);
+        let mut fields = fixture_fields(&report);
+        align_fixture_quote_rtmr3(&report, &mut fields);
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(
+            error.to_string().contains(&hex::encode([0xA5; 32])),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("MRTD"), "{error:#}");
+    }
+
+    #[test]
+    fn a_mismatched_boot_measurement_tuple_is_rejected() {
+        let report = near_fixture("qwen3-8-27b");
+        for index in 0..4 {
+            let mut fields = fixture_fields(&report);
+            let register = match index {
+                0 => &mut fields.mrtd,
+                _ => &mut fields.rtmrs[index - 1],
+            };
+            register[0] ^= 1;
+            let error = verify_fixture(&report, &fields).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no approved boot measurement tuple"),
+                "register {index}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn os_reference_mismatches_report_and_log_self_reported_vm_config() {
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Arc::clone(&log);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || LogWriter(Arc::clone(&writer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for unknown_os in [false, true] {
+                let raw: Value = serde_json::from_slice(include_bytes!(
+                    "../tests/fixtures/near/qwen3-8-27b.json"
+                ))
+                .unwrap();
+                let diagnostic =
+                    format!("self-reported info.vm_config={}", raw["info"]["vm_config"]);
+                let mut report: NearAttestation = serde_json::from_value(raw).unwrap();
+                let mut fields = fixture_fields(&report);
+                if unknown_os {
+                    rewrite_event_payload(&mut report, "os-image-hash", &[0xA5; 32]);
+                    align_fixture_quote_rtmr3(&report, &mut fields);
+                } else {
+                    fields.mrtd[0] ^= 1;
+                }
+                let error = verify_fixture(&report, &fields).unwrap_err();
+                assert!(error.to_string().contains(&diagnostic), "{error:#}");
+                log.lock().unwrap().clear();
+                let response = error_response(&error);
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+                assert!(logged.contains(&diagnostic), "{logged}");
+            }
+        });
+    }
+
+    #[test]
+    fn self_reported_vm_config_never_changes_os_reference_acceptance() {
+        let original: Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/near/qwen3-8-27b.json"))
+                .unwrap();
+        for vm_config in [
+            None,
+            Some(Value::Null),
+            Some(original["info"]["vm_config"].clone()),
+            Some(Value::String("not even JSON".into())),
+            Some(serde_json::json!({"os_image_hash": "untrusted", "cpu_count": 1})),
+        ] {
+            let mut raw = original.clone();
+            if let Some(config) = vm_config {
+                raw["info"]["vm_config"] = config;
+            } else {
+                raw["info"].as_object_mut().unwrap().remove("vm_config");
+            }
+            let mut report: NearAttestation = serde_json::from_value(raw).unwrap();
+            let fields = fixture_fields(&report);
+            verify_fixture(&report, &fields).unwrap();
+
+            let mut mismatched = fields;
+            mismatched.mrtd[0] ^= 1;
+            let error = verify_fixture(&report, &mismatched).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no approved boot measurement tuple"),
+                "{error:#}"
+            );
+
+            rewrite_event_payload(&mut report, "os-image-hash", &[0xA5; 32]);
+            let mut unknown = fields;
+            align_fixture_quote_rtmr3(&report, &mut unknown);
+            let error = verify_fixture(&report, &unknown).unwrap_err();
+            assert!(
+                error.to_string().contains("unknown OS image hash"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tampered_payload_cannot_replay_to_the_quote_rtmr3() {
+        let mut report = near_fixture("qwen3-8-27b");
+        rewrite_event_payload(&mut report, "app-id", &[0x99; 20]);
+        let fields = fixture_fields(&near_fixture("qwen3-8-27b"));
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(error.to_string().contains("RTMR3"), "{error:#}");
+    }
+
+    #[test]
+    fn a_payload_cannot_be_detached_from_its_extended_digest() {
+        let mut report = near_fixture("qwen3-8-27b");
+        let event = event_log_mut(&mut report)
+            .iter_mut()
+            .find(|event| event["imr"].as_u64() == Some(3) && event["event"] == "app-id")
+            .unwrap();
+        event["event_payload"] = Value::String(hex::encode([0x99; 20]));
+        let fields = fixture_fields(&near_fixture("qwen3-8-27b"));
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(
+            error.to_string().contains("digest does not match"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn missing_identity_or_boot_boundary_events_are_rejected() {
+        for name in IDENTITY_EVENTS {
+            let mut report = near_fixture("qwen3-8-27b");
+            event_log_mut(&mut report).retain(|event| event["event"] != name);
+            let mut fields = fixture_fields(&report);
+            align_fixture_quote_rtmr3(&report, &mut fields);
+            let error = verify_fixture(&report, &fields).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing the required {name}")),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_identity_or_boot_boundary_events_after_system_ready_are_rejected() {
+        for name in IDENTITY_EVENTS {
+            let mut report = near_fixture("qwen3-8-27b");
+            let duplicate = event_log_mut(&mut report)
+                .iter()
+                .find(|event| event["event"] == name)
+                .unwrap()
+                .clone();
+            event_log_mut(&mut report).push(duplicate);
+            let mut fields = fixture_fields(&report);
+            align_fixture_quote_rtmr3(&report, &mut fields);
+            let error = verify_fixture(&report, &fields).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("duplicate {name}")),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_hash_event_must_match_mr_config_id() {
+        let mut report = near_fixture("qwen3-8-27b");
+        rewrite_event_payload(&mut report, "compose-hash", &[0xCC; 32]);
+        let mut fields = fixture_fields(&report);
+        align_fixture_quote_rtmr3(&report, &mut fields);
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(error.to_string().contains("compose-hash"), "{error:#}");
+        assert!(!error.to_string().contains(NEAR_PIN_REVIEW), "{error:#}");
+    }
+
+    #[test]
+    fn unsupported_imr3_event_types_fail_even_with_valid_digests_and_replay() {
+        for event_type in [0, 3, 0x0800_0002, u32::MAX] {
+            let mut report = near_fixture("qwen3-8-27b");
+            let event = event_log_mut(&mut report)
+                .iter_mut()
+                .find(|event| event["event"] == "app-id")
+                .unwrap();
+            event["event_type"] = event_type.into();
+            rewrite_event_payload(&mut report, "app-id", &hex::decode(NEAR_APP_ID).unwrap());
+            let mut fields = fixture_fields(&report);
+            align_fixture_quote_rtmr3(&report, &mut fields);
+            let error = verify_fixture(&report, &fields).unwrap_err();
+            assert!(error.to_string().contains("event type"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn pin_mismatch_errors_point_to_the_reviewed_upgrade_procedure() {
+        for name in ["app-id", "os-image-hash", "key-provider"] {
+            let mut report = near_fixture("qwen3-8-27b");
+            let payload = if name == "key-provider" {
+                br#"{"name":"kms","id":"00"}"#.to_vec()
+            } else {
+                vec![0; 32]
+            };
+            rewrite_event_payload(&mut report, name, &payload);
+            let mut fields = fixture_fields(&report);
+            align_fixture_quote_rtmr3(&report, &mut fields);
+            let error = format!("{:#}", verify_fixture(&report, &fields).unwrap_err());
+            assert!(error.contains("docs/sourcing.md"), "{name}: {error}");
+        }
+        let report = near_fixture("qwen3-8-27b");
+        let mut fields = fixture_fields(&report);
+        fields.mrtd[0] ^= 1;
+        let error = format!("{:#}", verify_fixture(&report, &fields).unwrap_err());
+        assert!(error.contains("docs/sourcing.md"), "{error}");
+    }
+
+    #[test]
+    fn identity_events_must_precede_system_ready_in_boot_order() {
+        for names in IDENTITY_EVENTS.windows(2) {
+            let mut report = near_fixture("qwen3-8-27b");
+            let log = event_log_mut(&mut report);
+            let first = log
+                .iter()
+                .position(|event| event["event"] == names[0])
+                .unwrap();
+            let second = log
+                .iter()
+                .position(|event| event["event"] == names[1])
+                .unwrap();
+            log.swap(first, second);
+            let mut fields = fixture_fields(&report);
+            align_fixture_quote_rtmr3(&report, &mut fields);
+            let error = verify_fixture(&report, &fields).unwrap_err();
+            assert!(
+                error.to_string().contains("boot order"),
+                "{names:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_imr3_payload_and_digest_is_checked_including_unknown_runtime_events() {
+        let original = near_fixture("glm-5-3-flash");
+        let fields = fixture_fields(&original);
+        for (index, event) in original.info.tcb_info["event_log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            if event["imr"] != 3 {
+                continue;
+            }
+            for field in ["event_payload", "digest"] {
+                let mut report = near_fixture("glm-5-3-flash");
+                event_log_mut(&mut report)[index][field] = hex::encode([0; 48]).into();
+                let error = verify_fixture_application_identity(&report, &fields).unwrap_err();
+                assert!(
+                    error.to_string().contains("digest does not match"),
+                    "{event}: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_runtime_events_are_replayed_after_system_ready() {
+        let mut report = near_fixture("glm-5-3-flash");
+        let mut fields = fixture_fields(&report);
+        rewrite_event_payload(
+            &mut report,
+            "nearai-replica-report-key-v1",
+            b"another runtime value",
+        );
+        let error = verify_fixture_application_identity(&report, &fields).unwrap_err();
+        assert!(error.to_string().contains("does not replay"), "{error:#}");
+        align_fixture_quote_rtmr3(&report, &mut fields);
+        verify_fixture_application_identity(&report, &fields).unwrap();
+    }
+
+    #[test]
+    fn self_reported_tcb_fields_cannot_override_quote_or_replayed_events() {
+        let mut report = near_fixture("qwen3-8-27b");
+        let fields = fixture_fields(&report);
+        for field in [
+            "mrtd",
+            "rtmr0",
+            "rtmr1",
+            "rtmr2",
+            "rtmr3",
+            "os_image_hash",
+            "compose_hash",
+            "app_id",
+            "mr_kms",
+            "key_provider",
+        ] {
+            report.info.tcb_info[field] = "untrusted".into();
+        }
+        verify_fixture(&report, &fields).unwrap();
+        rewrite_event_payload(&mut report, "app-id", &[0; 20]);
+        report.info.tcb_info["app_id"] = NEAR_APP_ID.into();
+        let mut fields = fields;
+        align_fixture_quote_rtmr3(&report, &mut fields);
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(error.to_string().contains("app-id"), "{error:#}");
+    }
+
+    #[test]
+    fn identity_events_in_other_registers_cannot_supply_missing_imr3_identity() {
+        let mut report = near_fixture("qwen3-8-27b");
+        event_log_mut(&mut report)
+            .iter_mut()
+            .find(|event| event["event"] == "app-id")
+            .unwrap()["imr"] = 2.into();
+        let mut fields = fixture_fields(&report);
+        align_fixture_quote_rtmr3(&report, &mut fields);
+        let error = verify_fixture(&report, &fields).unwrap_err();
+        assert!(
+            error.to_string().contains("missing the required app-id"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -560,45 +1350,6 @@ mod tests {
         let upstream = upstream_request(request, target).unwrap();
         assert_eq!(upstream.headers()[HOST], GLM_53_FLASH_HOST);
         assert_eq!(upstream.uri().path(), CHAT_COMPLETIONS);
-    }
-
-    #[test]
-    fn glm_53_flash_attestation_for_another_model_fails_closed() {
-        let target = target_for_model(GLM_53_FLASH_MODEL).unwrap();
-        let nonce = [1_u8; 32];
-        let spki = [2_u8; 32];
-        let different_model_attestation = attestation(nonce, spki, "z-ai/glm-5.3");
-        let (report_data, mr_config_id) = fields(&different_model_attestation, nonce, spki);
-
-        let error = verify_identity(
-            &different_model_attestation,
-            target,
-            &nonce,
-            &spki,
-            AttestedFields {
-                report_data: &report_data,
-                mr_config_id: &mr_config_id,
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("attested model"));
-    }
-
-    #[test]
-    fn glm_53_flash_identity_requires_the_attested_tls_key() {
-        let target = target_for_model(GLM_53_FLASH_MODEL).unwrap();
-        let nonce = [1_u8; 32];
-        let attested_spki = [2_u8; 32];
-        let attestation = attestation(nonce, attested_spki, target.model);
-        let (report_data, mr_config_id) = fields(&attestation, nonce, attested_spki);
-        let fields = AttestedFields {
-            report_data: &report_data,
-            mr_config_id: &mr_config_id,
-        };
-        verify_identity(&attestation, target, &nonce, &attested_spki, fields).unwrap();
-
-        let error = verify_identity(&attestation, target, &nonce, &[3_u8; 32], fields).unwrap_err();
-        assert!(error.to_string().contains("live NEAR TLS key"));
     }
 
     #[test]
@@ -668,9 +1419,11 @@ mod tests {
             TARGETS[0],
             &nonce,
             &spki,
-            AttestedFields {
-                report_data: &report_data,
-                mr_config_id: &mr_config_id,
+            &AttestedFields {
+                report_data,
+                mr_config_id,
+                mrtd: [0; 48],
+                rtmrs: [[0; 48]; 4],
             },
         )
         .unwrap_err();
@@ -689,9 +1442,11 @@ mod tests {
             TARGETS[0],
             &nonce,
             &spki,
-            AttestedFields {
-                report_data: &report_data,
-                mr_config_id: &mr_config_id,
+            &AttestedFields {
+                report_data,
+                mr_config_id,
+                mrtd: [0; 48],
+                rtmrs: [[0; 48]; 4],
             },
         )
         .unwrap_err();
