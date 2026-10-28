@@ -1638,45 +1638,44 @@ mod tests {
 
     #[tokio::test]
     async fn a_source_product_absent_from_the_catalog_still_declares() {
-        let server = MockServer::start().await;
-        mount_catalog(&server, serde_json::json!([])).await;
-        mount_sources(
-            &server,
-            serde_json::json!([{
-                "provider": "deepinfra",
-                "model": "zai-org/GLM-5.2",
-                "buyer_provider": "zai",
-                "buyer_model": "glm-5.2",
-                "retail_price": retail(1_400_000_000, 4_400_000_000),
-                "capable_worker_count": 1,
-                "already_offered": false,
-            }]),
-        )
-        .await;
-        mount_declare(
-            &server,
-            serde_json::json!({
-                "provider": "deepinfra",
-                "model": "zai-org/GLM-5.2",
-                "discount_bp": 500,
-            }),
-        )
-        .await;
+        for (provider, model, buyer_model) in [
+            (Provider::DeepInfra, "zai-org/GLM-5.2", "glm-5.2"),
+            (Provider::Near, "z-ai/glm-5.3-flash", "glm-5.3-flash-tee"),
+        ] {
+            let server = MockServer::start().await;
+            mount_catalog(&server, serde_json::json!([])).await;
+            mount_sources(
+                &server,
+                serde_json::json!([{
+                    "provider": provider.as_str(),
+                    "model": model,
+                    "buyer_provider": "zai",
+                    "buyer_model": buyer_model,
+                    "retail_price": retail(1_400_000_000, 4_400_000_000),
+                    "capable_worker_count": 1,
+                    "already_offered": false,
+                }]),
+            )
+            .await;
+            mount_declare(
+                &server,
+                serde_json::json!({
+                    "provider": provider.as_str(),
+                    "model": model,
+                    "discount_bp": 500,
+                }),
+            )
+            .await;
 
-        let mut client = RegistryClient::new(config_for(&server));
-        cmd_declare_product(
-            &mut client,
-            &Provider::DeepInfra,
-            "zai-org/GLM-5.2",
-            500,
-            DeclareArgs::default(),
-        )
-        .await
-        .expect("a sourcing route declares even though GET /products omits it");
+            let mut client = RegistryClient::new(config_for(&server));
+            cmd_declare_product(&mut client, &provider, model, 500, DeclareArgs::default())
+                .await
+                .expect("a sourcing route declares even though GET /products omits it");
 
-        // The declare mock only answers the exact body above, so one hit here
-        // proves the wire shape as well as the call.
-        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+            // The declare mock only answers the exact body above, so one hit here
+            // proves the validated source pair and wire shape as well as the call.
+            assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+        }
     }
 
     #[tokio::test]

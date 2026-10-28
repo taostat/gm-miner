@@ -447,6 +447,7 @@ static_resources:
                           local verified_models = {
                             near = {
                               ["Qwen/Qwen3.8-27B"] = true,
+                              ["z-ai/glm-5.3-flash"] = true,
                               ["black-forest-labs/FLUX.2-klein-4B"] = true,
                             },
                             kubetee = {

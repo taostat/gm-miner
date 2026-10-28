@@ -74,6 +74,7 @@ explains the table and how to set each upstream up.
 | `qwen/qwen3.6-27b-tee` | `near/Qwen/Qwen3.6-27B-FP8` | retired by NEAR (2026-09-24) | `--near` |
 | `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | retired by NEAR (2026-09-24) | `--near` |
 | `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
+| `zai/glm-5.3-flash-tee` | `near/z-ai/glm-5.3-flash` | `glm-5-3-flash.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `near/black-forest-labs/FLUX.2-klein-4B` | `flux2-klein.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `deepinfra/black-forest-labs/FLUX-2-klein-4b` | `api.deepinfra.com` | `--deepinfra` |
 
@@ -267,6 +268,7 @@ gmcli declare-product --provider kubetee --model z-ai/glm-5.3 --discount-pct 5
 gmcli declare-product --provider kubetee --model z-ai/glm-5.3-flash --discount-pct 5
 gmcli declare-product --provider kubetee --model deepseek/deepseek-v4.1-flash --discount-pct 5
 gmcli declare-product --provider kubetee --model black-forest-labs/flux.2-klein-4b --discount-pct 5
+gmcli declare-product --provider near --model z-ai/glm-5.3-flash --discount-pct 5
 gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
 ```
@@ -274,14 +276,16 @@ gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
 ### NEAR attestation enforcement
 
 NEAR is not a normal TLS proxy route. When a NEAR key is present, the image
-first verifies every closed-list NEAR endpoint before starting Envoy. For each
-inference request, the co-located verifier then opens a fresh TLS connection,
+starts and supervises the co-located verifier. Endpoints are verified per
+request, so an unavailable model does not block startup for other models or
+providers. For each inference request, the verifier opens a fresh TLS connection,
 requests nonce-bound evidence on that connection, validates the Intel TDX quote,
 the exact model id, the live TLS public-key fingerprint, the compose measurement
 binding, and NVIDIA's GPU verdict, and only then forwards inference on that same
 connection. A missing, stale, substituted, malformed, or failed verdict returns
 an error; there is no direct-origin or unattested fallback route. The same
-checks cover `POST /v1/images/generations` for
+checks cover `POST /v1/chat/completions` for `near/Qwen/Qwen3.8-27B` and
+`near/z-ai/glm-5.3-flash`, plus `POST /v1/images/generations` for
 `near/black-forest-labs/FLUX.2-klein-4B`; the verifier never reads the body.
 
 The registry's `GET /v1/models` capability check is answered locally from that

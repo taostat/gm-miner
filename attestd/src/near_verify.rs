@@ -41,10 +41,15 @@ pub struct NearTarget {
     pub path: &'static str,
 }
 
-pub const TARGETS: [NearTarget; 2] = [
+pub const TARGETS: [NearTarget; 3] = [
     NearTarget {
         model: "Qwen/Qwen3.8-27B",
         host: "qwen3-8-27b.completions.near.ai",
+        path: CHAT_COMPLETIONS,
+    },
+    NearTarget {
+        model: "z-ai/glm-5.3-flash",
+        host: "glm-5-3-flash.completions.near.ai",
         path: CHAT_COMPLETIONS,
     },
     NearTarget {
@@ -483,6 +488,8 @@ mod tests {
 
     const FLUX_KLEIN_MODEL: &str = "black-forest-labs/FLUX.2-klein-4B";
     const FLUX_KLEIN_HOST: &str = "flux2-klein.completions.near.ai";
+    const GLM_53_FLASH_MODEL: &str = "z-ai/glm-5.3-flash";
+    const GLM_53_FLASH_HOST: &str = "glm-5-3-flash.completions.near.ai";
 
     fn attestation(nonce: [u8; 32], spki: [u8; 32], model: &str) -> NearAttestation {
         let signing_key = [7_u8; 32];
@@ -540,6 +547,61 @@ mod tests {
     }
 
     #[test]
+    fn glm_53_flash_resolves_to_its_chat_target() {
+        let target = target_for_model(GLM_53_FLASH_MODEL).unwrap();
+        assert_eq!(target.host, GLM_53_FLASH_HOST);
+        assert_eq!(target.path, CHAT_COMPLETIONS);
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(CHAT_COMPLETIONS)
+            .body(Body::empty())
+            .unwrap();
+        let upstream = upstream_request(request, target).unwrap();
+        assert_eq!(upstream.headers()[HOST], GLM_53_FLASH_HOST);
+        assert_eq!(upstream.uri().path(), CHAT_COMPLETIONS);
+    }
+
+    #[test]
+    fn glm_53_flash_attestation_for_another_model_fails_closed() {
+        let target = target_for_model(GLM_53_FLASH_MODEL).unwrap();
+        let nonce = [1_u8; 32];
+        let spki = [2_u8; 32];
+        let different_model_attestation = attestation(nonce, spki, "z-ai/glm-5.3");
+        let (report_data, mr_config_id) = fields(&different_model_attestation, nonce, spki);
+
+        let error = verify_identity(
+            &different_model_attestation,
+            target,
+            &nonce,
+            &spki,
+            AttestedFields {
+                report_data: &report_data,
+                mr_config_id: &mr_config_id,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("attested model"));
+    }
+
+    #[test]
+    fn glm_53_flash_identity_requires_the_attested_tls_key() {
+        let target = target_for_model(GLM_53_FLASH_MODEL).unwrap();
+        let nonce = [1_u8; 32];
+        let attested_spki = [2_u8; 32];
+        let attestation = attestation(nonce, attested_spki, target.model);
+        let (report_data, mr_config_id) = fields(&attestation, nonce, attested_spki);
+        let fields = AttestedFields {
+            report_data: &report_data,
+            mr_config_id: &mr_config_id,
+        };
+        verify_identity(&attestation, target, &nonce, &attested_spki, fields).unwrap();
+
+        let error = verify_identity(&attestation, target, &nonce, &[3_u8; 32], fields).unwrap_err();
+        assert!(error.to_string().contains("live NEAR TLS key"));
+    }
+
+    #[test]
     fn unknown_selector_has_no_network_target() {
         assert!(target_for_model("attacker/model").is_none());
     }
@@ -554,6 +616,7 @@ mod tests {
             actual,
             vec![
                 ("Qwen/Qwen3.8-27B", "qwen3-8-27b.completions.near.ai"),
+                (GLM_53_FLASH_MODEL, GLM_53_FLASH_HOST),
                 (FLUX_KLEIN_MODEL, FLUX_KLEIN_HOST),
             ]
         );
@@ -660,7 +723,7 @@ mod tests {
             (Method::POST, "/v1/images/variations"),
             (Method::POST, "/v1/images"),
         ] {
-            for target in [TARGETS[0], flux] {
+            for target in TARGETS {
                 let request = Request::builder()
                     .method(&method)
                     .uri(path)

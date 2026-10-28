@@ -719,7 +719,11 @@ fn near_only_passes_approved_source_models_to_the_local_verifier() {
         route(&parsed, "near", "/v1/chat/completions")["route"]["cluster"],
         "near_verify_proxy"
     );
-    for model in ["Qwen/Qwen3.8-27B", "unapproved-source"] {
+    for model in [
+        "Qwen/Qwen3.8-27B",
+        "z-ai/glm-5.3-flash",
+        "unapproved-source",
+    ] {
         let lua = run_request(
             &rendered,
             &[
@@ -736,6 +740,19 @@ fn near_only_passes_approved_source_models_to_the_local_verifier() {
                 .expect("status"),
             (model == "unapproved-source").then(|| "400".to_owned())
         );
+        if model != "unapproved-source" {
+            let headers = lua
+                .globals()
+                .get::<mlua::Table>("input_headers")
+                .expect("headers");
+            assert_eq!(
+                headers
+                    .get::<String>("x-gm-upstream-model")
+                    .expect("selector"),
+                model,
+                "the approved model must reach the local verifier"
+            );
+        }
     }
 }
 

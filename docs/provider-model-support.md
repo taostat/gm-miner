@@ -80,7 +80,7 @@ authority for which explicit routes that registry has published.
 | `GLM-5.3` | Z.ai API: `zai/glm-5.3` (`--zai`); Engy: `engy/glm-5.3` (`--engy`); DeepInfra: `deepinfra/zai-org/GLM-5.3` (`--deepinfra`) |
 | `GLM-5.3 TEE` | KubeTEE: `kubetee/z-ai/glm-5.3` (`--kubetee`) |
 | `GLM-5.3-Flash` | Z.ai API: `zai/glm-5.3-flash` (`--zai`); Engy: `engy/glm-5.3-flash` (`--engy`); DeepInfra: `deepinfra/zai-org/GLM-5.3-Flash` (`--deepinfra`) |
-| `GLM-5.3-Flash TEE` | KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`) |
+| `GLM-5.3-Flash TEE` | KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`); NEAR confidential inference: `near/z-ai/glm-5.3-flash` (`--near`) |
 | `GPT-5.4` | OpenAI API: `openai/gpt-5.4` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `GPT-5.4 mini` | OpenAI API: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `GPT-5.4 nano` | OpenAI API: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |

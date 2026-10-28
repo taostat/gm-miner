@@ -2180,6 +2180,13 @@ mod tests {
     fn every_offered_near_route_uses_its_hidden_source_model() {
         let declared = std::collections::HashMap::from([
             (
+                (Provider::Near, "z-ai/glm-5.3-flash".to_owned()),
+                DeclaredOffer {
+                    upstream_model: None,
+                    is_offered: true,
+                },
+            ),
+            (
                 (Provider::Near, "glm-5.1".to_owned()),
                 DeclaredOffer {
                     upstream_model: Some("zai-org/GLM-5.1-FP8".to_owned()),
@@ -2200,11 +2207,60 @@ mod tests {
             &declared,
         );
         let models = catalog.models_for(&Provider::Near);
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0].canonical, "glm-5.1");
         assert_eq!(models[0].wire_model(), "zai-org/GLM-5.1-FP8");
         assert_eq!(models[1].canonical, "qwen3.6-27b");
         assert_eq!(models[1].wire_model(), "Qwen/Qwen3.6-27B-FP8");
+        assert_eq!(models[2].canonical, "z-ai/glm-5.3-flash");
+        assert_eq!(models[2].wire_model(), "z-ai/glm-5.3-flash");
+
+        // Source declarations store the NEAR model, not the buyer's TEE id.
+        // Exercise worker coverage selection before constructing the probe.
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Near,
+                unscoped_coverage(&["z-ai/glm-5.3-flash"]),
+            )])),
+            worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
+        };
+        let selected = models_for_target(&target, &Provider::Near, models).expect("known coverage");
+        assert_eq!(selected.len(), 1);
+        let probe = build_probe(Provider::Near, &selected[0].model, None);
+        assert!(!probe.fallback);
+        assert_eq!(probe.path, "/v1/chat/completions");
+        assert_eq!(probe.body["model"], "z-ai/glm-5.3-flash");
+    }
+
+    #[test]
+    fn near_without_offered_routes_preserves_the_qwen_streaming_fallback() {
+        // A new CLI may probe an older worker that only admits Qwen chat.
+        // New target support must not silently change its advisory probe.
+        for declared in [
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([(
+                (Provider::Near, "z-ai/glm-5.3-flash".to_owned()),
+                DeclaredOffer {
+                    upstream_model: None,
+                    is_offered: false,
+                },
+            )]),
+        ] {
+            let catalog = resolve_probe_models(
+                &[Provider::Near],
+                &std::collections::HashMap::new(),
+                &declared,
+            );
+            let models = catalog.models_for(&Provider::Near);
+            assert_eq!(models.len(), 1);
+            let probe = build_probe(Provider::Near, &models[0], None);
+            assert_eq!(probe.model_label(), "Qwen/Qwen3.8-27B [fallback]");
+            assert_eq!(probe.path, "/v1/chat/completions");
+            assert_eq!(probe.body["model"], "Qwen/Qwen3.8-27B");
+        }
     }
 
     #[test]
