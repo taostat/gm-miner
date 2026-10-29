@@ -9,6 +9,7 @@
 //! — the same one the gm gateway's attestation surface produces, so the
 //! registry's single attestation checker verifies both services.
 
+mod attested_pool;
 pub mod bedrock_mantle;
 pub mod chutes_verify;
 pub mod eventlog;

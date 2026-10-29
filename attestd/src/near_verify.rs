@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -18,10 +19,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
-use tracing::warn;
 
+use crate::attested_pool::{Attested, Lease, Pool};
 use crate::tee_evidence::{self, nras};
 use crate::upstream_proxy::{self, retry_attestation, strip_hop_by_hop};
 
@@ -36,8 +37,9 @@ const NRAS_TIMEOUT: Duration = Duration::from_secs(60);
 const NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 const IMAGES_GENERATIONS: &str = "/v1/images/generations";
+const READY_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct NearTarget {
     pub model: &'static str,
     pub host: &'static str,
@@ -62,12 +64,20 @@ pub const TARGETS: [NearTarget; 3] = [
     },
 ];
 
+fn make_pools() -> HashMap<NearTarget, Arc<Pool>> {
+    TARGETS
+        .into_iter()
+        .map(|target| (target, Arc::new(Pool::default())))
+        .collect()
+}
+
 #[must_use]
 pub fn target_for_model(model: &str) -> Option<NearTarget> {
     TARGETS.iter().copied().find(|target| target.model == model)
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct NearAttestation {
     model_name: String,
     signing_address: String,
@@ -80,6 +90,7 @@ struct NearAttestation {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct AttestationInfo {
     tcb_info: Value,
 }
@@ -148,6 +159,9 @@ pub struct NearVerifier {
     tls: TlsConnector,
     collateral: CollateralClient,
     nras: reqwest::Client,
+    pools: Arc<HashMap<NearTarget, Arc<Pool>>>,
+    #[cfg(test)]
+    test_factory: Option<Arc<tests::LocalConnectionFactory>>,
 }
 
 impl fmt::Debug for NearVerifier {
@@ -178,6 +192,9 @@ impl NearVerifier {
             tls: TlsConnector::from(Arc::new(tls_config)),
             collateral: tee_evidence::collateral_client()?,
             nras,
+            pools: Arc::new(make_pools()),
+            #[cfg(test)]
+            test_factory: None,
         })
     }
 
@@ -187,9 +204,8 @@ impl NearVerifier {
     ///
     /// Returns an error for any connection or attestation failure.
     pub async fn preflight(&self, target: NearTarget) -> Result<()> {
-        let (sender, connection, _, _) = self.connect_and_attest(target).await?;
-        drop(sender);
-        upstream_proxy::finish_connection(PROVIDER, connection).await
+        self.connect_and_attest(target).await?.retire();
+        Ok(())
     }
 
     /// Verify one configured endpoint while pinning the TCP connection to an
@@ -201,12 +217,13 @@ impl NearVerifier {
     ///
     /// Returns an error for any connection or attestation failure.
     pub async fn preflight_at(&self, target: NearTarget, ip: IpAddr) -> Result<()> {
-        let (sender, connection, _, _) = self.connect_and_attest_once(target, Some(ip), 0).await?;
-        drop(sender);
-        upstream_proxy::finish_connection(PROVIDER, connection).await
+        self.connect_and_attest_once(target, Some(ip), 0)
+            .await?
+            .retire();
+        Ok(())
     }
 
-    /// Attest the selected endpoint and forward on that same TLS connection.
+    /// Forward on an attested connection, reusing one only for its target host.
     ///
     /// # Errors
     ///
@@ -221,28 +238,85 @@ impl NearVerifier {
             .context("NEAR model selector is not valid ASCII")?;
         let target = target_for_model(selector).context("unsupported NEAR model selector")?;
         validate_request(&request, target)?;
-        let (mut sender, connection, _, _) = self.connect_and_attest(target).await?;
-
         let upstream_request = upstream_request(request, target)?;
-        let response = send_inference(&mut sender, upstream_request).await?;
-        let (parts, body) = response.into_parts();
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                warn!(%error, "NEAR upstream connection ended with an error");
+        let pool = self.pool_for(target)?;
+        let mut connection = self.checkout(target, &pool).await?;
+
+        #[cfg(test)]
+        if let Some(factory) = &self.test_factory {
+            factory.before_inference().await;
+        }
+
+        connection.requests += 1;
+        let response = match send_inference(&mut connection.sender, upstream_request).await {
+            Ok(response) => response,
+            Err(InferenceSendError::Unsent { request, source }) => {
+                connection.retire();
+                let mut retry_connection =
+                    self.connect_and_attest(target).await.with_context(|| {
+                        format!("freshly attest NEAR connection after unsent request: {source:#}")
+                    })?;
+                if !pool.usable(&retry_connection) {
+                    retry_connection.retire();
+                    bail!("fresh NEAR retry connection expired or closed before inference");
+                }
+                retry_connection.requests += 1;
+                #[cfg(test)]
+                if let Some(factory) = &self.test_factory {
+                    factory.before_inference().await;
+                }
+                match send_inference(&mut retry_connection.sender, *request).await {
+                    Ok(response) => {
+                        connection = retry_connection;
+                        response
+                    }
+                    Err(error) => {
+                        retry_connection.retire();
+                        return Err(error.into_anyhow().context(format!(
+                            "fresh NEAR inference retry after unsent request: {source:#}"
+                        )));
+                    }
+                }
             }
-        });
+            Err(error) => {
+                connection.retire();
+                return Err(error.into_anyhow());
+            }
+        };
+        let (parts, body) = response.into_parts();
+        let body = Lease::new(Body::new(body), connection, pool);
         Ok(Response::from_parts(parts, Body::new(body)))
     }
 
-    async fn connect_and_attest(
-        &self,
-        target: NearTarget,
-    ) -> Result<(
-        SendRequest<Body>,
-        JoinHandle<Result<(), hyper::Error>>,
-        [u8; 32],
-        SocketAddr,
-    )> {
+    #[must_use]
+    pub fn idle_connections(&self, target: NearTarget) -> usize {
+        self.pools.get(&target).map_or(0, |pool| pool.idle())
+    }
+
+    fn pool_for(&self, target: NearTarget) -> Result<Arc<Pool>> {
+        self.pools
+            .get(&target)
+            .cloned()
+            .with_context(|| format!("no NEAR connection pool for {}", target.host))
+    }
+
+    async fn checkout(&self, target: NearTarget, pool: &Arc<Pool>) -> Result<Attested> {
+        while let Some(mut connection) = pool.take() {
+            let ready = timeout(READY_TIMEOUT, connection.sender.ready()).await;
+            if matches!(ready, Ok(Ok(()))) && pool.usable(&connection) {
+                return Ok(connection);
+            }
+            connection.retire();
+        }
+        let connection = self.connect_and_attest(target).await?;
+        if !pool.usable(&connection) {
+            connection.retire();
+            bail!("NEAR connection expired or closed before its first request");
+        }
+        Ok(connection)
+    }
+
+    async fn connect_and_attest(&self, target: NearTarget) -> Result<Attested> {
         let mut attempt = 0;
         retry_attestation(PROVIDER, || {
             let current_attempt = attempt;
@@ -257,18 +331,20 @@ impl NearVerifier {
         target: NearTarget,
         ip: Option<IpAddr>,
         attempt: usize,
-    ) -> Result<(
-        SendRequest<Body>,
-        JoinHandle<Result<(), hyper::Error>>,
-        [u8; 32],
-        SocketAddr,
-    )> {
-        let (mut sender, connection, live_spki, peer) = self.connect(target, ip, attempt).await?;
-        if let Err(error) = self.attest(&mut sender, target, &live_spki).await {
-            connection.abort();
-            return Err(error).with_context(|| format!("attest {} via {peer}", target.host));
-        }
-        Ok((sender, connection, live_spki, peer))
+    ) -> Result<Attested> {
+        let (sender, driver, live_spki, peer) = self.connect(target, ip, attempt).await?;
+        let mut connection = Attested {
+            sender,
+            driver,
+            attested_at: Instant::now(),
+            idle_since: None,
+            expires_at: None,
+            requests: 0,
+        };
+        self.attest(&mut connection.sender, target, &live_spki)
+            .await
+            .with_context(|| format!("attest {} via {peer}", target.host))?;
+        Ok(connection)
     }
 
     async fn connect(
@@ -282,6 +358,11 @@ impl NearVerifier {
         [u8; 32],
         SocketAddr,
     )> {
+        #[cfg(test)]
+        if let Some(factory) = &self.test_factory {
+            return factory.connect(&self.tls, target, ip).await;
+        }
+
         let connection = upstream_proxy::connect(
             &self.tls,
             PROVIDER,
@@ -323,16 +404,26 @@ impl NearVerifier {
         let attestation: NearAttestation =
             serde_json::from_slice(&body).context("decode NEAR attestation response")?;
         let raw_quote = hex::decode(&attestation.intel_quote).context("decode NEAR TDX quote")?;
-        let claims = tee_evidence::verify_quote(&self.collateral, &raw_quote)
-            .await
-            .context("verify NEAR TDX quote against Intel collateral")?;
-        let td = tee_evidence::td_report(&claims.report).context("NEAR attestation")?;
+        let (report_data, mr_config_id) = self.quote_fields(&raw_quote).await?;
         let fields = AttestedFields {
-            report_data: &td.report_data,
-            mr_config_id: &td.mr_config_id,
+            report_data: &report_data,
+            mr_config_id: &mr_config_id,
         };
         verify_identity(&attestation, target, &nonce, live_spki, fields)?;
         self.verify_gpu(&attestation, &nonce).await
+    }
+
+    async fn quote_fields(&self, raw_quote: &[u8]) -> Result<([u8; 64], [u8; 48])> {
+        #[cfg(test)]
+        if let Some(factory) = &self.test_factory {
+            return factory.quote_fields(raw_quote);
+        }
+
+        let claims = tee_evidence::verify_quote(&self.collateral, raw_quote)
+            .await
+            .context("verify NEAR TDX quote against Intel collateral")?;
+        let td = tee_evidence::td_report(&claims.report).context("NEAR attestation")?;
+        Ok((td.report_data, td.mr_config_id))
     }
 
     async fn verify_gpu(&self, attestation: &NearAttestation, nonce: &[u8; 32]) -> Result<()> {
@@ -345,10 +436,19 @@ impl NearVerifier {
         if !payload_nonce.eq_ignore_ascii_case(&hex::encode(nonce)) {
             bail!("NVIDIA evidence nonce does not match the fresh TDX nonce");
         }
-        let response: Value = self
-            .nras
+        let response = self.gpu_verdict(&payload).await?;
+        verify_nras_response(&response)
+    }
+
+    async fn gpu_verdict(&self, payload: &Value) -> Result<Value> {
+        #[cfg(test)]
+        if let Some(factory) = &self.test_factory {
+            return Ok(factory.gpu_verdict());
+        }
+
+        self.nras
             .post(NRAS_URL)
-            .json(&payload)
+            .json(payload)
             .send()
             .await
             .context("submit GPU evidence to NVIDIA NRAS")?
@@ -356,8 +456,7 @@ impl NearVerifier {
             .context("NVIDIA NRAS rejected GPU evidence")?
             .json()
             .await
-            .context("decode NVIDIA NRAS verdict")?;
-        verify_nras_response(&response)
+            .context("decode NVIDIA NRAS verdict")
     }
 }
 
@@ -487,15 +586,47 @@ pub fn error_response(error: &anyhow::Error) -> Response<Body> {
     upstream_proxy::error_response(PROVIDER, error)
 }
 
-// Inference is sent exactly once, after attestation, on the same connection.
+enum InferenceSendError {
+    /// Hyper returned the request before serializing it onto the connection.
+    Unsent {
+        request: Box<Request<Body>>,
+        source: anyhow::Error,
+    },
+    Failed(anyhow::Error),
+}
+
+impl InferenceSendError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Unsent { source, .. } | Self::Failed(source) => source,
+        }
+    }
+}
+
+// Only a request returned by try_send_request is safe for the caller to retry
+// on another connection: Hyper has not started serializing it.
 async fn send_inference(
     sender: &mut SendRequest<Body>,
     request: Request<Body>,
-) -> Result<Response<hyper::body::Incoming>> {
-    timeout(INFERENCE_TIMEOUT, sender.send_request(request))
-        .await
-        .context("NEAR inference timed out")?
-        .context("send NEAR inference on attested TLS connection")
+) -> std::result::Result<Response<hyper::body::Incoming>, InferenceSendError> {
+    match timeout(INFERENCE_TIMEOUT, sender.try_send_request(request)).await {
+        Err(_) => Err(InferenceSendError::Failed(anyhow::anyhow!(
+            "NEAR inference timed out"
+        ))),
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(mut error)) => {
+            let request = error.take_message();
+            let source = anyhow::Error::new(error.into_error())
+                .context("send NEAR inference on attested TLS connection");
+            match request {
+                Some(request) => Err(InferenceSendError::Unsent {
+                    request: Box::new(request),
+                    source,
+                }),
+                None => Err(InferenceSendError::Failed(source)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -505,15 +636,744 @@ async fn send_inference(
 )]
 mod tests {
     use super::*;
+    use crate::attested_pool::{MAX_AGE, MAX_IDLE_AGE};
     use axum::http::header::CONNECTION;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const FLUX_KLEIN_MODEL: &str = "black-forest-labs/FLUX.2-klein-4B";
     const FLUX_KLEIN_HOST: &str = "flux2-klein.completions.near.ai";
     const GLM_53_FLASH_MODEL: &str = "z-ai/glm-5.3-flash";
     const GLM_53_FLASH_HOST: &str = "glm-5-3-flash.completions.near.ai";
+    const TEST_LEAF: &[u8] = include_bytes!("../tests/fixtures/kubetee/test_leaf.der");
+    const TEST_KEY: &[u8] = include_bytes!("../tests/fixtures/kubetee/test_leaf_key.pk8");
+
+    #[derive(Clone, Copy, Debug, Default)]
+    enum EvidenceFault {
+        #[default]
+        None,
+        TlsKey,
+        Nonce,
+        ReportData,
+        Quote,
+        GpuNonce,
+        GpuVerdict,
+    }
+
+    #[derive(Default)]
+    struct LocalServerState {
+        attestations: AtomicUsize,
+        quote_checks: AtomicUsize,
+        gpu_checks: AtomicUsize,
+        inferences: AtomicUsize,
+        fail_next_inference: AtomicBool,
+        fail_next_upload: AtomicBool,
+        incomplete_next_response: AtomicBool,
+        fail_next_body: AtomicBool,
+        stall_next_inference: AtomicBool,
+        fail_attestation: AtomicBool,
+        closes_before_inference: std::sync::Mutex<usize>,
+        attestation_delay: std::sync::Mutex<Duration>,
+        fault: std::sync::Mutex<EvidenceFault>,
+        peers: std::sync::Mutex<Vec<Option<IpAddr>>>,
+        drivers: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+        servers: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    }
+
+    impl LocalServerState {
+        async fn respond(
+            &self,
+            request: Request<hyper::body::Incoming>,
+            target: NearTarget,
+            attested: &AtomicBool,
+        ) -> std::io::Result<Response<Body>> {
+            assert_eq!(request.headers()[HOST], target.host);
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            if path == target.path && self.fail_next_upload.swap(false, Ordering::SeqCst) {
+                assert!(attested.load(Ordering::SeqCst));
+                let mut body = request.into_body();
+                assert_eq!(
+                    body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                    "partial request"
+                );
+                return Err(std::io::Error::other("local upload interrupted"));
+            }
+            let body = request
+                .into_body()
+                .collect()
+                .await
+                .map_err(|_| std::io::Error::other("local request body failed"))?
+                .to_bytes();
+            if path == "/v1/attestation/report" {
+                self.attestations.fetch_add(1, Ordering::SeqCst);
+                if self.fail_attestation.load(Ordering::SeqCst) {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::empty())
+                        .unwrap());
+                }
+                let delay = *self.attestation_delay.lock().unwrap();
+                tokio::time::sleep(delay).await;
+                attested.store(true, Ordering::SeqCst);
+                return Ok(Response::new(Body::from(evidence_body(
+                    self, target, &query,
+                ))));
+            }
+
+            assert!(attested.load(Ordering::SeqCst));
+            assert_eq!(path, target.path);
+            assert_eq!(body, "request body");
+            self.inferences.fetch_add(1, Ordering::SeqCst);
+            if self.stall_next_inference.swap(false, Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.fail_next_inference.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::other("local inference failed"));
+            }
+            let fail_body = self.fail_next_body.swap(false, Ordering::SeqCst);
+            if self.incomplete_next_response.swap(false, Ordering::SeqCst) || fail_body {
+                use futures_util::{stream, StreamExt as _};
+                let chunks = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"partial",
+                ))])
+                .chain(stream::once(async move {
+                    if fail_body {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        Err(std::io::Error::other("local response body failed"))
+                    } else {
+                        std::future::pending().await
+                    }
+                }));
+                return Ok(Response::new(Body::from_stream(chunks)));
+            }
+            Ok(Response::new(Body::from("completion")))
+        }
+
+        fn record_server(&self, server: &tokio::task::JoinHandle<()>) {
+            self.servers.lock().unwrap().push(server.abort_handle());
+        }
+
+        async fn close_latest_peer(&self) {
+            let server = self.servers.lock().unwrap().last().unwrap().clone();
+            let driver = self.drivers.lock().unwrap().last().unwrap().clone();
+            server.abort();
+            timeout(Duration::from_secs(1), async {
+                while !driver.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct LocalConnectionFactory {
+        state: Arc<LocalServerState>,
+    }
+
+    // TLS, nonce generation, evidence fetching, identity binding and GPU verdict
+    // enforcement use the production path. Only Intel appraisal and the NRAS
+    // service use synthetic evidence, keeping these lifecycle tests offline.
+    impl LocalConnectionFactory {
+        pub(super) async fn before_inference(&self) {
+            let close = {
+                let mut remaining = self.state.closes_before_inference.lock().unwrap();
+                let close = *remaining > 0;
+                *remaining = remaining.saturating_sub(1);
+                close
+            };
+            if close {
+                self.state.close_latest_peer().await;
+            }
+        }
+
+        pub(super) async fn connect(
+            &self,
+            tls: &TlsConnector,
+            target: NearTarget,
+            ip: Option<IpAddr>,
+        ) -> Result<(
+            SendRequest<Body>,
+            JoinHandle<Result<(), hyper::Error>>,
+            [u8; 32],
+            SocketAddr,
+        )> {
+            use hyper::service::service_fn;
+            use hyper_util::rt::TokioIo;
+            use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+            self.state.peers.lock().unwrap().push(ip);
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from(TEST_LEAF)],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_KEY.to_vec())),
+                )?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+            let state = Arc::clone(&self.state);
+            let attested = Arc::new(AtomicBool::new(false));
+            let (client, server) = tokio::io::duplex(4096);
+            let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                let state = Arc::clone(&state);
+                let attested = Arc::clone(&attested);
+                async move { state.respond(request, target, &attested).await }
+            });
+            let server = tokio::spawn(async move {
+                let server = acceptor.accept(server).await.unwrap();
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(server), service)
+                    .await;
+            });
+            self.state.record_server(&server);
+            let client = tls
+                .connect(ServerName::try_from(target.host)?, client)
+                .await?;
+            let live_spki = tee_evidence::spki_sha256(
+                client.get_ref().1.peer_certificates().unwrap()[0].as_ref(),
+            )?;
+            let (sender, driver) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+                .await
+                .context("start local NEAR HTTP connection")?;
+            let driver = tokio::spawn(driver);
+            self.state
+                .drivers
+                .lock()
+                .unwrap()
+                .push(driver.abort_handle());
+            Ok((
+                sender,
+                driver,
+                live_spki,
+                SocketAddr::new(ip.unwrap_or(IpAddr::from([127, 0, 0, 1])), 443),
+            ))
+        }
+
+        pub(super) fn quote_fields(&self, raw: &[u8]) -> Result<([u8; 64], [u8; 48])> {
+            self.state.quote_checks.fetch_add(1, Ordering::SeqCst);
+            if matches!(*self.state.fault.lock().unwrap(), EvidenceFault::Quote) {
+                bail!("local quote appraisal failed");
+            }
+            let (report_data, mr_config_id) = raw.split_at(64);
+            Ok((report_data.try_into()?, mr_config_id.try_into()?))
+        }
+
+        pub(super) fn gpu_verdict(&self) -> Value {
+            self.state.gpu_checks.fetch_add(1, Ordering::SeqCst);
+            nras_response(&serde_json::json!({
+                "x-nvidia-overall-att-result": !matches!(
+                    *self.state.fault.lock().unwrap(), EvidenceFault::GpuVerdict
+                )
+            }))
+        }
+    }
+
+    fn evidence_body(state: &LocalServerState, target: NearTarget, query: &str) -> Vec<u8> {
+        assert!(query.contains("include_tls_fingerprint=true&signing_algo=ed25519"));
+        let nonce: [u8; 32] = hex::decode(query.split_once("nonce=").unwrap().1)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let spki = tee_evidence::spki_sha256(TEST_LEAF).unwrap();
+        let mut attestation = attestation(nonce, spki, target.model);
+        let (mut report_data, mr_config_id) = fields(&attestation, nonce, spki);
+        match *state.fault.lock().unwrap() {
+            EvidenceFault::TlsKey => attestation.tls_cert_fingerprint = hex::encode([42; 32]),
+            EvidenceFault::Nonce => attestation.request_nonce = hex::encode([42; 32]),
+            EvidenceFault::ReportData => report_data[0] ^= 1,
+            EvidenceFault::GpuNonce => {
+                attestation.nvidia_payload =
+                    serde_json::json!({"nonce": hex::encode([42; 32])}).to_string();
+            }
+            EvidenceFault::None | EvidenceFault::Quote | EvidenceFault::GpuVerdict => {}
+        }
+        attestation.intel_quote =
+            hex::encode([report_data.as_slice(), mr_config_id.as_slice()].concat());
+        serde_json::to_vec(&attestation).unwrap()
+    }
+
+    fn local_verifier() -> (NearVerifier, Arc<LocalServerState>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let factory = Arc::new(LocalConnectionFactory::default());
+        let state = Arc::clone(&factory.state);
+        let mut verifier = NearVerifier::new().unwrap();
+        verifier.test_factory = Some(factory);
+        (verifier, state)
+    }
+
+    fn inference_request(target: NearTarget) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(target.path)
+            .header(SELECTOR_HEADER, target.model)
+            .body(Body::from("request body"))
+            .unwrap()
+    }
+
+    async fn complete_inference(verifier: &NearVerifier, target: NearTarget) {
+        let response = verifier.forward(inference_request(target)).await.unwrap();
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_inference_reuses_its_target_connection_without_reattesting() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, target).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 1);
+        assert_eq!(state.quote_checks.load(Ordering::SeqCst), 1);
+        assert_eq!(state.gpu_checks.load(Ordering::SeqCst), 1);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+        assert_eq!(verifier.idle_connections(target), 1);
+    }
+
+    #[tokio::test]
+    async fn each_target_host_uses_its_own_pool() {
+        let first = TARGETS[0];
+        let second = TARGETS[1];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, first).await;
+        complete_inference(&verifier, second).await;
+        complete_inference(&verifier, first).await;
+        complete_inference(&verifier, second).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 4);
+        assert_eq!(verifier.idle_connections(first), 1);
+        assert_eq!(verifier.idle_connections(second), 1);
+        let other_model = NearTarget {
+            model: second.model,
+            ..first
+        };
+        let other_path = NearTarget {
+            path: IMAGES_GENERATIONS,
+            ..first
+        };
+        assert!(verifier.pool_for(other_model).is_err());
+        assert!(verifier.pool_for(other_path).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_connection_is_reattested_before_inference() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, target).await;
+        // Keep the connection active so the shorter idle limit cannot make
+        // this test pass without enforcing the attestation age.
+        let interval = Duration::from_secs(60);
+        for _ in 1..MAX_AGE.as_secs() / interval.as_secs() {
+            tokio::time::advance(interval).await;
+            complete_inference(&verifier, target).await;
+            assert_eq!(state.attestations.load(Ordering::SeqCst), 1);
+        }
+        tokio::time::advance(interval).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.quote_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(state.gpu_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 11);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_past_the_limit_is_reattested() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, target).await;
+        tokio::time::advance(MAX_IDLE_AGE + Duration::from_secs(1)).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_time_starts_after_the_response_is_consumed_and_resets_on_return() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        let response = verifier.forward(inference_request(target)).await.unwrap();
+        tokio::time::advance(MAX_IDLE_AGE + Duration::from_secs(1)).await;
+        assert_eq!(verifier.idle_connections(target), 0);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "completion"
+        );
+        complete_inference(&verifier, target).await;
+        tokio::time::advance(MAX_IDLE_AGE.checked_sub(Duration::from_secs(1)).unwrap()).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 1);
+        tokio::time::advance(MAX_IDLE_AGE).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_peer_closed_while_idle_is_reattested_on_checkout() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, target).await;
+        state.close_latest_peer().await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unsent_inference_retries_once_on_a_fresh_attested_connection() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, target).await;
+        *state.closes_before_inference.lock().unwrap() = 1;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.quote_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(state.gpu_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+        assert_eq!(verifier.idle_connections(target), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_unsent_failure_is_not_retried_again() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, target).await;
+        *state.closes_before_inference.lock().unwrap() = 2;
+        assert!(verifier.forward(inference_request(target)).await.is_err());
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.quote_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(state.gpu_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 1);
+        assert_eq!(verifier.idle_connections(target), 0);
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 3);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unsent_retry_requires_successful_fresh_attestation() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, target).await;
+        *state.closes_before_inference.lock().unwrap() = 1;
+        *state.fault.lock().unwrap() = EvidenceFault::GpuVerdict;
+        assert!(verifier.forward(inference_request(target)).await.is_err());
+        assert_eq!(
+            state.attestations.load(Ordering::SeqCst),
+            1 + upstream_proxy::ATTESTATION_ATTEMPTS
+        );
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 1);
+        assert_eq!(verifier.idle_connections(target), 0);
+        let drivers = state.drivers.lock().unwrap().clone();
+        timeout(Duration::from_secs(1), async {
+            while drivers.iter().any(|driver| !driver.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attested_at_starts_with_nonce_bound_attestation() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        let delay = Duration::from_secs(30);
+        *state.attestation_delay.lock().unwrap() = delay;
+        complete_inference(&verifier, target).await;
+        let interval = Duration::from_secs(60);
+        for _ in 1..MAX_AGE.as_secs() / interval.as_secs() {
+            tokio::time::advance(interval).await;
+            complete_inference(&verifier, target).await;
+            assert_eq!(state.attestations.load(Ordering::SeqCst), 1);
+        }
+        tokio::time::advance(interval.checked_sub(delay).unwrap()).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 11);
+    }
+
+    #[tokio::test]
+    async fn request_limit_forces_a_new_attestation() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        for _ in 0..crate::attested_pool::MAX_REQUESTS {
+            complete_inference(&verifier, target).await;
+        }
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 1);
+        assert_eq!(verifier.idle_connections(target), 0);
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 101);
+    }
+
+    async fn first_driver_stopped(state: &LocalServerState) {
+        let driver = state.drivers.lock().unwrap()[0].clone();
+        timeout(Duration::from_secs(1), async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_inference_retires_its_connection_before_reuse() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.stall_next_inference.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let error = verifier
+            .forward(inference_request(target))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "NEAR inference timed out");
+        assert_eq!(started.elapsed(), INFERENCE_TIMEOUT);
+        assert_eq!(verifier.idle_connections(target), 0);
+        first_driver_stopped(&state).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_inference_retires_its_connection() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.stall_next_inference.store(true, Ordering::SeqCst);
+        let worker = verifier.clone();
+        let request = tokio::spawn(async move { worker.forward(inference_request(target)).await });
+        timeout(Duration::from_secs(1), async {
+            while state.inferences.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(verifier.idle_connections(target), 0);
+        first_driver_stopped(&state).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_attestation_closes_the_pending_connection() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        *state.attestation_delay.lock().unwrap() = ATTESTATION_TIMEOUT;
+        let worker = verifier.clone();
+        let request = tokio::spawn(async move { worker.forward(inference_request(target)).await });
+        timeout(Duration::from_secs(1), async {
+            while state.attestations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(verifier.idle_connections(target), 0);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 0);
+        first_driver_stopped(&state).await;
+        *state.attestation_delay.lock().unwrap() = Duration::ZERO;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_attestation_never_sends_inference_or_enters_the_pool() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.fail_attestation.store(true, Ordering::SeqCst);
+        assert!(verifier.forward(inference_request(target)).await.is_err());
+        assert_eq!(
+            state.attestations.load(Ordering::SeqCst),
+            upstream_proxy::ATTESTATION_ATTEMPTS
+        );
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 0);
+        assert_eq!(verifier.idle_connections(target), 0);
+        state.fail_attestation.store(false, Ordering::SeqCst);
+        complete_inference(&verifier, target).await;
+        assert_eq!(
+            state.attestations.load(Ordering::SeqCst),
+            upstream_proxy::ATTESTATION_ATTEMPTS + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consumed_inference_failure_is_not_retried() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.fail_next_inference.store(true, Ordering::SeqCst);
+        assert!(verifier.forward(inference_request(target)).await.is_err());
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 1);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 1);
+        assert_eq!(verifier.idle_connections(target), 0);
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_partly_written_request_is_never_retried() {
+        use futures_util::{stream, StreamExt as _};
+
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.fail_next_upload.store(true, Ordering::SeqCst);
+        let mut request = inference_request(target);
+        *request.body_mut() = Body::from_stream(
+            stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"partial request",
+            ))])
+            .chain(stream::pending()),
+        );
+        assert!(timeout(Duration::from_secs(1), verifier.forward(request))
+            .await
+            .unwrap()
+            .is_err());
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 1);
+        assert_eq!(verifier.idle_connections(target), 0);
+        first_driver_stopped(&state).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_evidence_never_carries_inference_or_enters_the_pool() {
+        for fault in [
+            EvidenceFault::TlsKey,
+            EvidenceFault::Nonce,
+            EvidenceFault::ReportData,
+            EvidenceFault::Quote,
+            EvidenceFault::GpuNonce,
+            EvidenceFault::GpuVerdict,
+        ] {
+            let (verifier, state) = local_verifier();
+            *state.fault.lock().unwrap() = fault;
+            assert!(
+                verifier
+                    .forward(inference_request(TARGETS[0]))
+                    .await
+                    .is_err(),
+                "{fault:?}"
+            );
+            assert_eq!(
+                state.attestations.load(Ordering::SeqCst),
+                upstream_proxy::ATTESTATION_ATTEMPTS
+            );
+            assert_eq!(state.inferences.load(Ordering::SeqCst), 0);
+            assert_eq!(verifier.idle_connections(TARGETS[0]), 0);
+            first_driver_stopped(&state).await;
+            *state.fault.lock().unwrap() = EvidenceFault::None;
+            complete_inference(&verifier, TARGETS[0]).await;
+            assert_eq!(
+                state.attestations.load(Ordering::SeqCst),
+                upstream_proxy::ATTESTATION_ATTEMPTS + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_body_discards_its_connection() {
+        let (verifier, state) = local_verifier();
+        let mut request = inference_request(TARGETS[0]);
+        *request.body_mut() = Body::from_stream(futures_util::stream::iter([
+            Ok(Bytes::from_static(b"partial request")),
+            Err(std::io::Error::other("caller disconnected")),
+        ]));
+        assert!(verifier.forward(request).await.is_err());
+        assert_eq!(verifier.idle_connections(TARGETS[0]), 0);
+        first_driver_stopped(&state).await;
+        complete_inference(&verifier, TARGETS[0]).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_response_body_discards_its_connection() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.incomplete_next_response.store(true, Ordering::SeqCst);
+        let response = verifier.forward(inference_request(target)).await.unwrap();
+        let mut body = response.into_body();
+        assert!(body.frame().await.unwrap().unwrap().is_data());
+        drop(body);
+        assert_eq!(verifier.idle_connections(target), 0);
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_response_body_error_discards_its_connection() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.fail_next_body.store(true, Ordering::SeqCst);
+        let response = verifier.forward(inference_request(target)).await.unwrap();
+        assert!(response.into_body().collect().await.is_err());
+        assert_eq!(verifier.idle_connections(target), 0);
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unread_response_is_not_reused() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.incomplete_next_response.store(true, Ordering::SeqCst);
+        let response = verifier.forward(inference_request(target)).await.unwrap();
+        assert_eq!(verifier.idle_connections(target), 0);
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+        drop(response);
+        first_driver_stopped(&state).await;
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn preflight_connections_are_not_pooled() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        verifier.preflight(target).await.unwrap();
+        assert_eq!(verifier.idle_connections(target), 0);
+        first_driver_stopped(&state).await;
+        verifier
+            .preflight_at(target, "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(verifier.idle_connections(target), 0);
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 3);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 1);
+        verifier.preflight(target).await.unwrap();
+        verifier
+            .preflight_at(target, "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(verifier.idle_connections(target), 1);
+        complete_inference(&verifier, target).await;
+        assert_eq!(state.attestations.load(Ordering::SeqCst), 5);
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *state.peers.lock().unwrap(),
+            [
+                None,
+                Some("127.0.0.1".parse().unwrap()),
+                None,
+                None,
+                Some("127.0.0.1".parse().unwrap())
+            ]
+        );
+    }
 
     // Real HTTP over an in-memory connection lets Tokio advance simulated
     // time without live TLS/attestation services or wall-clock sleeps.
@@ -551,7 +1411,9 @@ mod tests {
             .header(SELECTOR_HEADER, target.model)
             .body(Body::from("request body"))
             .unwrap();
-        let result = send_inference(&mut sender, upstream_request(request, target).unwrap()).await;
+        let result = send_inference(&mut sender, upstream_request(request, target).unwrap())
+            .await
+            .map_err(InferenceSendError::into_anyhow);
         // These tests use a complete small body; stop both drivers on error.
         if result.is_err() {
             connection.abort();

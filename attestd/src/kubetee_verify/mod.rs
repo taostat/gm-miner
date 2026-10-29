@@ -15,7 +15,7 @@ pub mod pool;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ use http_body_util::{BodyExt as _, Limited};
 use hyper::body::Incoming;
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
 
 use crate::tee_evidence;
@@ -121,6 +121,7 @@ pub struct KubeteeVerifier {
     address: Option<SocketAddr>,
     collateral: Arc<dyn Collateral>,
     nonce: fn() -> [u8; 32],
+    limits: Limits,
     pool: Arc<Pool>,
 }
 
@@ -167,7 +168,8 @@ impl KubeteeVerifier {
             address,
             collateral,
             nonce,
-            pool: Arc::new(Pool::new(limits)),
+            limits,
+            pool: Arc::new(Pool::new(limits.pool_limits())),
         }
     }
 
@@ -177,7 +179,7 @@ impl KubeteeVerifier {
     ///
     /// Returns an error when every attempt to connect and attest fails.
     pub async fn preflight(&self) -> Result<Attestation> {
-        let (connection, attestation) = self.connect_and_attest().await?;
+        let (connection, attestation, _) = self.connect_and_attest().await?;
         drop(connection.sender);
         upstream_proxy::finish_connection(PROVIDER, connection.driver).await?;
         Ok(attestation)
@@ -194,7 +196,7 @@ impl KubeteeVerifier {
     pub async fn forward(&self, request: Request<Body>) -> Result<Response<Body>> {
         let selector = validate_request(&request)?;
         let request = timeout(
-            self.pool.limits().request_read_timeout,
+            self.limits.request_read_timeout,
             require_body_model(request, selector),
         )
         .await
@@ -217,7 +219,11 @@ impl KubeteeVerifier {
         let (mut parts, body) = response.into_parts();
         strip_supplier_headers(&mut parts.headers);
         strip_hop_by_hop(&mut parts.headers);
-        let body = Lease::new(body, connection, Arc::clone(&self.pool));
+        let body = Lease::new(
+            Body::new(pool::SupplierBody(body)),
+            connection,
+            Arc::clone(&self.pool),
+        );
         Ok(Response::from_parts(parts, Body::new(body)))
     }
 
@@ -242,7 +248,7 @@ impl KubeteeVerifier {
         let mut connection = self.checkout().await?;
         connection.requests += 1;
         let result = timeout(
-            self.pool.limits().fetch_timeout,
+            self.limits.fetch_timeout,
             read_models(&mut connection.sender, upstream),
         )
         .await
@@ -272,12 +278,13 @@ impl KubeteeVerifier {
             }
             connection.retire();
         }
-        let (connection, attestation) = self.connect_and_attest().await?;
+        let (connection, attestation, attested_at) = self.connect_and_attest().await?;
         let connection = pool::Attested {
             sender: connection.sender,
             driver: connection.driver,
-            attested_at: Instant::now(),
-            keyset_not_after: attestation.keyset_not_after,
+            attested_at,
+            idle_since: None,
+            expires_at: attestation.keyset_not_after,
             requests: 0,
         };
         // Fresh connections need the same final check as pooled ones: the
@@ -289,7 +296,7 @@ impl KubeteeVerifier {
         Ok(connection)
     }
 
-    async fn connect_and_attest(&self) -> Result<(UpstreamConnection, Attestation)> {
+    async fn connect_and_attest(&self) -> Result<(UpstreamConnection, Attestation, Instant)> {
         let mut attempt = 0;
         retry_attestation(PROVIDER, || {
             let current = attempt;
@@ -302,11 +309,11 @@ impl KubeteeVerifier {
     async fn connect_and_attest_once(
         &self,
         attempt: usize,
-    ) -> Result<(UpstreamConnection, Attestation)> {
+    ) -> Result<(UpstreamConnection, Attestation, Instant)> {
         let mut connection =
             upstream_proxy::connect(&self.tls, PROVIDER, HOST_NAME, self.address, attempt).await?;
         match self.attest(&mut connection).await {
-            Ok(attestation) => Ok((connection, attestation)),
+            Ok((attestation, attested_at)) => Ok((connection, attestation, attested_at)),
             Err(error) => {
                 connection.driver.abort();
                 Err(error).with_context(|| format!("attest {HOST_NAME} via {}", connection.peer))
@@ -314,7 +321,8 @@ impl KubeteeVerifier {
         }
     }
 
-    async fn attest(&self, connection: &mut UpstreamConnection) -> Result<Attestation> {
+    async fn attest(&self, connection: &mut UpstreamConnection) -> Result<(Attestation, Instant)> {
+        let attested_at = Instant::now();
         let nonce = hex::encode((self.nonce)());
         let uri: Uri = format!("/v1/attestation?nonce={nonce}")
             .parse()
@@ -325,7 +333,7 @@ impl KubeteeVerifier {
             .header(HOST, HOST_NAME)
             .body(Body::empty())
             .context("build KubeTEE attestation request")?;
-        let body = timeout(self.pool.limits().fetch_timeout, async {
+        let body = timeout(self.limits.fetch_timeout, async {
             let response = connection
                 .sender
                 .send_request(request)
@@ -366,12 +374,15 @@ impl KubeteeVerifier {
             binding.ensure_current(Utc::now())?;
         }
         evidence::log_attested(&payload.pod, &measurements);
-        Ok(Attestation {
-            pod: payload.pod,
-            peer: connection.peer,
-            measurements,
-            keyset_not_after: binding.map(|binding| binding.not_after),
-        })
+        Ok((
+            Attestation {
+                pod: payload.pod,
+                peer: connection.peer,
+                measurements,
+                keyset_not_after: binding.map(|binding| binding.not_after),
+            },
+            attested_at,
+        ))
     }
 }
 
@@ -479,7 +490,7 @@ fn upstream_request(mut request: Request<Body>) -> Result<Request<Body>> {
     strip_supplier_headers(headers);
     strip_hop_by_hop(headers);
     headers.insert(HOST, HeaderValue::from_static(HOST_NAME));
-    let mut request = request.map(|body| Body::new(body.map_frame(pool::strip_supplier_trailers)));
+    let mut request = request.map(|body| Body::new(pool::SupplierBody(body)));
     let path = request
         .uri()
         .path_and_query()

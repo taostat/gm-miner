@@ -277,28 +277,40 @@ gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
 
 ### NEAR attestation enforcement
 
-NEAR is not a normal TLS proxy route. When a NEAR key is present, the image
-starts and supervises the co-located verifier. Endpoints are verified per
-request, so an unavailable model does not block startup for other models or
-providers. For each inference request, the verifier opens a fresh TLS connection,
-requests nonce-bound evidence on that connection, validates the Intel TDX quote,
-the exact model id, the live TLS public-key fingerprint, the compose measurement
-binding, and NVIDIA's GPU verdict, and only then forwards inference on that same
-connection. A missing, stale, substituted, malformed, or failed verdict returns
-an error; there is no direct-origin or unattested fallback route. The same
-checks cover `POST /v1/chat/completions` for `near/Qwen/Qwen3.8-27B` and
+When a NEAR key is present, the image starts and supervises the co-located
+verifier. Each model's endpoint is verified on demand, allowing models and
+providers to start independently. For each compiled target host, the verifier
+keeps up to eight idle keep-alive connections. A new TLS connection receives
+nonce-bound evidence, and the verifier validates its Intel TDX quote, exact
+model id, live TLS public-key fingerprint, and compose measurement binding.
+A positive NVIDIA NRAS verdict is required before inference is forwarded on
+that same connection. An attested connection is reusable for ten minutes
+from the start of attestation and up to 100 inference requests. Each idle
+period is limited to 90 seconds, starting when the complete response body is
+consumed.
+
+The attestation fetch has a single 120-second deadline covering response
+headers and body, with a 2 MiB body limit; inference response headers have a
+separate 1800-second deadline.
+
+A connection returns to the pool after its complete response body is consumed;
+errors, timeouts, cancellations, and early body drops close it. Diagnostic
+preflights always attest and close a fresh connection. When Hyper confirms
+that an inference request was unsent, the verifier allows one retry on a
+freshly attested connection. The same checks cover
+`POST /v1/chat/completions` for `near/Qwen/Qwen3.8-27B` and
 `near/z-ai/glm-5.3-flash`, plus `POST /v1/images/generations` for
-`near/black-forest-labs/FLUX.2-klein-4B`; the verifier never reads the body.
+`near/black-forest-labs/FLUX.2-klein-4B`. The verifier streams request bodies to
+the selected endpoint and sends inference only on a connection that passed
+attestation.
 
 The registry's `GET /v1/models` capability check is answered locally from that
-same compiled allowlist. It does not contact an unattested catalog endpoint;
-the registry's follow-up one-token balance check still takes the fully attested
-inference path for the exact offered source model.
+same compiled allowlist. The registry's follow-up one-token balance check takes
+the fully attested inference path for the exact offered source model.
 
 The verifier's endpoint and model allowlist is compiled into the measured miner
 image. Adding a NEAR model therefore requires a new image build and the normal
-registry image-approval process; changing a CLI catalog row alone cannot make an
-arbitrary NEAR host reachable.
+registry image-approval process.
 
 ### Chutes TEE verification
 
@@ -332,11 +344,10 @@ image build and the normal image-approval process.
 ### KubeTEE attestation verification
 
 With a KubeTEE key set, the image runs a co-located KubeTEE verifier, and every
-KubeTEE chat request is served through it; there is no direct KubeTEE chat
-route. The verifier keeps a small pool of keep-alive TLS 1.3 connections to
-`llm.kubetee.ai`. Each connection is attested before any request is sent on
-it: the verifier requests a quote for a fresh nonce on that connection and
-requires
+KubeTEE chat request is served through it. The verifier keeps a small pool of
+keep-alive TLS 1.3 connections to `llm.kubetee.ai`. Each connection is attested
+before serving inference: the verifier requests a quote for a fresh nonce on
+that connection and requires
 
 - the nonce echoed back exactly;
 - the Intel TDX quote verifying at `UpToDate` TCB with the debug bit clear;
@@ -349,10 +360,12 @@ requires
 - KubeTEE's TLS-possession proof naming this connection's certificate, with
   that certificate's key signing the nonce.
 
-An attested connection carries one request at a time and is renewed after 10
-minutes or 100 requests; a connection that fails or closes is retired and the
-next request attests a new one. A connection whose attestation fails is never
-used, and the request gets a 502. A chat request is never sent twice.
+An attested connection carries one request at a time and is renewed after ten
+minutes from the start of attestation or 100 requests, or when its quote-bound
+keyset expires. The verifier retains up to eight idle connections within these
+limits. A connection that fails or closes is retired and the next request
+attests a new one. Successful attestation is required to serve a request;
+verification failures return a 502. Each chat request is sent at most once.
 The supplier's `x-kubetee-*` and `x-litellm-*` response headers are removed
 before the response leaves the worker. The verifier logs the replica's pod name
 and measured registers (MRTD, MRCONFIGID, RTMR0-3) for each attested

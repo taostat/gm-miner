@@ -13,6 +13,7 @@ use axum::http::{HeaderMap, HeaderName, Response, StatusCode};
 use hyper::client::conn::http1::{self, SendRequest};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, ServerName};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{lookup_host, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -22,6 +23,8 @@ use tracing::{info, warn};
 /// How many times an attestation is attempted before the request fails.
 pub const ATTESTATION_ATTEMPTS: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 struct PendingHandshake<'a> {
     provider: &'a str,
@@ -87,6 +90,12 @@ pub async fn connect(
         .await
         .with_context(|| format!("{provider} TCP connect timed out"))?
         .with_context(|| format!("connect to {host} via {address}"))?;
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    SockRef::from(&tcp)
+        .set_tcp_keepalive(&keepalive)
+        .with_context(|| format!("enable {provider} TCP keepalive"))?;
     let peer = tcp
         .peer_addr()
         .with_context(|| format!("read {provider} peer address for {host}"))?;
