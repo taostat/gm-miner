@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-10-28**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-10-29**. This is a miner setup matrix, not a buyer product
 catalog. It distinguishes transport capability from registry admission:
 
 * A direct/API-key source is declarable when the registry publishes the route
@@ -101,11 +101,11 @@ their presence here does not establish registry admission.
 | `GPT-5.6 Luna` | OpenAI API: `openai/gpt-5.6-luna` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `GPT-5.6 Sol` | OpenAI API: `openai/gpt-5.6-sol` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `GPT-5.6 Terra` | OpenAI API: `openai/gpt-5.6-terra` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-6 Astra` | OpenAI API: `openai/gpt-6-astra` (`--openai`) |
-| `GPT-6 Luna` | OpenAI API: `openai/gpt-6-luna` (`--openai`) |
-| `GPT-6 Sol` | OpenAI API: `openai/gpt-6-sol` (`--openai`) |
-| `GPT-6.1 Sol` | OpenAI API: `openai/gpt-6.1-sol` (`--openai`) |
-| `GPT-6.1 Terra` | OpenAI API: `openai/gpt-6.1-terra` (`--openai`) |
+| `GPT-6 Astra` | OpenAI API: `openai/gpt-6-astra` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
+| `GPT-6 Luna` | OpenAI API: `openai/gpt-6-luna` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
+| `GPT-6 Sol` | OpenAI API: `openai/gpt-6-sol` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
+| `GPT-6.1 Sol` | OpenAI API: `openai/gpt-6.1-sol` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
+| `GPT-6.1 Terra` | OpenAI API: `openai/gpt-6.1-terra` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
 | `gpt-oss-20b` | DeepInfra: `deepinfra/openai/gpt-oss-20b` (`--deepinfra`); chat completions only |
 | `Kimi K2.6 TEE` | Chutes: `chutes/moonshotai/Kimi-K2.6-TEE` (`--chutes`) |
 | `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`); Chutes (TEE sibling): `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
