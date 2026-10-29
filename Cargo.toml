@@ -33,7 +33,7 @@ base64 = "0.23"
 ed25519-dalek = { version = "3.0", features = ["rand_core", "zeroize"] }
 sha2 = "0.11"
 hex = "0.4"
-dcap-qvl = { version = "0.6.1", default-features = false, features = ["std", "report", "ring", "default-x509"] }
+dcap-qvl = { version = "0.7.0", default-features = false, features = ["std", "report", "ring", "default-x509"] }
 http-body-util = "0.1"
 hyper = { version = "1.6", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -42,8 +42,8 @@ rustls = { version = "0.23.43", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 x509-parser = "0.18.1"
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
-futures-util = { version = "=0.3.32", default-features = false }
-ml-kem = { version = "=0.3.2", features = ["getrandom", "zeroize"] }
+futures-util = { version = "=0.3.34", default-features = false }
+ml-kem = { version = "=0.3.3", features = ["getrandom", "zeroize"] }
 ring = "=0.17.14"
 # Mozilla's root set for the KubeTEE verifier's WebPKI TLS; already in the
 # lockfile through reqwest's rustls-tls feature.
