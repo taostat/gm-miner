@@ -295,8 +295,8 @@ separate 1800-second deadline.
 
 A connection returns to the pool after its complete response body is consumed;
 errors, timeouts, cancellations, and early body drops close it. Diagnostic
-preflights always attest and close a fresh connection. When Hyper confirms
-that an inference request was unsent, the verifier allows one retry on a
+preflights always attest and close a fresh connection. When an inference
+request was never written to the upstream, the verifier allows one retry on a
 freshly attested connection. The same checks cover
 `POST /v1/chat/completions` for `near/Qwen/Qwen3.8-27B` and
 `near/z-ai/glm-5.3-flash`, plus `POST /v1/images/generations` for

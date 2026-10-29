@@ -25,6 +25,8 @@ pub const ATTESTATION_ATTEMPTS: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct PendingHandshake<'a> {
     provider: &'a str,
@@ -96,6 +98,10 @@ pub async fn connect(
     SockRef::from(&tcp)
         .set_tcp_keepalive(&keepalive)
         .with_context(|| format!("enable {provider} TCP keepalive"))?;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
+    SockRef::from(&tcp)
+        .set_tcp_user_timeout(Some(TCP_USER_TIMEOUT))
+        .with_context(|| format!("enable {provider} TCP user timeout"))?;
     let peer = tcp
         .peer_addr()
         .with_context(|| format!("read {provider} peer address for {host}"))?;

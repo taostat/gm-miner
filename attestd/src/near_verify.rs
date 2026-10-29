@@ -204,8 +204,7 @@ impl NearVerifier {
     ///
     /// Returns an error for any connection or attestation failure.
     pub async fn preflight(&self, target: NearTarget) -> Result<()> {
-        self.connect_and_attest(target).await?.retire();
-        Ok(())
+        finish_preflight(self.connect_and_attest(target).await?).await
     }
 
     /// Verify one configured endpoint while pinning the TCP connection to an
@@ -217,10 +216,7 @@ impl NearVerifier {
     ///
     /// Returns an error for any connection or attestation failure.
     pub async fn preflight_at(&self, target: NearTarget, ip: IpAddr) -> Result<()> {
-        self.connect_and_attest_once(target, Some(ip), 0)
-            .await?
-            .retire();
-        Ok(())
+        finish_preflight(self.connect_and_attest_once(target, Some(ip), 0).await?).await
     }
 
     /// Forward on an attested connection, reusing one only for its target host.
@@ -256,6 +252,10 @@ impl NearVerifier {
                     self.connect_and_attest(target).await.with_context(|| {
                         format!("freshly attest NEAR connection after unsent request: {source:#}")
                     })?;
+                if let Err(error) = wait_for_readiness(&mut retry_connection.sender).await {
+                    retry_connection.retire();
+                    return Err(error.context("fresh NEAR retry connection is not ready"));
+                }
                 if !pool.usable(&retry_connection) {
                     retry_connection.retire();
                     bail!("fresh NEAR retry connection expired or closed before inference");
@@ -302,13 +302,17 @@ impl NearVerifier {
 
     async fn checkout(&self, target: NearTarget, pool: &Arc<Pool>) -> Result<Attested> {
         while let Some(mut connection) = pool.take() {
-            let ready = timeout(READY_TIMEOUT, connection.sender.ready()).await;
-            if matches!(ready, Ok(Ok(()))) && pool.usable(&connection) {
+            if wait_for_readiness(&mut connection.sender).await.is_ok() && pool.usable(&connection)
+            {
                 return Ok(connection);
             }
             connection.retire();
         }
-        let connection = self.connect_and_attest(target).await?;
+        let mut connection = self.connect_and_attest(target).await?;
+        if let Err(error) = wait_for_readiness(&mut connection.sender).await {
+            connection.retire();
+            return Err(error.context("fresh NEAR connection is not ready"));
+        }
         if !pool.usable(&connection) {
             connection.retire();
             bail!("NEAR connection expired or closed before its first request");
@@ -344,6 +348,10 @@ impl NearVerifier {
         self.attest(&mut connection.sender, target, &live_spki)
             .await
             .with_context(|| format!("attest {} via {peer}", target.host))?;
+        #[cfg(test)]
+        if let Some(factory) = &self.test_factory {
+            factory.after_attestation().await;
+        }
         Ok(connection)
     }
 
@@ -457,6 +465,35 @@ impl NearVerifier {
             .json()
             .await
             .context("decode NVIDIA NRAS verdict")
+    }
+}
+
+async fn wait_for_readiness(sender: &mut SendRequest<Body>) -> Result<()> {
+    timeout(READY_TIMEOUT, sender.ready())
+        .await
+        .context("NEAR connection readiness timed out")?
+        .context("NEAR connection closed before inference")
+}
+
+async fn finish_preflight(mut connection: Attested) -> Result<()> {
+    // Drop the sender to request graceful shutdown, but keep the driver owned
+    // by Attested so a timeout or cancellation still aborts the transport.
+    let (placeholder_io, placeholder_peer) = tokio::io::duplex(1);
+    let (placeholder_sender, placeholder_driver) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(placeholder_io))
+            .await
+            .context("prepare NEAR preflight connection shutdown")?;
+    drop(placeholder_driver);
+    drop(placeholder_peer);
+    drop(std::mem::replace(
+        &mut connection.sender,
+        placeholder_sender,
+    ));
+    match timeout(Duration::from_secs(2), &mut connection.driver).await {
+        Ok(joined) => joined
+            .context("join NEAR HTTP connection")?
+            .context("NEAR HTTP connection"),
+        Err(_) => Ok(()),
     }
 }
 
@@ -673,6 +710,8 @@ mod tests {
         fail_next_body: AtomicBool,
         stall_next_inference: AtomicBool,
         fail_attestation: AtomicBool,
+        closes_after_attestation: AtomicBool,
+        completed_drivers: AtomicUsize,
         closes_before_inference: std::sync::Mutex<usize>,
         attestation_delay: std::sync::Mutex<Duration>,
         fault: std::sync::Mutex<EvidenceFault>,
@@ -790,6 +829,16 @@ mod tests {
             }
         }
 
+        pub(super) async fn after_attestation(&self) {
+            if self
+                .state
+                .closes_after_attestation
+                .swap(false, Ordering::SeqCst)
+            {
+                self.state.close_latest_peer().await;
+            }
+        }
+
         pub(super) async fn connect(
             &self,
             tls: &TlsConnector,
@@ -835,10 +884,17 @@ mod tests {
             let live_spki = tee_evidence::spki_sha256(
                 client.get_ref().1.peer_certificates().unwrap()[0].as_ref(),
             )?;
-            let (sender, driver) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+            let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client))
                 .await
                 .context("start local NEAR HTTP connection")?;
-            let driver = tokio::spawn(driver);
+            let driver_state = Arc::clone(&self.state);
+            let driver = tokio::spawn(async move {
+                let result = connection.await;
+                driver_state
+                    .completed_drivers
+                    .fetch_add(1, Ordering::SeqCst);
+                result
+            });
             self.state
                 .drivers
                 .lock()
@@ -1340,25 +1396,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_connections_are_not_pooled() {
+    async fn preflight_connections_close_their_drivers_without_pooling() {
         let target = TARGETS[0];
         let (verifier, state) = local_verifier();
         verifier.preflight(target).await.unwrap();
         assert_eq!(verifier.idle_connections(target), 0);
+        assert_eq!(state.completed_drivers.load(Ordering::SeqCst), 1);
         first_driver_stopped(&state).await;
         verifier
             .preflight_at(target, "127.0.0.1".parse().unwrap())
             .await
             .unwrap();
         assert_eq!(verifier.idle_connections(target), 0);
+        assert_eq!(state.completed_drivers.load(Ordering::SeqCst), 2);
         complete_inference(&verifier, target).await;
         assert_eq!(state.attestations.load(Ordering::SeqCst), 3);
         assert_eq!(state.inferences.load(Ordering::SeqCst), 1);
         verifier.preflight(target).await.unwrap();
+        assert_eq!(state.completed_drivers.load(Ordering::SeqCst), 3);
         verifier
             .preflight_at(target, "127.0.0.1".parse().unwrap())
             .await
             .unwrap();
+        assert_eq!(state.completed_drivers.load(Ordering::SeqCst), 4);
         assert_eq!(verifier.idle_connections(target), 1);
         complete_inference(&verifier, target).await;
         assert_eq!(state.attestations.load(Ordering::SeqCst), 5);
@@ -1373,6 +1433,151 @@ mod tests {
                 Some("127.0.0.1".parse().unwrap())
             ]
         );
+    }
+
+    struct StalledShutdown {
+        io: tokio::io::DuplexStream,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl tokio::io::AsyncRead for StalledShutdown {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for StalledShutdown {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.started.notify_one();
+            std::task::Poll::Pending
+        }
+    }
+
+    async fn connection_with_stalled_shutdown(
+    ) -> (Attested, tokio::io::DuplexStream, Arc<tokio::sync::Notify>) {
+        let (io, peer) = tokio::io::duplex(4096);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (sender, driver) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(StalledShutdown {
+                io,
+                started: Arc::clone(&started),
+            }))
+            .await
+            .unwrap();
+        (
+            Attested {
+                sender,
+                driver: tokio::spawn(driver),
+                attested_at: Instant::now(),
+                idle_since: None,
+                expires_at: None,
+                requests: 0,
+            },
+            peer,
+            started,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preflight_shutdown_timeout_closes_the_transport() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (connection, mut peer, shutdown_started) = connection_with_stalled_shutdown().await;
+        let started = Instant::now();
+        finish_preflight(connection).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        timeout(Duration::from_secs(1), shutdown_started.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), peer.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_preflight_shutdown_closes_the_transport() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (connection, mut peer, shutdown_started) = connection_with_stalled_shutdown().await;
+        let preflight = tokio::spawn(finish_preflight(connection));
+        timeout(Duration::from_secs(1), shutdown_started.notified())
+            .await
+            .unwrap();
+        preflight.abort();
+        assert!(preflight.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            timeout(Duration::from_secs(1), peer.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_connection_must_be_ready_before_inference() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        state.closes_after_attestation.store(true, Ordering::SeqCst);
+
+        let error = verifier
+            .forward(inference_request(target))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("fresh NEAR connection is not ready"));
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 0);
+        assert_eq!(verifier.idle_connections(target), 0);
+        first_driver_stopped(&state).await;
+    }
+
+    #[tokio::test]
+    async fn an_unsent_retry_must_be_ready_before_inference() {
+        let target = TARGETS[0];
+        let (verifier, state) = local_verifier();
+        complete_inference(&verifier, target).await;
+        *state.closes_before_inference.lock().unwrap() = 1;
+        state.closes_after_attestation.store(true, Ordering::SeqCst);
+
+        let error = verifier
+            .forward(inference_request(target))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("fresh NEAR retry connection is not ready"));
+        assert_eq!(state.inferences.load(Ordering::SeqCst), 1);
+        assert_eq!(verifier.idle_connections(target), 0);
+        first_driver_stopped(&state).await;
     }
 
     // Real HTTP over an in-memory connection lets Tokio advance simulated
