@@ -76,6 +76,40 @@ render azure-clouds GM_NETWORK=testnet GM_NODE_SECRET="${SECRET}" \
 render bedrock GM_NETWORK=testnet GM_NODE_SECRET="${SECRET}" \
   ANTHROPIC_UPSTREAM=bedrock BEDROCK_REGION=us-east-1 BEDROCK_API_KEY=b
 
+python3 - "${WORK}/configs/kubetee-runtime.yaml" "${WORK}/configs/direct-all.yaml" <<'PY'
+import json
+import sys
+
+def routes(path):
+    with open(path, encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    return config["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0][
+        "typed_config"
+    ]["route_config"]["virtual_hosts"][0]["routes"]
+
+def provider(route):
+    for header in route.get("match", {}).get("headers", []):
+        if header.get("name") == "x-gm-provider":
+            return header.get("string_match", {}).get("exact")
+    return None
+
+def route_for(items, name, path_key, path):
+    for item in items:
+        if provider(item) == name and item.get("match", {}).get(path_key) == path:
+            return item
+    raise AssertionError(f"missing {name} route with {path_key} {path}")
+
+kubetee = routes(sys.argv[1])
+direct = routes(sys.argv[2])
+chat = route_for(kubetee, "kubetee", "path", "/v1/chat/completions")
+models = route_for(kubetee, "kubetee", "path", "/v1/models")
+openai = route_for(direct, "openai", "prefix", "/")
+assert "x-gm-session-id" not in chat["request_headers_to_remove"]
+assert "x-gm-session-id" in models["request_headers_to_remove"]
+assert "x-gm-session-id" in openai["request_headers_to_remove"]
+print("ok: session header survives only on the KubeTEE chat route")
+PY
+
 # The rendered files are 0600 under a 0700 temp dir; ENVOY_UID=0 stops the
 # image entrypoint dropping to the unprivileged envoy user, which could not
 # read them.

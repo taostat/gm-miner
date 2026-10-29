@@ -573,6 +573,23 @@ fn chat(selector: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn chat_with_session(selector: &str, ids: &[&str], supplier_id: Option<&str>) -> Request<Body> {
+    let mut request = chat(selector);
+    for id in ids {
+        request.headers_mut().append(
+            "x-gm-session-id",
+            HeaderValue::from_bytes(id.as_bytes()).unwrap(),
+        );
+    }
+    if let Some(id) = supplier_id {
+        request.headers_mut().insert(
+            "x-litellm-session-id",
+            HeaderValue::from_bytes(id.as_bytes()).unwrap(),
+        );
+    }
+    request
+}
+
 /// Send one chat and read its body to the end, as Envoy does.
 async fn round_trip(verifier: &KubeteeVerifier, selector: &str) -> (StatusCode, Bytes) {
     let response = verifier.forward(chat(selector)).await.unwrap();
@@ -615,6 +632,45 @@ async fn a_chat_streams_through_unchanged_without_supplier_headers() {
         .keys()
         .all(|name| !name.as_str().starts_with("x-kubetee-")));
     assert!(!sent.contains_key(SELECTOR_HEADER));
+}
+
+#[tokio::test]
+async fn chat_session_ids_are_validated_and_supplier_values_are_untrusted() {
+    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    let valid_id = "0123456789abcdef".repeat(4);
+    let too_short = "a".repeat(63);
+    let too_long = "a".repeat(65);
+    let uppercase = "a".repeat(63) + "A";
+    let non_hex = "g".repeat(64);
+    let cases: Vec<(Vec<&str>, Option<&str>)> = vec![
+        (vec![valid_id.as_str()], Some("spoofed-01")),
+        (vec![], Some("forged-01")),
+        (vec![too_short.as_str()], None),
+        (vec![too_long.as_str()], None),
+        (vec![uppercase.as_str()], None),
+        (vec![non_hex.as_str()], None),
+        (vec![valid_id.as_str(), valid_id.as_str()], None),
+    ];
+
+    for (ids, supplier_id) in cases {
+        let response = verifier
+            .forward(chat_with_session(TARGETS[0], &ids, supplier_id))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
+
+    let sent = upstream.chat_headers.lock().unwrap();
+    assert_eq!(sent.len(), 7);
+    assert_eq!(sent[0]["x-litellm-session-id"], valid_id.as_str());
+    assert!(sent[1..]
+        .iter()
+        .all(|headers| !headers.contains_key("x-litellm-session-id")));
+    assert!(sent
+        .iter()
+        .all(|headers| !headers.contains_key("x-gm-session-id")));
+    assert_eq!(counts(&upstream).2, 7, "invalid IDs still reach upstream");
 }
 
 #[tokio::test]

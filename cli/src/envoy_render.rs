@@ -34,16 +34,16 @@ const ROUTES_MARKER: &str = "gm:upstream-routes";
 const CLUSTERS_MARKER: &str = "gm:upstream-clusters";
 const SLOT_CONFIG_TOKEN: &str = "SLOT_CONFIG";
 
-/// Headers every upstream route removes before forwarding. The Lua filter
-/// already strips `x-gm-*` except the route discriminator; the route-level
-/// list is the second layer, and the only one that removes `x-gm-provider`.
-const GM_INTERNAL_HEADERS: [&str; 6] = [
+/// Headers appended to each upstream route's removal list. `KubeTEE` chat keeps
+/// its session id for the verifier; the route list alone removes the provider.
+const GM_INTERNAL_HEADERS: [&str; 7] = [
     "x-gm-request-id",
     "x-gm-gateway-sig",
     "x-gm-product",
     "x-gm-node-key",
     "x-gm-provider",
     "x-gm-upstream-slot",
+    "x-gm-session-id",
 ];
 
 /// Key-slot settings for one upstream, rendered into the Lua `slot_config`.
@@ -268,7 +268,16 @@ fn add_internal_header_strip(route: &mut Value, provider: &str) -> Result<()> {
         Some(Value::Array(existing)) => existing,
         Some(_) => bail!("{provider}: request_headers_to_remove must be a list"),
     };
+    let keep_kubetee_chat_session = provider == "kubetee"
+        && map
+            .get("match")
+            .and_then(|matched| matched.get("path"))
+            .and_then(Value::as_str)
+            == Some("/v1/chat/completions");
     for header in GM_INTERNAL_HEADERS {
+        if keep_kubetee_chat_session && header == "x-gm-session-id" {
+            continue;
+        }
         let header = Value::from(header);
         if !headers.contains(&header) {
             headers.push(header);
@@ -492,6 +501,208 @@ clusters:
             .collect();
         assert_eq!(*removed, serde_json::json!(expected));
         assert_eq!(out["clusters"][0]["host"], "api.acme.test");
+    }
+
+    #[test]
+    fn session_id_survives_only_the_kubetee_chat_route() {
+        let fixture = Fixture::new(
+            include_str!("../../image/envoy/base.yaml"),
+            &[
+                (
+                    "kubetee.yaml",
+                    include_str!("../../image/envoy/upstreams/kubetee.yaml"),
+                ),
+                (
+                    "openai.direct.yaml",
+                    include_str!("../../image/envoy/upstreams/openai.direct.yaml"),
+                ),
+            ],
+        );
+        let out = parsed(
+            &fixture
+                .render(
+                    &[("openai", "direct")],
+                    &[("GM_NODE_SECRET", "secret-0001")],
+                )
+                .expect("render"),
+        );
+        let routes = out
+            .pointer(concat!(
+                "/static_resources/listeners/0/filter_chains/0/filters/0/typed_config/",
+                "route_config/virtual_hosts/0/routes",
+            ))
+            .and_then(serde_json::Value::as_array)
+            .expect("rendered routes");
+        let route = |provider: &str, path: &str| {
+            routes
+                .iter()
+                .find(|route| {
+                    let matched = &route["match"];
+                    (matched["path"] == path || matched["prefix"] == path)
+                        && matched["headers"].as_array().is_some_and(|headers| {
+                            headers.iter().any(|header| {
+                                header["name"] == "x-gm-provider"
+                                    && header["string_match"]["exact"] == provider
+                            })
+                        })
+                })
+                .expect("provider route exists")
+        };
+        let removes_session = |route: &serde_json::Value| {
+            route["request_headers_to_remove"]
+                .as_array()
+                .expect("removed headers")
+                .iter()
+                .any(|header| header == "x-gm-session-id")
+        };
+
+        assert!(!removes_session(route("kubetee", "/v1/chat/completions")));
+        assert!(removes_session(route("kubetee", "/v1/models")));
+        assert!(removes_session(route("kubetee", "/v1/images/generations")));
+        assert!(removes_session(route("kubetee", "/v1/videos")));
+        assert!(removes_session(route("kubetee", "/v1/videos/")));
+        assert!(removes_session(route("openai", "/")));
+    }
+
+    fn mock_envoy_headers(lua: &mlua::Lua, values: &[(&str, &str)]) -> mlua::Table {
+        let headers = lua.create_table().expect("headers");
+        for (name, value) in values {
+            headers.set(*name, *value).expect("header");
+        }
+        let methods = lua.create_table().expect("header methods");
+        methods
+            .set(
+                "get",
+                lua.create_function(|_, (headers, name): (mlua::Table, String)| {
+                    headers.get::<Option<String>>(name)
+                })
+                .expect("get method"),
+            )
+            .expect("get method");
+        methods
+            .set(
+                "remove",
+                lua.create_function(|_, (headers, name): (mlua::Table, String)| {
+                    headers.raw_set(name, mlua::Value::Nil)
+                })
+                .expect("remove method"),
+            )
+            .expect("remove method");
+        let metatable = lua.create_table().expect("header metatable");
+        metatable.set("__index", methods).expect("header index");
+        headers
+            .set_metatable(Some(metatable))
+            .expect("header metatable");
+        headers
+    }
+
+    fn mock_envoy_handle(lua: &mlua::Lua, headers: mlua::Table) -> mlua::Table {
+        let metadata = lua.create_table().expect("metadata");
+        metadata
+            .set(
+                "set",
+                lua.create_function(
+                    |_,
+                     (_metadata, _namespace, _key, _value): (
+                        mlua::Table,
+                        String,
+                        String,
+                        mlua::Value,
+                    )| Ok(()),
+                )
+                .expect("metadata set"),
+            )
+            .expect("metadata set");
+        let stream_info = lua.create_table().expect("stream info");
+        stream_info
+            .set(
+                "dynamicMetadata",
+                lua.create_function(move |_, _stream_info: mlua::Table| Ok(metadata.clone()))
+                    .expect("dynamic metadata"),
+            )
+            .expect("dynamic metadata");
+        let handle = lua.create_table().expect("handle");
+        handle
+            .set(
+                "headers",
+                lua.create_function(move |_, _handle: mlua::Table| Ok(headers.clone()))
+                    .expect("headers method"),
+            )
+            .expect("headers method");
+        handle
+            .set(
+                "streamInfo",
+                lua.create_function(move |_, _handle: mlua::Table| Ok(stream_info.clone()))
+                    .expect("stream info method"),
+            )
+            .expect("stream info method");
+        handle
+            .set(
+                "respond",
+                lua.create_function(
+                    |_, (_handle, _headers, body): (mlua::Table, mlua::Table, String)| {
+                        Err::<(), _>(mlua::Error::RuntimeError(format!(
+                            "unexpected Envoy local reply: {body}"
+                        )))
+                    },
+                )
+                .expect("respond method"),
+            )
+            .expect("respond method");
+        handle
+    }
+
+    #[test]
+    fn lua_keeps_the_session_id_for_kubetee_and_strips_it_for_openai() {
+        let fixture = Fixture::new(
+            include_str!("../../image/envoy/base.yaml"),
+            &[("kubetee.yaml", "routes: []\nclusters: []\n")],
+        );
+        let out = parsed(
+            &fixture
+                .render(&[], &[("GM_NODE_SECRET", "secret-0001")])
+                .expect("render"),
+        );
+        let source = out
+            .pointer(concat!(
+                "/static_resources/listeners/0/filter_chains/0/filters/0/typed_config/",
+                "http_filters/0/typed_config/default_source_code/inline_string",
+            ))
+            .and_then(serde_json::Value::as_str)
+            .expect("Lua source");
+        let lua = mlua::Lua::new();
+        lua.load(source).exec().expect("rendered Lua runs");
+        let on_request: mlua::Function =
+            lua.globals().get("envoy_on_request").expect("request hook");
+        let session_id = "0123456789abcdef".repeat(4);
+
+        for (provider, selector, want_session) in [
+            ("kubetee", Some("z-ai/glm-5.2"), true),
+            ("openai", None, false),
+        ] {
+            let mut values = vec![
+                (":method", "POST"),
+                (":path", "/v1/chat/completions"),
+                ("x-gm-provider", provider),
+                ("x-gm-node-key", "secret-0001"),
+                ("x-gm-session-id", session_id.as_str()),
+            ];
+            if let Some(selector) = selector {
+                values.push(("x-gm-upstream-model", selector));
+            }
+            let headers = mock_envoy_headers(&lua, &values);
+            on_request
+                .call::<()>(mock_envoy_handle(&lua, headers.clone()))
+                .expect("request hook runs");
+            assert_eq!(
+                headers
+                    .get::<Option<String>>("x-gm-session-id")
+                    .expect("session header")
+                    .as_deref(),
+                want_session.then_some(session_id.as_str()),
+                "provider {provider}"
+            );
+        }
     }
 
     #[test]

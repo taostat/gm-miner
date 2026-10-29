@@ -47,6 +47,8 @@ pub const BIND_ADDR: &str = "127.0.0.1:8084";
 pub const HOST_NAME: &str = "llm.kubetee.ai";
 /// Header carrying the upstream model id Envoy selected for this request.
 pub const SELECTOR_HEADER: &str = "x-gm-upstream-model";
+const SESSION_ID_HEADER: &str = "x-gm-session-id";
+const LITELLM_SESSION_ID_HEADER: &str = "x-litellm-session-id";
 pub const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 pub const MODELS: &str = "/v1/models";
 
@@ -474,9 +476,14 @@ async fn require_body_model(request: Request<Body>, selector: &str) -> Result<Re
 }
 
 fn upstream_request(mut request: Request<Body>) -> Result<Request<Body>> {
+    let session_id = request_session_id(&request);
     let headers = request.headers_mut();
     headers.remove(SELECTOR_HEADER);
     strip_supplier_headers(headers);
+    headers.remove(SESSION_ID_HEADER);
+    if let Some(session_id) = session_id {
+        headers.insert(LITELLM_SESSION_ID_HEADER, session_id);
+    }
     strip_hop_by_hop(headers);
     headers.insert(HOST, HeaderValue::from_static(HOST_NAME));
     let mut request = request.map(|body| Body::new(body.map_frame(pool::strip_supplier_trailers)));
@@ -486,6 +493,23 @@ fn upstream_request(mut request: Request<Body>) -> Result<Request<Body>> {
         .map_or(CHAT_COMPLETIONS, axum::http::uri::PathAndQuery::as_str);
     *request.uri_mut() = path.parse().context("encode KubeTEE upstream URI")?;
     Ok(request)
+}
+
+fn request_session_id(request: &Request<Body>) -> Option<HeaderValue> {
+    let mut values = request.headers().get_all(SESSION_ID_HEADER).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() != 64
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    Some(value.clone())
 }
 
 /// Remove every `x-kubetee-*` and `x-litellm-*` header.

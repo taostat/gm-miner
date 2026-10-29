@@ -252,7 +252,8 @@ static_resources:
                             -- Envoy forbids header mutation during iteration. Keep the
                             -- route discriminator until route actions remove it,
                             -- NEAR's and KubeTEE's validated selectors until their
-                            -- loopback verifiers, Chutes' selector and ordinary marker,
+                            -- loopback verifiers, KubeTEE's session id for chat,
+                            -- Chutes' selector and ordinary marker,
                             -- and the execution policy plus model-binding revision only
                             -- on the exact guarded loopback adapter route. The adapter
                             -- builds the fixed upstream request itself.
@@ -272,6 +273,8 @@ static_resources:
                                 and not ((provider == "near" or provider == "chutes"
                                     or provider == "kubetee")
                                   and name == "x-gm-upstream-model")
+                                and not (provider == "kubetee"
+                                  and name == "x-gm-session-id")
                                 and not (provider == "chutes" and name == "x-gm-ordinary") then
                                 names[#names + 1] = name
                               end

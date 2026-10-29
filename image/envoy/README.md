@@ -32,9 +32,14 @@ Docker after changing anything here.
    `x-gm-provider` value.
 3. **Header strip.** Every upstream route gets the gm-internal headers
    (`x-gm-request-id`, `x-gm-gateway-sig`, `x-gm-product`, `x-gm-node-key`,
-   `x-gm-provider`, `x-gm-upstream-slot`) appended to its
-   `request_headers_to_remove`. Upstream files list only the extra headers a
-   route removes.
+   `x-gm-provider`, `x-gm-upstream-slot`, `x-gm-session-id`) appended to its
+   `request_headers_to_remove`. The exact KubeTEE chat route keeps
+   `x-gm-session-id` for the loopback verifier; every other route removes it.
+   Lua also strips `x-gm-session-id` for every provider except KubeTEE. The
+   verifier maps one chat value of exactly 64 lowercase hexadecimal characters
+   (`[0-9a-f]{64}`) to `x-litellm-session-id` after stripping all caller-supplied
+   `x-litellm-*` headers. Upstream files list only the extra headers a route
+   removes.
 4. **Slot config.** The Lua filter's `slot_config` table is generated from
    each upstream's `slots` block plus the `GM_<PROVIDER>_SLOT_IDS` variable
    that `gmcli slot-env` exported.
