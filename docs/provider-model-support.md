@@ -20,8 +20,8 @@ catalog. It distinguishes transport capability from registry admission:
   `bedrock-mantle-model-bindings-v1` approved image feature and the selected
   binding's row revision. The measured adapter validates the raw provider
   response identity, then canonicalizes the response model before content release.
-  Older images and unadmitted models remain unavailable. A known model id
-  or successful HTTP probe is not sufficient.
+  Unadmitted models remain unavailable. A known model id or successful
+  HTTP probe is not sufficient.
 
 Bedrock bindings refresh every 60 seconds and expire 120 seconds after the last
 successful refresh. Failed refreshes do not extend validity. The adapter rechecks
@@ -58,16 +58,16 @@ their presence here does not establish registry admission.
 
 | Model you want to provide | Sources and admission status |
 |---|---|
-| `claude-fable-5` | Anthropic API: `anthropic/claude-fable-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
-| `claude-fable-5-1` | Anthropic API: `anthropic/claude-fable-5-1` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
-| `claude-haiku-4-5` | Anthropic API: `anthropic/claude-haiku-4-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
+| `claude-fable-5` | Anthropic API: `anthropic/claude-fable-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport |
+| `claude-fable-5-1` | Anthropic API: `anthropic/claude-fable-5-1` (`--anthropic`); Microsoft Foundry: ARM-verified transport |
+| `claude-haiku-4-5` | Anthropic API: `anthropic/claude-haiku-4-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport |
 | `claude-haiku-5-5` | Anthropic API: `anthropic/claude-haiku-5-5` (`--anthropic`) |
-| `claude-opus-4-7` | Anthropic API: `anthropic/claude-opus-4-7` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
-| `claude-opus-4-8` | Anthropic API: `anthropic/claude-opus-4-8` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
-| `claude-opus-5` | Anthropic API: `anthropic/claude-opus-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
+| `claude-opus-4-7` | Anthropic API: `anthropic/claude-opus-4-7` (`--anthropic`); Microsoft Foundry: ARM-verified transport |
+| `claude-opus-4-8` | Anthropic API: `anthropic/claude-opus-4-8` (`--anthropic`); Microsoft Foundry: ARM-verified transport |
+| `claude-opus-5` | Anthropic API: `anthropic/claude-opus-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport |
 | `claude-opus-5-5` | Anthropic API: `anthropic/claude-opus-5-5` (`--anthropic`) |
-| `claude-sonnet-4-6` | Anthropic API: `anthropic/claude-sonnet-4-6` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
-| `claude-sonnet-5` | Anthropic API: `anthropic/claude-sonnet-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport, feature-gated admission |
+| `claude-sonnet-4-6` | Anthropic API: `anthropic/claude-sonnet-4-6` (`--anthropic`); Microsoft Foundry: ARM-verified transport |
+| `claude-sonnet-5` | Anthropic API: `anthropic/claude-sonnet-5` (`--anthropic`); Microsoft Foundry: ARM-verified transport |
 | `claude-sonnet-5-5` | Anthropic API: `anthropic/claude-sonnet-5-5` (`--anthropic`) |
 | `DeepSeek V3.2 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V3.2-TEE` (`--chutes`) |
 | `DeepSeek V4 Flash 0731` | Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`); Chutes (TEE sibling): `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`) |
@@ -93,19 +93,19 @@ their presence here does not establish registry admission.
 | `GLM-5.3 TEE` | KubeTEE: `kubetee/z-ai/glm-5.3` (`--kubetee`) |
 | `GLM-5.3-Flash` | Z.ai API: `zai/glm-5.3-flash` (`--zai`); Engy: `engy/glm-5.3-flash` (`--engy`); DeepInfra: `deepinfra/zai-org/GLM-5.3-Flash` (`--deepinfra`); KubeTEE (TEE sibling): `kubetee/z-ai/glm-5.3-flash` (`--kubetee`) |
 | `GLM-5.3-Flash TEE` | KubeTEE: `kubetee/z-ai/glm-5.3-flash` (`--kubetee`); NEAR confidential inference: `near/z-ai/glm-5.3-flash` (`--near`) |
-| `GPT-5.4` | OpenAI API: `openai/gpt-5.4` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-5.4 mini` | OpenAI API: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-5.4 nano` | OpenAI API: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-5.5` | OpenAI API: `openai/gpt-5.5` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-5.5 Pro` | OpenAI API: `openai/gpt-5.5-pro` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-5.6 Luna` | OpenAI API: `openai/gpt-5.6-luna` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-5.6 Sol` | OpenAI API: `openai/gpt-5.6-sol` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-5.6 Terra` | OpenAI API: `openai/gpt-5.6-terra` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-6 Astra` | OpenAI API: `openai/gpt-6-astra` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-6 Luna` | OpenAI API: `openai/gpt-6-luna` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-6 Sol` | OpenAI API: `openai/gpt-6-sol` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-6.1 Sol` | OpenAI API: `openai/gpt-6.1-sol` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `GPT-6.1 Terra` | OpenAI API: `openai/gpt-6.1-terra` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
+| `GPT-5.4` | OpenAI API: `openai/gpt-5.4` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-5.4 mini` | OpenAI API: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-5.4 nano` | OpenAI API: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-5.5` | OpenAI API: `openai/gpt-5.5` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-5.5 Pro` | OpenAI API: `openai/gpt-5.5-pro` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-5.6 Luna` | OpenAI API: `openai/gpt-5.6-luna` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-5.6 Sol` | OpenAI API: `openai/gpt-5.6-sol` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-5.6 Terra` | OpenAI API: `openai/gpt-5.6-terra` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-6 Astra` | OpenAI API: `openai/gpt-6-astra` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-6 Luna` | OpenAI API: `openai/gpt-6-luna` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-6 Sol` | OpenAI API: `openai/gpt-6-sol` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-6.1 Sol` | OpenAI API: `openai/gpt-6.1-sol` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `GPT-6.1 Terra` | OpenAI API: `openai/gpt-6.1-terra` (`--openai`); Azure OpenAI: ARM-verified transport |
 | `gpt-oss-20b` | DeepInfra: `deepinfra/openai/gpt-oss-20b` (`--deepinfra`); chat completions only |
 | `Kimi K2.6 TEE` | Chutes: `chutes/moonshotai/Kimi-K2.6-TEE` (`--chutes`) |
 | `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`); Chutes (TEE sibling): `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
@@ -118,8 +118,8 @@ their presence here does not establish registry admission.
 | `Nano Banana 2.1` | Google native `generateContent`: `gemini/gemini-nano-banana-2.1` (`--google`) |
 | `Nano Banana Pro` | Google native `generateContent`: `gemini/gemini-3-pro-image` (`--google`) |
 | `Nemotron 3 Nano Omni 30B TEE` | Chutes: `chutes/Nemotron-3-Nano-Omni-30B-TEE` (`--chutes`) |
-| `o3` | OpenAI API: `openai/o3` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
-| `o4-mini` | OpenAI API: `openai/o4-mini` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
+| `o3` | OpenAI API: `openai/o3` (`--openai`); Azure OpenAI: ARM-verified transport |
+| `o4-mini` | OpenAI API: `openai/o4-mini` (`--openai`); Azure OpenAI: ARM-verified transport |
 | `Ornith 1.5 397B` | KubeTEE (TEE sibling): `kubetee/ornith/ornith-1.5-397b` (`--kubetee`) |
 | `Ornith 1.5 397B TEE` | KubeTEE: `kubetee/ornith/ornith-1.5-397b` (`--kubetee`) |
 | `Qwen3 235B A22B Thinking 2507 TEE` | Chutes: `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` (`--chutes`) |

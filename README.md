@@ -331,9 +331,8 @@ increase. Older registries continue to accept declarations immediately.
 Use the registry-owned source model for every admitted route; do not override it with a deployment
 name. After the capability check, a cloud offer is declared exactly like its direct
 counterpart; the registry decides whether each worker is eligible. Azure Responses remains
-unqualified. Bedrock offers require a current registry model binding and the feature-gated
-adapter; AWS selector values are read from the fixed registry endpoint and are not accepted
-from miner offers or caller headers.
+unqualified. Bedrock offers require a current registry model binding; AWS selector values are
+read from the fixed registry endpoint and are not accepted from miner offers or caller headers.
 
 Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price
 you would receive on **every dimension the product prices** — input and output, plus prompt
