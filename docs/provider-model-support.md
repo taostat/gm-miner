@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-10-29**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-10-30**. This is a miner setup matrix, not a buyer product
 catalog. It distinguishes transport capability from registry admission:
 
 * A direct/API-key source is declarable when the registry publishes the route
@@ -114,6 +114,8 @@ their presence here does not establish registry admission.
 | `MiMo V2.6 Pro Ultraspeed` | KubeTEE (TEE sibling): `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
 | `MiMo V2.6 Pro Ultraspeed TEE` | KubeTEE: `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
 | `MiniMax H3` | Engy: `engy/MiniMax-H3` (`--engy`, native async video API); KubeTEE (**disabled in catalog**): `kubetee/minimax/h3` (`--kubetee`) |
+| `Mistral Large 4` | KubeTEE (TEE sibling): `kubetee/mistralai/mistral-large-4` (`--kubetee`) |
+| `Mistral Large 4 TEE` | KubeTEE: `kubetee/mistralai/mistral-large-4` (`--kubetee`) |
 | `Mistral Nemo Instruct 2407 TEE` | Chutes: `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` (`--chutes`) |
 | `Nano Banana 2.1` | Google native `generateContent`: `gemini/gemini-nano-banana-2.1` (`--google`) |
 | `Nano Banana Pro` | Google native `generateContent`: `gemini/gemini-3-pro-image` (`--google`) |

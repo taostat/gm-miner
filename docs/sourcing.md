@@ -64,6 +64,7 @@ explains the table and how to set each upstream up.
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash-tee` | `kubetee/deepseek/deepseek-v4.1-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash-1017-tee` | `kubetee/deepseek/deepseek-v4.1-flash-1017` | `llm.kubetee.ai` | `--kubetee` |
+| `mistral/mistral-large-4-tee` | `kubetee/mistralai/mistral-large-4` | `llm.kubetee.ai` | `--kubetee` |
 | `ornith/ornith-1.5-397b-tee` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
 | `xiaomi/mimo-v2.6-pro-ultraspeed-tee` | `kubetee/xiaomi/mimo-v2.6-pro` | `llm.kubetee.ai` | `--kubetee` |
 | `bfl/flux.2-klein-4b` | `kubetee/black-forest-labs/flux.2-klein-4b` | `llm.kubetee.ai` | `--kubetee` |
@@ -374,12 +375,13 @@ connection.
 The verifier serves only the chat models compiled into the image:
 `z-ai/glm-5.2`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`,
 `deepseek/deepseek-v4.1-flash`, `deepseek/deepseek-v4.1-flash-1017`,
-`ornith/ornith-1.5-397b` and
+`mistralai/mistral-large-4`, `ornith/ornith-1.5-397b` and
 `xiaomi/mimo-v2.6-pro`. Envoy answers a chat request for any other KubeTEE model
 with 400, and the verifier refuses a request whose body names a model other than
 the one selected. Image generation keeps its direct route. Its `GET /v1/models`
-answer is KubeTEE's own list narrowed to those chat models and the image model
-the image route serves, `black-forest-labs/flux.2-klein-4b`. Each attestation
+answer is KubeTEE's own list narrowed to those chat models, the image model
+`black-forest-labs/flux.2-klein-4b` and the video model `minimax/h3` served by
+the direct routes. Discovery does not establish registry admission. Each attestation
 and model-list response is read within 60 seconds, body included. Adding a
 KubeTEE chat model requires a new image build and the normal image-approval
 process.
