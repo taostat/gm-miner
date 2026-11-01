@@ -39,3 +39,7 @@ hosting = "github"
 # file as out-of-date. After any `dist init`/`dist generate`, re-pin the
 # `uses:` lines per the note at the top of release.yml.
 allow-dirty = ["ci"]
+
+# dist 0.31 defaults aarch64-apple-darwin to macos-14, which GitHub retires on 2026-11-02.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
