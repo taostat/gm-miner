@@ -18,7 +18,7 @@ use axum::{
     body::{to_bytes, Body, Bytes},
     extract::State,
     http::{
-        header::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
+        header::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER},
         HeaderMap, HeaderValue, Method, Request, Response, StatusCode,
     },
     routing::any,
@@ -52,6 +52,9 @@ const MAX_STREAM_PREAMBLE: usize = 64 * 1024;
 /// the thinking (about 75 KB at 32k thinking tokens); 4 MiB leaves wide headroom.
 const MAX_STREAM_FRAME: usize = 4 * 1024 * 1024;
 const MAX_BINDINGS_BODY: usize = 1024 * 1024;
+const MAX_ERROR_BODY: usize = 64 * 1024;
+const ERROR_BODY_WAIT: Duration = Duration::from_secs(5);
+const PROMPT_TOO_LONG: &[u8] = b"prompt is too long";
 const MAX_MODEL_BINDINGS: usize = 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -551,27 +554,38 @@ enum Reject {
     Upstream,
     UpstreamTransport,
     UpstreamHttp(u16),
+    UpstreamThrottled { retry_after_secs: Option<u32> },
+    UpstreamUnauthorized,
+    UpstreamForbidden,
+    UpstreamInvalidRequest { prompt_too_long: bool },
+    UpstreamTooLarge,
     ModelIdentityMismatch,
 }
 
 impl Reject {
     // Fixed categories only: never log provider bodies, model strings, headers,
-    // credentials, or request content. Public error bodies remain unchanged.
+    // credentials, or request content.
     fn upstream_diagnostic(self) -> Option<(&'static str, Option<u16>)> {
         match self {
             Self::Upstream => Some(("upstream_response_invalid", None)),
             Self::UpstreamTransport => Some(("upstream_transport_failed", None)),
             Self::UpstreamHttp(status) => Some(("upstream_http_rejected", Some(status))),
+            Self::UpstreamThrottled { .. } => Some(("upstream_http_rejected", Some(429))),
+            Self::UpstreamUnauthorized => Some(("upstream_http_rejected", Some(401))),
+            Self::UpstreamForbidden => Some(("upstream_http_rejected", Some(403))),
+            Self::UpstreamInvalidRequest { .. } => Some(("upstream_http_rejected", Some(400))),
+            Self::UpstreamTooLarge => Some(("upstream_http_rejected", Some(413))),
             Self::ModelIdentityMismatch => Some(("model_identity_mismatch", None)),
             _ => None,
         }
     }
 
-    fn into_response(self) -> Response<Body> {
-        if let Some((reason, upstream_status)) = self.upstream_diagnostic() {
-            tracing::warn!(reason, upstream_status, "Bedrock Mantle request rejected");
-        }
-        let (status, error_type, message) = match self {
+    // Public bodies are fixed strings, never provider text: an AWS error can
+    // name the account, role or ARN behind the worker's credential. The gm
+    // gateway reads the 401/403 bodies' `invalid_api_key` as a provider-account
+    // failure on any status; no other body here may carry a drain phrase.
+    fn public_error(self) -> (StatusCode, &'static str, &'static str) {
+        match self {
             Self::Method => (
                 StatusCode::METHOD_NOT_ALLOWED,
                 "invalid_request_error",
@@ -612,6 +626,40 @@ impl Reject {
                 "api_error",
                 "Bedrock model bindings are unavailable or stale",
             ),
+            Self::UpstreamThrottled { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "Bedrock Mantle throttled the request",
+            ),
+            Self::UpstreamUnauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Bedrock Mantle rejected the worker credential (invalid_api_key)",
+            ),
+            Self::UpstreamForbidden => (
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Bedrock Mantle denied the worker credential access (invalid_api_key)",
+            ),
+            Self::UpstreamInvalidRequest {
+                prompt_too_long: true,
+            } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Bedrock Mantle rejected the request: prompt is too long",
+            ),
+            Self::UpstreamInvalidRequest {
+                prompt_too_long: false,
+            } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Bedrock Mantle rejected the request as invalid",
+            ),
+            Self::UpstreamTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "Bedrock Mantle rejected the request size",
+            ),
             Self::Upstream
             | Self::UpstreamTransport
             | Self::UpstreamHttp(_)
@@ -620,9 +668,25 @@ impl Reject {
                 "api_error",
                 "Bedrock Mantle request failed",
             ),
-        };
+        }
+    }
+
+    fn into_response(self) -> Response<Body> {
+        if let Some((reason, upstream_status)) = self.upstream_diagnostic() {
+            tracing::warn!(reason, upstream_status, "Bedrock Mantle request rejected");
+        }
+        let (status, error_type, message) = self.public_error();
         let body = format!("{{\"error\":{{\"type\":\"{error_type}\",\"message\":\"{message}\"}}}}");
-        response(status, "application/json", Body::from(body))
+        let mut response = response(status, "application/json", Body::from(body));
+        if let Self::UpstreamThrottled {
+            retry_after_secs: Some(seconds),
+        } = self
+        {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -707,7 +771,7 @@ async fn finish_upstream_response(
     stream_response: bool,
 ) -> Result<Response<Body>, Reject> {
     if upstream.status() != StatusCode::OK {
-        return Err(Reject::UpstreamHttp(upstream.status().as_u16()));
+        return Err(upstream_rejection(upstream).await);
     }
     if stream_response {
         let content_type = upstream
@@ -756,7 +820,7 @@ async fn finish_upstream_response(
         {
             return Err(Reject::Upstream);
         }
-        let body = read_bounded_response(upstream).await?;
+        let body = read_bounded_body(upstream, MAX_RESPONSE_BODY).await?;
         let body = canonicalize_response_identity(&body, &binding.response_model, &binding.model)?;
         Ok(response_with_binding_revision(
             StatusCode::OK,
@@ -765,6 +829,44 @@ async fn finish_upstream_response(
             binding.revision,
         ))
     }
+}
+
+async fn upstream_rejection(upstream: reqwest::Response) -> Reject {
+    match upstream.status() {
+        StatusCode::TOO_MANY_REQUESTS => Reject::UpstreamThrottled {
+            retry_after_secs: retry_after_secs(upstream.headers()),
+        },
+        StatusCode::UNAUTHORIZED => Reject::UpstreamUnauthorized,
+        StatusCode::FORBIDDEN => Reject::UpstreamForbidden,
+        StatusCode::BAD_REQUEST => Reject::UpstreamInvalidRequest {
+            prompt_too_long: tokio::time::timeout(
+                ERROR_BODY_WAIT,
+                read_bounded_body(upstream, MAX_ERROR_BODY),
+            )
+            .await
+            .is_ok_and(|body| body.is_ok_and(|body| signals_prompt_too_long(&body))),
+        },
+        StatusCode::PAYLOAD_TOO_LARGE => Reject::UpstreamTooLarge,
+        status => Reject::UpstreamHttp(status.as_u16()),
+    }
+}
+
+/// Only the delay-seconds form is relayed; an HTTP-date or garbage value is
+/// dropped rather than replaced with a guess.
+fn retry_after_secs(headers: &HeaderMap) -> Option<u32> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+// Anthropic's context-window refusal; the gm gateway reroutes a 400 carrying
+// this phrase to a wider-window route when its capability retry is enabled.
+fn signals_prompt_too_long(body: &[u8]) -> bool {
+    body.to_ascii_lowercase()
+        .windows(PROMPT_TOO_LONG.len())
+        .any(|window| window == PROMPT_TOO_LONG)
 }
 
 fn validate_inbound_headers(headers: &HeaderMap) -> Result<u64, Reject> {
@@ -1234,12 +1336,12 @@ fn validate_output_config(value: &Value) -> Result<(), Reject> {
     Ok(())
 }
 
-async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, Reject> {
+async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, Reject> {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| Reject::UpstreamTransport)?;
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(Reject::Upstream);
         }
         body.extend_from_slice(&chunk);
@@ -1675,6 +1777,7 @@ fn upstream_url(test_override: Option<&str>) -> &str {
 )]
 mod tests {
     use super::*;
+    use crate::gateway_contract::signals_drain;
     use axum::{
         body::to_bytes,
         routing::{get, post},
@@ -2029,9 +2132,9 @@ mod tests {
             (Reject::Upstream, "upstream_response_invalid", None),
             (Reject::UpstreamTransport, "upstream_transport_failed", None),
             (
-                Reject::UpstreamHttp(403),
+                Reject::UpstreamHttp(503),
                 "upstream_http_rejected",
-                Some(403),
+                Some(503),
             ),
             (
                 Reject::ModelIdentityMismatch,
@@ -2076,7 +2179,7 @@ mod tests {
                 .expect("HTTP response"),
         );
         assert_eq!(
-            read_bounded_response(response).await,
+            read_bounded_body(response, MAX_RESPONSE_BODY).await,
             Err(Reject::UpstreamTransport)
         );
         assert!(matches!(
@@ -2090,14 +2193,208 @@ mod tests {
         let binding = test_bindings_payload().bindings[TEST_MODEL_A].clone();
         let upstream = reqwest::Response::from(
             Response::builder()
-                .status(403)
+                .status(503)
                 .body("private provider error details")
                 .expect("HTTP response"),
         );
         let failure = finish_upstream_response(upstream, &binding, false)
             .await
             .expect_err("upstream rejection");
-        assert_eq!(failure, Reject::UpstreamHttp(403));
+        assert_eq!(failure, Reject::UpstreamHttp(503));
+    }
+
+    struct Relayed {
+        status: StatusCode,
+        retry_after: Option<String>,
+        error_type: String,
+        body: String,
+    }
+
+    async fn relay_upstream_error(
+        status: u16,
+        headers: &[(&'static str, &'static str)],
+        body: &'static str,
+        streaming: bool,
+    ) -> Relayed {
+        let headers = headers.to_vec();
+        let upstream_app = Router::new().route(
+            "/anthropic/v1/messages",
+            post(move || async move {
+                let mut response = Response::builder()
+                    .status(status)
+                    .header(CONTENT_TYPE, "application/json");
+                for (name, value) in headers {
+                    response = response.header(name, value);
+                }
+                response.body(Body::from(body)).expect("upstream response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task: JoinHandle<()> = tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.expect("upstream");
+        });
+        let state = BedrockMantleState::for_test(
+            &format!("http://{address}/anthropic/v1/messages"),
+            "Bearer configured-only",
+        );
+        let request_body = if streaming {
+            VALID_BODY.replace("\"max_tokens\"", "\"stream\":true,\"max_tokens\"")
+        } else {
+            VALID_BODY.to_owned()
+        };
+        let response = handle_request(
+            State(AppState(state)),
+            request("/v1/messages", &request_body),
+        )
+        .await;
+        upstream_task.abort();
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .map(|value| value.to_str().expect("ASCII Retry-After").to_owned());
+        let raw = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("error body");
+        let value: Value = serde_json::from_slice(&raw).expect("JSON error body");
+        Relayed {
+            status,
+            retry_after,
+            error_type: value["error"]["type"].as_str().expect("type").to_owned(),
+            body: String::from_utf8(raw.to_vec()).expect("UTF-8 body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_throttle_is_relayed_as_a_429_with_only_a_numeric_provider_hint() {
+        for (headers, expected_hint, streaming) in [
+            (&[("retry-after", "7")][..], Some("7"), false),
+            (&[("retry-after", "7")][..], Some("7"), true),
+            (&[][..], None, false),
+            (
+                &[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")][..],
+                None,
+                false,
+            ),
+            (&[("retry-after", "-3")][..], None, false),
+            (
+                &[("x-amzn-errortype", "ThrottlingException")][..],
+                None,
+                false,
+            ),
+        ] {
+            let relayed = relay_upstream_error(
+                429,
+                headers,
+                r#"{"message":"Too many requests for account 123456789012"}"#,
+                streaming,
+            )
+            .await;
+            assert_eq!(relayed.status, StatusCode::TOO_MANY_REQUESTS, "{headers:?}");
+            assert_eq!(relayed.retry_after.as_deref(), expected_hint, "{headers:?}");
+            assert_eq!(relayed.error_type, "rate_limit_error");
+            assert!(!relayed.body.contains("123456789012"));
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_credential_failures_keep_their_status_and_read_as_an_account_failure() {
+        let aws_denial = r#"{"message":"User: arn:aws:iam::123456789012:user/miner is not authorized to perform: bedrock:InvokeModel"}"#;
+        for (status, expected, error_type) in [
+            (401, StatusCode::UNAUTHORIZED, "authentication_error"),
+            (403, StatusCode::FORBIDDEN, "permission_error"),
+        ] {
+            let relayed = relay_upstream_error(status, &[], aws_denial, false).await;
+            assert_eq!(relayed.status, expected);
+            assert_eq!(relayed.error_type, error_type);
+            assert!(relayed.body.contains("invalid_api_key"));
+            assert!(!relayed.body.contains("arn:aws"));
+            assert!(!relayed.body.contains("123456789012"));
+            assert_eq!(relayed.retry_after, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_request_errors_stay_buyer_errors_without_provider_text() {
+        let too_long = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        let relayed = relay_upstream_error(400, &[], too_long, false).await;
+        assert_eq!(relayed.status, StatusCode::BAD_REQUEST);
+        assert_eq!(relayed.error_type, "invalid_request_error");
+        assert!(relayed.body.contains("prompt is too long"));
+        assert!(!relayed.body.contains("250000"));
+
+        let invalid = r#"{"message":"messages.0.content: field required"}"#;
+        let relayed = relay_upstream_error(400, &[], invalid, false).await;
+        assert_eq!(relayed.status, StatusCode::BAD_REQUEST);
+        assert_eq!(relayed.error_type, "invalid_request_error");
+        assert!(!relayed.body.contains("prompt is too long"));
+        assert!(!relayed.body.contains("field required"));
+
+        let relayed = relay_upstream_error(413, &[], "{}", false).await;
+        assert_eq!(relayed.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(relayed.error_type, "request_too_large");
+    }
+
+    #[tokio::test]
+    async fn upstream_server_and_worker_side_failures_stay_502() {
+        for status in [404, 408, 424, 500, 503, 529] {
+            let relayed = relay_upstream_error(
+                status,
+                &[("retry-after", "7")],
+                r#"{"message":"private provider details"}"#,
+                false,
+            )
+            .await;
+            assert_eq!(relayed.status, StatusCode::BAD_GATEWAY, "{status}");
+            assert_eq!(relayed.error_type, "api_error");
+            assert_eq!(relayed.retry_after, None, "{status}");
+            assert!(!relayed.body.contains("private provider details"));
+        }
+    }
+
+    #[tokio::test]
+    async fn public_bodies_honour_the_gateway_drain_and_saturation_contract() {
+        let credential = [Reject::UpstreamUnauthorized, Reject::UpstreamForbidden];
+        let every_other = [
+            Reject::Method,
+            Reject::Path,
+            Reject::Header,
+            Reject::BodyTooLarge,
+            Reject::InvalidBody,
+            Reject::UnsupportedModel,
+            Reject::BindingRevision,
+            Reject::BindingsUnavailable,
+            Reject::Upstream,
+            Reject::UpstreamTransport,
+            Reject::UpstreamHttp(503),
+            Reject::UpstreamThrottled {
+                retry_after_secs: Some(7),
+            },
+            Reject::UpstreamInvalidRequest {
+                prompt_too_long: true,
+            },
+            Reject::UpstreamInvalidRequest {
+                prompt_too_long: false,
+            },
+            Reject::UpstreamTooLarge,
+            Reject::ModelIdentityMismatch,
+        ];
+        let body = |failure: Reject| async move {
+            let raw = to_bytes(failure.into_response().into_body(), 4096)
+                .await
+                .expect("error body");
+            String::from_utf8(raw.to_vec()).expect("UTF-8 body")
+        };
+        for failure in credential {
+            let text = body(failure).await;
+            assert!(signals_drain(&text), "{failure:?}");
+        }
+        for failure in every_other {
+            let text = body(failure).await;
+            assert!(!signals_drain(&text), "{failure:?}");
+            assert!(!text.contains("miner saturated"), "{failure:?}");
+        }
     }
 
     #[test]

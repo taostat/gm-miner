@@ -13,6 +13,8 @@ mod attested_pool;
 pub mod bedrock_mantle;
 pub mod chutes_verify;
 pub mod eventlog;
+#[cfg(test)]
+mod gateway_contract;
 pub mod identity;
 pub mod info;
 pub mod keypair;
