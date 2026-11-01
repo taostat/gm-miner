@@ -143,5 +143,19 @@ These apply to every provider route unless its file says otherwise.
   responses pass through byte for byte. The 502 body must never contain a
   provider-drain phrase (quota, credit, billing, account, api key), because
   the gateway matches those substrings on any status.
+- **Bedrock Mantle errors.** The adapter keeps AWS's status but replaces the
+  body with a fixed one, since AWS errors can name the account behind the key.
+  429 stays 429 and relays a numeric `Retry-After` when AWS sent one. 401 and
+  403 keep their status, and their body carries `invalid_api_key` so the
+  gateway treats the key as unusable rather than blaming the buyer. 400 and
+  413 stay buyer errors; a 400 says "prompt is too long" only when AWS said so.
+  Every other status, 404 included, becomes 502.
+- **Chutes account errors.** The Chutes verifier never relays Chutes' error
+  body; a drained account's body carries a payment address. A 401, 402 or 403
+  keeps its status, as does the 401 for a key Envoy did not inject, and the
+  gm-authored body carries `invalid_api_key` (401, 403) or `insufficient_quota`
+  (402) so the gateway treats the worker's account as unusable rather than
+  blaming the buyer. Other statuses pass through with a body that names only
+  the status.
 - **Metrics.** `:9902` exposes only `/stats/prometheus`, gated on the node
   key. The full admin interface stays on loopback `:9901`.

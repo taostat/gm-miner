@@ -63,11 +63,30 @@ impl ChutesError {
         }
     }
 
+    // Chutes' own account errors carry a payment address, so the body stays
+    // gm-authored; the gm gateway reads these phrases as a worker account
+    // failure and reroutes instead of returning the status to the buyer. A
+    // missing injected key is the worker's misconfiguration, never the buyer's.
+    fn account_marker(&self) -> Option<&'static str> {
+        match self {
+            Self::MissingCredential => Some("invalid_api_key"),
+            Self::Upstream { status, .. } => match *status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some("invalid_api_key"),
+                StatusCode::PAYMENT_REQUIRED => Some("insufficient_quota"),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The JSON error response carrying the status and the cause.
     #[must_use]
     pub fn into_response(self) -> Response<Body> {
         let status = self.status();
-        let message = self.to_string();
+        let message = match self.account_marker() {
+            Some(marker) => format!("{self} ({marker})"),
+            None => self.to_string(),
+        };
         warn!(%status, kind = self.kind(), cause = %message, "Chutes request failed closed");
         let body = serde_json::json!({"error": {"type": self.kind(), "message": message}});
         let mut response = Response::new(Body::from(body.to_string()));
@@ -84,6 +103,7 @@ impl ChutesError {
 #[expect(clippy::unwrap_used, reason = "test bodies are local JSON")]
 mod tests {
     use super::*;
+    use crate::gateway_contract::signals_drain;
     use http_body_util::BodyExt as _;
 
     #[tokio::test]
@@ -101,6 +121,62 @@ mod tests {
             body["error"]["message"],
             "Chutes invoke answered 429 Too Many Requests"
         );
+    }
+
+    async fn upstream_body(status: StatusCode) -> String {
+        let response = ChutesError::Upstream {
+            stage: "invoke",
+            status,
+        }
+        .into_response();
+        assert_eq!(response.status(), status);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn account_statuses_keep_their_status_and_read_as_a_worker_account_failure() {
+        for (status, marker) in [
+            (StatusCode::UNAUTHORIZED, "invalid_api_key"),
+            (StatusCode::PAYMENT_REQUIRED, "insufficient_quota"),
+            (StatusCode::FORBIDDEN, "invalid_api_key"),
+        ] {
+            let text = upstream_body(status).await;
+            assert!(text.contains(marker), "{text}");
+            assert!(signals_drain(&text), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_injected_key_reads_as_a_worker_account_failure() {
+        let response = ChutesError::MissingCredential.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("invalid_api_key"), "{text}");
+        assert!(signals_drain(&text), "{text}");
+    }
+
+    #[tokio::test]
+    async fn other_statuses_and_local_failures_never_read_as_an_account_failure() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let text = upstream_body(status).await;
+            assert!(!signals_drain(&text), "{text}");
+        }
+        for error in [
+            ChutesError::RateLimited { stage: "evidence" },
+            ChutesError::BelowEvidenceMinimum,
+        ] {
+            let body = error.into_response().into_body().collect().await.unwrap();
+            let text = String::from_utf8(body.to_bytes().to_vec()).unwrap();
+            assert!(!signals_drain(&text), "{text}");
+        }
     }
 
     #[tokio::test]

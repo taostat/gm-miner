@@ -247,6 +247,7 @@ mod tests {
     use crate::chutes_verify::admission::tests::FakeApi;
     use crate::chutes_verify::crypto::tests::{Instance, Responder};
     use crate::chutes_verify::stream::tests::{content, usage_frame};
+    use crate::gateway_contract::signals_drain;
     use http_body_util::BodyExt as _;
 
     const MODEL: &str = "zai-org/GLM-5.2-TEE";
@@ -346,14 +347,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_credential_is_unauthorized() {
+    async fn missing_credential_is_unauthorized_and_reads_as_a_worker_account_failure() {
         let (verifier, _) = verifier(|_| (StatusCode::OK, Vec::new()));
         let mut unauthenticated = request(&chat(false));
         unauthenticated.headers_mut().remove(header::AUTHORIZATION);
-        assert_eq!(
-            verifier.forward(unauthenticated).await.status(),
-            StatusCode::UNAUTHORIZED
-        );
+        let response = verifier.forward(unauthenticated).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(signals_drain(&body_text(response).await.unwrap()));
     }
 
     #[tokio::test]
@@ -367,6 +367,27 @@ mod tests {
             let response = verifier.forward(request(&chat(false))).await;
             assert_eq!(response.status(), status);
             assert!(!body_text(response).await.unwrap().contains("relay detail"));
+        }
+    }
+
+    #[tokio::test]
+    async fn account_rejections_keep_their_status_without_the_payment_address() {
+        let address = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty";
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::PAYMENT_REQUIRED,
+            StatusCode::FORBIDDEN,
+        ] {
+            let detail = format!(
+                r#"{{"detail":"Quota exceeded and account balance is $0.0, please pay with fiat or send tao to {address}"}}"#
+            );
+            let (verifier, _) = verifier(move |_| (status, detail.clone().into_bytes()));
+            let response = verifier.forward(request(&chat(false))).await;
+            assert_eq!(response.status(), status);
+            let text = body_text(response).await.unwrap();
+            assert!(!text.contains(address), "{text}");
+            assert!(!text.contains("send tao"), "{text}");
+            assert!(signals_drain(&text), "{text}");
         }
     }
 
