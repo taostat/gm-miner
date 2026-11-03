@@ -16,8 +16,13 @@ both present. Azure Responses is unqualified because its echo is the deployment 
 Bedrock Mantle accepts models listed in the fixed network-selected registry binding snapshot
 in `us-east-1`; it requires the `bedrock-mantle-model-bindings-v1` approved image feature and
 the selected binding's row revision. The measured adapter validates the raw provider response
-identity, then canonicalizes the response model before releasing content. Older images and
-unadmitted models remain unavailable. Direct Anthropic/OpenAI routes use
+identity, then canonicalizes the response model before releasing content. Its request checks
+keep the 20 MiB body limit and require a strict duplicate-key-free top-level JSON object, the
+bound model id and optional boolean `stream`. It rewrites only the model and lets Bedrock
+validate every other body field. It forwards one optional validated `anthropic-beta` header
+unchanged; other buyer headers are not forwarded. The adapter supplies the worker credential
+and fixed protocol headers. Older images and unadmitted models remain
+unavailable. Direct Anthropic/OpenAI routes use
 verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 

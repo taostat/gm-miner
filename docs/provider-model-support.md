@@ -23,6 +23,30 @@ catalog. It distinguishes transport capability from registry admission:
   Unadmitted models remain unavailable. A known model id or successful
   HTTP probe is not sufficient.
 
+The adapter keeps its 20 MiB body limit and requires a strict duplicate-key-free
+top-level JSON object, a valid bound `model`, and boolean `stream` when present.
+It rewrites only `model` and leaves every other body field and content block to
+Bedrock's validation. It checks the gateway execution policy, binding revision,
+JSON content type, and Anthropic version. It forwards one optional
+`anthropic-beta` value unchanged when it is a visible-ASCII comma-separated
+HTTP-token list of at most 1024 bytes. Malformed, repeated, or overlong values
+receive the standard 400 Header reject. The adapter has no beta-name allowlist;
+Bedrock decides which beta values a model supports. Other buyer headers are
+ignored and never forwarded. The upstream request uses the worker's configured
+Bedrock credential.
+
+Unknown response fields, content blocks, deltas, and SSE event types pass through.
+The adapter still validates the raw model identity before releasing content and
+enforces SSE framing, size bounds, and message start/termination ordering. Unknown
+events before `message_start` are buffered until identity is verified; malformed
+frames and known events in the wrong order are rejected immediately.
+
+The gateway protocol, image feature, and binding revisions are unchanged. Gateways
+that send the required execution policy and binding revision can use the updated
+miner; gateways that omit either header still receive a 400. Older miners retain
+their request restrictions, so newly accepted body fields and beta headers can
+still receive 400s during a mixed-image rollout.
+
 Bedrock bindings refresh every 60 seconds and expire 120 seconds after the last
 successful refresh. Failed refreshes do not extend validity. The adapter rechecks
 the current binding after reading the request body and immediately before dispatch.
