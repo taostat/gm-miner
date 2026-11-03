@@ -131,7 +131,9 @@ explicitly rejected because its echo is the deployment name. Bedrock Mantle acce
 from the fixed network-selected registry binding snapshot in `us-east-1` and requires the
 `bedrock-mantle-model-bindings-v1` approved image feature plus the selected row revision.
 The adapter validates the raw provider identity and canonicalizes the response model before
-content release. Older images and unadmitted models remain unavailable. Selecting one per worker does
+content release. It rewrites only the bound request model and forwards every other
+body field for Bedrock to validate. Older images and unadmitted models remain
+unavailable. Selecting one per worker does
 **not** make every model on that provider a registry-admissible route, and a
 successful upstream probe is not evidence of admission:
 

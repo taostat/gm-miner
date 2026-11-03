@@ -1,14 +1,14 @@
 //! Fixed Bedrock Mantle Messages adapter for registry-authorized Anthropic models.
 //!
 //! The inbound Anthropic request is parsed into a bounded, duplicate-aware
-//! JSON value. Only the reviewed Messages fields and client-executed custom
-//! tool protocol are accepted. The adapter then builds a fresh request to the
-//! fixed Mantle hostname and path, replacing only the request model selector.
+//! JSON value. The adapter rewrites only the bound request model and leaves all
+//! other body fields for Bedrock to validate. It builds a fresh request to the
+//! fixed Mantle hostname and path.
 //! The raw AWS response identity is checked before its model field is rewritten
 //! to the canonical registry model and before any response bytes are released.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io,
     sync::Arc,
     time::{Duration, Instant},
@@ -18,7 +18,7 @@ use axum::{
     body::{to_bytes, Body, Bytes},
     extract::State,
     http::{
-        header::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER},
+        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
         HeaderMap, HeaderValue, Method, Request, Response, StatusCode,
     },
     routing::any,
@@ -27,7 +27,7 @@ use axum::{
 use futures_util::{stream, StreamExt};
 use reqwest::{redirect::Policy, Client};
 use rustls::{ClientConfig, RootCertStore};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 use tokio::{net::TcpListener, sync::RwLock, time::MissedTickBehavior};
 use tracing::info;
@@ -46,6 +46,7 @@ pub const MODEL_BINDING_REVISION_HEADER: &str = "x-gm-model-binding-revision";
 const BEDROCK_MANTLE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages";
 const BEDROCK_BINDINGS_PATH: &str = "/model-bindings/bedrock";
 const MAX_REQUEST_BODY: usize = 20 * 1024 * 1024;
+const MAX_ANTHROPIC_BETA_HEADER_BYTES: usize = 1024;
 const MAX_RESPONSE_BODY: usize = 32 * 1024 * 1024;
 const MAX_STREAM_PREAMBLE: usize = 64 * 1024;
 /// One in-body SSE frame. A thinking block's closing signature frame grows with
@@ -60,10 +61,6 @@ const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const BINDINGS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const BINDINGS_FRESHNESS_TTL: Duration = Duration::from_secs(120);
-/// Protocol-safe integer bound only. Model output ceilings belong to the
-/// provider/catalog; this bound does not drive allocation in the adapter.
-const MAX_TOKEN_FIELD_VALUE: u64 = u32::MAX as u64;
-const MAX_MESSAGES: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelBinding {
@@ -609,7 +606,7 @@ impl Reject {
             Self::InvalidBody => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "Bedrock Messages body is not supported",
+                "Bedrock Messages body is invalid",
             ),
             Self::UnsupportedModel => (
                 StatusCode::BAD_REQUEST,
@@ -705,17 +702,16 @@ async fn forward_request(
     {
         return Err(Reject::Path);
     }
-    let requested_binding_revision = validate_inbound_headers(request.headers())?;
+    let (requested_binding_revision, anthropic_beta) = validate_inbound_headers(request.headers())?;
 
     let bytes = to_bytes(request.into_body(), MAX_REQUEST_BODY)
         .await
         .map_err(|_| Reject::BodyTooLarge)?;
-    let (mut request_body, stream_response) = prepare_request_body(&bytes)?;
-    let model = request_body
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or(Reject::InvalidBody)?
-        .to_owned();
+    let PreparedRequestBody {
+        mut fields,
+        model,
+        stream_response,
+    } = prepare_request_body(&bytes)?;
     let accept = if stream_response {
         "text/event-stream"
     } else {
@@ -737,21 +733,22 @@ async fn forward_request(
     // between the current binding check and request construction.
     let cache = state.bindings.read().await;
     let binding = cache.current_binding(&model, requested_binding_revision, Instant::now())?;
-    request_body
-        .as_object_mut()
-        .ok_or(Reject::InvalidBody)?
-        .insert(
-            "model".to_owned(),
-            Value::String(binding.upstream_model.clone()),
-        );
-    let upstream_body = serde_json::to_vec(&request_body).map_err(|_| Reject::InvalidBody)?;
-    let upstream_request = state
+    fields.insert(
+        "model".to_owned(),
+        Value::String(binding.upstream_model.clone()),
+    );
+    let upstream_body = serde_json::to_vec(&fields).map_err(|_| Reject::InvalidBody)?;
+    let mut upstream_request = state
         .client
         .post(url)
         .header(AUTHORIZATION, state.authorization.clone())
         .header("anthropic-version", ANTHROPIC_VERSION)
         .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, accept)
+        .header(ACCEPT, accept);
+    if let Some(value) = anthropic_beta {
+        upstream_request = upstream_request.header("anthropic-beta", value);
+    }
+    let upstream_request = upstream_request
         .body(upstream_body)
         .build()
         .map_err(|_| Reject::Upstream)?;
@@ -869,7 +866,7 @@ fn signals_prompt_too_long(body: &[u8]) -> bool {
         .any(|window| window == PROMPT_TOO_LONG)
 }
 
-fn validate_inbound_headers(headers: &HeaderMap) -> Result<u64, Reject> {
+fn validate_inbound_headers(headers: &HeaderMap) -> Result<(u64, Option<HeaderValue>), Reject> {
     let mut execution_policies = headers.get_all(EXECUTION_POLICY_HEADER).iter();
     if execution_policies
         .next()
@@ -877,19 +874,6 @@ fn validate_inbound_headers(headers: &HeaderMap) -> Result<u64, Reject> {
         != Some(EXACT_CANONICAL_NO_REPLAY_POLICY)
         || execution_policies.next().is_some()
     {
-        return Err(Reject::Header);
-    }
-
-    if headers.contains_key("anthropic-workspace-id")
-        || headers.contains_key("anthropic-beta")
-        || headers.contains_key(CONTENT_ENCODING)
-    {
-        return Err(Reject::Header);
-    }
-    if headers.keys().any(|name| {
-        name.as_str().starts_with("x-amzn-bedrock-")
-            || (name.as_str().starts_with("anthropic-") && name.as_str() != "anthropic-version")
-    }) {
         return Err(Reject::Header);
     }
 
@@ -930,410 +914,91 @@ fn validate_inbound_headers(headers: &HeaderMap) -> Result<u64, Reject> {
     if revisions[0].as_bytes() != revision.to_string().as_bytes() {
         return Err(Reject::Header);
     }
-    Ok(revision)
+    let anthropic_beta = validate_anthropic_beta_header(headers)?;
+    Ok((revision, anthropic_beta))
 }
 
-fn prepare_request_body(bytes: &[u8]) -> Result<(Value, bool), Reject> {
-    let mut value = parse_unique_json(bytes).map_err(|_| Reject::InvalidBody)?;
-    let object = value.as_object_mut().ok_or(Reject::InvalidBody)?;
-    let allowed = [
-        "model",
-        "max_tokens",
-        "messages",
-        "system",
-        "stop_sequences",
-        "temperature",
-        "top_p",
-        "top_k",
-        "stream",
-        "tools",
-        "tool_choice",
-        "thinking",
-        "output_config",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    if object.keys().any(|key| !allowed.contains(key.as_str())) {
-        return Err(Reject::InvalidBody);
+fn validate_anthropic_beta_header(headers: &HeaderMap) -> Result<Option<HeaderValue>, Reject> {
+    let mut values = headers.get_all("anthropic-beta").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Reject::Header);
     }
 
-    let model = object
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_ANTHROPIC_BETA_HEADER_BYTES
+        || bytes.iter().any(|byte| !(0x20..=0x7e).contains(byte))
+    {
+        return Err(Reject::Header);
+    }
+    for item in bytes.split(|byte| *byte == b',') {
+        let Some(start) = item.iter().position(|byte| *byte != b' ') else {
+            return Err(Reject::Header);
+        };
+        let Some(end) = item.iter().rposition(|byte| *byte != b' ') else {
+            return Err(Reject::Header);
+        };
+        if !item[start..=end].iter().copied().all(is_http_token_byte) {
+            return Err(Reject::Header);
+        }
+    }
+    Ok(Some(value.clone()))
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+#[derive(Debug, PartialEq)]
+struct PreparedRequestBody {
+    fields: Map<String, Value>,
+    model: String,
+    stream_response: bool,
+}
+
+fn prepare_request_body(bytes: &[u8]) -> Result<PreparedRequestBody, Reject> {
+    let value = parse_unique_json(bytes).map_err(|_| Reject::InvalidBody)?;
+    let Value::Object(fields) = value else {
+        return Err(Reject::InvalidBody);
+    };
+    let model = fields
         .get("model")
         .and_then(Value::as_str)
-        .ok_or(Reject::InvalidBody)?;
-    if !valid_model_id(model) {
+        .ok_or(Reject::InvalidBody)?
+        .to_owned();
+    if !valid_model_id(&model) {
         return Err(Reject::InvalidBody);
     }
-    let max_tokens = object
-        .get("max_tokens")
-        .and_then(Value::as_u64)
-        .filter(|value| (1..=MAX_TOKEN_FIELD_VALUE).contains(value))
-        .ok_or(Reject::InvalidBody)?;
-    let _ = max_tokens;
-    let messages = object
-        .get("messages")
-        .and_then(Value::as_array)
-        .filter(|messages| !messages.is_empty() && messages.len() <= MAX_MESSAGES)
-        .ok_or(Reject::InvalidBody)?;
-    for message in messages {
-        validate_message(message)?;
-    }
-    if let Some(system) = object.get("system") {
-        validate_text_content(system)?;
-    }
-    let stream_response = match object.get("stream") {
+    let stream_response = match fields.get("stream") {
         Some(Value::Bool(value)) => *value,
         Some(_) => return Err(Reject::InvalidBody),
         None => false,
     };
-    if let Some(Value::Array(stops)) = object.get("stop_sequences") {
-        if stops.len() > 64 || stops.iter().any(|value| value.as_str().is_none()) {
-            return Err(Reject::InvalidBody);
-        }
-    } else if object.contains_key("stop_sequences") {
-        return Err(Reject::InvalidBody);
-    }
-    if let Some(value) = object.get("temperature") {
-        if !valid_unit_float(value) {
-            return Err(Reject::InvalidBody);
-        }
-    }
-    if let Some(value) = object.get("top_p") {
-        if !valid_unit_float(value) {
-            return Err(Reject::InvalidBody);
-        }
-    }
-    if let Some(value) = object.get("top_k") {
-        if value.as_u64().is_none_or(|value| value > 500) {
-            return Err(Reject::InvalidBody);
-        }
-    }
-    if let Some(value) = object.get("tools") {
-        validate_tools(value)?;
-    }
-    if let Some(value) = object.get("tool_choice") {
-        validate_tool_choice(value)?;
-    }
-    if let Some(value) = object.get("thinking") {
-        validate_thinking(value)?;
-    }
-    if let Some(value) = object.get("output_config") {
-        validate_output_config(value)?;
-    }
-    Ok((value, stream_response))
-}
-
-fn valid_unit_float(value: &Value) -> bool {
-    value
-        .as_number()
-        .and_then(Number::as_f64)
-        .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
-}
-
-fn validate_message(value: &Value) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "role" | "content"))
-    {
-        return Err(Reject::InvalidBody);
-    }
-    if !matches!(
-        object.get("role").and_then(Value::as_str),
-        Some("user" | "assistant")
-    ) {
-        return Err(Reject::InvalidBody);
-    }
-    let content = object.get("content").ok_or(Reject::InvalidBody)?;
-    validate_content(content, true)
-}
-
-fn validate_text_content(value: &Value) -> Result<(), Reject> {
-    match value {
-        Value::String(_) => Ok(()),
-        Value::Array(blocks) => {
-            for block in blocks {
-                validate_block(block, false)?;
-            }
-            Ok(())
-        }
-        _ => Err(Reject::InvalidBody),
-    }
-}
-
-fn validate_content(value: &Value, allow_tool_blocks: bool) -> Result<(), Reject> {
-    match value {
-        Value::String(_) => Ok(()),
-        Value::Array(blocks) => {
-            for block in blocks {
-                validate_block(block, allow_tool_blocks)?;
-            }
-            Ok(())
-        }
-        _ => Err(Reject::InvalidBody),
-    }
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "the complete closed content-block allowlist stays together for audit"
-)]
-fn validate_block(value: &Value, allow_tool_blocks: bool) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    let kind = object
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or(Reject::InvalidBody)?;
-    match kind {
-        "text" => {
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "text" | "cache_control"))
-                || object.get("text").and_then(Value::as_str).is_none()
-            {
-                return Err(Reject::InvalidBody);
-            }
-            validate_cache_control(object.get("cache_control"))
-        }
-        "image" => {
-            if !allow_tool_blocks
-                || object
-                    .keys()
-                    .any(|key| !matches!(key.as_str(), "type" | "source" | "cache_control"))
-            {
-                return Err(Reject::InvalidBody);
-            }
-            validate_cache_control(object.get("cache_control"))?;
-            validate_inline_source(
-                object.get("source").ok_or(Reject::InvalidBody)?,
-                &["image/jpeg", "image/png", "image/gif", "image/webp"],
-            )
-        }
-        "document" => {
-            if !allow_tool_blocks
-                || object.keys().any(|key| {
-                    !matches!(
-                        key.as_str(),
-                        "type" | "source" | "title" | "context" | "cache_control"
-                    )
-                })
-            {
-                return Err(Reject::InvalidBody);
-            }
-            for key in ["title", "context"] {
-                if object
-                    .get(key)
-                    .is_some_and(|value| value.as_str().is_none())
-                {
-                    return Err(Reject::InvalidBody);
-                }
-            }
-            validate_cache_control(object.get("cache_control"))?;
-            validate_inline_source(
-                object.get("source").ok_or(Reject::InvalidBody)?,
-                &["application/pdf"],
-            )
-        }
-        "tool_use" if allow_tool_blocks => {
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "id" | "name" | "input"))
-                || object.get("id").and_then(Value::as_str).is_none()
-                || object.get("name").and_then(Value::as_str).is_none()
-                || object.get("input").is_none()
-            {
-                return Err(Reject::InvalidBody);
-            }
-            Ok(())
-        }
-        "tool_result" if allow_tool_blocks => {
-            if object.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "type" | "tool_use_id" | "content" | "is_error" | "cache_control"
-                )
-            }) || object.get("tool_use_id").and_then(Value::as_str).is_none()
-                || object
-                    .get("is_error")
-                    .is_some_and(|value| value.as_bool().is_none())
-            {
-                return Err(Reject::InvalidBody);
-            }
-            validate_cache_control(object.get("cache_control"))?;
-            if let Some(content) = object.get("content") {
-                validate_content(content, true)?;
-            }
-            Ok(())
-        }
-        "thinking" if allow_tool_blocks => {
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "thinking" | "signature"))
-                || object.get("thinking").and_then(Value::as_str).is_none()
-                || object.get("signature").and_then(Value::as_str).is_none()
-            {
-                return Err(Reject::InvalidBody);
-            }
-            Ok(())
-        }
-        "redacted_thinking" if allow_tool_blocks => {
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "data"))
-                || object.get("data").and_then(Value::as_str).is_none()
-            {
-                return Err(Reject::InvalidBody);
-            }
-            Ok(())
-        }
-        _ => Err(Reject::InvalidBody),
-    }
-}
-
-fn validate_inline_source(value: &Value, allowed_media_types: &[&str]) -> Result<(), Reject> {
-    let source = value.as_object().ok_or(Reject::InvalidBody)?;
-    if source
-        .keys()
-        .any(|key| !matches!(key.as_str(), "type" | "media_type" | "data"))
-        || source.get("type").and_then(Value::as_str) != Some("base64")
-        || source
-            .get("media_type")
-            .and_then(Value::as_str)
-            .is_none_or(|media| !allowed_media_types.contains(&media))
-        || source.get("data").and_then(Value::as_str).is_none()
-    {
-        return Err(Reject::InvalidBody);
-    }
-    Ok(())
-}
-
-fn validate_cache_control(value: Option<&Value>) -> Result<(), Reject> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "type" | "ttl"))
-        || object.get("type").and_then(Value::as_str) != Some("ephemeral")
-        || object
-            .get("ttl")
-            .is_some_and(|ttl| !matches!(ttl.as_str(), Some("5m" | "1h")))
-    {
-        return Err(Reject::InvalidBody);
-    }
-    Ok(())
-}
-
-fn validate_tools(value: &Value) -> Result<(), Reject> {
-    let tools = value.as_array().ok_or(Reject::InvalidBody)?;
-    if tools.len() > 128 {
-        return Err(Reject::InvalidBody);
-    }
-    for tool in tools {
-        let object = tool.as_object().ok_or(Reject::InvalidBody)?;
-        if object.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "type" | "name" | "description" | "input_schema" | "cache_control" | "strict"
-            )
-        }) || object
-            .get("type")
-            .is_some_and(|value| value.as_str() != Some("custom"))
-            || object
-                .get("name")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            || object
-                .get("input_schema")
-                .and_then(Value::as_object)
-                .is_none()
-            || object
-                .get("description")
-                .is_some_and(|value| value.as_str().is_none())
-            || object
-                .get("strict")
-                .is_some_and(|value| value.as_bool().is_none())
-        {
-            return Err(Reject::InvalidBody);
-        }
-        validate_cache_control(object.get("cache_control"))?;
-    }
-    Ok(())
-}
-
-fn validate_tool_choice(value: &Value) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "type" | "name" | "disable_parallel_tool_use"))
-        || !matches!(
-            object.get("type").and_then(Value::as_str),
-            Some("auto" | "any" | "tool" | "none")
-        )
-        || object
-            .get("name")
-            .is_some_and(|value| value.as_str().is_none())
-        || object
-            .get("disable_parallel_tool_use")
-            .is_some_and(|value| value.as_bool().is_none())
-    {
-        return Err(Reject::InvalidBody);
-    }
-    if object.get("type").and_then(Value::as_str) == Some("tool")
-        && object.get("name").and_then(Value::as_str).is_none()
-    {
-        return Err(Reject::InvalidBody);
-    }
-    Ok(())
-}
-
-fn validate_thinking(value: &Value) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "type" | "budget_tokens" | "effort"))
-        || !matches!(
-            object.get("type").and_then(Value::as_str),
-            Some("enabled" | "adaptive" | "disabled")
-        )
-        || object.get("budget_tokens").is_some_and(|value| {
-            value
-                .as_u64()
-                .is_none_or(|value| value == 0 || value > MAX_TOKEN_FIELD_VALUE)
-        })
-        || object
-            .get("effort")
-            .is_some_and(|value| !matches!(value.as_str(), Some("low" | "medium" | "high" | "max")))
-    {
-        return Err(Reject::InvalidBody);
-    }
-    Ok(())
-}
-
-fn validate_output_config(value: &Value) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "effort" | "format"))
-        || object
-            .get("effort")
-            .is_some_and(|value| !matches!(value.as_str(), Some("low" | "medium" | "high" | "max")))
-    {
-        return Err(Reject::InvalidBody);
-    }
-    if let Some(format) = object.get("format") {
-        let format = format.as_object().ok_or(Reject::InvalidBody)?;
-        if format
-            .keys()
-            .any(|key| !matches!(key.as_str(), "type" | "schema"))
-            || format.get("type").and_then(Value::as_str) != Some("json_schema")
-            || format.get("schema").and_then(Value::as_object).is_none()
-        {
-            return Err(Reject::InvalidBody);
-        }
-    }
-    Ok(())
+    Ok(PreparedRequestBody {
+        fields,
+        model,
+        stream_response,
+    })
 }
 
 async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, Reject> {
@@ -1405,9 +1070,7 @@ async fn validate_stream_identity(
                 return Err(Reject::Upstream);
             }
             match parse_sse_preamble_frame(frame, expected_raw_model, canonical_model)? {
-                StreamPreambleEvent::Empty | StreamPreambleEvent::Ping => {
-                    scanned = after_frame;
-                }
+                StreamPreambleEvent::Other => scanned = after_frame,
                 StreamPreambleEvent::MessageStart(canonical_frame) => {
                     let capacity = buffer
                         .len()
@@ -1419,15 +1082,10 @@ async fn validate_stream_identity(
                     preamble.extend_from_slice(&buffer[after_frame..]);
                     return Ok((Bytes::from(preamble), source));
                 }
-                StreamPreambleEvent::Other => return Err(Reject::Upstream),
             }
         }
         if buffer.len().saturating_sub(scanned) > MAX_STREAM_PREAMBLE {
             return Err(Reject::Upstream);
-        }
-        if scanned > 0 && scanned >= buffer.len() / 2 {
-            buffer.drain(..scanned);
-            scanned = 0;
         }
     }
 }
@@ -1478,8 +1136,9 @@ fn guard_stream(source: BoxBodyStream) -> BoxBodyStream {
                             ));
                         }
                         match parse_stream_event(&pending[start..frame_end]) {
-                            Ok(StreamEvent::Empty | StreamEvent::Ping) if !terminal => {}
-                            Ok(StreamEvent::MessageStart) if !started && !terminal => {
+                            Ok(StreamEvent::Empty | StreamEvent::Ping | StreamEvent::Unknown)
+                                if !terminal => {}
+                            Ok(StreamEvent::MessageStart(_)) if !started && !terminal => {
                                 started = true;
                             }
                             Ok(StreamEvent::MessageStop | StreamEvent::Error)
@@ -1587,10 +1246,11 @@ impl StreamEnd {
 enum StreamEvent {
     Empty,
     Ping,
-    MessageStart,
+    MessageStart(Value),
     MessageStop,
     Error,
     Other,
+    Unknown,
 }
 
 fn parse_stream_event(frame: &[u8]) -> Result<StreamEvent, Reject> {
@@ -1640,23 +1300,21 @@ fn parse_stream_event(frame: &[u8]) -> Result<StreamEvent, Reject> {
         .filter(|data| !data.is_empty())
         .ok_or(Reject::Upstream)?;
     let value = parse_unique_json(&data).map_err(|_| Reject::Upstream)?;
-    if value.get("type").and_then(Value::as_str) != Some(event) {
+    if event.is_empty() || value.get("type").and_then(Value::as_str) != Some(event) {
         return Err(Reject::Upstream);
     }
     match event {
-        "message_start" => Ok(StreamEvent::MessageStart),
+        "message_start" => Ok(StreamEvent::MessageStart(value)),
         "message_stop" => Ok(StreamEvent::MessageStop),
         "error" => Ok(StreamEvent::Error),
         "content_block_start" | "content_block_delta" | "content_block_stop" | "message_delta" => {
             Ok(StreamEvent::Other)
         }
-        _ => Err(Reject::Upstream),
+        _ => Ok(StreamEvent::Unknown),
     }
 }
 
 enum StreamPreambleEvent {
-    Empty,
-    Ping,
     MessageStart(Vec<u8>),
     Other,
 }
@@ -1666,51 +1324,13 @@ fn parse_sse_preamble_frame(
     expected_raw_model: &str,
     canonical_model: &str,
 ) -> Result<StreamPreambleEvent, Reject> {
-    let text = std::str::from_utf8(frame).map_err(|_| Reject::Upstream)?;
-    let mut event = None;
-    let mut data = Vec::new();
-    for line in text.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.is_empty() || line.starts_with(':') {
-            continue;
+    let mut value = match parse_stream_event(frame)? {
+        StreamEvent::MessageStart(value) => value,
+        StreamEvent::Empty | StreamEvent::Ping | StreamEvent::Unknown => {
+            return Ok(StreamPreambleEvent::Other);
         }
-        if let Some(value) = line.strip_prefix("event:") {
-            if event.is_some() {
-                return Err(Reject::Upstream);
-            }
-            event = Some(value.trim_start());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                return Err(Reject::Upstream);
-            }
-            data.extend_from_slice(value.trim_start().as_bytes());
-        } else {
-            return Err(Reject::Upstream);
-        }
-    }
-    let Some(event) = event else {
-        return if data.is_empty() {
-            Ok(StreamPreambleEvent::Empty)
-        } else {
-            Err(Reject::Upstream)
-        };
+        _ => return Err(Reject::Upstream),
     };
-    if event == "ping" {
-        if !data.is_empty() {
-            let ping = parse_unique_json(&data).map_err(|_| Reject::Upstream)?;
-            if ping.get("type").and_then(Value::as_str) != Some("ping") {
-                return Err(Reject::Upstream);
-            }
-        }
-        return Ok(StreamPreambleEvent::Ping);
-    }
-    if event != "message_start" || data.is_empty() {
-        return Ok(StreamPreambleEvent::Other);
-    }
-    let mut value = parse_unique_json(&data).map_err(|_| Reject::Upstream)?;
-    if value.get("type").and_then(Value::as_str) != Some("message_start") {
-        return Err(Reject::Upstream);
-    }
     let message = value
         .get_mut("message")
         .and_then(Value::as_object_mut)
@@ -1794,10 +1414,10 @@ mod tests {
 
     #[test]
     fn request_model_is_validated_and_left_for_registry_binding_rewrite() {
-        let (value, streaming) = prepare_request_body(VALID_BODY.as_bytes()).expect("body");
-        assert_eq!(value["model"], TEST_MODEL_A);
-        assert_eq!(value["messages"][0]["content"], "hello");
-        assert!(!streaming);
+        let prepared = prepare_request_body(VALID_BODY.as_bytes()).expect("body");
+        assert_eq!(prepared.model, TEST_MODEL_A);
+        assert_eq!(prepared.fields["messages"][0]["content"], "hello");
+        assert!(!prepared.stream_response);
         for model in ["anthropic/test-model-a", "bad model"] {
             let body = VALID_BODY.replace(TEST_MODEL_A, model);
             assert_eq!(
@@ -1810,19 +1430,20 @@ mod tests {
     }
 
     #[test]
-    fn token_fields_use_protocol_integer_bounds_not_current_model_limits() {
-        let body = VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":128001");
-        assert!(prepare_request_body(body.as_bytes()).is_ok());
-        let largest = VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":4294967295");
-        assert!(prepare_request_body(largest.as_bytes()).is_ok());
+    fn request_parser_rejects_invalid_json_and_ambiguous_route_controls() {
         for invalid in [
-            VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":4294967296"),
-            VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":32.5"),
-            VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":-1"),
+            "not json",
+            "[]",
+            "{}",
+            r#"{"max_tokens":32}"#,
+            r#"{"model":"bad/model"}"#,
+            r#"{"model":"test-model-a","stream":"true"}"#,
+            r#"{"model":"test-model-a","model":"test-model-b"}"#,
         ] {
             assert_eq!(
                 prepare_request_body(invalid.as_bytes()),
-                Err(Reject::InvalidBody)
+                Err(Reject::InvalidBody),
+                "{invalid}"
             );
         }
     }
@@ -2035,28 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cloudtrail_selector_type_confusion_and_unknown_capture_fields() {
-        for field in [
-            r#""stream":"false""#,
-            r#""max_tokens":"32""#,
-            r#""metadata":{"user_id":"buyer"}"#,
-            r#""mcp_servers":[]"#,
-            r#""container":{"id":"remote"}"#,
-            r#""unknown_feature":true"#,
-        ] {
-            let body = format!(
-                r#"{{"model":"{TEST_MODEL_A}","max_tokens":32,"messages":[{{"role":"user","content":"hello"}}],{field}}}"#
-            );
-            assert_eq!(
-                prepare_request_body(body.as_bytes()),
-                Err(Reject::InvalidBody),
-                "{field}"
-            );
-        }
-    }
-
-    #[test]
-    fn preserves_client_side_tool_workflows_and_inline_media_semantically() {
+    fn prepares_client_side_tool_workflows_and_inline_media_unchanged() {
         let value = json!({
             "model": TEST_MODEL_A,
             "max_tokens": 1024,
@@ -2076,37 +1676,9 @@ mod tests {
             ]
         });
         let bytes = serde_json::to_vec(&value).expect("json");
-        let (rewritten, stream) = prepare_request_body(&bytes).expect("tool workflow");
-        assert_eq!(rewritten["model"], TEST_MODEL_A);
-        assert_eq!(rewritten["messages"], value["messages"]);
-        assert_eq!(rewritten["tools"], value["tools"]);
-        assert_eq!(rewritten["system"], value["system"]);
-        assert!(stream);
-    }
-
-    #[test]
-    fn rejects_server_side_tools_and_external_or_file_media() {
-        let bodies = [
-            r#"{"type":"web_search_20250305","name":"search","input_schema":{"type":"object"}}"#,
-            r#"{"type":"mcp_toolset","mcp_servers":[]}"#,
-        ];
-        for tool in bodies {
-            let body = format!("{{\"model\":\"{TEST_MODEL_A}\",\"max_tokens\":32,\"tools\":[{tool}],\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}]}}" );
-            assert_eq!(
-                prepare_request_body(body.as_bytes()),
-                Err(Reject::InvalidBody)
-            );
-        }
-        for source in [
-            r#"{"type":"url","url":"https://example.invalid/prompt.pdf"}"#,
-            r#"{"type":"file_id","file_id":"file_123"}"#,
-        ] {
-            let body = format!("{{\"model\":\"{TEST_MODEL_A}\",\"max_tokens\":32,\"messages\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"image\",\"source\":{source}}}]}}]}}" );
-            assert_eq!(
-                prepare_request_body(body.as_bytes()),
-                Err(Reject::InvalidBody)
-            );
-        }
+        let prepared = prepare_request_body(&bytes).expect("tool workflow");
+        assert_eq!(Value::Object(prepared.fields), value);
+        assert!(prepared.stream_response);
     }
 
     #[test]
@@ -2154,6 +1726,15 @@ mod tests {
             );
         }
         assert_eq!(Reject::InvalidBody.upstream_diagnostic(), None);
+        let invalid_body = Reject::InvalidBody.into_response();
+        assert_eq!(invalid_body.status(), StatusCode::BAD_REQUEST);
+        let invalid_body = to_bytes(invalid_body.into_body(), 4096)
+            .await
+            .expect("invalid-body response");
+        assert_eq!(
+            invalid_body.as_ref(),
+            br#"{"error":{"type":"invalid_request_error","message":"Bedrock Messages body is invalid"}}"#
+        );
         assert_eq!(
             canonicalize_response_identity(
                 br#"{"content":[]}"#,
@@ -2442,6 +2023,85 @@ mod tests {
         assert!(canonical.contains(TEST_MODEL_A));
         assert!(!canonical.contains(TEST_RESPONSE_MODEL_A));
         assert!(rest.next().await.is_none());
+
+        let future_events = concat!(
+            "event: future_event\ndata: {\"type\":\"future_event\",\"extra\":true}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a-provider-echo\",\"future_field\":true}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"future_content_block\",\"future_field\":true}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"future_delta\",\"future_field\":true}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (preamble, rest) = validate_stream_identity(
+            in_chunks(future_events.as_bytes(), 9),
+            TEST_RESPONSE_MODEL_A,
+            TEST_MODEL_A,
+        )
+        .await
+        .expect("unknown events pass after the raw model identity is verified");
+        let chunks = stream::once(async move { Ok::<Bytes, io::Error>(preamble) })
+            .chain(rest)
+            .boxed();
+        let collected = guard_stream(chunks).collect::<Vec<_>>().await;
+        let mut forwarded = Vec::new();
+        for chunk in collected {
+            forwarded.extend_from_slice(chunk.expect("valid future event stream").as_ref());
+        }
+        let forwarded = String::from_utf8(forwarded).expect("UTF-8 stream");
+        assert!(forwarded.contains("event: future_event\n"));
+        assert!(forwarded.contains("\"future_field\":true"));
+        assert!(forwarded.contains("future_content_block"));
+        assert!(forwarded.contains("future_delta"));
+        assert!(forwarded.contains(TEST_MODEL_A));
+        assert!(!forwarded.contains(TEST_RESPONSE_MODEL_A));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_identity_rejects_known_events_before_start_without_waiting() {
+        for event in [
+            "error",
+            "message_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+        ] {
+            let frame = format!("event: {event}\ndata: {{\"type\":\"{event}\"}}\n\n");
+            let source = stream::iter([Ok(Bytes::from(frame))])
+                .chain(stream::pending())
+                .boxed();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                validate_stream_identity(source, TEST_RESPONSE_MODEL_A, TEST_MODEL_A),
+            )
+            .await;
+            assert!(matches!(result, Ok(Err(Reject::Upstream))), "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_identity_rejects_malformed_preamble_before_valid_start() {
+        let start = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a-provider-echo\"}}\n\n";
+        for frame in [
+            "event: future_event\ndata: not-json\n\n",
+            "event: future_event\ndata: {\"type\":\"other_event\"}\n\n",
+            "event: future_event\ndata: {\"type\":\"future_event\",\"type\":\"future_event\"}\n\n",
+            "event: future_event\n\n",
+            "event: message_start\ndata:\n\n",
+            "data:\n\n",
+        ] {
+            let source = stream::iter([
+                Ok(Bytes::copy_from_slice(frame.as_bytes())),
+                Ok(Bytes::from_static(start)),
+            ])
+            .boxed();
+            assert!(
+                matches!(
+                    validate_stream_identity(source, TEST_RESPONSE_MODEL_A, TEST_MODEL_A).await,
+                    Err(Reject::Upstream)
+                ),
+                "{frame}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2732,9 +2392,7 @@ mod tests {
         assert!(!log.contains("AAAA"), "log carries stream bytes: {log}");
 
         let unknown = stream_with_frame(b"event: unknown\ndata: {\"type\":\"unknown\"}\n\n");
-        let log = guard_log(&unknown).await;
-        assert!(log.contains("reason=\"invalid_event\""), "log: {log}");
-        assert!(!log.contains("unknown"), "log carries stream bytes: {log}");
+        assert_eq!(guard_log(&unknown).await, "");
 
         let mut after_terminal = stream_with_frame(&[]);
         after_terminal.extend_from_slice(b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
@@ -2798,7 +2456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_proxy_rejects_query_path_and_workspace_before_upstream() {
+    async fn local_proxy_rejects_query_path_and_ignores_unforwarded_workspace_header() {
         let (state, calls) = test_state().await;
         let response = handle_request(
             State(AppState(state.clone())),
@@ -2811,7 +2469,25 @@ mod tests {
             .headers_mut()
             .insert("anthropic-workspace-id", HeaderValue::from_static("other"));
         let response = handle_request(State(AppState(state)), workspace).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unbound_models_and_oversized_requests_are_rejected_before_dispatch() {
+        let (state, calls) = test_state().await;
+        let unbound = VALID_BODY.replace(TEST_MODEL_A, "unbound-model");
+        let response = handle_request(
+            State(AppState(state.clone())),
+            request("/v1/messages", &unbound),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let oversized = request("/v1/messages", VALID_BODY)
+            .map(|_| Body::from(vec![b' '; MAX_REQUEST_BODY + 1]));
+        let response = handle_request(State(AppState(state)), oversized).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
@@ -2856,6 +2532,49 @@ mod tests {
                 request.headers_mut().insert(
                     MODEL_BINDING_REVISION_HEADER,
                     HeaderValue::from_static("07"),
+                );
+                request
+            }),
+            ("empty beta token", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request.headers_mut().insert(
+                    "anthropic-beta",
+                    HeaderValue::from_static("future-feature,,interleaved-thinking-2025-05-14"),
+                );
+                request
+            }),
+            ("invalid beta token", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request
+                    .headers_mut()
+                    .insert("anthropic-beta", HeaderValue::from_static("future feature"));
+                request
+            }),
+            ("duplicate beta header", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request
+                    .headers_mut()
+                    .insert("anthropic-beta", HeaderValue::from_static("future-feature"));
+                request.headers_mut().append(
+                    "anthropic-beta",
+                    HeaderValue::from_static("another-feature"),
+                );
+                request
+            }),
+            ("non-visible beta byte", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request.headers_mut().insert(
+                    "anthropic-beta",
+                    HeaderValue::from_bytes(b"future-\xff").expect("opaque header byte"),
+                );
+                request
+            }),
+            ("overlong beta header", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                let value = format!("future-{}", "x".repeat(MAX_ANTHROPIC_BETA_HEADER_BYTES));
+                request.headers_mut().insert(
+                    "anthropic-beta",
+                    HeaderValue::from_str(&value).expect("long ASCII header"),
                 );
                 request
             }),
@@ -3249,7 +2968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_sends_only_fixed_headers_and_rewrites_only_model() {
+    async fn proxy_forwards_anthropic_beta_and_rewrites_only_model() {
         let received = std::sync::Arc::new(std::sync::Mutex::new(None));
         let capture = received.clone();
         let upstream_app = Router::new().route(
@@ -3286,6 +3005,21 @@ mod tests {
         request
             .headers_mut()
             .insert("x-private", HeaderValue::from_static("must-not-forward"));
+        request
+            .headers_mut()
+            .insert("x-api-key", HeaderValue::from_static("buyer-api-key"));
+        request.headers_mut().insert(
+            "anthropic-beta",
+            HeaderValue::from_static("future-feature, interleaved-thinking-2025-05-14"),
+        );
+        request.headers_mut().insert(
+            "anthropic-workspace-id",
+            HeaderValue::from_static("buyer-workspace"),
+        );
+        request.headers_mut().insert(
+            "x-amzn-bedrock-session-token",
+            HeaderValue::from_static("buyer-session-token"),
+        );
         let response = handle_request(State(AppState(state)), request).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -3320,8 +3054,191 @@ mod tests {
             Some(ANTHROPIC_VERSION)
         );
         assert!(headers.get("x-private").is_none());
+        assert!(headers.get("x-api-key").is_none());
+        assert_eq!(
+            headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("future-feature, interleaved-thinking-2025-05-14")
+        );
+        assert!(headers.get("anthropic-workspace-id").is_none());
+        assert!(headers.get("x-amzn-bedrock-session-token").is_none());
         assert!(headers.get(EXECUTION_POLICY_HEADER).is_none());
         upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn opus_55_adaptive_summarized_body_and_effort_are_forwarded_with_bound_model() {
+        const MODEL: &str = "claude-opus-5-5";
+        const SELECTOR: &str = "anthropic.claude-opus-5-5-v1";
+        const RESPONSE_MODEL: &str = "claude-opus-5-5-bedrock-echo";
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = received.clone();
+        let upstream_app = Router::new().route(
+            "/anthropic/v1/messages",
+            post(move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    let headers = request.headers().clone();
+                    let body = to_bytes(request.into_body(), MAX_REQUEST_BODY)
+                        .await
+                        .expect("body");
+                    *capture.lock().expect("capture") = Some((headers, body.to_vec()));
+                    let message_start = json!({
+                        "type": "message_start",
+                        "message": { "model": RESPONSE_MODEL },
+                    });
+                    let message_stop = json!({ "type": "message_stop" });
+                    let body = format!(
+                        "event: message_start\ndata: {message_start}\n\nevent: message_stop\ndata: {message_stop}\n\n"
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .expect("stream response")
+                }
+            }),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let upstream_addr = upstream_listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app)
+                .await
+                .expect("upstream");
+        });
+        let state = BedrockMantleState::for_test(
+            &format!("http://{upstream_addr}/anthropic/v1/messages"),
+            "Bearer configured-only",
+        );
+        install_test_binding(&state, MODEL, SELECTOR, RESPONSE_MODEL, 11).await;
+
+        let mut body = json!({
+            "model": MODEL,
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": { "type": "adaptive", "display": "summarized" },
+            "output_config": { "effort": "medium" },
+            "messages": [{ "role": "user", "content": "Reason about this." }]
+        });
+        let mut request = request("/v1/messages", &body.to_string());
+        request.headers_mut().insert(
+            MODEL_BINDING_REVISION_HEADER,
+            HeaderValue::from_static("11"),
+        );
+        let response = handle_request(State(AppState(state)), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), MAX_RESPONSE_BODY)
+            .await
+            .expect("stream body");
+        assert!(String::from_utf8_lossy(&response_body).contains(MODEL));
+
+        body["model"] = json!(SELECTOR);
+        let (headers, sent) = received
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("upstream request");
+        let sent: Value = serde_json::from_slice(&sent).expect("sent JSON");
+        assert_eq!(sent, body);
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer configured-only")
+        );
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_request_fields_and_content_blocks_are_forwarded_unchanged() {
+        const SELECTOR: &str = "anthropic.test-model-a-v1";
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = received.clone();
+        let upstream_app = Router::new().route(
+            "/anthropic/v1/messages",
+            post(move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    let headers = request.headers().clone();
+                    let body = to_bytes(request.into_body(), MAX_REQUEST_BODY)
+                        .await
+                        .expect("body");
+                    *capture.lock().expect("capture") = Some((headers, body.to_vec()));
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        json!({ "model": TEST_RESPONSE_MODEL_A }).to_string(),
+                    )
+                }
+            }),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let upstream_addr = upstream_listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app)
+                .await
+                .expect("upstream");
+        });
+        let state = BedrockMantleState::for_test(
+            &format!("http://{upstream_addr}/anthropic/v1/messages"),
+            "Bearer configured-only",
+        );
+        let mut body = json!({
+            "model": TEST_MODEL_A,
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "future_content_block",
+                    "payload": { "preserve": [1, 2, 3] }
+                }]
+            }],
+            "future_top_level_field": { "preserve": true }
+        });
+        let request = request("/v1/messages", &body.to_string());
+        let response = handle_request(State(AppState(state)), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, sent) = received
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("upstream request");
+        body["model"] = json!(SELECTOR);
+        assert!(headers.get("anthropic-beta").is_none());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&sent).expect("sent JSON"),
+            body
+        );
+        upstream_task.abort();
+    }
+
+    async fn install_test_binding(
+        state: &BedrockMantleState,
+        model: &str,
+        selector: &str,
+        response_model: &str,
+        revision: u64,
+    ) {
+        let mut cache = state.bindings.write().await;
+        let mut snapshot = cache
+            .current
+            .as_ref()
+            .expect("test binding snapshot")
+            .snapshot
+            .clone();
+        snapshot.revision = revision;
+        snapshot.bindings.insert(
+            model.to_owned(),
+            ModelBinding {
+                provider: "anthropic".to_owned(),
+                model: model.to_owned(),
+                upstream_model: selector.to_owned(),
+                response_model: response_model.to_owned(),
+                revision,
+            },
+        );
+        cache.apply(snapshot, Instant::now()).expect("test binding");
     }
 
     fn request(uri: &str, body: &str) -> Request<Body> {
