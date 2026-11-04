@@ -70,6 +70,7 @@ explains the table and how to set each upstream up.
 | `xiaomi/mimo-v2.6-pro-ultraspeed-tee` | `kubetee/xiaomi/mimo-v2.6-pro` | `llm.kubetee.ai` | `--kubetee` |
 | `bfl/flux.2-klein-4b` | `kubetee/black-forest-labs/flux.2-klein-4b` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
+| `moonshot/kimi-k3.1-pro` | `engy/kimi-k3.1-pro` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
 | `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
 | `zai/glm-5.1-tee` | `near/zai-org/GLM-5.1-FP8` | retired by NEAR (2026-09-24) | `--near` |
@@ -81,9 +82,6 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.3-flash-tee` | `near/z-ai/glm-5.3-flash` | `glm-5-3-flash.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `near/black-forest-labs/FLUX.2-klein-4B` | `flux2-klein.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `deepinfra/black-forest-labs/FLUX-2-klein-4b` | `api.deepinfra.com` | `--deepinfra` |
-
-`kubetee/moonshotai/kimi-k3.1-pro` is declared ahead of KubeTEE listing
-Kimi K3.1 Pro; declare it once the model appears in KubeTEE's catalog.
 
 Source pairs that differ from their buyer are absent from the public catalog:
 they are dispatch targets, not products a buyer can request by name. The
@@ -256,6 +254,7 @@ source pair happens to equal the buyer pair:
 ```sh
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider engy --model kimi-k3 --discount-pct 5
+gmcli declare-product --provider engy --model kimi-k3.1-pro --discount-pct 5
 gmcli declare-product --provider engy --model deepseek-v4-flash-0731 --discount-pct 5
 gmcli declare-product --provider engy --model deepseek-v4.1-flash --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.6-35b-a3b --discount-pct 5
