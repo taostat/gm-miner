@@ -1,6 +1,6 @@
 //! The checks on a `KubeTEE` `/v1/attestation` payload, apart from fetching
-//! it: the DCAP appraisal, the nonce binding, the event log replay and the
-//! TLS-possession proof.
+//! it: the `kubetee.attestation.v1` binding, the DCAP appraisal, the event
+//! log replay and the TLS-possession proof.
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -13,7 +13,7 @@ use ring::signature::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256, Sha512};
+use sha2::{Digest as _, Sha256};
 use tracing::info;
 use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_PKCS1_RSAENCRYPTION};
 use x509_parser::parse_x509_certificate;
@@ -24,7 +24,7 @@ use crate::tee_evidence;
 
 /// The signature algorithms a TLS-possession proof may name: `ES256` (ECDSA
 /// over SHA-256 on P-256 — the per-boot serving key) and `RS256` (RSASSA-
-/// PKCS1-v1_5 over SHA-256 — a legacy RSA key). The proof is accepted in
+/// PKCS1-v1_5 over SHA-256 — an RSA serving key). The proof is accepted in
 /// the encoding the named algorithm implies and fails closed on any other
 /// spelling or on a key-type mismatch.
 const ES256: &str = "ES256";
@@ -49,9 +49,8 @@ pub struct TlsPossession {
     pub tls_cert_sha256: String,
 }
 
-/// The `kubetee.attestation.v1` fields of a v1 response: the served keyset
-/// and its binding statement (spec sections 4-5). Optional: a response
-/// without them is the legacy `SHA-512(nonce)` construction.
+/// The `kubetee.attestation.v1` fields of a response: the served keyset
+/// and its binding statement (spec sections 4-5).
 #[derive(Debug, Deserialize)]
 pub struct BindingFields {
     pub keyset: Value,
@@ -66,11 +65,9 @@ pub struct BindingStatement {
 }
 
 /// The pre-quote v1 binding gate: hash the exact statement bytes into the
-/// shape a v1 quote must carry, so `verify_report_data` checks one
-/// construction. v2-only responses (both `keyset` and `bindings`) are also
-/// checked here against this connection's leaf certificate: the served
-/// keyset must name the same serving key, be unexpired, and carry the v1
-/// version tag.
+/// `report_data` the quote must carry. The served keyset is checked against
+/// this connection's leaf certificate: it must name the same serving key,
+/// be unexpired, and carry the v1 version tag.
 pub(crate) struct BindingGuard;
 
 /// Binding fields checked against the serving key and statement. The
@@ -95,18 +92,19 @@ impl Binding {
 
 impl BindingGuard {
     /// Derive the binding to verify from `body`, or fail closed on any
-    /// malformed, mixed, or v1-shape response that does not verify.
+    /// malformed response, one without both v1 fields, or one that does not
+    /// verify.
     ///
     /// # Errors
     ///
-    /// Returns an error when the response is v1-shaped and the statement,
-    /// keyset, or version check fails.
+    /// Returns an error when the response lacks `keyset` or `bindings`, or
+    /// when the statement, keyset, or version check fails.
     pub(crate) fn run(
         body: &[u8],
         nonce: &str,
         leaf: &[u8],
         now: DateTime<Utc>,
-    ) -> Result<Option<Binding>> {
+    ) -> Result<Binding> {
         let payload = crate::strict_json::parse_unique_json(body)
             .context("decode KubeTEE attestation response")?;
         let keyset_present = payload.get("keyset").is_some();
@@ -136,9 +134,11 @@ impl BindingGuard {
                     not_after,
                 };
                 binding.ensure_current(now)?;
-                Ok(Some(binding))
+                Ok(binding)
             }
-            (false, false) => Ok(None),
+            (false, false) => {
+                bail!("KubeTEE attestation response has no kubetee.attestation.v1 binding")
+            }
             _ => bail!("KubeTEE attestation response has half a v1 binding"),
         }
     }
@@ -210,48 +210,35 @@ impl Measurements {
     }
 }
 
-/// Check a verified attestation against the nonce this proxy
-/// sent and the certificate of the connection it arrived on.
+/// Check a verified attestation against the nonce this proxy sent, the
+/// `report_data` its v1 binding statement requires, and the certificate of
+/// the connection it arrived on.
 ///
-/// `claims` must come from Intel's chain of trust for `payload.quote`.
+/// `claims` must come from Intel's chain of trust for `payload.quote`, and
+/// `report_data` from [`BindingGuard::run`] on the same response.
 ///
 /// # Errors
 ///
 /// Returns an error naming the first check that fails: the echoed nonce,
-/// the DCAP appraisal, the nonce binding in `report_data`, the event log
-/// replay, or the TLS-possession proof.
+/// the DCAP appraisal, the binding in `report_data`, the event log replay,
+/// or the TLS-possession proof.
 pub fn verify_attestation(
     payload: &AttestationPayload,
     nonce: &str,
     leaf: &[u8],
     claims: &QuoteClaims,
     now: u64,
-) -> Result<Measurements> {
-    verify_attestation_bound(payload, nonce, leaf, claims, now, None)
-}
-
-/// `verify_attestation` with the binding a v1 response already proved:
-/// `Some(report_data)` from the served statement, `None` for the legacy
-/// `SHA-512(nonce)` construction.
-///
-/// # Errors
-///
-/// Returns an error naming the first check that fails, as
-/// [`verify_attestation`] does.
-pub fn verify_attestation_bound(
-    payload: &AttestationPayload,
-    nonce: &str,
-    leaf: &[u8],
-    claims: &QuoteClaims,
-    now: u64,
-    binding: Option<[u8; 64]>,
+    report_data: &[u8; 64],
 ) -> Result<Measurements> {
     ensure!(
         payload.nonce.as_bytes() == nonce.as_bytes(),
         "KubeTEE echoed a different nonce"
     );
     let td = tee_evidence::appraise(claims, now)?;
-    verify_report_data_bound(td, nonce, binding)?;
+    ensure!(
+        td.report_data == *report_data,
+        "TDX report_data is not the kubetee.attestation.v1 binding for the nonce sent"
+    );
     let measurements = Measurements::of(td);
     let log = payload
         .cc_eventlog
@@ -264,15 +251,6 @@ pub fn verify_attestation_bound(
         .context("KubeTEE attestation has no tls_possession")?;
     verify_tls_possession(possession, nonce, leaf)?;
     Ok(measurements)
-}
-
-fn verify_report_data_bound(td: &TDReport10, nonce: &str, bound: Option<[u8; 64]>) -> Result<()> {
-    let expected = bound.unwrap_or_else(|| Sha512::digest(nonce.as_bytes()).into());
-    ensure!(
-        td.report_data == expected,
-        "TDX report_data is not the binding for the nonce sent"
-    );
-    Ok(())
 }
 
 fn verify_event_log(log: &str, quoted: &[Register; 4]) -> Result<()> {
@@ -426,9 +404,7 @@ mod tests {
         let digest = binding::recompute_keyset_digest(&keyset).unwrap();
         let stmt = statement(&digest, FIXTURE_NONCE);
         let body = fixture_body(&keyset, &stmt, &digest);
-        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now())
-            .unwrap()
-            .unwrap();
+        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap();
         assert_eq!(
             bound.report_data,
             binding::report_data_of_statement(&stmt, &digest, FIXTURE_NONCE).unwrap()
@@ -441,13 +417,11 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_response_binds_the_legacy_construction() {
+    fn a_response_without_the_v1_binding_fails_closed() {
         let body = br#"{"nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","quote":"","report_data_input":"sha512(nonce)"}"#;
-        assert!(
-            BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, fixture_now())
-                .unwrap()
-                .is_none()
-        );
+        let error =
+            BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap_err();
+        assert!(format!("{error:#}").contains("no kubetee.attestation.v1 binding"));
     }
 
     #[test]
@@ -473,9 +447,7 @@ mod tests {
             .unwrap();
         let body = self_consistent_body("2026-12-01T00:00:00.123456789Z", SPKI_SHA256);
         let before = deadline - chrono::Duration::nanoseconds(1);
-        let binding = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, before)
-            .unwrap()
-            .unwrap();
+        let binding = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, before).unwrap();
         assert_eq!(binding.not_after, deadline);
         binding.ensure_current(before).unwrap();
         for now in [deadline, deadline + chrono::Duration::nanoseconds(1)] {
@@ -548,9 +520,8 @@ mod tests {
         );
         for deadline in [cert_deadline - chrono::Duration::seconds(1), cert_deadline] {
             let body = self_consistent_body(&deadline.to_rfc3339(), SPKI_SHA256);
-            let binding = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now())
-                .unwrap()
-                .unwrap();
+            let binding =
+                BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap();
             assert_eq!(binding.not_after, deadline);
         }
         let later = cert_deadline + chrono::Duration::nanoseconds(1);
@@ -605,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_top_level_names_fail_closed_even_for_legacy_evidence() {
+    fn duplicate_top_level_names_fail_closed_before_the_binding_check() {
         let original = self_consistent_body("2026-12-01T00:00:00Z", SPKI_SHA256);
         let duplicated = format!(
             "{{\"keyset\":{{}},{}",
@@ -626,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_unordered_json_with_whitespace_and_legacy_numbers_still_passes() {
+    fn unique_unordered_json_with_whitespace_and_unknown_numbers_still_passes() {
         let keyset = format!(
             r#"{{
             "tls_public_keys": [{{"spki_sha256":"{SPKI_SHA256}", "domain":"llm.kubetee.ai"}}],
@@ -634,20 +605,17 @@ mod tests {
             "not_after":"2026-12-01T00:00:00Z", "e2ee_keys": []
         }}"#
         );
-        assert!(BindingGuard::run(
-            &body_with_raw_keyset(&keyset),
-            FIXTURE_NONCE,
-            SESSION_LEAF,
-            fixture_now()
-        )
-        .unwrap()
-        .is_some());
-        let legacy = br#"{"nonce":"value", "unknown":[-12,1.25,18446744073709551615,true,null,{"name":"value"}]}"#;
-        assert!(
-            BindingGuard::run(legacy, FIXTURE_NONCE, SESSION_LEAF, fixture_now())
+        let body = body_with_raw_keyset(&keyset);
+        BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap();
+        let unknown = r#"{"nonce":"value", "unknown":[-12,1.25,18446744073709551615,true,null,{"name":"value"}],"#;
+        let body = format!(
+            "{unknown}{}",
+            std::str::from_utf8(&body)
                 .unwrap()
-                .is_none()
+                .strip_prefix('{')
+                .unwrap()
         );
+        BindingGuard::run(body.as_bytes(), FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap();
     }
 
     /// An `ES256` possession proof over the per-boot P-256 key, as

@@ -1,10 +1,12 @@
 # KubeTEE attestation fixtures
 
 - `attestation.json`: one `GET https://llm.kubetee.ai/v1/attestation?nonce=<nonce>`
-  response, captured 2026-09-27 (pod `litellm-5959f596d-l4qkl`). It carries the
-  TDX quote, the CC event log, the echoed nonce and the TLS-possession proof.
-- `session_leaf.der`: the leaf certificate `llm.kubetee.ai` presented on the TLS
-  session that response arrived on.
+  response, captured verbatim 2026-11-04 (pod `litellm-5dcbc54579-7rm6g`). It
+  is `kubetee.attestation.v1` evidence: the TDX quote, the CC event log, the
+  echoed nonce, the TLS-possession proof, and the `keyset` and `bindings` whose
+  statement the quote's `report_data` binds.
+- `session_leaf.der`: the leaf certificate `llm.kubetee.ai` serves. The
+  response's `tls_cert_sha256` and its keyset's `spki_sha256` both name it.
 - `collateral.json`: the Intel `QuoteCollateralV3` for that quote, fetched the
   same day from Phala's PCCS. Tests verify the quote offline at a fixed time
   inside its validity window.
