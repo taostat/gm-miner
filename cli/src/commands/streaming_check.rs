@@ -2024,7 +2024,7 @@ mod tests {
             catalog_row("zai", "glm-5.3", Value::Null),
         ];
         let routes = [
-            route("kubetee", "minimax/h3", "minimax", "h3"),
+            route("engy", "MiniMax-H3", "minimax", "h3"),
             route("deepinfra", "google/veo-3.1-fast", "google", "veo-3.1-fast"),
             route("deepinfra", "Wan-AI/Wan2.6-T2V", "wan-ai", "wan-2.6-t2v"),
             route("kubetee", "z-ai/glm-5.3", "zai", "glm-5.3"),
@@ -2034,7 +2034,7 @@ mod tests {
             ("minimax", "h3"),
             ("google", "veo-3.1-fast"),
             ("wan-ai", "wan-2.6-t2v"),
-            ("kubetee", "minimax/h3"),
+            ("engy", "MiniMax-H3"),
             ("deepinfra", "google/veo-3.1-fast"),
             ("deepinfra", "Wan-AI/Wan2.6-T2V"),
         ]
@@ -2079,9 +2079,9 @@ mod tests {
             ..Default::default()
         };
         let catalog = fetch_catalog(&cfg).await;
-        let routes = [route("kubetee", "minimax/h3", "minimax", "h3")];
+        let routes = [route("engy", "MiniMax-H3", "minimax", "h3")];
         let excluded = non_chat_probe_exclusions(&catalog, &routes);
-        assert!(excluded.contains(&("kubetee".to_owned(), "minimax/h3".to_owned())));
+        assert!(excluded.contains(&("engy".to_owned(), "MiniMax-H3".to_owned())));
     }
 
     #[test]

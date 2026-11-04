@@ -559,8 +559,6 @@ clusters:
         assert!(!removes_session(route("kubetee", "/v1/chat/completions")));
         assert!(removes_session(route("kubetee", "/v1/models")));
         assert!(removes_session(route("kubetee", "/v1/images/generations")));
-        assert!(removes_session(route("kubetee", "/v1/videos")));
-        assert!(removes_session(route("kubetee", "/v1/videos/")));
         assert!(removes_session(route("openai", "/")));
     }
 

@@ -213,7 +213,7 @@ fn an_es256_proof_over_the_rsa_session_key_fails_closed() {
 }
 
 #[test]
-fn the_model_list_is_narrowed_to_the_chat_image_and_video_models() {
+fn the_model_list_is_narrowed_to_the_chat_and_image_models() {
     let list = serde_json::json!({"object": "list", "data": [
         {"id": "z-ai/glm-5.3", "object": "model"},
         {"id": "minimax/h3", "object": "model"},
@@ -227,7 +227,6 @@ fn the_model_list_is_narrowed_to_the_chat_image_and_video_models() {
         served["data"],
         serde_json::json!([
             {"id": "z-ai/glm-5.3", "object": "model"},
-            {"id": "minimax/h3", "object": "model"},
             {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
             {"id": "xiaomi/mimo-v2.6-pro", "object": "model"},
         ])
@@ -962,7 +961,6 @@ async fn the_model_list_is_fetched_on_an_attested_connection_and_narrowed() {
         list["data"],
         serde_json::json!([
             {"id": "z-ai/glm-5.3", "object": "model"},
-            {"id": "minimax/h3", "object": "model"},
             {"id": "black-forest-labs/flux.2-klein-4b", "object": "model"},
         ])
     );

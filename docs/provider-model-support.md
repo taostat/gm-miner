@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-10-30**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-11-04**. This is a miner setup matrix, not a buyer product
 catalog. It distinguishes transport capability from registry admission:
 
 * A direct/API-key source is declarable when the registry publishes the route
@@ -144,22 +144,19 @@ their presence here does not establish registry admission.
 | `GPT-6.1 Terra` | OpenAI API: `openai/gpt-6.1-terra` (`--openai`); Azure OpenAI: ARM-verified transport |
 | `gpt-oss-20b` | DeepInfra: `deepinfra/openai/gpt-oss-20b` (`--deepinfra`); chat completions only |
 | `Kimi K2.6 TEE` | Chutes: `chutes/moonshotai/Kimi-K2.6-TEE` (`--chutes`) |
-| `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`); Chutes (TEE sibling): `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
-| `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
-| `Kimi K3.1 Pro` | Moonshot API: `moonshot/kimi-k3.1-pro` (`--moonshot`) |
+| `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`); Chutes (TEE sibling): `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`); KubeTEE (TEE sibling): `kubetee/moonshotai/kimi-k3` (`--kubetee`) |
+| `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`); KubeTEE: `kubetee/moonshotai/kimi-k3` (`--kubetee`) |
+| `Kimi K3.1 Pro` | Moonshot API: `moonshot/kimi-k3.1-pro` (`--moonshot`); KubeTEE (TEE sibling, declared ahead of KubeTEE listing it): `kubetee/moonshotai/kimi-k3.1-pro` (`--kubetee`) |
+| `Kimi K3.1 Pro TEE` | KubeTEE (declared ahead of KubeTEE listing it): `kubetee/moonshotai/kimi-k3.1-pro` (`--kubetee`) |
 | `MiMo V2.6 Pro Ultraspeed` | KubeTEE (TEE sibling): `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
 | `MiMo V2.6 Pro Ultraspeed TEE` | KubeTEE: `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
-| `MiniMax H3` | Engy: `engy/MiniMax-H3` (`--engy`, native async video API); KubeTEE (**disabled in catalog**): `kubetee/minimax/h3` (`--kubetee`) |
-| `Mistral Large 4` | KubeTEE (TEE sibling): `kubetee/mistralai/mistral-large-4` (`--kubetee`) |
-| `Mistral Large 4 TEE` | KubeTEE: `kubetee/mistralai/mistral-large-4` (`--kubetee`) |
+| `MiniMax H3` | Engy: `engy/MiniMax-H3` (`--engy`, native async video API) |
 | `Mistral Nemo Instruct 2407 TEE` | Chutes: `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` (`--chutes`) |
 | `Nano Banana 2.1` | Google native `generateContent`: `gemini/gemini-nano-banana-2.1` (`--google`) |
 | `Nano Banana Pro` | Google native `generateContent`: `gemini/gemini-3-pro-image` (`--google`) |
 | `Nemotron 3 Nano Omni 30B TEE` | Chutes: `chutes/Nemotron-3-Nano-Omni-30B-TEE` (`--chutes`) |
 | `o3` | OpenAI API: `openai/o3` (`--openai`); Azure OpenAI: ARM-verified transport |
 | `o4-mini` | OpenAI API: `openai/o4-mini` (`--openai`); Azure OpenAI: ARM-verified transport |
-| `Ornith 1.5 397B` | KubeTEE (TEE sibling): `kubetee/ornith/ornith-1.5-397b` (`--kubetee`) |
-| `Ornith 1.5 397B TEE` | KubeTEE: `kubetee/ornith/ornith-1.5-397b` (`--kubetee`) |
 | `Qwen3 235B A22B Thinking 2507 TEE` | Chutes: `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` (`--chutes`) |
 | `Qwen3 32B TEE` | Chutes: `chutes/Qwen/Qwen3-32B-TEE` (`--chutes`) |
 | `Qwen3.5 397B A17B TEE` | Chutes: `chutes/Qwen/Qwen3.5-397B-A17B-TEE` (`--chutes`) |

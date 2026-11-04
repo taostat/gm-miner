@@ -243,7 +243,7 @@ kubetee_runtime() {
   port="$(docker port "${container}" 8080/tcp | head -n 1 | sed 's/.*://')"
   await_listener "${port}"
   expect "off-list selector" 400 "missing or unsupported KubeTEE source model" \
-    "$(request "${port}" POST /v1/chat/completions -H 'x-gm-upstream-model: minimax/h3')" || ok=1
+    "$(request "${port}" POST /v1/chat/completions -H 'x-gm-upstream-model: mistralai/mistral-large-4')" || ok=1
   expect "missing selector" 400 "missing or unsupported KubeTEE source model" \
     "$(request "${port}" POST /v1/chat/completions)" || ok=1
   expect "unreachable verifier" 502 "envoy_upstream_error" \

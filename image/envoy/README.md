@@ -97,7 +97,7 @@ These apply to every provider route unless its file says otherwise.
   also strips caller-supplied retry headers, and the adapter disables its HTTP
   transport retry policy.
 - **No retry** on non-idempotent paths (DeepInfra `/v1/inference/`, KubeTEE
-  image generation, Engy `/v2/video_generation`, and both suppliers' `/v1/videos`
+  image generation, Engy `/v2/video_generation`, and DeepInfra's `/v1/videos`
   and `/v1/videos/` routes),
   on the loopback NEAR, Chutes-verifier, KubeTEE-verifier
   and attestation routes (a retry would mask a local failure), or on
