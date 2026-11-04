@@ -146,8 +146,8 @@ their presence here does not establish registry admission.
 | `Kimi K2.6 TEE` | Chutes: `chutes/moonshotai/Kimi-K2.6-TEE` (`--chutes`) |
 | `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`); Chutes (TEE sibling): `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`); KubeTEE (TEE sibling): `kubetee/moonshotai/kimi-k3` (`--kubetee`) |
 | `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`); KubeTEE: `kubetee/moonshotai/kimi-k3` (`--kubetee`) |
-| `Kimi K3.1 Pro` | Moonshot API: `moonshot/kimi-k3.1-pro` (`--moonshot`); KubeTEE (TEE sibling, declared ahead of KubeTEE listing it): `kubetee/moonshotai/kimi-k3.1-pro` (`--kubetee`) |
-| `Kimi K3.1 Pro TEE` | KubeTEE (declared ahead of KubeTEE listing it): `kubetee/moonshotai/kimi-k3.1-pro` (`--kubetee`) |
+| `Kimi K3.1 Pro` | Moonshot API: `moonshot/kimi-k3.1-pro` (`--moonshot`); Engy: `engy/kimi-k3.1-pro` (`--engy`); KubeTEE (TEE sibling): `kubetee/moonshotai/kimi-k3.1-pro` (`--kubetee`) |
+| `Kimi K3.1 Pro TEE` | KubeTEE: `kubetee/moonshotai/kimi-k3.1-pro` (`--kubetee`) |
 | `MiMo V2.6 Pro Ultraspeed` | KubeTEE (TEE sibling): `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
 | `MiMo V2.6 Pro Ultraspeed TEE` | KubeTEE: `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
 | `MiniMax H3` | Engy: `engy/MiniMax-H3` (`--engy`, native async video API) |
