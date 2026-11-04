@@ -57,15 +57,16 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.2-tee` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-flash-tee` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-tee` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
-| `minimax/h3` | `kubetee/minimax/h3` | `llm.kubetee.ai` | `--kubetee` |
+| `minimax/h3` | `kubetee/minimax/h3` | retired by KubeTEE (2026-11-03) | `--kubetee` |
 | `minimax/h3` | `engy/MiniMax-H3` | `api.engy.ai` (`/v2/video_generation`) | `--engy` |
 | `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | retired by KubeTEE | `--kubetee` |
-| `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash-tee` | `kubetee/deepseek/deepseek-v4.1-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash-1017-tee` | `kubetee/deepseek/deepseek-v4.1-flash-1017` | `llm.kubetee.ai` | `--kubetee` |
-| `mistral/mistral-large-4-tee` | `kubetee/mistralai/mistral-large-4` | `llm.kubetee.ai` | `--kubetee` |
-| `ornith/ornith-1.5-397b-tee` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
+| `moonshot/kimi-k3-tee` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
+| `moonshot/kimi-k3.1-pro-tee` | `kubetee/moonshotai/kimi-k3.1-pro` | `llm.kubetee.ai` | `--kubetee` |
+| `mistral/mistral-large-4-tee` | `kubetee/mistralai/mistral-large-4` | retired by KubeTEE (2026-11-03) | `--kubetee` |
+| `ornith/ornith-1.5-397b-tee` | `kubetee/ornith/ornith-1.5-397b` | retired by KubeTEE (2026-11-03) | `--kubetee` |
 | `xiaomi/mimo-v2.6-pro-ultraspeed-tee` | `kubetee/xiaomi/mimo-v2.6-pro` | `llm.kubetee.ai` | `--kubetee` |
 | `bfl/flux.2-klein-4b` | `kubetee/black-forest-labs/flux.2-klein-4b` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
@@ -80,6 +81,9 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.3-flash-tee` | `near/z-ai/glm-5.3-flash` | `glm-5-3-flash.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `near/black-forest-labs/FLUX.2-klein-4B` | `flux2-klein.completions.near.ai` | `--near` |
 | `bfl/flux.2-klein-4b` | `deepinfra/black-forest-labs/FLUX-2-klein-4b` | `api.deepinfra.com` | `--deepinfra` |
+
+`kubetee/moonshotai/kimi-k3.1-pro` is declared ahead of KubeTEE listing
+Kimi K3.1 Pro; declare it once the model appears in KubeTEE's catalog.
 
 Source pairs that differ from their buyer are absent from the public catalog:
 they are dispatch targets, not products a buyer can request by name. The
@@ -377,13 +381,11 @@ connection.
 The verifier serves only the chat models compiled into the image:
 `z-ai/glm-5.2`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`,
 `deepseek/deepseek-v4.1-flash`, `deepseek/deepseek-v4.1-flash-1017`,
-`mistralai/mistral-large-4`, `ornith/ornith-1.5-397b` and
-`xiaomi/mimo-v2.6-pro`. Envoy answers a chat request for any other KubeTEE model
+`moonshotai/kimi-k3`, `moonshotai/kimi-k3.1-pro` and `xiaomi/mimo-v2.6-pro`. Envoy answers a chat request for any other KubeTEE model
 with 400, and the verifier refuses a request whose body names a model other than
 the one selected. Image generation keeps its direct route. Its `GET /v1/models`
-answer is KubeTEE's own list narrowed to those chat models, the image model
-`black-forest-labs/flux.2-klein-4b` and the video model `minimax/h3` served by
-the direct routes. Discovery does not establish registry admission. Each attestation
+answer is KubeTEE's own list narrowed to those chat models and the image model
+`black-forest-labs/flux.2-klein-4b` served by the direct route. Discovery does not establish registry admission. Each attestation
 and model-list response is read within 60 seconds, body included. Adding a
 KubeTEE chat model requires a new image build and the normal image-approval
 process.

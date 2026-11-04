@@ -162,7 +162,7 @@ instead buyer-visible products. Engy's `deepseek-v4.1-flash` is a source route f
 the canonical `deepseek-v4.1-flash` buyer product. KubeTEE's chat routes serve the
 `-tee` buyer products `zai/glm-5.2-tee`, `zai/glm-5.3-tee`, `zai/glm-5.3-flash-tee`,
 `deepseek/deepseek-v4.1-flash-tee`, `deepseek/deepseek-v4.1-flash-1017-tee`,
-`mistral/mistral-large-4-tee`, `ornith/ornith-1.5-397b-tee` and
+`moonshot/kimi-k3-tee`, `moonshot/kimi-k3.1-pro-tee` and
 `xiaomi/mimo-v2.6-pro-ultraspeed-tee`, and their ordinary siblings through the
 catalog's explicit links. The precise model ids are listed in the
 [miner model sourcing matrix](docs/provider-model-support.md). One model can have several such

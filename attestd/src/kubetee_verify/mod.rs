@@ -60,16 +60,14 @@ pub const TARGETS: [&str; 8] = [
     "z-ai/glm-5.3-flash",
     "deepseek/deepseek-v4.1-flash",
     "deepseek/deepseek-v4.1-flash-1017",
-    "mistralai/mistral-large-4",
-    "ornith/ornith-1.5-397b",
+    "moonshotai/kimi-k3",
+    "moonshotai/kimi-k3.1-pro",
     "xiaomi/mimo-v2.6-pro",
 ];
 
 /// Image models the direct `/v1/images/generations` route serves. They are
 /// listed in model discovery; chat for them is refused.
 pub const IMAGE_MODELS: [&str; 1] = ["black-forest-labs/flux.2-klein-4b"];
-/// Video models the direct `/v1/videos` route serves.
-pub const VIDEO_MODELS: [&str; 1] = ["minimax/h3"];
 
 /// Header families the supplier sets that are removed in both directions.
 const SUPPLIER_HEADER_PREFIXES: [&str; 2] = ["x-kubetee-", "x-litellm-"];
@@ -230,8 +228,8 @@ impl KubeteeVerifier {
         Ok(Response::from_parts(parts, Body::new(body)))
     }
 
-    /// The upstream model list, narrowed to [`TARGETS`], [`IMAGE_MODELS`] and
-    /// [`VIDEO_MODELS`], fetched on an attested connection.
+    /// The upstream model list, narrowed to [`TARGETS`] and [`IMAGE_MODELS`],
+    /// fetched on an attested connection.
     ///
     /// # Errors
     ///
@@ -418,8 +416,8 @@ async fn read_models(
     Ok(Response::from_parts(parts, Body::from(served)))
 }
 
-/// The upstream model list with every entry outside [`TARGETS`],
-/// [`IMAGE_MODELS`] and [`VIDEO_MODELS`] removed.
+/// The upstream model list with every entry outside [`TARGETS`] and
+/// [`IMAGE_MODELS`] removed.
 #[must_use]
 pub fn served_targets(list: &Value) -> Value {
     let data = list
@@ -429,11 +427,10 @@ pub fn served_targets(list: &Value) -> Value {
             models
                 .iter()
                 .filter(|model| {
-                    model.get("id").and_then(Value::as_str).is_some_and(|id| {
-                        TARGETS.contains(&id)
-                            || IMAGE_MODELS.contains(&id)
-                            || VIDEO_MODELS.contains(&id)
-                    })
+                    model
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| TARGETS.contains(&id) || IMAGE_MODELS.contains(&id))
                 })
                 .cloned()
                 .collect::<Vec<_>>()

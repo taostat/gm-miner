@@ -32,8 +32,8 @@ declaration, and price management.
   On `POST /v1/chat/completions`, it maps exactly one `x-gm-session-id` to
   `x-litellm-session-id` when its value is exactly 64 lowercase hexadecimal
   characters (`[0-9a-f]{64}`). It strips the input header and caller-supplied
-  `x-litellm-*`; malformed or duplicate IDs are ignored. Models, image and
-  video requests do not receive the session header.
+  `x-litellm-*`; malformed or duplicate IDs are ignored. Models and image
+  requests do not receive the session header.
 - `image/` — the miner container image (Dockerfile, `start.sh`, and `envoy/`: `base.yaml` plus one `upstreams/<provider>[.<variant>].yaml` per upstream — see `image/envoy/README.md`)
 - `cli/src/envoy_render.rs` — hidden `gmcli render-envoy`: assembles the Envoy config inside the TEE at start (token fill, route/cluster splice, generated Lua `slot_config`); writes JSON so no scalar is retyped. `scripts/validate-envoy.sh` (CI job `envoy-validate`) loads every rendered variant into the pinned Envoy image with `--mode validate`
 - `dstack/` — the compose template `gmcli deploy` renders and submits to Phala Cloud
