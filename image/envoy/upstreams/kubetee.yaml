@@ -6,8 +6,8 @@ slots:
 routes:
   ##  llm.kubetee.ai serves the OpenAI-compatible surface
   ##  under /v1 itself, so no path rewrite is needed.
-  ##  Image generation is paid and non-idempotent; never
-  ##  retry it after an upstream reset or 5xx.
+  ##  Image generation is paid and non-idempotent; it passes through the
+  ##  verifier and is never retried after an upstream reset or 5xx.
   - match:
       path: "/v1/images/generations"
       headers:
@@ -15,14 +15,12 @@ routes:
           string_match:
             exact: "kubetee"
     route:
-      cluster: kubetee
-      host_rewrite_literal: llm.kubetee.ai
+      cluster: kubetee_verify_proxy
       timeout: 1800s
-  ##  Chat and the model list terminate only at the co-located
-  ##  measured kubetee-verify-proxy. It owns the closed selector
-  ##  allowlist and sends chat requests only on upstream TLS
-  ##  connections it has attested. No retry: a retry would mask a
-  ##  local failure. There is no direct KubeTEE chat route.
+  ##  Chat, image generation and the model list terminate at the co-located
+  ##  measured proxy. It owns the registry snapshot and sends inference only
+  ##  on upstream TLS connections it has attested. No retry: a retry would
+  ##  mask a local failure.
   - match:
       path: "/v1/models"
       headers:

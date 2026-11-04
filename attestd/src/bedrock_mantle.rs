@@ -10,7 +10,7 @@
 use std::{
     collections::BTreeMap,
     io,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -25,18 +25,23 @@ use axum::{
     Router,
 };
 use futures_util::{stream, StreamExt};
-use rand::RngExt as _;
 use reqwest::{redirect::Policy, Client};
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::{Map, Value};
 
-use tokio::{
-    net::TcpListener,
-    sync::{watch, RwLock},
-    time::Instant as TokioInstant,
-};
+use tokio::net::TcpListener;
+#[cfg(test)]
+use tokio::sync::{watch, RwLock};
 use tracing::info;
 
+#[cfg(test)]
+use crate::model_bindings::RefreshStatus as BindingRefreshStatus;
+use crate::model_bindings::{self, RegistryCache, RegistrySnapshot, SnapshotCache};
+#[cfg(test)]
+use crate::model_bindings::{
+    next_delay, FRESHNESS_TTL as BINDINGS_FRESHNESS_TTL,
+    ON_DEMAND_MIN_INTERVAL as BINDINGS_ON_DEMAND_MIN_INTERVAL,
+};
 use crate::strict_json::parse_unique_json;
 
 pub const BEDROCK_MANTLE_FEATURE: &str = "bedrock-mantle-model-bindings-v1";
@@ -57,40 +62,12 @@ const MAX_STREAM_PREAMBLE: usize = 64 * 1024;
 /// One in-body SSE frame. A thinking block's closing signature frame grows with
 /// the thinking (about 75 KB at 32k thinking tokens); 4 MiB leaves wide headroom.
 const MAX_STREAM_FRAME: usize = 4 * 1024 * 1024;
-const MAX_BINDINGS_BODY: usize = 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const ERROR_BODY_WAIT: Duration = Duration::from_secs(5);
 const PROMPT_TOO_LONG: &[u8] = b"prompt is too long";
 const MAX_MODEL_BINDINGS: usize = 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-const BINDINGS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const BINDINGS_ON_DEMAND_MIN_INTERVAL: Duration = Duration::from_secs(3);
-const BINDINGS_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
-const BINDINGS_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(3);
-const BINDINGS_RETRY_MAX_DELAY: Duration = Duration::from_secs(35);
-const BINDINGS_FRESHNESS_TTL: Duration = Duration::from_secs(15 * 60);
-
-const _: () = assert!(
-    BINDINGS_REFRESH_TIMEOUT.as_millis()
-        + BINDINGS_RETRY_MAX_DELAY.as_millis()
-        + BINDINGS_RETRY_MAX_DELAY.as_millis() / 4
-        < BINDINGS_REFRESH_INTERVAL.as_millis()
-);
-
-fn next_delay(failures: u32, jitter_fraction: f64) -> Duration {
-    debug_assert!((0.0..=1.0).contains(&jitter_fraction));
-
-    let shift = failures.saturating_sub(1);
-    let base_seconds = BINDINGS_RETRY_INITIAL_DELAY
-        .as_secs()
-        .checked_shl(shift)
-        .unwrap_or(u64::MAX)
-        .min(BINDINGS_RETRY_MAX_DELAY.as_secs());
-    let base = Duration::from_secs(base_seconds);
-    base.saturating_add(base.mul_f64(jitter_fraction / 4.0))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelBinding {
     provider: String,
@@ -107,15 +84,9 @@ struct BindingsSnapshot {
     bindings: BTreeMap<String, ModelBinding>,
 }
 
-#[derive(Debug, Clone)]
-struct CachedBindings {
-    snapshot: BindingsSnapshot,
-    fetched_at: Instant,
-}
-
 #[derive(Debug, Default)]
 struct BindingCache {
-    current: Option<CachedBindings>,
+    snapshots: SnapshotCache<BindingsSnapshot>,
     /// Retained across removals so a model cannot be re-added with an old or
     /// reused row revision during this runtime's lifetime.
     highest_binding: BTreeMap<String, ModelBinding>,
@@ -125,28 +96,24 @@ impl BindingCache {
     #[cfg(test)]
     fn with_snapshot(snapshot: BindingsSnapshot, fetched_at: Instant) -> Self {
         let highest_binding = snapshot.bindings.clone();
+        let mut snapshots = SnapshotCache::default();
+        snapshots.publish(snapshot, fetched_at);
         Self {
-            current: Some(CachedBindings {
-                snapshot,
-                fetched_at,
-            }),
+            snapshots,
             highest_binding,
         }
     }
 
     fn apply(&mut self, snapshot: BindingsSnapshot, now: Instant) -> Result<(), &'static str> {
-        if let Some(current) = &self.current {
-            if snapshot.revision < current.snapshot.revision {
+        if let Some(current) = self.snapshots.current() {
+            if snapshot.revision < current.revision {
                 return Err("registry binding snapshot revision moved backwards");
             }
-            if snapshot.revision == current.snapshot.revision {
-                if snapshot != current.snapshot {
+            if snapshot.revision == current.revision {
+                if snapshot != *current {
                     return Err("registry changed binding payload without advancing revision");
                 }
-                self.current = Some(CachedBindings {
-                    snapshot,
-                    fetched_at: now,
-                });
+                self.snapshots.publish(snapshot, now);
                 return Ok(());
             }
 
@@ -160,9 +127,7 @@ impl BindingCache {
                 if next.revision == previous.revision && next != previous {
                     return Err("model binding changed without advancing its revision");
                 }
-                if !current.snapshot.bindings.contains_key(model)
-                    && next.revision <= previous.revision
-                {
+                if !current.bindings.contains_key(model) && next.revision <= previous.revision {
                     return Err("removed model binding was re-added without a new revision");
                 }
             }
@@ -171,22 +136,19 @@ impl BindingCache {
         for (model, binding) in &snapshot.bindings {
             self.highest_binding.insert(model.clone(), binding.clone());
         }
-        self.current = Some(CachedBindings {
-            snapshot,
-            fetched_at: now,
-        });
+        self.snapshots.publish(snapshot, now);
         Ok(())
     }
 
     fn current_binding(&self, model: &str, expected_revision: u64, now: Instant) -> BindingLookup {
-        let Some(cached) = self.current.as_ref() else {
+        let Some(snapshot) = self.snapshots.current() else {
             return BindingLookup::Refresh(Reject::BindingsUnavailable);
         };
-        let binding = cached.snapshot.bindings.get(model);
+        let binding = snapshot.bindings.get(model);
         if binding.is_some_and(|binding| expected_revision < binding.revision) {
             return BindingLookup::Behind;
         }
-        if now.saturating_duration_since(cached.fetched_at) > BINDINGS_FRESHNESS_TTL {
+        if !self.snapshots.is_fresh(now) {
             return BindingLookup::Refresh(Reject::BindingsUnavailable);
         }
         let Some(binding) = binding else {
@@ -199,6 +161,20 @@ impl BindingCache {
     }
 }
 
+impl RegistryCache<BindingsSnapshot> for BindingCache {
+    fn publish(
+        &mut self,
+        snapshot: BindingsSnapshot,
+        fetched_at: Instant,
+    ) -> Result<(), &'static str> {
+        self.apply(snapshot, fetched_at)
+    }
+
+    fn current_cached(&self) -> Option<&model_bindings::CachedSnapshot<BindingsSnapshot>> {
+        self.snapshots.current_cached()
+    }
+}
+
 enum BindingLookup {
     Ready(ModelBinding),
     Behind,
@@ -206,10 +182,7 @@ enum BindingLookup {
 }
 
 impl BindingLookup {
-    fn needs_refresh(&self) -> bool {
-        matches!(self, Self::Refresh(_))
-    }
-
+    #[cfg(test)]
     fn into_result(self) -> Result<ModelBinding, Reject> {
         match self {
             Self::Ready(binding) => Ok(binding),
@@ -223,12 +196,7 @@ impl BindingLookup {
 pub struct BedrockMantleState {
     client: Client,
     authorization: HeaderValue,
-    registry_network: String,
-    registry_url: String,
-    bindings: Arc<RwLock<BindingCache>>,
-    refresh_task_started: Arc<OnceLock<()>>,
-    refresh_nudge: watch::Sender<u64>,
-    refresh_status: watch::Sender<BindingRefreshStatus>,
+    registry: RegistrySnapshot<BindingsSnapshot, BindingCache>,
     #[cfg(test)]
     test_upstream_url: Option<String>,
 }
@@ -244,7 +212,7 @@ impl BedrockMantleState {
     /// or when the fixed TLS client cannot be initialized.
     pub fn from_environment() -> Result<Self, &'static str> {
         let network = std::env::var("GM_NETWORK").map_err(|_| "missing measured GM_NETWORK")?;
-        let registry_url = registry_url_for_network(&network)
+        let registry_url = model_bindings::registry_url_for_network(&network)
             .ok_or("GM_NETWORK must be exactly mainnet or testnet")?;
         let region = std::env::var("BEDROCK_REGION").map_err(|_| "missing Bedrock region")?;
         if region != "us-east-1" {
@@ -258,21 +226,19 @@ impl BedrockMantleState {
             .map_err(|_| "Bedrock API key is not a valid HTTP credential")?;
 
         let client = production_http_client()?;
-        let (refresh_nudge, _) = watch::channel(0);
-        let (refresh_status, _) = watch::channel(BindingRefreshStatus::OnDemandGap {
-            generation: 0,
-            until: TokioInstant::now(),
-        });
+        let registry = RegistrySnapshot::new(
+            model_bindings::registry_http_client()?,
+            format!("{registry_url}{BEDROCK_BINDINGS_PATH}"),
+            network,
+            BindingCache::default(),
+            parse_bindings_payload,
+            "Bedrock",
+        );
 
         Ok(Self {
             client,
             authorization,
-            registry_network: network,
-            registry_url: format!("{registry_url}{BEDROCK_BINDINGS_PATH}"),
-            bindings: Arc::new(RwLock::new(BindingCache::default())),
-            refresh_task_started: Arc::new(OnceLock::new()),
-            refresh_nudge,
-            refresh_status,
+            registry,
             #[cfg(test)]
             test_upstream_url: None,
         })
@@ -293,273 +259,35 @@ impl BedrockMantleState {
             .timeout(Duration::from_secs(2))
             .build()
             .expect("test HTTP client");
-        let (refresh_nudge, _) = watch::channel(0);
-        let (refresh_status, _) = watch::channel(BindingRefreshStatus::OnDemandGap {
-            generation: 0,
-            until: TokioInstant::now(),
-        });
+        let registry = RegistrySnapshot::new(
+            client.clone(),
+            format!("https://registry.saygm.com{BEDROCK_BINDINGS_PATH}"),
+            "mainnet".to_owned(),
+            BindingCache::with_snapshot(test_bindings_payload(), Instant::now()),
+            parse_bindings_payload,
+            "Bedrock",
+        );
         Self {
             client,
             authorization: HeaderValue::from_str(authorization).expect("test credential"),
-            registry_network: "mainnet".to_owned(),
-            registry_url: format!("https://registry.saygm.com{BEDROCK_BINDINGS_PATH}"),
-            bindings: Arc::new(RwLock::new(BindingCache::with_snapshot(
-                test_bindings_payload(),
-                Instant::now(),
-            ))),
-            refresh_task_started: Arc::new(OnceLock::new()),
-            refresh_nudge,
-            refresh_status,
+            registry,
             test_upstream_url: Some(url.to_owned()),
         }
     }
 
     #[cfg(test)]
     fn with_test_registry_url(mut self, url: &str) -> Self {
-        self.registry_url = url.to_owned();
+        self.registry = self.registry.with_url(url);
         self
     }
 
     #[cfg(test)]
     async fn refresh_bindings(&self) -> Result<(), &'static str> {
-        self.binding_refresher().refresh_bindings().await
-    }
-
-    fn binding_refresher(&self) -> BindingRefresher {
-        BindingRefresher {
-            client: self.client.clone(),
-            registry_network: self.registry_network.clone(),
-            registry_url: self.registry_url.clone(),
-            bindings: self.bindings.clone(),
-        }
-    }
-
-    fn start_binding_refresher(&self) {
-        self.refresh_task_started.get_or_init(|| {
-            let refresher = self.binding_refresher();
-            let nudge = self.refresh_nudge.subscribe();
-            let status = self.refresh_status.clone();
-            tokio::spawn(run_binding_refresher(refresher, nudge, status));
-        });
+        self.registry.refresh().await
     }
 
     async fn wait_for_binding_refresh(&self) {
-        let mut status = self.refresh_status.subscribe();
-        self.start_binding_refresher();
-        let initial = *status.borrow_and_update();
-        let generation = initial.generation();
-        let now = TokioInstant::now();
-        let deadline = match initial {
-            BindingRefreshStatus::InFlight { deadline, .. } => deadline,
-            BindingRefreshStatus::FailureBackoff { until, .. } if now < until => {
-                return;
-            }
-            BindingRefreshStatus::OnDemandGap { until, .. } => {
-                until.max(now) + BINDINGS_REFRESH_TIMEOUT
-            }
-            BindingRefreshStatus::FailureBackoff { .. } => now + BINDINGS_REFRESH_TIMEOUT,
-        };
-        let _ = tokio::time::timeout_at(deadline, async {
-            loop {
-                let current = *status.borrow_and_update();
-                if current.generation() != generation {
-                    return;
-                }
-                let should_nudge = match current {
-                    BindingRefreshStatus::InFlight { .. } => false,
-                    BindingRefreshStatus::FailureBackoff { until, .. }
-                        if TokioInstant::now() < until =>
-                    {
-                        return;
-                    }
-                    BindingRefreshStatus::OnDemandGap { until, .. }
-                        if TokioInstant::now() < until =>
-                    {
-                        tokio::select! {
-                            () = tokio::time::sleep_until(until) => {}
-                            changed = status.changed() => {
-                                if changed.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    BindingRefreshStatus::FailureBackoff { .. }
-                    | BindingRefreshStatus::OnDemandGap { .. } => true,
-                };
-                if should_nudge {
-                    self.refresh_nudge
-                        .send_modify(|requested| *requested = (*requested).max(generation));
-                }
-                if status.changed().await.is_err() {
-                    return;
-                }
-            }
-        })
-        .await;
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum BindingRefreshStatus {
-    InFlight {
-        generation: u64,
-        deadline: TokioInstant,
-    },
-    FailureBackoff {
-        generation: u64,
-        until: TokioInstant,
-    },
-    OnDemandGap {
-        generation: u64,
-        until: TokioInstant,
-    },
-}
-
-impl BindingRefreshStatus {
-    fn generation(self) -> u64 {
-        match self {
-            Self::InFlight { generation, .. }
-            | Self::FailureBackoff { generation, .. }
-            | Self::OnDemandGap { generation, .. } => generation,
-        }
-    }
-}
-
-struct BindingRefresher {
-    client: Client,
-    registry_network: String,
-    registry_url: String,
-    bindings: Arc<RwLock<BindingCache>>,
-}
-
-impl BindingRefresher {
-    async fn refresh_bindings(&self) -> Result<(), &'static str> {
-        let response = self
-            .client
-            .get(&self.registry_url)
-            .timeout(BINDINGS_REFRESH_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| "fixed registry binding fetch failed")?;
-        if response.status() != StatusCode::OK {
-            return Err("fixed registry binding fetch returned a non-200 status");
-        }
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !content_type
-            .split(';')
-            .next()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-        {
-            return Err("fixed registry binding response is not JSON");
-        }
-        let body = read_bounded_registry_body(response).await?;
-        let snapshot = parse_bindings_payload(&body, &self.registry_network)?;
-        self.bindings.write().await.apply(snapshot, Instant::now())
-    }
-}
-
-async fn run_binding_refresher(
-    refresher: BindingRefresher,
-    mut nudge: watch::Receiver<u64>,
-    status: watch::Sender<BindingRefreshStatus>,
-) {
-    let mut consecutive_failures = 0_u32;
-    let mut last_completed_at = None;
-    let mut next_attempt_at = None;
-    let mut current_generation = status.borrow().generation();
-    let mut nudge_pending = false;
-
-    loop {
-        if nudge.has_changed().unwrap_or(false) {
-            let requested_generation = *nudge.borrow_and_update();
-            nudge_pending = requested_generation >= current_generation;
-        }
-
-        let now = TokioInstant::now();
-        let periodic_at = next_attempt_at.unwrap_or(now);
-        let demand_at = nudge_pending.then(|| {
-            let min_interval_at = last_completed_at.map_or(now, |last_completed_at| {
-                last_completed_at + BINDINGS_ON_DEMAND_MIN_INTERVAL
-            });
-            let backoff_at = if consecutive_failures > 0 {
-                next_attempt_at.unwrap_or(now)
-            } else {
-                now
-            };
-            min_interval_at.max(backoff_at)
-        });
-        let wake_at = demand_at.map_or(periodic_at, |demand_at| periodic_at.min(demand_at));
-
-        if now < wake_at {
-            tokio::select! {
-                () = tokio::time::sleep_until(wake_at) => {}
-                changed = nudge.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    let requested_generation = *nudge.borrow_and_update();
-                    nudge_pending = requested_generation >= current_generation;
-                    continue;
-                }
-            }
-        }
-
-        let now = TokioInstant::now();
-        let periodic_due = next_attempt_at.is_none_or(|next_attempt_at| now >= next_attempt_at);
-        let demand_due = demand_at.is_some_and(|demand_at| now >= demand_at);
-        if !periodic_due && !demand_due {
-            continue;
-        }
-
-        let _ = nudge.borrow_and_update();
-        status.send_replace(BindingRefreshStatus::InFlight {
-            generation: current_generation,
-            deadline: now + BINDINGS_REFRESH_TIMEOUT,
-        });
-        let result = refresher.refresh_bindings().await;
-        let completed_at = TokioInstant::now();
-        last_completed_at = Some(completed_at);
-        let delay = if result.is_ok() {
-            consecutive_failures = 0;
-            BINDINGS_REFRESH_INTERVAL
-        } else {
-            consecutive_failures = consecutive_failures.saturating_add(1);
-            next_delay(consecutive_failures, rand::rng().random::<f64>())
-        };
-        let next_attempt = completed_at + delay;
-        next_attempt_at = Some(next_attempt);
-        current_generation = current_generation.wrapping_add(1);
-        let next_status = if result.is_ok() {
-            BindingRefreshStatus::OnDemandGap {
-                generation: current_generation,
-                until: completed_at + BINDINGS_ON_DEMAND_MIN_INTERVAL,
-            }
-        } else {
-            BindingRefreshStatus::FailureBackoff {
-                generation: current_generation,
-                until: next_attempt,
-            }
-        };
-        status.send_replace(next_status);
-        nudge_pending = *nudge.borrow_and_update() >= current_generation;
-        if let Err(error) = result {
-            tracing::warn!(error, "Bedrock model bindings refresh was rejected");
-        }
-    }
-}
-
-/// Return the only registry origins permitted by the measured network literal.
-fn registry_url_for_network(network: &str) -> Option<&'static str> {
-    match network {
-        "mainnet" => Some("https://registry.saygm.com"),
-        "testnet" => Some("https://test-registry.saygm.com"),
-        _ => None,
+        self.registry.wait_for_refresh().await;
     }
 }
 
@@ -588,50 +316,19 @@ fn test_bindings_payload() -> BindingsSnapshot {
     }
 }
 
-async fn read_bounded_registry_body(response: reqwest::Response) -> Result<Vec<u8>, &'static str> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_BINDINGS_BODY as u64)
-    {
-        return Err("registry binding response exceeds the size limit");
-    }
-    let mut body = Vec::new();
-    let mut source = response.bytes_stream();
-    while let Some(chunk) = source.next().await {
-        let chunk = chunk.map_err(|_| "registry binding response body failed")?;
-        if body.len().saturating_add(chunk.len()) > MAX_BINDINGS_BODY {
-            return Err("registry binding response exceeds the size limit");
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 fn parse_bindings_payload(
     bytes: &[u8],
     expected_network: &str,
 ) -> Result<BindingsSnapshot, &'static str> {
-    let value =
-        parse_unique_json(bytes).map_err(|_| "registry binding response is invalid JSON")?;
-    let object = value
-        .as_object()
-        .filter(|object| {
-            object_has_only_keys(
-                object,
-                &["schema_version", "network", "revision", "bindings"],
-            )
-        })
-        .ok_or("registry binding response has an invalid envelope")?;
-    if object.get("schema_version").and_then(Value::as_u64) != Some(1) {
-        return Err("registry binding schema version is unsupported");
-    }
+    let object = model_bindings::parse_envelope(
+        bytes,
+        expected_network,
+        &["schema_version", "network", "revision", "bindings"],
+    )?;
     let network = object
         .get("network")
         .and_then(Value::as_str)
         .ok_or("registry binding response has no network")?;
-    if network != expected_network {
-        return Err("registry binding response is for a different network");
-    }
     let revision = object
         .get("revision")
         .and_then(Value::as_u64)
@@ -648,7 +345,7 @@ fn parse_bindings_payload(
         let row = row
             .as_object()
             .filter(|row| {
-                object_has_only_keys(
+                model_bindings::object_has_exact_keys(
                     row,
                     &[
                         "provider",
@@ -668,7 +365,7 @@ fn parse_bindings_payload(
         let model = row
             .get("model")
             .and_then(Value::as_str)
-            .filter(|model| valid_model_id(model))
+            .filter(|model| model_bindings::valid_model_id(model, &[]))
             .ok_or("registry model binding has an invalid canonical model")?;
         let upstream_model = row
             .get("upstream_model")
@@ -678,7 +375,7 @@ fn parse_bindings_payload(
         let response_model = row
             .get("response_model")
             .and_then(Value::as_str)
-            .filter(|model| valid_model_id(model))
+            .filter(|model| model_bindings::valid_model_id(model, &[]))
             .ok_or("registry model binding has an invalid response identity")?;
         let binding_revision = row
             .get("revision")
@@ -703,23 +400,6 @@ fn parse_bindings_payload(
         revision,
         bindings,
     })
-}
-
-fn object_has_only_keys(object: &Map<String, Value>, allowed: &[&str]) -> bool {
-    object.keys().all(|key| allowed.contains(&key.as_str()))
-        && allowed.iter().all(|key| object.contains_key(*key))
-}
-
-fn valid_model_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_MODEL_ID_BYTES
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
 }
 
 fn valid_bedrock_selector(value: &str) -> bool {
@@ -777,7 +457,7 @@ struct AppState(BedrockMantleState);
 ///
 /// Returns an error if the server stops with an I/O failure.
 pub async fn serve(listener: TcpListener, state: BedrockMantleState) -> Result<(), &'static str> {
-    state.start_binding_refresher();
+    state.registry.start();
     let app = Router::new()
         .route("/v1/messages", any(handle_request))
         .with_state(AppState(state));
@@ -990,35 +670,31 @@ async fn forward_request(
     // read lock through the synchronous model rewrite and request build, then
     // start the provider request immediately; a refresh cannot interleave
     // between the current binding check and request construction.
-    let mut cache = state.bindings.read().await;
-    let mut lookup = cache.current_binding(&model, requested_binding_revision, Instant::now());
-    if lookup.needs_refresh() {
-        drop(cache);
+    let mut config = BindingRequestConfig {
+        model: &model,
+        revision: requested_binding_revision,
+        fields: &mut fields,
+        client: &state.client,
+        url,
+        authorization: &state.authorization,
+        anthropic_beta: anthropic_beta.as_ref(),
+        accept,
+    };
+    let mut prepared = state
+        .registry
+        .with_cache(|cache, now| prepare_binding_request(cache, &mut config, now))
+        .await?;
+    if matches!(&prepared, PreparedBindingRequest::Refresh(_)) {
         state.wait_for_binding_refresh().await;
-        cache = state.bindings.read().await;
-        lookup = cache.current_binding(&model, requested_binding_revision, Instant::now());
+        prepared = state
+            .registry
+            .with_cache(|cache, now| prepare_binding_request(cache, &mut config, now))
+            .await?;
     }
-    let binding = lookup.into_result()?;
-    fields.insert(
-        "model".to_owned(),
-        Value::String(binding.upstream_model.clone()),
-    );
-    let upstream_body = serde_json::to_vec(&fields).map_err(|_| Reject::InvalidBody)?;
-    let mut upstream_request = state
-        .client
-        .post(url)
-        .header(AUTHORIZATION, state.authorization.clone())
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, accept);
-    if let Some(value) = anthropic_beta {
-        upstream_request = upstream_request.header("anthropic-beta", value);
-    }
-    let upstream_request = upstream_request
-        .body(upstream_body)
-        .build()
-        .map_err(|_| Reject::Upstream)?;
-    drop(cache);
+    let (binding, upstream_request) = match prepared {
+        PreparedBindingRequest::Ready(binding, request) => (binding, *request),
+        PreparedBindingRequest::Refresh(reject) => return Err(reject),
+    };
     let upstream = state
         .client
         .execute(upstream_request)
@@ -1026,6 +702,51 @@ async fn forward_request(
         .map_err(|_| Reject::UpstreamTransport)?;
 
     finish_upstream_response(upstream, &binding, stream_response).await
+}
+
+struct BindingRequestConfig<'a> {
+    model: &'a str,
+    revision: u64,
+    fields: &'a mut Map<String, Value>,
+    client: &'a Client,
+    url: &'a str,
+    authorization: &'a HeaderValue,
+    anthropic_beta: Option<&'a HeaderValue>,
+    accept: &'a str,
+}
+
+enum PreparedBindingRequest {
+    Refresh(Reject),
+    Ready(ModelBinding, Box<reqwest::Request>),
+}
+
+fn prepare_binding_request(
+    cache: &BindingCache,
+    config: &mut BindingRequestConfig<'_>,
+    now: Instant,
+) -> Result<PreparedBindingRequest, Reject> {
+    let binding = match cache.current_binding(config.model, config.revision, now) {
+        BindingLookup::Ready(binding) => binding,
+        BindingLookup::Behind => return Err(Reject::BindingRevision),
+        BindingLookup::Refresh(reject) => return Ok(PreparedBindingRequest::Refresh(reject)),
+    };
+    config.fields.insert(
+        "model".to_owned(),
+        Value::String(binding.upstream_model.clone()),
+    );
+    let body = serde_json::to_vec(config.fields).map_err(|_| Reject::InvalidBody)?;
+    let mut request = config
+        .client
+        .post(config.url)
+        .header(AUTHORIZATION, config.authorization.clone())
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, config.accept);
+    if let Some(value) = config.anthropic_beta {
+        request = request.header("anthropic-beta", value.clone());
+    }
+    let request = request.body(body).build().map_err(|_| Reject::Upstream)?;
+    Ok(PreparedBindingRequest::Ready(binding, Box::new(request)))
 }
 
 async fn finish_upstream_response(
@@ -1071,19 +792,12 @@ async fn finish_upstream_response(
             binding.revision,
         ))
     } else {
-        let content_type = upstream
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !content_type
-            .split(';')
-            .next()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-        {
+        if !model_bindings::is_json_content_type(upstream.headers()) {
             return Err(Reject::Upstream);
         }
-        let body = read_bounded_body(upstream, MAX_RESPONSE_BODY).await?;
+        let body = model_bindings::read_bounded_body(upstream, MAX_RESPONSE_BODY)
+            .await
+            .map_err(map_bounded_body_error)?;
         let body = canonicalize_response_identity(&body, &binding.response_model, &binding.model)?;
         Ok(response_with_binding_revision(
             StatusCode::OK,
@@ -1104,13 +818,20 @@ async fn upstream_rejection(upstream: reqwest::Response) -> Reject {
         StatusCode::BAD_REQUEST => Reject::UpstreamInvalidRequest {
             prompt_too_long: tokio::time::timeout(
                 ERROR_BODY_WAIT,
-                read_bounded_body(upstream, MAX_ERROR_BODY),
+                model_bindings::read_bounded_body(upstream, MAX_ERROR_BODY),
             )
             .await
             .is_ok_and(|body| body.is_ok_and(|body| signals_prompt_too_long(&body))),
         },
         StatusCode::PAYLOAD_TOO_LARGE => Reject::UpstreamTooLarge,
         status => Reject::UpstreamHttp(status.as_u16()),
+    }
+}
+
+fn map_bounded_body_error(error: model_bindings::BoundedBodyError) -> Reject {
+    match error {
+        model_bindings::BoundedBodyError::Read => Reject::UpstreamTransport,
+        model_bindings::BoundedBodyError::TooLarge => Reject::Upstream,
     }
 }
 
@@ -1145,6 +866,7 @@ fn validate_inbound_headers(headers: &HeaderMap) -> Result<(u64, Option<HeaderVa
 
     let content_types = headers.get_all(CONTENT_TYPE).iter().collect::<Vec<_>>();
     if content_types.len() != 1
+        || !model_bindings::is_json_content_type(headers)
         || content_types[0]
             .to_str()
             .ok()
@@ -1252,7 +974,7 @@ fn prepare_request_body(bytes: &[u8]) -> Result<PreparedRequestBody, Reject> {
         .and_then(Value::as_str)
         .ok_or(Reject::InvalidBody)?
         .to_owned();
-    if !valid_model_id(&model) {
+    if !model_bindings::valid_model_id(&model, &[]) {
         return Err(Reject::InvalidBody);
     }
     let stream_response = match fields.get("stream") {
@@ -1265,19 +987,6 @@ fn prepare_request_body(bytes: &[u8]) -> Result<PreparedRequestBody, Reject> {
         model,
         stream_response,
     })
-}
-
-async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, Reject> {
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| Reject::UpstreamTransport)?;
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(Reject::Upstream);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 fn canonicalize_response_identity(
@@ -2058,7 +1767,9 @@ mod tests {
                 .expect("HTTP response"),
         );
         assert_eq!(
-            read_bounded_body(response, MAX_RESPONSE_BODY).await,
+            model_bindings::read_bounded_body(response, MAX_RESPONSE_BODY)
+                .await
+                .map_err(map_bounded_body_error),
             Err(Reject::UpstreamTransport)
         );
         assert!(matches!(
@@ -2909,7 +2620,7 @@ mod tests {
     #[tokio::test]
     async fn request_without_a_snapshot_joins_the_initial_refresh() {
         let (state, upstream_calls) = test_state().await;
-        *state.bindings.write().await = BindingCache::default();
+        *state.registry.cache_for_test().write().await = BindingCache::default();
         let registry = MockBindingRegistry::start(&test_bindings_payload(), true).await;
         let state = registry.attach(state);
         let response = handle_request(State(AppState(state)), request("/v1/messages", VALID_BODY));
@@ -3031,7 +2742,7 @@ mod tests {
         let (state, upstream_calls) = test_state().await;
         let registry = MockBindingRegistry::start(&test_bindings_payload(), true).await;
         let state = registry.attach(state);
-        let mut status = state.refresh_status.subscribe();
+        let mut status = state.registry.status_for_test();
         let observed = status.borrow_and_update().generation();
         let delayed = handle_request(
             State(AppState(state.clone())),
@@ -3104,9 +2815,9 @@ mod tests {
         let (state, _) = test_state().await;
         let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
         let state = registry.attach(state);
-        let mut status = state.refresh_status.subscribe();
+        let mut status = state.registry.status_for_test();
         let mut observed = status.borrow_and_update().generation();
-        state.start_binding_refresher();
+        state.registry.start();
 
         registry.wait_for_call().await;
         observed = wait_for_generation(&mut status, observed).await;
@@ -3154,10 +2865,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failed_initial_refresh_retries_after_backoff_without_dispatch() {
         let (state, upstream_calls) = test_state().await;
-        *state.bindings.write().await = BindingCache::default();
+        *state.registry.cache_for_test().write().await = BindingCache::default();
         let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
         let state = registry.attach(state);
-        let mut status = state.refresh_status.subscribe();
+        let mut status = state.registry.status_for_test();
         let mut observed = status.borrow_and_update().generation();
 
         let response = tokio::spawn(handle_request(
@@ -3381,11 +3092,13 @@ mod tests {
             });
             started_rx.await.expect("body collection started");
             {
-                let mut cache = state.bindings.write().await;
+                let cache_arc = state.registry.cache_for_test();
+                let mut cache = cache_arc.write().await;
                 if change == "expiry" {
-                    cache.current.as_mut().expect("test snapshot").fetched_at = Instant::now()
-                        .checked_sub(BINDINGS_FRESHNESS_TTL + Duration::from_secs(1))
-                        .expect("expiry instant");
+                    cache.snapshots.age(
+                        Instant::now(),
+                        BINDINGS_FRESHNESS_TTL + Duration::from_secs(1),
+                    );
                 } else {
                     let mut snapshot = test_bindings_payload();
                     snapshot.revision += 1;
@@ -3953,12 +3666,13 @@ mod tests {
         response_model: &str,
         revision: u64,
     ) {
-        let mut cache = state.bindings.write().await;
+        let cache_arc = state.registry.cache_for_test();
+        let mut cache = cache_arc.write().await;
         let mut snapshot = cache
-            .current
-            .as_ref()
+            .snapshots
+            .current()
             .expect("test binding snapshot")
-            .snapshot
+            .as_ref()
             .clone();
         snapshot.revision = revision;
         snapshot.bindings.insert(
@@ -3992,10 +3706,12 @@ mod tests {
     }
 
     async fn expire_bindings(state: &BedrockMantleState) {
-        let mut cache = state.bindings.write().await;
-        cache.current.as_mut().expect("test snapshot").fetched_at = Instant::now()
-            .checked_sub(BINDINGS_FRESHNESS_TTL + Duration::from_secs(1))
-            .expect("expiry instant");
+        let cache_arc = state.registry.cache_for_test();
+        let mut cache = cache_arc.write().await;
+        cache.snapshots.age(
+            Instant::now(),
+            BINDINGS_FRESHNESS_TTL + Duration::from_secs(1),
+        );
     }
 
     fn paused_clock_guard() -> JoinHandle<()> {

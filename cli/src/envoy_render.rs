@@ -651,7 +651,7 @@ clusters:
     }
 
     #[test]
-    fn lua_keeps_the_session_id_for_kubetee_and_strips_it_for_openai() {
+    fn lua_keeps_registry_selectors_for_kubetee_and_strips_session_ids_by_path() {
         let fixture = Fixture::new(
             include_str!("../../image/envoy/base.yaml"),
             &[("kubetee.yaml", "routes: []\nclusters: []\n")],
@@ -674,13 +674,24 @@ clusters:
             lua.globals().get("envoy_on_request").expect("request hook");
         let session_id = "0123456789abcdef".repeat(4);
 
-        for (provider, selector, want_session) in [
-            ("kubetee", Some("z-ai/glm-5.2"), true),
-            ("openai", None, false),
+        for (provider, path, selector, want_session) in [
+            (
+                "kubetee",
+                "/v1/chat/completions",
+                Some("registry/model-added-later"),
+                true,
+            ),
+            (
+                "kubetee",
+                "/v1/images/generations",
+                Some("registry/image-added-later"),
+                false,
+            ),
+            ("openai", "/v1/chat/completions", None, false),
         ] {
             let mut values = vec![
                 (":method", "POST"),
-                (":path", "/v1/chat/completions"),
+                (":path", path),
                 ("x-gm-provider", provider),
                 ("x-gm-node-key", "secret-0001"),
                 ("x-gm-session-id", session_id.as_str()),
@@ -700,6 +711,49 @@ clusters:
                 want_session.then_some(session_id.as_str()),
                 "provider {provider}"
             );
+            assert_eq!(
+                headers
+                    .get::<Option<String>>("x-gm-upstream-model")
+                    .expect("selector header")
+                    .as_deref(),
+                selector,
+                "provider {provider} on {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn kubetee_chat_and_image_routes_forward_the_selector_to_the_verifier() {
+        let fixture = Fixture::new(
+            include_str!("../../image/envoy/base.yaml"),
+            &[(
+                "kubetee.yaml",
+                include_str!("../../image/envoy/upstreams/kubetee.yaml"),
+            )],
+        );
+        let out = parsed(
+            &fixture
+                .render(&[], &[("GM_NODE_SECRET", "secret-0001")])
+                .expect("render"),
+        );
+        let routes = out
+            .pointer(concat!(
+                "/static_resources/listeners/0/filter_chains/0/filters/0/typed_config/",
+                "route_config/virtual_hosts/0/routes",
+            ))
+            .and_then(serde_json::Value::as_array)
+            .expect("rendered routes");
+        for path in ["/v1/chat/completions", "/v1/images/generations"] {
+            let route = routes
+                .iter()
+                .find(|route| route["match"]["path"] == path)
+                .expect("KubeTEE route");
+            assert_eq!(route["route"]["cluster"], "kubetee_verify_proxy");
+            assert!(!route["request_headers_to_remove"]
+                .as_array()
+                .expect("header removal list")
+                .iter()
+                .any(|header| header == "x-gm-upstream-model"));
         }
     }
 

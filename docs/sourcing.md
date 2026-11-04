@@ -350,9 +350,9 @@ image build and the normal image-approval process.
 
 ### KubeTEE attestation verification
 
-With a KubeTEE key set, the image runs a co-located KubeTEE verifier, and every
-KubeTEE chat request is served through it. The verifier keeps a small pool of
-keep-alive TLS 1.3 connections to `llm.kubetee.ai`. Each connection is attested
+With a KubeTEE key set, the image runs a co-located KubeTEE verifier for chat
+and image requests. It keeps a small pool of keep-alive TLS 1.3 connections to
+`llm.kubetee.ai`. Each connection is attested
 before serving inference: the verifier requests a quote for a fresh nonce on
 that connection and requires
 
@@ -373,23 +373,26 @@ minutes from the start of attestation or 100 requests, or when its quote-bound
 keyset expires. The verifier retains up to eight idle connections within these
 limits. A connection that fails or closes is retired and the next request
 attests a new one. Successful attestation is required to serve a request;
-verification failures return a 502. Each chat request is sent at most once.
+verification failures return a 502. Each chat or image request is sent at most
+once.
 The supplier's `x-kubetee-*` and `x-litellm-*` response headers are removed
 before the response leaves the worker. The verifier logs the replica's pod name
 and measured registers (MRTD, MRCONFIGID, RTMR0-3) for each attested
 connection.
 
-The verifier serves only the chat models compiled into the image:
-`z-ai/glm-5.2`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`,
-`deepseek/deepseek-v4.1-flash`, `deepseek/deepseek-v4.1-flash-1017`,
-`moonshotai/kimi-k3`, `moonshotai/kimi-k3.1-pro` and `xiaomi/mimo-v2.6-pro`. Envoy answers a chat request for any other KubeTEE model
-with 400, and the verifier refuses a request whose body names a model other than
-the one selected. Image generation keeps its direct route. Its `GET /v1/models`
-answer is KubeTEE's own list narrowed to those chat models and the image model
-`black-forest-labs/flux.2-klein-4b` served by the direct route. Discovery does not establish registry admission. Each attestation
-and model-list response is read within 60 seconds, body included. Adding a
-KubeTEE chat model requires a new image build and the normal image-approval
-process.
+The measured verifier refreshes a strict, network-specific snapshot from the
+registry's `GET /model-bindings/kubetee` endpoint at startup and every 60
+seconds. Each row binds an exact upstream model id to either
+`chat_completions` or `images_generations`; the verifier validates the envelope,
+network, ordering, unique model ids, endpoint kinds, and bounded response size
+before publishing it. A last-known-good snapshot remains usable for up to 15
+minutes. With no fresh snapshot, inference and `GET /v1/models` fail closed with
+503. Chat and image requests must match both the snapshot's endpoint kind and
+the exact selected model, and the request body's `model` must equal the
+selector. The model-list response is KubeTEE's own list filtered to snapshot
+ids. Envoy sends both verified endpoint paths through the measured verifier
+without a retry. Adding or removing a KubeTEE model takes effect through the
+registry snapshot and does not require a miner image rebuild.
 
 `gmcli sources` prints this line for you, pre-filled, for every undeclared route
 where declaring it would actually get you somewhere — one a worker already

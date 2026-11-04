@@ -8,9 +8,7 @@ use axum::extract::State;
 use axum::http::{Request, Response, StatusCode};
 use axum::routing::{any, get};
 use axum::Router;
-use gm_miner_attestd::kubetee_verify::{
-    error_response, KubeteeVerifier, BIND_ADDR, HOST_NAME, TARGETS,
-};
+use gm_miner_attestd::kubetee_verify::{error_response, KubeteeVerifier, BIND_ADDR, HOST_NAME};
 use gm_miner_attestd::upstream_proxy::option_value;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -38,6 +36,7 @@ async fn run() -> Result<()> {
     if arguments.iter().any(|argument| argument == "--verify-once") {
         return verify_once(&verifier, option_value(&arguments, "--model")?).await;
     }
+    verifier.start_model_bindings_refresh();
     let address: SocketAddr = BIND_ADDR
         .parse()
         .context("parse KubeTEE proxy bind address")?;
@@ -58,14 +57,15 @@ async fn run() -> Result<()> {
         .context("serve KubeTEE verification proxy")
 }
 
-/// Attest `llm.kubetee.ai` once, sending no inference. The quote is per
-/// host, not per model, so `--model` only checks the id is a compiled target.
+/// Attest `llm.kubetee.ai` once, sending no inference. When supplied,
+/// `--model` is checked against a freshly fetched registry snapshot.
 async fn verify_once(verifier: &KubeteeVerifier, model: Option<&str>) -> Result<()> {
     if let Some(model) = model {
-        anyhow::ensure!(
-            TARGETS.contains(&model),
-            "--model is not in the compiled KubeTEE target allowlist"
-        );
+        verifier
+            .check_model_binding(model)
+            .await
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("check KubeTEE model binding for {model}"))?;
     }
     let attested = verifier
         .preflight()

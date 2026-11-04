@@ -102,12 +102,16 @@ def route_for(items, name, path_key, path):
 kubetee = routes(sys.argv[1])
 direct = routes(sys.argv[2])
 chat = route_for(kubetee, "kubetee", "path", "/v1/chat/completions")
+images = route_for(kubetee, "kubetee", "path", "/v1/images/generations")
 models = route_for(kubetee, "kubetee", "path", "/v1/models")
 openai = route_for(direct, "openai", "prefix", "/")
 assert "x-gm-session-id" not in chat["request_headers_to_remove"]
 assert "x-gm-session-id" in models["request_headers_to_remove"]
 assert "x-gm-session-id" in openai["request_headers_to_remove"]
-print("ok: session header survives only on the KubeTEE chat route")
+for route in (chat, images):
+    assert route["route"]["cluster"] == "kubetee_verify_proxy"
+    assert "x-gm-upstream-model" not in route["request_headers_to_remove"]
+print("ok: KubeTEE chat and image routes forward the model selector to the verifier")
 PY
 
 # The rendered files are 0600 under a 0700 temp dir; ENVOY_UID=0 stops the
@@ -238,21 +242,26 @@ await_listener() {
 }
 
 kubetee_runtime() {
-  local container port ok=0 target='x-gm-upstream-model: z-ai/glm-5.3'
+  local container port ok=0 path id target
   container="$(serve kubetee-runtime KUBETEE_API_KEY k)"
   port="$(docker port "${container}" 8080/tcp | head -n 1 | sed 's/.*://')"
   await_listener "${port}"
-  expect "off-list selector" 400 "missing or unsupported KubeTEE source model" \
-    "$(request "${port}" POST /v1/chat/completions -H 'x-gm-upstream-model: mistralai/mistral-large-4')" || ok=1
-  expect "missing selector" 400 "missing or unsupported KubeTEE source model" \
-    "$(request "${port}" POST /v1/chat/completions)" || ok=1
-  expect "unreachable verifier" 502 "envoy_upstream_error" \
-    "$(request "${port}" POST /v1/chat/completions -H "${target}" \
-      -H 'x-gm-request-id: kt-unreachable')" || ok=1
-  expect_log "${container}" kt-unreachable \
-    '"upstream_cluster":"kubetee_verify_proxy"' '"response_flags":"UF"' || ok=1
+  for path in /v1/chat/completions /v1/images/generations; do
+    id="kt-${path##*/}"
+    target='x-gm-upstream-model: mistralai/mistral-large-4'
+    got="$(request "${port}" POST "${path}" -H "${target}" -H "x-gm-request-id: ${id}")"
+    status="${got%% *}"
+    if [[ "${status}" == 502 || "${status}" == 503 ]]; then
+      echo "ok: KubeTEE ${path} reaches its verifier (${status})"
+    else
+      echo "FAIL: KubeTEE ${path} did not reach a verifier response: ${got}" >&2
+      ok=1
+    fi
+    expect_log "${container}" "${id}" \
+      '"upstream_cluster":"kubetee_verify_proxy"' || ok=1
+  done
   expect "unverified path" 501 "provider not configured" \
-    "$(request "${port}" POST /v1/completions -H "${target}")" || ok=1
+    "$(request "${port}" POST /v1/completions)" || ok=1
   docker stop "${container}" >/dev/null
   return "${ok}"
 }
