@@ -47,9 +47,21 @@ miner; gateways that omit either header still receive a 400. Older miners retain
 their request restrictions, so newly accepted body fields and beta headers can
 still receive 400s during a mixed-image rollout.
 
-Bedrock bindings refresh every 60 seconds and expire 120 seconds after the last
-successful refresh. Failed refreshes do not extend validity. The adapter rechecks
-the current binding after reading the request body and immediately before dispatch.
+After a successful refresh, Bedrock bindings are fetched again in 60 seconds. A
+last-known-good snapshot remains valid for 15 minutes after its successful
+fetch. Failed refreshes retry with jittered exponential backoff but do not extend
+the snapshot's validity. The 15-second fetch timeout and maximum retry delay fit
+within the 60-second cadence. A missing snapshot, absent model, or newer requested
+row revision requests a shared refresh. Requests join an in-flight fetch and
+re-check once after it finishes, bounded by its 15-second timeout. During the
+three-second post-success gap, a request waits out the remaining gap, then joins
+the shared fetch at the gap's end; its total wait is bounded by the gap remainder
+plus the fetch timeout. During failure backoff, requests immediately re-check
+the current snapshot and return the existing reject if it still does not match.
+Lower revisions receive an immediate 409 without a fetch, even after snapshot
+expiry.
+The adapter rechecks the current binding after reading the request body and
+immediately before dispatch.
 Requests already dispatched finish against the binding captured for that request;
 a later mapping change does not replay or retarget them.
 

@@ -10,7 +10,7 @@
 use std::{
     collections::BTreeMap,
     io,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -25,11 +25,16 @@ use axum::{
     Router,
 };
 use futures_util::{stream, StreamExt};
+use rand::RngExt as _;
 use reqwest::{redirect::Policy, Client};
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::{Map, Value};
 
-use tokio::{net::TcpListener, sync::RwLock, time::MissedTickBehavior};
+use tokio::{
+    net::TcpListener,
+    sync::{watch, RwLock},
+    time::Instant as TokioInstant,
+};
 use tracing::info;
 
 use crate::strict_json::parse_unique_json;
@@ -60,7 +65,31 @@ const MAX_MODEL_BINDINGS: usize = 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const BINDINGS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const BINDINGS_FRESHNESS_TTL: Duration = Duration::from_secs(120);
+const BINDINGS_ON_DEMAND_MIN_INTERVAL: Duration = Duration::from_secs(3);
+const BINDINGS_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+const BINDINGS_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(3);
+const BINDINGS_RETRY_MAX_DELAY: Duration = Duration::from_secs(35);
+const BINDINGS_FRESHNESS_TTL: Duration = Duration::from_secs(15 * 60);
+
+const _: () = assert!(
+    BINDINGS_REFRESH_TIMEOUT.as_millis()
+        + BINDINGS_RETRY_MAX_DELAY.as_millis()
+        + BINDINGS_RETRY_MAX_DELAY.as_millis() / 4
+        < BINDINGS_REFRESH_INTERVAL.as_millis()
+);
+
+fn next_delay(failures: u32, jitter_fraction: f64) -> Duration {
+    debug_assert!((0.0..=1.0).contains(&jitter_fraction));
+
+    let shift = failures.saturating_sub(1);
+    let base_seconds = BINDINGS_RETRY_INITIAL_DELAY
+        .as_secs()
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX)
+        .min(BINDINGS_RETRY_MAX_DELAY.as_secs());
+    let base = Duration::from_secs(base_seconds);
+    base.saturating_add(base.mul_f64(jitter_fraction / 4.0))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelBinding {
@@ -149,28 +178,44 @@ impl BindingCache {
         Ok(())
     }
 
-    fn current_binding(
-        &self,
-        model: &str,
-        expected_revision: u64,
-        now: Instant,
-    ) -> Result<ModelBinding, Reject> {
-        let cached = self
-            .current
-            .as_ref()
-            .filter(|cached| {
-                now.saturating_duration_since(cached.fetched_at) <= BINDINGS_FRESHNESS_TTL
-            })
-            .ok_or(Reject::BindingsUnavailable)?;
-        let binding = cached
-            .snapshot
-            .bindings
-            .get(model)
-            .ok_or(Reject::UnsupportedModel)?;
-        if binding.revision != expected_revision {
-            return Err(Reject::BindingRevision);
+    fn current_binding(&self, model: &str, expected_revision: u64, now: Instant) -> BindingLookup {
+        let Some(cached) = self.current.as_ref() else {
+            return BindingLookup::Refresh(Reject::BindingsUnavailable);
+        };
+        let binding = cached.snapshot.bindings.get(model);
+        if binding.is_some_and(|binding| expected_revision < binding.revision) {
+            return BindingLookup::Behind;
         }
-        Ok(binding.clone())
+        if now.saturating_duration_since(cached.fetched_at) > BINDINGS_FRESHNESS_TTL {
+            return BindingLookup::Refresh(Reject::BindingsUnavailable);
+        }
+        let Some(binding) = binding else {
+            return BindingLookup::Refresh(Reject::UnsupportedModel);
+        };
+        if binding.revision != expected_revision {
+            return BindingLookup::Refresh(Reject::BindingRevision);
+        }
+        BindingLookup::Ready(binding.clone())
+    }
+}
+
+enum BindingLookup {
+    Ready(ModelBinding),
+    Behind,
+    Refresh(Reject),
+}
+
+impl BindingLookup {
+    fn needs_refresh(&self) -> bool {
+        matches!(self, Self::Refresh(_))
+    }
+
+    fn into_result(self) -> Result<ModelBinding, Reject> {
+        match self {
+            Self::Ready(binding) => Ok(binding),
+            Self::Behind => Err(Reject::BindingRevision),
+            Self::Refresh(reject) => Err(reject),
+        }
     }
 }
 
@@ -181,6 +226,9 @@ pub struct BedrockMantleState {
     registry_network: String,
     registry_url: String,
     bindings: Arc<RwLock<BindingCache>>,
+    refresh_task_started: Arc<OnceLock<()>>,
+    refresh_nudge: watch::Sender<u64>,
+    refresh_status: watch::Sender<BindingRefreshStatus>,
     #[cfg(test)]
     test_upstream_url: Option<String>,
 }
@@ -210,6 +258,11 @@ impl BedrockMantleState {
             .map_err(|_| "Bedrock API key is not a valid HTTP credential")?;
 
         let client = production_http_client()?;
+        let (refresh_nudge, _) = watch::channel(0);
+        let (refresh_status, _) = watch::channel(BindingRefreshStatus::OnDemandGap {
+            generation: 0,
+            until: TokioInstant::now(),
+        });
 
         Ok(Self {
             client,
@@ -217,6 +270,9 @@ impl BedrockMantleState {
             registry_network: network,
             registry_url: format!("{registry_url}{BEDROCK_BINDINGS_PATH}"),
             bindings: Arc::new(RwLock::new(BindingCache::default())),
+            refresh_task_started: Arc::new(OnceLock::new()),
+            refresh_nudge,
+            refresh_status,
             #[cfg(test)]
             test_upstream_url: None,
         })
@@ -237,6 +293,11 @@ impl BedrockMantleState {
             .timeout(Duration::from_secs(2))
             .build()
             .expect("test HTTP client");
+        let (refresh_nudge, _) = watch::channel(0);
+        let (refresh_status, _) = watch::channel(BindingRefreshStatus::OnDemandGap {
+            generation: 0,
+            until: TokioInstant::now(),
+        });
         Self {
             client,
             authorization: HeaderValue::from_str(authorization).expect("test credential"),
@@ -246,6 +307,9 @@ impl BedrockMantleState {
                 test_bindings_payload(),
                 Instant::now(),
             ))),
+            refresh_task_started: Arc::new(OnceLock::new()),
+            refresh_nudge,
+            refresh_status,
             test_upstream_url: Some(url.to_owned()),
         }
     }
@@ -256,11 +320,126 @@ impl BedrockMantleState {
         self
     }
 
+    #[cfg(test)]
+    async fn refresh_bindings(&self) -> Result<(), &'static str> {
+        self.binding_refresher().refresh_bindings().await
+    }
+
+    fn binding_refresher(&self) -> BindingRefresher {
+        BindingRefresher {
+            client: self.client.clone(),
+            registry_network: self.registry_network.clone(),
+            registry_url: self.registry_url.clone(),
+            bindings: self.bindings.clone(),
+        }
+    }
+
+    fn start_binding_refresher(&self) {
+        self.refresh_task_started.get_or_init(|| {
+            let refresher = self.binding_refresher();
+            let nudge = self.refresh_nudge.subscribe();
+            let status = self.refresh_status.clone();
+            tokio::spawn(run_binding_refresher(refresher, nudge, status));
+        });
+    }
+
+    async fn wait_for_binding_refresh(&self) {
+        let mut status = self.refresh_status.subscribe();
+        self.start_binding_refresher();
+        let initial = *status.borrow_and_update();
+        let generation = initial.generation();
+        let now = TokioInstant::now();
+        let deadline = match initial {
+            BindingRefreshStatus::InFlight { deadline, .. } => deadline,
+            BindingRefreshStatus::FailureBackoff { until, .. } if now < until => {
+                return;
+            }
+            BindingRefreshStatus::OnDemandGap { until, .. } => {
+                until.max(now) + BINDINGS_REFRESH_TIMEOUT
+            }
+            BindingRefreshStatus::FailureBackoff { .. } => now + BINDINGS_REFRESH_TIMEOUT,
+        };
+        let _ = tokio::time::timeout_at(deadline, async {
+            loop {
+                let current = *status.borrow_and_update();
+                if current.generation() != generation {
+                    return;
+                }
+                let should_nudge = match current {
+                    BindingRefreshStatus::InFlight { .. } => false,
+                    BindingRefreshStatus::FailureBackoff { until, .. }
+                        if TokioInstant::now() < until =>
+                    {
+                        return;
+                    }
+                    BindingRefreshStatus::OnDemandGap { until, .. }
+                        if TokioInstant::now() < until =>
+                    {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(until) => {}
+                            changed = status.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    BindingRefreshStatus::FailureBackoff { .. }
+                    | BindingRefreshStatus::OnDemandGap { .. } => true,
+                };
+                if should_nudge {
+                    self.refresh_nudge
+                        .send_modify(|requested| *requested = (*requested).max(generation));
+                }
+                if status.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BindingRefreshStatus {
+    InFlight {
+        generation: u64,
+        deadline: TokioInstant,
+    },
+    FailureBackoff {
+        generation: u64,
+        until: TokioInstant,
+    },
+    OnDemandGap {
+        generation: u64,
+        until: TokioInstant,
+    },
+}
+
+impl BindingRefreshStatus {
+    fn generation(self) -> u64 {
+        match self {
+            Self::InFlight { generation, .. }
+            | Self::FailureBackoff { generation, .. }
+            | Self::OnDemandGap { generation, .. } => generation,
+        }
+    }
+}
+
+struct BindingRefresher {
+    client: Client,
+    registry_network: String,
+    registry_url: String,
+    bindings: Arc<RwLock<BindingCache>>,
+}
+
+impl BindingRefresher {
     async fn refresh_bindings(&self) -> Result<(), &'static str> {
         let response = self
             .client
             .get(&self.registry_url)
-            .timeout(Duration::from_secs(15))
+            .timeout(BINDINGS_REFRESH_TIMEOUT)
             .send()
             .await
             .map_err(|_| "fixed registry binding fetch failed")?;
@@ -282,6 +461,96 @@ impl BedrockMantleState {
         let body = read_bounded_registry_body(response).await?;
         let snapshot = parse_bindings_payload(&body, &self.registry_network)?;
         self.bindings.write().await.apply(snapshot, Instant::now())
+    }
+}
+
+async fn run_binding_refresher(
+    refresher: BindingRefresher,
+    mut nudge: watch::Receiver<u64>,
+    status: watch::Sender<BindingRefreshStatus>,
+) {
+    let mut consecutive_failures = 0_u32;
+    let mut last_completed_at = None;
+    let mut next_attempt_at = None;
+    let mut current_generation = status.borrow().generation();
+    let mut nudge_pending = false;
+
+    loop {
+        if nudge.has_changed().unwrap_or(false) {
+            let requested_generation = *nudge.borrow_and_update();
+            nudge_pending = requested_generation >= current_generation;
+        }
+
+        let now = TokioInstant::now();
+        let periodic_at = next_attempt_at.unwrap_or(now);
+        let demand_at = nudge_pending.then(|| {
+            let min_interval_at = last_completed_at.map_or(now, |last_completed_at| {
+                last_completed_at + BINDINGS_ON_DEMAND_MIN_INTERVAL
+            });
+            let backoff_at = if consecutive_failures > 0 {
+                next_attempt_at.unwrap_or(now)
+            } else {
+                now
+            };
+            min_interval_at.max(backoff_at)
+        });
+        let wake_at = demand_at.map_or(periodic_at, |demand_at| periodic_at.min(demand_at));
+
+        if now < wake_at {
+            tokio::select! {
+                () = tokio::time::sleep_until(wake_at) => {}
+                changed = nudge.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let requested_generation = *nudge.borrow_and_update();
+                    nudge_pending = requested_generation >= current_generation;
+                    continue;
+                }
+            }
+        }
+
+        let now = TokioInstant::now();
+        let periodic_due = next_attempt_at.is_none_or(|next_attempt_at| now >= next_attempt_at);
+        let demand_due = demand_at.is_some_and(|demand_at| now >= demand_at);
+        if !periodic_due && !demand_due {
+            continue;
+        }
+
+        let _ = nudge.borrow_and_update();
+        status.send_replace(BindingRefreshStatus::InFlight {
+            generation: current_generation,
+            deadline: now + BINDINGS_REFRESH_TIMEOUT,
+        });
+        let result = refresher.refresh_bindings().await;
+        let completed_at = TokioInstant::now();
+        last_completed_at = Some(completed_at);
+        let delay = if result.is_ok() {
+            consecutive_failures = 0;
+            BINDINGS_REFRESH_INTERVAL
+        } else {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            next_delay(consecutive_failures, rand::rng().random::<f64>())
+        };
+        let next_attempt = completed_at + delay;
+        next_attempt_at = Some(next_attempt);
+        current_generation = current_generation.wrapping_add(1);
+        let next_status = if result.is_ok() {
+            BindingRefreshStatus::OnDemandGap {
+                generation: current_generation,
+                until: completed_at + BINDINGS_ON_DEMAND_MIN_INTERVAL,
+            }
+        } else {
+            BindingRefreshStatus::FailureBackoff {
+                generation: current_generation,
+                until: next_attempt,
+            }
+        };
+        status.send_replace(next_status);
+        nudge_pending = *nudge.borrow_and_update() >= current_generation;
+        if let Err(error) = result {
+            tracing::warn!(error, "Bedrock model bindings refresh was rejected");
+        }
     }
 }
 
@@ -508,17 +777,7 @@ struct AppState(BedrockMantleState);
 ///
 /// Returns an error if the server stops with an I/O failure.
 pub async fn serve(listener: TcpListener, state: BedrockMantleState) -> Result<(), &'static str> {
-    let refresh_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(BINDINGS_REFRESH_INTERVAL);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            if let Err(error) = refresh_state.refresh_bindings().await {
-                tracing::warn!(error, "Bedrock model bindings refresh was rejected");
-            }
-        }
-    });
+    state.start_binding_refresher();
     let app = Router::new()
         .route("/v1/messages", any(handle_request))
         .with_state(AppState(state));
@@ -731,8 +990,15 @@ async fn forward_request(
     // read lock through the synchronous model rewrite and request build, then
     // start the provider request immediately; a refresh cannot interleave
     // between the current binding check and request construction.
-    let cache = state.bindings.read().await;
-    let binding = cache.current_binding(&model, requested_binding_revision, Instant::now())?;
+    let mut cache = state.bindings.read().await;
+    let mut lookup = cache.current_binding(&model, requested_binding_revision, Instant::now());
+    if lookup.needs_refresh() {
+        drop(cache);
+        state.wait_for_binding_refresh().await;
+        cache = state.bindings.read().await;
+        lookup = cache.current_binding(&model, requested_binding_revision, Instant::now());
+    }
+    let binding = lookup.into_result()?;
     fields.insert(
         "model".to_owned(),
         Value::String(binding.upstream_model.clone()),
@@ -1540,13 +1806,16 @@ mod tests {
                 TEST_MODEL_REVISION_A,
                 now + BINDINGS_FRESHNESS_TTL
             )
+            .into_result()
             .is_ok());
         assert_eq!(
-            cache.current_binding(
-                TEST_MODEL_A,
-                TEST_MODEL_REVISION_A,
-                now + BINDINGS_FRESHNESS_TTL + Duration::from_millis(1),
-            ),
+            cache
+                .current_binding(
+                    TEST_MODEL_A,
+                    TEST_MODEL_REVISION_A,
+                    now + BINDINGS_FRESHNESS_TTL + Duration::from_millis(1),
+                )
+                .into_result(),
             Err(Reject::BindingsUnavailable)
         );
 
@@ -1562,6 +1831,7 @@ mod tests {
                 TEST_MODEL_REVISION_A,
                 refreshed_at + BINDINGS_FRESHNESS_TTL,
             )
+            .into_result()
             .is_ok());
 
         let lower = BindingsSnapshot {
@@ -1578,14 +1848,42 @@ mod tests {
         assert!(cache
             .apply(changed_same_revision, refreshed_at + Duration::from_secs(1))
             .is_err());
+        assert!(
+            cache
+                .current_binding(
+                    TEST_MODEL_A,
+                    TEST_MODEL_REVISION_A,
+                    refreshed_at + BINDINGS_FRESHNESS_TTL,
+                )
+                .into_result()
+                .is_ok(),
+            "rejected refreshes must leave the last successful binding usable through its TTL"
+        );
         assert_eq!(
-            cache.current_binding(
-                TEST_MODEL_A,
-                TEST_MODEL_REVISION_A,
-                refreshed_at + BINDINGS_FRESHNESS_TTL + Duration::from_millis(1),
-            ),
+            cache
+                .current_binding(
+                    TEST_MODEL_A,
+                    TEST_MODEL_REVISION_A,
+                    refreshed_at + BINDINGS_FRESHNESS_TTL + Duration::from_millis(1),
+                )
+                .into_result(),
             Err(Reject::BindingsUnavailable),
             "rejected refreshes must not renew binding freshness"
+        );
+    }
+
+    #[test]
+    fn binding_refresh_backoff_grows_caps_and_resets_after_success() {
+        let expected = [3, 6, 12, 24, 35, 35, 35];
+        for (consecutive_failures, seconds) in (1_u32..=7).zip(expected) {
+            assert_eq!(
+                next_delay(consecutive_failures, 0.0),
+                Duration::from_secs(seconds),
+            );
+        }
+        assert_eq!(
+            next_delay(5, 1.0),
+            Duration::from_secs(43) + Duration::from_millis(750),
         );
     }
 
@@ -2476,6 +2774,9 @@ mod tests {
     #[tokio::test]
     async fn unbound_models_and_oversized_requests_are_rejected_before_dispatch() {
         let (state, calls) = test_state().await;
+        let registry_snapshot = test_bindings_payload();
+        let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+        let state = registry.attach(state);
         let unbound = VALID_BODY.replace(TEST_MODEL_A, "unbound-model");
         let response = handle_request(
             State(AppState(state.clone())),
@@ -2489,6 +2790,7 @@ mod tests {
         let response = handle_request(State(AppState(state)), oversized).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(registry.calls(), 1);
     }
 
     #[tokio::test]
@@ -2587,38 +2889,484 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_model_binding_revision_is_rejected_before_upstream_dispatch() {
-        let (state, calls) = test_state().await;
-        let mut request = request("/v1/messages", VALID_BODY);
-        request
+    async fn lower_model_binding_revision_is_rejected_without_refresh() {
+        for expired in [false, true] {
+            let (state, upstream_calls) = test_state().await;
+            if expired {
+                expire_bindings(&state).await;
+            }
+            let registry = MockBindingRegistry::start(&test_bindings_payload(), false).await;
+            let state = registry.attach(state);
+            let request = request_with_revision("/v1/messages", VALID_BODY, "6");
+            let response = handle_request(State(AppState(state)), request).await;
+
+            assert_eq!(response.status(), StatusCode::CONFLICT, "expired={expired}");
+            assert_eq!(registry.calls(), 0, "expired={expired}");
+            assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_without_a_snapshot_joins_the_initial_refresh() {
+        let (state, upstream_calls) = test_state().await;
+        *state.bindings.write().await = BindingCache::default();
+        let registry = MockBindingRegistry::start(&test_bindings_payload(), true).await;
+        let state = registry.attach(state);
+        let response = handle_request(State(AppState(state)), request("/v1/messages", VALID_BODY));
+        tokio::pin!(response);
+        assert!(futures_util::poll!(&mut response).is_pending());
+        registry.wait_for_call().await;
+        assert!(futures_util::poll!(&mut response).is_pending());
+        registry.release(1);
+
+        assert_eq!(response.await.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn newer_model_binding_revision_refreshes_before_dispatch() {
+        let (state, upstream_calls) = test_state().await;
+        let registry_snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+        let state = registry.attach(state);
+        let request = request_with_revision("/v1/messages", VALID_BODY, "8");
+
+        let response = handle_request(State(AppState(state)), request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn request_joins_one_startable_refresh_and_is_served() {
+        let (state, upstream_calls) = test_state().await;
+        let registry_snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        let registry = MockBindingRegistry::start(&registry_snapshot, true).await;
+        let state = registry.attach(state);
+        let response = tokio::spawn(handle_request(
+            State(AppState(state)),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        ));
+
+        registry.wait_for_call().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !response.is_finished(),
+            "request waits for the in-flight fetch"
+        );
+        assert_eq!(registry.calls(), 1);
+        registry.release(1);
+
+        assert_eq!(response.await.expect("request").status(), StatusCode::OK);
+        assert_eq!(
+            registry.calls(),
+            1,
+            "request must wait for exactly one fetch"
+        );
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn refreshed_binding_revision_must_match_exactly() {
+        for (row_revision, label) in [
+            (TEST_MODEL_REVISION_A, "registry remains behind"),
+            (TEST_MODEL_REVISION_A + 2, "registry advances past request"),
+        ] {
+            let (state, upstream_calls) = test_state().await;
+            let registry_snapshot = if row_revision == TEST_MODEL_REVISION_A {
+                test_bindings_payload()
+            } else {
+                snapshot_with_model_revision(row_revision)
+            };
+            let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+            let state = registry.attach(state);
+            let request = request_with_revision("/v1/messages", VALID_BODY, "8");
+
+            let response = handle_request(State(AppState(state)), request).await;
+
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{label}");
+            assert_eq!(registry.calls(), 1, "{label}");
+            assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_newer_revisions_share_one_refresh() {
+        let (state, upstream_calls) = test_state().await;
+        let registry_snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        let registry = MockBindingRegistry::start(&registry_snapshot, true).await;
+        let state = registry.attach(state);
+        let requests = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut request = request("/v1/messages", VALID_BODY);
+                    request
+                        .headers_mut()
+                        .insert(MODEL_BINDING_REVISION_HEADER, HeaderValue::from_static("8"));
+                    handle_request(State(AppState(state)), request).await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        registry.wait_for_call().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(registry.calls(), 1);
+        registry.release(8);
+        for request in requests {
+            assert_eq!(
+                request.await.expect("concurrent request").status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_waiter_rechecks_after_its_fetch_even_if_another_fetch_completed() {
+        let clock_guard = paused_clock_guard();
+        let (state, upstream_calls) = test_state().await;
+        let registry = MockBindingRegistry::start(&test_bindings_payload(), true).await;
+        let state = registry.attach(state);
+        let mut status = state.refresh_status.subscribe();
+        let observed = status.borrow_and_update().generation();
+        let delayed = handle_request(
+            State(AppState(state.clone())),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        );
+        tokio::pin!(delayed);
+        assert!(futures_util::poll!(&mut delayed).is_pending());
+        registry.wait_for_call().await;
+        registry.release(1);
+        let _ = wait_for_generation(&mut status, observed).await;
+
+        // Leave this request unpolled while another caller completes a refresh.
+        tokio::time::advance(BINDINGS_ON_DEMAND_MIN_INTERVAL).await;
+        let next = tokio::spawn(handle_request(
+            State(AppState(state)),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        ));
+        registry.wait_for_call().await;
+        registry.release(1);
+        assert_eq!(
+            next.await.expect("second request").status(),
+            StatusCode::CONFLICT
+        );
+
+        let polled = futures_util::poll!(&mut delayed);
+        assert!(
+            matches!(polled, std::task::Poll::Ready(ref response) if response.status() == StatusCode::CONFLICT),
+            "a completed fetch must release its waiter even after later completions"
+        );
+        assert_eq!(registry.calls(), 2);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        clock_guard.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_does_not_cancel_the_shared_refresh() {
+        let (state, upstream_calls) = test_state().await;
+        let snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        let registry = MockBindingRegistry::start(&snapshot, true).await;
+        let state = registry.attach(state);
+        let mut first = request("/v1/messages", VALID_BODY);
+        first
             .headers_mut()
             .insert(MODEL_BINDING_REVISION_HEADER, HeaderValue::from_static("8"));
+        let first_state = state.clone();
+        let cancelled = tokio::spawn(handle_request(State(AppState(first_state)), first));
+        registry.wait_for_call().await;
+        cancelled.abort();
+        assert!(cancelled
+            .await
+            .expect_err("cancelled request")
+            .is_cancelled());
+
+        let mut second = request("/v1/messages", VALID_BODY);
+        second
+            .headers_mut()
+            .insert(MODEL_BINDING_REVISION_HEADER, HeaderValue::from_static("8"));
+        let response = handle_request(State(AppState(state)), second);
+        tokio::pin!(response);
+        assert!(futures_util::poll!(&mut response).is_pending());
+        registry.release(1);
+
+        assert_eq!(response.await.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_refreshes_obey_backoff_and_reset_after_recovery() {
+        let (state, _) = test_state().await;
+        let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+        let state = registry.attach(state);
+        let mut status = state.refresh_status.subscribe();
+        let mut observed = status.borrow_and_update().generation();
+        state.start_binding_refresher();
+
+        registry.wait_for_call().await;
+        observed = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 1);
+        let first_minimum = next_delay(1, 0.0);
+        let first_maximum = next_delay(1, 1.0);
+        tokio::time::advance(first_minimum.saturating_sub(Duration::from_millis(1))).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 1);
+        tokio::time::advance(
+            first_maximum
+                .saturating_sub(first_minimum)
+                .saturating_add(Duration::from_millis(1)),
+        )
+        .await;
+        registry.wait_for_call().await;
+        observed = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 2);
+
+        *registry.body.write().await = snapshot_json(&test_bindings_payload());
+        let second_minimum = next_delay(2, 0.0);
+        let second_maximum = next_delay(2, 1.0);
+        tokio::time::advance(second_minimum.saturating_sub(Duration::from_millis(1))).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 2);
+        tokio::time::advance(
+            second_maximum
+                .saturating_sub(second_minimum)
+                .saturating_add(Duration::from_millis(1)),
+        )
+        .await;
+        registry.wait_for_call().await;
+        observed = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 3);
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 3);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        registry.wait_for_call().await;
+        let _ = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_initial_refresh_retries_after_backoff_without_dispatch() {
+        let (state, upstream_calls) = test_state().await;
+        *state.bindings.write().await = BindingCache::default();
+        let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+        let state = registry.attach(state);
+        let mut status = state.refresh_status.subscribe();
+        let mut observed = status.borrow_and_update().generation();
+
+        let response = tokio::spawn(handle_request(
+            State(AppState(state.clone())),
+            request("/v1/messages", VALID_BODY),
+        ));
+        registry.wait_for_call().await;
+        let response = response.await.expect("initial request");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        observed = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let minimum = next_delay(1, 0.0);
+        let maximum = next_delay(1, 1.0);
+        tokio::time::advance(minimum.saturating_sub(Duration::from_millis(1))).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 1);
+        tokio::time::advance(
+            maximum
+                .saturating_sub(minimum)
+                .saturating_add(Duration::from_millis(1)),
+        )
+        .await;
+        registry.wait_for_call().await;
+        let _ = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 2);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_demand_refresh_waits_out_minimum_gap_and_serves_new_revision() {
+        let clock_guard = paused_clock_guard();
+        let (state, upstream_calls) = test_state().await;
+        let registry = MockBindingRegistry::start(&test_bindings_payload(), false).await;
+        let state = registry.attach(state);
+        let first = handle_request(
+            State(AppState(state.clone())),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        );
+        assert_eq!(first.await.status(), StatusCode::CONFLICT);
+        assert_eq!(registry.calls(), 1);
+
+        let newer_snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        *registry.body.write().await = snapshot_json(&newer_snapshot);
+        let second = handle_request(
+            State(AppState(state)),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        );
+        tokio::pin!(second);
+        assert!(futures_util::poll!(&mut second).is_pending());
+        tokio::time::advance(
+            BINDINGS_ON_DEMAND_MIN_INTERVAL.saturating_sub(Duration::from_millis(1)),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 1);
+        assert!(futures_util::poll!(&mut second).is_pending());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        registry.wait_for_call().await;
+        let response = second.await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 2);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        clock_guard.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newer_revision_rejects_immediately_during_failure_backoff() {
+        let clock_guard = paused_clock_guard();
+        for (kind, expected_status, expired, model, revision) in [
+            (
+                "newer revision",
+                StatusCode::CONFLICT,
+                false,
+                TEST_MODEL_A,
+                "8",
+            ),
+            (
+                "unknown model",
+                StatusCode::BAD_REQUEST,
+                false,
+                "unknown-model",
+                "7",
+            ),
+            (
+                "expired snapshot",
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+                TEST_MODEL_A,
+                "7",
+            ),
+        ] {
+            let (state, upstream_calls) = test_state().await;
+            if expired {
+                expire_bindings(&state).await;
+            }
+            let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+            let state = registry.attach(state);
+            let body = VALID_BODY.replace(TEST_MODEL_A, model);
+            let first = handle_request(
+                State(AppState(state.clone())),
+                request_with_revision("/v1/messages", &body, revision),
+            );
+            assert_eq!(first.await.status(), expected_status, "{kind}");
+            assert_eq!(registry.calls(), 1, "{kind}");
+
+            let second = handle_request(
+                State(AppState(state)),
+                request_with_revision("/v1/messages", &body, revision),
+            );
+            tokio::pin!(second);
+            let polled = futures_util::poll!(&mut second);
+            assert!(polled.is_ready(), "{kind} must reject immediately");
+            let response = match polled {
+                std::task::Poll::Ready(response) => Some(response),
+                std::task::Poll::Pending => None,
+            }
+            .expect("an immediately rejected request must be ready");
+            assert_eq!(response.status(), expected_status, "{kind}");
+            assert_eq!(registry.calls(), 1, "{kind} must not start another fetch");
+            assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        clock_guard.abort();
+    }
+
+    #[tokio::test]
+    async fn newly_approved_unknown_model_refreshes_before_dispatch() {
+        const MODEL_B: &str = "future-model-2027-01";
+        const SELECTOR_B: &str = "anthropic.future-model-2027-01-v1";
+        const ECHO_B: &str = "future-model-2027-01-provider-echo";
+
+        let (state, upstream_calls) = test_state_with_response(ECHO_B).await;
+        let mut registry_snapshot = test_bindings_payload();
+        registry_snapshot.revision += 1;
+        registry_snapshot.bindings.insert(
+            MODEL_B.to_owned(),
+            ModelBinding {
+                provider: "anthropic".to_owned(),
+                model: MODEL_B.to_owned(),
+                upstream_model: SELECTOR_B.to_owned(),
+                response_model: ECHO_B.to_owned(),
+                revision: 11,
+            },
+        );
+        let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+        let state = registry.attach(state);
+        let body = VALID_BODY.replace(TEST_MODEL_A, MODEL_B);
+        let mut request = request("/v1/messages", &body);
+        request.headers_mut().insert(
+            MODEL_BINDING_REVISION_HEADER,
+            HeaderValue::from_static("11"),
+        );
+
         let response = handle_request(State(AppState(state)), request).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("response body");
+        let value: Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(value["model"], MODEL_B);
     }
 
     #[tokio::test]
     async fn expired_binding_snapshot_fails_closed_before_upstream_dispatch() {
         let (state, calls) = test_state().await;
-        {
-            let mut cache = state.bindings.write().await;
-            let current = cache.current.as_mut().expect("test snapshot");
-            current.fetched_at = Instant::now()
-                .checked_sub(BINDINGS_FRESHNESS_TTL)
-                .and_then(|fetched_at| fetched_at.checked_sub(Duration::from_secs(1)))
-                .expect("test expiry instant is safely in the past");
-        }
+        expire_bindings(&state).await;
+        let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+        let state = registry.attach(state);
         let response =
             handle_request(State(AppState(state)), request("/v1/messages", VALID_BODY)).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(registry.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_on_demand_refresh_does_not_restore_expired_bindings() {
+        let (state, upstream_calls) = test_state().await;
+        expire_bindings(&state).await;
+        let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+        let state = registry.attach(state);
+        let request = request_with_revision("/v1/messages", VALID_BODY, "8");
+
+        let response = handle_request(State(AppState(state)), request).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn binding_changes_during_body_collection_reject_before_dispatch() {
         for change in ["revision", "removal", "expiry"] {
             let (state, calls) = test_state().await;
+            let mut revoked = test_bindings_payload();
+            revoked.revision += 1;
+            revoked.bindings.clear();
+            let registry_snapshot = if change == "expiry" {
+                invalid_bindings_payload()
+            } else {
+                revoked
+            };
+            let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+            let state = registry.attach(state);
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let body = Body::from_stream(stream::once(async move {
@@ -2667,6 +3415,11 @@ mod tests {
                 calls.load(std::sync::atomic::Ordering::Relaxed),
                 0,
                 "{change}"
+            );
+            assert_eq!(
+                registry.calls(),
+                usize::from(change != "revision"),
+                "{change} must use the mock registry when refreshing"
             );
         }
     }
@@ -2759,29 +3512,8 @@ mod tests {
             ]),
         };
 
-        let snapshot_body = Arc::new(RwLock::new(snapshot_json(&initial)));
-        let registry_body = snapshot_body.clone();
-        let registry_app = Router::new().route(
-            "/model-bindings/bedrock",
-            get(move || {
-                let registry_body = registry_body.clone();
-                async move {
-                    let body = registry_body.read().await.clone();
-                    ([(CONTENT_TYPE, "application/json")], body)
-                }
-            }),
-        );
-        let registry_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("registry listener");
-        let registry_addr = registry_listener.local_addr().expect("registry address");
-        let registry_task = tokio::spawn(async move {
-            axum::serve(registry_listener, registry_app)
-                .await
-                .expect("registry");
-        });
-        let state =
-            state.with_test_registry_url(&format!("http://{registry_addr}/model-bindings/bedrock"));
+        let registry = MockBindingRegistry::start(&initial, false).await;
+        let state = registry.attach(state);
         state
             .refresh_bindings()
             .await
@@ -2802,7 +3534,7 @@ mod tests {
         let adapter_url = format!("http://{adapter_addr}/v1/messages");
         let client = Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(10))
             .build()
             .expect("adapter test client");
 
@@ -2816,7 +3548,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        *snapshot_body.write().await = snapshot_json(&added_snapshot);
+        *registry.body.write().await = snapshot_json(&added_snapshot);
         state
             .refresh_bindings()
             .await
@@ -2863,8 +3595,10 @@ mod tests {
                 initial.bindings[TEST_MODEL_A].clone(),
             )]),
         };
-        *snapshot_body.write().await = snapshot_json(&revoked_snapshot);
+        *registry.body.write().await = snapshot_json(&revoked_snapshot);
         state.refresh_bindings().await.expect("revoke future model");
+        tokio::time::pause();
+        tokio::time::advance(BINDINGS_ON_DEMAND_MIN_INTERVAL).await;
         let (body, revision) = request_b(false, "11");
         let response = test_adapter_request(&client, &adapter_url, &body, revision).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2886,7 +3620,7 @@ mod tests {
                 ),
             ]),
         };
-        *snapshot_body.write().await = snapshot_json(&readded_snapshot);
+        *registry.body.write().await = snapshot_json(&readded_snapshot);
         state.refresh_bindings().await.expect("new row revision");
         let (body, revision) = request_b(false, "11");
         let response = test_adapter_request(&client, &adapter_url, &body, revision).await;
@@ -2894,7 +3628,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 3);
 
         adapter_task.abort();
-        registry_task.abort();
         upstream_task.abort();
     }
 
@@ -3241,22 +3974,165 @@ mod tests {
         cache.apply(snapshot, Instant::now()).expect("test binding");
     }
 
+    fn snapshot_with_model_revision(revision: u64) -> BindingsSnapshot {
+        let mut snapshot = test_bindings_payload();
+        snapshot.revision += 1;
+        snapshot
+            .bindings
+            .get_mut(TEST_MODEL_A)
+            .expect("test binding")
+            .revision = revision;
+        snapshot
+    }
+
+    fn invalid_bindings_payload() -> BindingsSnapshot {
+        let mut snapshot = test_bindings_payload();
+        snapshot.network = "testnet".to_owned();
+        snapshot
+    }
+
+    async fn expire_bindings(state: &BedrockMantleState) {
+        let mut cache = state.bindings.write().await;
+        cache.current.as_mut().expect("test snapshot").fetched_at = Instant::now()
+            .checked_sub(BINDINGS_FRESHNESS_TTL + Duration::from_secs(1))
+            .expect("expiry instant");
+    }
+
+    fn paused_clock_guard() -> JoinHandle<()> {
+        tokio::spawn(async {
+            loop {
+                // Keep the paused clock from auto-advancing while this spinner yields.
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    async fn wait_for_generation(
+        receiver: &mut watch::Receiver<BindingRefreshStatus>,
+        previous: u64,
+    ) -> u64 {
+        loop {
+            let current = receiver.borrow_and_update().generation();
+            if current != previous {
+                return current;
+            }
+            receiver.changed().await.expect("binding refresh status");
+        }
+    }
+
+    struct MockBindingRegistry {
+        url: String,
+        body: Arc<RwLock<Vec<u8>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+        task: JoinHandle<()>,
+    }
+
+    impl MockBindingRegistry {
+        async fn start(snapshot: &BindingsSnapshot, blocked: bool) -> Self {
+            let body = Arc::new(RwLock::new(snapshot_json(snapshot)));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let entered = Arc::new(tokio::sync::Semaphore::new(0));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let registry_body = body.clone();
+            let registry_calls = calls.clone();
+            let registry_entered = entered.clone();
+            let registry_release = release.clone();
+            let registry_app = Router::new().route(
+                "/model-bindings/bedrock",
+                get(move || {
+                    let body = registry_body.clone();
+                    let calls = registry_calls.clone();
+                    let entered = registry_entered.clone();
+                    let release = registry_release.clone();
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        entered.add_permits(1);
+                        if blocked {
+                            release
+                                .acquire()
+                                .await
+                                .expect("registry response release")
+                                .forget();
+                        }
+                        let body = body.read().await.clone();
+                        ([(CONTENT_TYPE, "application/json")], body)
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("registry listener");
+            let address = listener.local_addr().expect("registry address");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, registry_app)
+                    .await
+                    .expect("mock registry");
+            });
+            Self {
+                url: format!("http://{address}/model-bindings/bedrock"),
+                body,
+                calls,
+                entered,
+                release,
+                task,
+            }
+        }
+
+        fn attach(&self, state: BedrockMantleState) -> BedrockMantleState {
+            state.with_test_registry_url(&self.url)
+        }
+
+        async fn wait_for_call(&self) {
+            self.entered
+                .acquire()
+                .await
+                .expect("mock registry semaphore")
+                .forget();
+        }
+
+        fn release(&self, count: usize) {
+            self.release.add_permits(count);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for MockBindingRegistry {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
     fn request(uri: &str, body: &str) -> Request<Body> {
+        request_with_revision(uri, body, "7")
+    }
+
+    fn request_with_revision(uri: &str, body: &str, revision: &str) -> Request<Body> {
         Request::builder()
             .method(Method::POST)
             .uri(uri)
             .header(CONTENT_TYPE, "application/json")
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header(EXECUTION_POLICY_HEADER, EXACT_CANONICAL_NO_REPLAY_POLICY)
-            .header(
-                MODEL_BINDING_REVISION_HEADER,
-                TEST_MODEL_REVISION_A.to_string(),
-            )
+            .header(MODEL_BINDING_REVISION_HEADER, revision)
             .body(Body::from(body.to_owned()))
             .expect("request")
     }
 
     async fn test_state() -> (
+        BedrockMantleState,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        test_state_with_response(TEST_RESPONSE_MODEL_A).await
+    }
+
+    async fn test_state_with_response(
+        response_model: &'static str,
+    ) -> (
         BedrockMantleState,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
@@ -3268,10 +4144,8 @@ mod tests {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    (
-                        [(CONTENT_TYPE, "application/json")],
-                        r#"{"model":"test-model-a-provider-echo"}"#,
-                    )
+                    let body = json!({ "model": response_model }).to_string();
+                    ([(CONTENT_TYPE, "application/json")], body)
                 }
             }),
         );
