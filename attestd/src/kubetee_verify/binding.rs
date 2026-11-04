@@ -29,21 +29,15 @@ const STATEMENT_SUFFIX: &str = "\",\"purpose\":\"kubetee.attestation.v1\"}";
 
 /// The JSON tree a keyset and a statement are built from.
 #[derive(Clone, Debug)]
-pub enum Json {
+enum Json {
     String(String),
     Array(Vec<Json>),
     Object(BTreeMap<String, Json>),
 }
 
-impl From<&str> for Json {
-    fn from(value: &str) -> Self {
-        Self::String(value.to_owned())
-    }
-}
-
 /// RFC 8785 canonical JSON for the attestation input class.
 #[must_use]
-pub fn jcs(value: &Json) -> String {
+fn jcs(value: &Json) -> String {
     match value {
         Json::String(text) => jcs_string(text),
         Json::Array(items) => {
@@ -90,58 +84,10 @@ fn jcs_string(text: &str) -> String {
     out
 }
 
-/// The served keyset (spec section 5) for a serving certificate's DER SPKI
-/// and RFC 3339 `not_after` (`YYYY-MM-DDThh:mm:ssZ`). The SPKI digest is
-/// recomputed from the connection's own leaf, never taken from the response.
-#[must_use]
-pub fn keyset_json(spki_der: &[u8], not_after: &str, domain: &str) -> Json {
-    let mut tls_key = BTreeMap::new();
-    tls_key.insert("domain".to_owned(), Json::from(domain));
-    tls_key.insert(
-        "spki_sha256".to_owned(),
-        Json::String(hex::encode(Sha256::digest(spki_der))),
-    );
-    let mut fields = BTreeMap::new();
-    fields.insert(
-        "subject".to_owned(),
-        Json::String(format!("{PURPOSE}/{domain}")),
-    );
-    fields.insert("not_after".to_owned(), Json::String(not_after.to_owned()));
-    fields.insert(
-        "tls_public_keys".to_owned(),
-        Json::Array(vec![Json::Object(tls_key)]),
-    );
-    fields.insert("signing_keys".to_owned(), Json::Array(Vec::new()));
-    fields.insert("e2ee_keys".to_owned(), Json::Array(Vec::new()));
-    Json::Object(fields)
-}
-
-/// Check a served v1 statement against the expected keyset digest, the nonce
-/// sent, and the quote's `report_data` (spec section 4): derive the binding
-/// the statement names and require the quote to carry exactly it.
-///
-/// # Errors
-///
-/// Returns an error naming the first check that fails: the statement shape,
-/// its keyset digest, its nonce, its purpose tag, or the quoted binding.
-pub fn verify_statement(
-    statement: &str,
-    keyset_digest: &str,
-    nonce: &str,
-    report_data: &[u8; 64],
-) -> Result<()> {
-    let expected = report_data_of_statement(statement, keyset_digest, nonce)?;
-    ensure!(
-        *report_data == expected,
-        "TDX report_data is not the v1 binding statement hash"
-    );
-    Ok(())
-}
-
 /// `sha256:<hex>` over JCS(keyset) — what the statement's `keyset_digest`
 /// must equal when recomputed from the served keyset (spec section 5).
 #[must_use]
-pub fn keyset_digest(keyset: &Json) -> String {
+fn keyset_digest(keyset: &Json) -> String {
     format!(
         "{KEYSET_DIGEST_PREFIX}{}",
         hex::encode(Sha256::digest(jcs(keyset).as_bytes()))
@@ -231,6 +177,53 @@ mod tests {
     )]
 
     use super::*;
+
+    impl From<&str> for Json {
+        fn from(value: &str) -> Self {
+            Self::String(value.to_owned())
+        }
+    }
+
+    /// The served keyset (spec section 5) for a serving certificate's DER SPKI
+    /// and RFC 3339 `not_after` (`YYYY-MM-DDThh:mm:ssZ`).
+    fn keyset_json(spki_der: &[u8], not_after: &str, domain: &str) -> Json {
+        let mut tls_key = BTreeMap::new();
+        tls_key.insert("domain".to_owned(), Json::from(domain));
+        tls_key.insert(
+            "spki_sha256".to_owned(),
+            Json::String(hex::encode(Sha256::digest(spki_der))),
+        );
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "subject".to_owned(),
+            Json::String(format!("{PURPOSE}/{domain}")),
+        );
+        fields.insert("not_after".to_owned(), Json::String(not_after.to_owned()));
+        fields.insert(
+            "tls_public_keys".to_owned(),
+            Json::Array(vec![Json::Object(tls_key)]),
+        );
+        fields.insert("signing_keys".to_owned(), Json::Array(Vec::new()));
+        fields.insert("e2ee_keys".to_owned(), Json::Array(Vec::new()));
+        Json::Object(fields)
+    }
+
+    /// Check a served v1 statement against the expected keyset digest, the nonce
+    /// sent, and the quote's `report_data` (spec section 4): derive the binding
+    /// the statement names and require the quote to carry exactly it.
+    fn verify_statement(
+        statement: &str,
+        keyset_digest: &str,
+        nonce: &str,
+        report_data: &[u8; 64],
+    ) -> Result<()> {
+        let expected = report_data_of_statement(statement, keyset_digest, nonce)?;
+        ensure!(
+            *report_data == expected,
+            "TDX report_data is not the v1 binding statement hash"
+        );
+        Ok(())
+    }
 
     #[test]
     fn jcs_orders_object_names_by_utf16_at_every_depth() {

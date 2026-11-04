@@ -3,14 +3,17 @@
     reason = "test fixtures intentionally fail hard on malformed local values"
 )]
 
-//! The evidence is one live `GET /v1/attestation` response from
-//! `llm.kubetee.ai` (2026-09-27, pod `litellm-5959f596d-l4qkl`), the leaf
-//! certificate of the TLS session it arrived on, and the Intel collateral
-//! for its quote, verified offline at [`FIXTURE_NOW`].
+//! The evidence is one live `kubetee.attestation.v1` `GET /v1/attestation`
+//! response from `llm.kubetee.ai` (2026-11-04, pod
+//! `litellm-5dcbc54579-7rm6g`), the leaf certificate it was served under,
+//! and the Intel collateral for its quote, verified offline at
+//! [`FIXTURE_NOW`].
 //!
 //! The end-to-end tests serve that quote from a local TLS server whose
 //! certificate chains to a test root, and which signs the TLS-possession
-//! proof with its own test key.
+//! proof with its own test key. Its v1 keyset names the test leaf, so the
+//! quote's signature chain is verified for real and its `report_data` is then
+//! set to that keyset's binding: [`FixtureChain`] is the only substitution.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -28,10 +31,13 @@ use sha2::{Digest as _, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use super::evidence::verify_attestation;
+use super::binding;
+use super::evidence::{verify_attestation, BindingGuard};
 use super::*;
 
-const FIXTURE_NOW: u64 = 1_790_532_956;
+const FIXTURE_NOW: u64 = 1_793_789_636;
+/// Within the test leaf's validity, which ends in 2126.
+const TEST_KEYSET_NOT_AFTER: &str = "2126-01-01T00:00:00Z";
 const ATTESTATION: &[u8] = include_bytes!("../../tests/fixtures/kubetee/attestation.json");
 const SESSION_LEAF: &[u8] = include_bytes!("../../tests/fixtures/kubetee/session_leaf.der");
 const COLLATERAL: &[u8] = include_bytes!("../../tests/fixtures/kubetee/collateral.json");
@@ -49,7 +55,7 @@ fn fixture_nonce() -> [u8; 32] {
     hex::decode(payload().nonce).unwrap().try_into().unwrap()
 }
 
-fn collateral() -> QuoteCollateralV3 {
+fn collateral() -> dcap_qvl::QuoteCollateralV3 {
     serde_json::from_slice(COLLATERAL).unwrap()
 }
 
@@ -69,8 +75,19 @@ fn td_mut(claims: &mut QuoteClaims) -> &mut TDReport10 {
     }
 }
 
+fn fixture_time() -> DateTime<Utc> {
+    DateTime::from_timestamp(i64::try_from(FIXTURE_NOW).unwrap(), 0).unwrap()
+}
+
+/// The `report_data` the recorded response's v1 statement binds.
+fn bound() -> [u8; 64] {
+    BindingGuard::run(ATTESTATION, &payload().nonce, SESSION_LEAF, fixture_time())
+        .unwrap()
+        .report_data
+}
+
 fn standalone(payload: &AttestationPayload, nonce: &str, claims: &QuoteClaims) -> Result<()> {
-    verify_attestation(payload, nonce, SESSION_LEAF, claims, FIXTURE_NOW).map(|_| ())
+    verify_attestation(payload, nonce, SESSION_LEAF, claims, FIXTURE_NOW, &bound()).map(|_| ())
 }
 
 fn failure(result: Result<()>) -> String {
@@ -80,16 +97,43 @@ fn failure(result: Result<()>) -> String {
 #[test]
 fn the_live_attestation_verifies_offline() {
     let payload = payload();
+    let binding =
+        BindingGuard::run(ATTESTATION, &payload.nonce, SESSION_LEAF, fixture_time()).unwrap();
+    assert_eq!(
+        binding.not_after,
+        "2026-12-21T10:08:05Z".parse::<DateTime<Utc>>().unwrap()
+    );
     let measurements = verify_attestation(
         &payload,
         &payload.nonce,
         SESSION_LEAF,
         &claims(),
         FIXTURE_NOW,
+        &binding.report_data,
     )
     .unwrap();
     assert_eq!(measurements.rtmrs[3], [0; 48], "RTMR3 carries no events");
     assert_ne!(measurements.rtmrs[2], [0; 48]);
+}
+
+#[test]
+fn the_live_response_without_its_v1_fields_fails_closed() {
+    let mut body: Value = serde_json::from_slice(ATTESTATION).unwrap();
+    let fields = body.as_object_mut().unwrap();
+    fields.remove("keyset");
+    fields.remove("bindings");
+    let body = serde_json::to_vec(&body).unwrap();
+    let error =
+        BindingGuard::run(&body, &payload().nonce, SESSION_LEAF, fixture_time()).unwrap_err();
+    assert!(format!("{error:#}").contains("no kubetee.attestation.v1 binding"));
+}
+
+#[test]
+fn a_quote_carrying_the_sha512_nonce_construction_fails_the_binding() {
+    let mut claims = claims();
+    let nonce = payload().nonce;
+    td_mut(&mut claims).report_data = sha2::Sha512::digest(nonce.as_bytes()).into();
+    assert!(failure(standalone(&payload(), &nonce, &claims)).contains("report_data"));
 }
 
 #[test]
@@ -109,11 +153,33 @@ fn an_uppercased_echo_is_not_the_nonce_sent() {
 }
 
 #[test]
-fn a_replayed_quote_under_a_new_nonce_fails_the_binding() {
+fn a_replayed_response_under_a_new_nonce_fails_the_statement() {
+    let fresh = hex::encode([9_u8; 32]);
+    let error = BindingGuard::run(ATTESTATION, &fresh, SESSION_LEAF, fixture_time()).unwrap_err();
+    assert!(format!("{error:#}").contains("different nonce"));
+}
+
+#[test]
+fn a_replayed_quote_under_a_restated_nonce_fails_the_binding() {
+    let original: Value = serde_json::from_slice(ATTESTATION).unwrap();
+    let digest = original["bindings"]["keyset_digest"].as_str().unwrap();
     let mut payload = payload();
     let fresh = hex::encode([9_u8; 32]);
     payload.nonce.clone_from(&fresh);
-    assert!(failure(standalone(&payload, &fresh, &claims())).contains("report_data"));
+    let restated = format!(
+        "{{\"keyset_digest\":\"{digest}\",\"nonce\":\"{fresh}\",\"purpose\":\"{}\"}}",
+        binding::PURPOSE
+    );
+    let report_data = binding::report_data_of_statement(&restated, digest, &fresh).unwrap();
+    let result = verify_attestation(
+        &payload,
+        &fresh,
+        SESSION_LEAF,
+        &claims(),
+        FIXTURE_NOW,
+        &report_data,
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("report_data"));
 }
 
 #[test]
@@ -182,7 +248,14 @@ fn an_rtmr3_extended_without_events_does_not_replay() {
 #[test]
 fn a_proof_for_another_certificate_fails_closed() {
     let payload = payload();
-    let result = verify_attestation(&payload, &payload.nonce, TEST_LEAF, &claims(), FIXTURE_NOW);
+    let result = verify_attestation(
+        &payload,
+        &payload.nonce,
+        TEST_LEAF,
+        &claims(),
+        FIXTURE_NOW,
+        &bound(),
+    );
     assert!(format!("{:#}", result.unwrap_err()).contains("other than this connection's"));
 }
 
@@ -285,6 +358,8 @@ enum Evidence {
     OtherCertificate,
     /// The recorded quote, echoed under a nonce other than the one sent.
     Replayed,
+    /// The recorded response without its `keyset` and `bindings`.
+    Unbound,
     /// Headers and half the body, then nothing.
     Stalled,
 }
@@ -301,16 +376,51 @@ struct Upstream {
     attestation_requests: Mutex<Vec<(String, HeaderMap, usize)>>,
 }
 
-struct FixtureCollateral;
+/// The v1 binding the local upstream serves for the test leaf and the
+/// fixture nonce.
+struct TestBinding {
+    keyset: Value,
+    digest: String,
+    statement: String,
+    report_data: [u8; 64],
+}
+
+fn test_binding() -> TestBinding {
+    let (_, leaf) = x509_parser::parse_x509_certificate(TEST_LEAF).unwrap();
+    let keyset = serde_json::json!({
+        "subject": format!("{}/{HOST_NAME}", binding::PURPOSE),
+        "not_after": TEST_KEYSET_NOT_AFTER,
+        "tls_public_keys": [{
+            "domain": HOST_NAME,
+            "spki_sha256": hex::encode(Sha256::digest(leaf.public_key().raw)),
+        }],
+        "signing_keys": [],
+        "e2ee_keys": [],
+    });
+    let digest = binding::recompute_keyset_digest(&keyset).unwrap();
+    let statement = format!(
+        "{{\"keyset_digest\":\"{digest}\",\"nonce\":\"{}\",\"purpose\":\"{}\"}}",
+        payload().nonce,
+        binding::PURPOSE
+    );
+    let report_data =
+        binding::report_data_of_statement(&statement, &digest, &payload().nonce).unwrap();
+    TestBinding {
+        keyset,
+        digest,
+        statement,
+        report_data,
+    }
+}
+
+struct FixtureChain;
 
 #[async_trait]
-impl Collateral for FixtureCollateral {
-    async fn fetch(&self, _quote: &[u8]) -> Result<QuoteCollateralV3> {
-        Ok(collateral())
-    }
-
-    fn now(&self) -> Result<u64> {
-        Ok(FIXTURE_NOW)
+impl QuoteChain for FixtureChain {
+    async fn verify(&self, quote: &[u8]) -> Result<(QuoteClaims, u64)> {
+        let mut claims = tee_evidence::verify_signature_chain(quote, collateral(), FIXTURE_NOW)?;
+        td_mut(&mut claims).report_data = test_binding().report_data;
+        Ok((claims, FIXTURE_NOW))
     }
 }
 
@@ -338,8 +448,24 @@ fn attestation_body(evidence: Evidence) -> Vec<u8> {
             "tls_cert_sha256": hex::encode(Sha256::digest(TEST_LEAF)),
         });
     }
-    if matches!(evidence, Evidence::Replayed) {
-        payload["nonce"] = Value::from(hex::encode([5_u8; 32]));
+    let served = test_binding();
+    payload["keyset"] = served.keyset;
+    payload["bindings"] = serde_json::json!({
+        "version": binding::PURPOSE,
+        "report_data_statement": served.statement,
+        "keyset_digest": served.digest,
+    });
+    match evidence {
+        Evidence::Replayed => payload["nonce"] = Value::from(hex::encode([5_u8; 32])),
+        Evidence::Unbound => {
+            let fields = payload.as_object_mut().unwrap();
+            fields.remove("keyset");
+            fields.remove("bindings");
+        }
+        Evidence::Genuine
+        | Evidence::Unavailable
+        | Evidence::OtherCertificate
+        | Evidence::Stalled => {}
     }
     serde_json::to_vec(&payload).unwrap()
 }
@@ -552,7 +678,7 @@ async fn serve(evidence: Evidence, chat: Chat, limits: Limits) -> (KubeteeVerifi
     let verifier = KubeteeVerifier::with_parts(
         roots,
         Some(address),
-        Arc::new(FixtureCollateral),
+        Arc::new(FixtureChain),
         fixture_nonce,
         limits,
     );
@@ -676,10 +802,11 @@ async fn chat_session_ids_are_validated_and_supplier_values_are_untrusted() {
 #[tokio::test]
 async fn retiring_an_expired_connection_attests_again_before_chat_or_models() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
-    // The signed fixture is legacy evidence. Add an expired deadline only
-    // to the cache entry to test transport retirement, not v1 cryptography.
     let mut connection = verifier.checkout().await.unwrap();
-    assert_eq!(connection.expires_at, None);
+    assert_eq!(
+        connection.expires_at,
+        Some(TEST_KEYSET_NOT_AFTER.parse().unwrap())
+    );
     connection.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
     verifier.pool.give_back(connection);
     assert_eq!(verifier.idle_connections(), 0);
@@ -827,6 +954,7 @@ async fn a_connection_that_fails_attestation_never_carries_a_chat() {
         (Evidence::Unavailable, "502"),
         (Evidence::OtherCertificate, "other than this connection's"),
         (Evidence::Replayed, "echoed a different nonce"),
+        (Evidence::Unbound, "no kubetee.attestation.v1 binding"),
     ] {
         let (verifier, upstream) = serve(evidence, Chat::Served, limits()).await;
         let error = verifier.forward(chat(TARGETS[0])).await.unwrap_err();
@@ -990,7 +1118,7 @@ async fn the_model_list_is_never_fetched_on_a_connection_that_failed_attestation
 async fn preflight_reports_the_attested_replica() {
     let (verifier, _) = serve(Evidence::Genuine, Chat::Served, limits()).await;
     let attested = verifier.preflight().await.unwrap();
-    assert_eq!(attested.pod, "litellm-5959f596d-l4qkl");
+    assert_eq!(attested.pod, "litellm-5dcbc54579-7rm6g");
     assert_eq!(attested.measurements.rtmrs[3], [0; 48]);
     assert_eq!(
         verifier.idle_connections(),

@@ -353,12 +353,13 @@ before serving inference: the verifier requests a quote for a fresh nonce on
 that connection and requires
 
 - the nonce echoed back exactly;
+- a `kubetee.attestation.v1` keyset that names this connection's serving key
+  for `llm.kubetee.ai` and has not expired, and a binding statement over that
+  keyset's digest and the nonce (the `kubetee.attestation.v1` specification
+  §4-5). A response without the v1 `keyset` and `bindings` fields is refused;
 - the Intel TDX quote verifying at `UpToDate` TCB with the debug bit clear;
-- the quote's `report_data` equal to SHA-512 of the nonce (the live gateway
-  construction; the v1 `kubetee.attestation.v1` JCS-statement binding replaces
-  it at the gateway flip — see the `kubetee.attestation.v1` specification §4,
-  incl. the pinned conformance vectors; `attestd/src/report_data.rs`'s
-  `sha512(pubkey || nonce)` is the separate gm-side attestation-info contract);
+- the quote's `report_data` equal to SHA-256 of that statement, zero-padded to
+  64 bytes;
 - the CC event log replaying to the quote's RTMR0-3;
 - KubeTEE's TLS-possession proof naming this connection's certificate, with
   that certificate's key signing the nonce.
