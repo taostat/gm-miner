@@ -37,7 +37,7 @@ handles the full operator lifecycle from your laptop.
 
 Three steps to a running miner.
 
-1. **Install the Phala CLI** (the miner deploys to Phala Cloud) and have a funded account:
+1. **Install Phala CLI 1.1.19 or newer** (the miner deploys to Phala Cloud) and have a funded account:
 
    ```sh
    npm i -g phala
@@ -264,6 +264,10 @@ incompatible explicit version/image selections fail at this preflight too.
 
 Deploy creates a Phala Cloud CVM, verifies the deployed image hashes against the registry's
 approved versions, and registers the worker — all in one step.
+
+New workers created by `gmcli deploy` and `gmcli worker add` use the registry's default Phala KMS
+contract. Pass `--kms-contract-id <id>` to either command to choose another non-expiring KMS
+contract listed by the registry.
 
 `gmcli deploy` and `gmcli worker add` support the registry-attested `tdx.small` (1 vCPU / 2 GiB)
 and `tdx.medium` (2 vCPU / 4 GiB, the default) sizes.

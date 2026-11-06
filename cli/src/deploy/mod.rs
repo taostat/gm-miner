@@ -6,16 +6,17 @@
 //! measured hashes against the registry allow-list, and registers the
 //! image.
 //!
-//! Phala Cloud owns the confidential VM, the KMS, and `app_id`
-//! authorization. The trust check therefore rests entirely on verifying
-//! the deployed CVM's compose hash and OS image hash against the
-//! registry's approved `ImageVersion` list — there is no client-side KMS
-//! trust-pinning to do.
+//! Phala Cloud owns the confidential VM, KMS, and `app_id` authorization.
+//! New CVMs select a Phala KMS contract at creation; existing CVMs keep that
+//! selection. The trust check rests on verifying the deployed CVM's compose
+//! hash and OS image hash against the registry's approved `ImageVersion` list.
 //!
 //! Steps (orchestrated from `commands::deploy::cmd_deploy`):
-//!   1. Read provider API keys from config; error early if none set.
+//!   1. Resolve the default KMS contract or validate the explicit override
+//!      against `GET /kms-roots`, before any image build or CVM creation.
 //!   2. Auth preflight (`GET /miners/me`) — fail fast if the operator
-//!      forgot `gmcli login` or has a stale token, before any CVM work.
+//!      forgot `gmcli login` or has a stale token. Check the CVM name is free,
+//!      accept terms, and require provider API keys before any image build.
 //!   3. Fetch the approved `ImageVersion` list from the registry.
 //!   4. Select this CLI release's supported image (or a pinned one if `--version`
 //!      given).
@@ -40,18 +41,19 @@ use anyhow::Result;
 mod compose;
 mod cvm;
 mod hashes;
+mod kms_roots;
 mod registry_auth;
 mod version;
 
 pub use compose::{render_compose, render_env_file, COMPOSE_TEMPLATE, PRELAUNCH_SCRIPT};
 pub use cvm::{
     build_phala_deploy_args, parse_phala_cvm_app_id, parse_phala_cvm_detail,
-    parse_phala_cvm_endpoint, parse_phala_cvm_name, phala_command, preflight_phala_cli,
-    to_ratls_passthrough_endpoint, PhalaClient, PhalaDeployArgs, RealPhalaClient,
-    PHALA_APP_ID_FIELD, PHALA_COMPOSE_HASH_FIELD, PHALA_ENDPOINT_FIELD, PHALA_OS_IMAGE_HASH_FIELD,
-    POLL_INTERVAL_SECS,
+    parse_phala_cvm_endpoint, parse_phala_cvm_name, phala_command, to_ratls_passthrough_endpoint,
+    PhalaClient, PhalaCommand, PhalaDeployArgs, RealPhalaClient, PHALA_APP_ID_FIELD,
+    PHALA_COMPOSE_HASH_FIELD, PHALA_ENDPOINT_FIELD, PHALA_OS_IMAGE_HASH_FIELD, POLL_INTERVAL_SECS,
 };
 pub use hashes::{normalize_hash, verify_hashes, DeployOutcome, DstackDeployResult};
+pub use kms_roots::resolve_kms_contract_id;
 pub use registry_auth::{
     fetch_anonymous_token, image_is_public, non_empty_env, parse_bearer_challenge, registry_host,
     resolve_registry_credentials, split_repo_reference, visibility_from_status, BearerChallenge,

@@ -176,12 +176,15 @@ pub async fn resolve_key(flag: Option<&str>, assume_yes: bool) -> Result<Option<
 /// non-zero when unauthenticated, so a zero exit means a usable session — the
 /// same probe `gmcli doctor`'s Phala check uses, kept consistent here.
 fn phala_cli_logged_in() -> bool {
-    std::process::Command::new("phala")
+    let Ok(mut command) = crate::deploy::phala_command(None) else {
+        return false;
+    };
+    command
         .arg("whoami")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|status| status.success())
 }
 
 /// A short label for whichever credential source a deploy would use, or `None`

@@ -13,13 +13,13 @@ use gm_miner_cli::{
     client::{RegistryClient, UPSTREAM_MODEL_ECHO_CAPABILITY},
     cloud_policy::{cloud_fence_required_for_image_recovery, cloud_fence_required_for_worker},
     config::{self, Config, WorkerRecord},
-    dependency::{ensure_dependency, PHALA},
+    dependency::{check_dependency_presence, ensure_dependency, PHALA},
     deploy::{
         fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
-        parse_phala_cvm_endpoint, parse_phala_cvm_name, preflight_phala_cli, prepare_deploy_target,
-        resolve_image_source, resolve_registry_credentials, select_version,
-        to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, ImageVersion,
-        PhalaClient, PHALA_ENDPOINT_FIELD,
+        parse_phala_cvm_endpoint, parse_phala_cvm_name, prepare_deploy_target,
+        resolve_image_source, resolve_kms_contract_id, resolve_registry_credentials,
+        select_version, to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner,
+        ImageSource, ImageVersion, PhalaClient, PHALA_ENDPOINT_FIELD,
     },
     node_secret, slots, terms,
     types::{
@@ -49,6 +49,7 @@ pub(crate) struct DeployArgs {
     pub(crate) image_tag: String,
     pub(crate) instance_type: String,
     pub(crate) disk_size: String,
+    pub(crate) kms_contract_id: Option<String>,
     pub(crate) repo_root: Option<std::path::PathBuf>,
     pub(crate) version: Option<usize>,
     pub(crate) boot_timeout_secs: u64,
@@ -108,6 +109,7 @@ pub(crate) fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
         image_tag: flags.image_tag,
         instance_type: flags.instance_type.as_str().to_owned(),
         disk_size: flags.disk_size,
+        kms_contract_id: flags.kms_contract_id,
         repo_root: flags.repo_root,
         version: flags.version,
         boot_timeout_secs: flags.boot_timeout_secs,
@@ -115,6 +117,12 @@ pub(crate) fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
         assume_yes: flags.yes,
         accept_terms: flags.accept_terms,
     }
+}
+
+/// Shared test fixture built from the command-line defaults.
+#[cfg(test)]
+pub(crate) fn default_test_deploy_args() -> DeployArgs {
+    deploy_args_from_flags(default_deploy_flags())
 }
 
 /// Build and run the deploy subcommand from parsed CLI arguments.
@@ -130,6 +138,7 @@ pub(crate) async fn cmd_deploy_subcommand(
     // subprocesses via the client (never the global env), so it never reaches
     // the `git`/`docker` children of the image build.
     let phala_api_key = phala_preflight(&args).await?;
+    let mut client = RegistryClient::new(cfg.clone());
     let phala = gm_miner_cli::deploy::RealPhalaClient::new(
         args.app_name.clone(),
         args.project_dir.clone(),
@@ -138,7 +147,6 @@ pub(crate) async fn cmd_deploy_subcommand(
         gm_miner_cli::deploy::DEFAULT_OS_IMAGE.to_owned(),
     )
     .with_api_key(phala_api_key);
-    let mut client = RegistryClient::new(cfg.clone());
     cmd_deploy(&cfg, &mut client, &phala, &args, &registration).await
 }
 
@@ -632,6 +640,7 @@ pub(crate) async fn cmd_deploy(
     args: &DeployArgs,
     registration: &WorkerRegistration,
 ) -> Result<()> {
+    let kms_contract_id = resolve_kms_contract_id(client, args.kms_contract_id.as_deref()).await?;
     let keys = deploy_preflight(cfg, client, phala, args, registration).await?;
     let worker_backends = keys.worker_backends();
     require_cloud_registration_capability_for_worker(
@@ -687,6 +696,7 @@ pub(crate) async fn cmd_deploy(
         args.boot_timeout_secs
     );
     let actual = phala.deploy(
+        &kms_contract_id,
         &target.rendered_compose,
         keys,
         &record.node_secret,
@@ -906,7 +916,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
     }
 
     // Recovery must not block on an interactive dependency-install prompt.
-    preflight_phala_cli()?;
+    check_dependency_presence(&PHALA)?;
 
     let out = registered_cvm_detail(app_id, phala_key.as_deref())?;
 
@@ -982,9 +992,15 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
 
 fn registered_cvm_detail(app_id: &str, phala_key: Option<&str>) -> Result<std::process::Output> {
     let out = gm_miner_cli::deploy::phala_command(phala_key)
+        .context("prepare isolated Phala CLI working directory")?
         .args(["cvms", "get", app_id, "--json"])
         .output()
-        .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
+        .with_context(|| {
+            format!(
+                "run phala cvms get — is the Phala CLI installed? ({})",
+                PHALA.installer.display
+            )
+        })?;
     if !out.status.success() {
         bail!(
             "phala cvms get {app_id} failed: {}",
@@ -1410,19 +1426,71 @@ mod tests {
     fn deploy_args() -> DeployArgs {
         DeployArgs {
             app_name: "miner".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("."),
-            image_repo: None,
             image_tag: "latest".to_owned(),
             instance_type: "small".to_owned(),
             disk_size: "30".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
             assume_yes: true,
             accept_terms: true,
+            ..super::default_test_deploy_args()
         }
+    }
+
+    #[tokio::test]
+    async fn kms_roots_are_fetched_before_the_cvm_creation_flow() {
+        struct UnexpectedCvmCreation;
+
+        impl PhalaClient for UnexpectedCvmCreation {
+            fn deploy(
+                &self,
+                _kms_contract_id: &str,
+                _compose_yaml: &str,
+                _env_vars: &ProviderKeys,
+                _node_secret: &str,
+                _registry_creds: Option<&gm_miner_cli::deploy::RegistryCredentials>,
+                _boot_timeout_secs: u64,
+            ) -> Result<gm_miner_cli::deploy::DeployOutcome> {
+                bail!("CVM creation must not be reached after a KMS roots lookup failure")
+            }
+
+            fn existing_cvm_app_id(&self) -> Result<Option<String>> {
+                Ok(None)
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/kms-roots"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let mut cfg = registry_cfg(&server);
+        cfg.provider_keys = Some(ProviderKeys {
+            anthropic: Some("test-key".to_owned()),
+            ..Default::default()
+        });
+        let mut client = RegistryClient::new(cfg.clone());
+        let error = cmd_deploy(
+            &cfg,
+            &mut client,
+            &UnexpectedCvmCreation,
+            &deploy_args(),
+            &WorkerRegistration::Add {
+                hotkey: "5HK".to_owned(),
+            },
+        )
+        .await
+        .expect_err("an unsupported KMS roots endpoint must stop deployment");
+
+        assert!(error.to_string().contains("/kms-roots"), "{error:#}");
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "a KMS roots failure must stop before other deploy work: {requests:?}"
+        );
+        assert_eq!(requests[0].url.path(), "/kms-roots");
     }
 
     #[test]
@@ -1761,6 +1829,7 @@ mod tests {
     impl PhalaClient for CollidingPhala {
         fn deploy(
             &self,
+            _kms_contract_id: &str,
             _compose_yaml: &str,
             _env_vars: &ProviderKeys,
             _node_secret: &str,
@@ -1781,6 +1850,7 @@ mod tests {
     impl PhalaClient for FreeNamePhala {
         fn deploy(
             &self,
+            _kms_contract_id: &str,
             _compose_yaml: &str,
             _env_vars: &ProviderKeys,
             _node_secret: &str,

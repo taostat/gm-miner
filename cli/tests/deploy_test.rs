@@ -51,6 +51,7 @@ impl StubPhala {
 impl PhalaClient for StubPhala {
     fn deploy(
         &self,
+        _kms_contract_id: &str,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
@@ -79,6 +80,7 @@ struct TimedOutPhala;
 impl PhalaClient for TimedOutPhala {
     fn deploy(
         &self,
+        _kms_contract_id: &str,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
@@ -104,6 +106,7 @@ struct FailingPhala;
 impl PhalaClient for FailingPhala {
     fn deploy(
         &self,
+        _kms_contract_id: &str,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
@@ -283,7 +286,14 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            "registry-selected-contract",
+            &rendered,
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+        )
         .unwrap();
 
     assert!(stub.deploy_called.get(), "deploy must have been called");
@@ -320,7 +330,14 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            "registry-selected-contract",
+            &rendered,
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+        )
         .unwrap();
 
     let err = verify_hashes(&actual.hashes, approved)
@@ -428,7 +445,14 @@ fn phala_failure_surfaces_as_error() {
         ..ProviderKeys::default()
     };
     let err = FailingPhala
-        .deploy("compose-content", &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            "registry-selected-contract",
+            "compose-content",
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+        )
         .expect_err("failing phala must produce an error");
     assert!(err.to_string().contains("phala deploy exited"));
 }
@@ -447,7 +471,14 @@ fn timeout_error_is_actionable() {
         ..ProviderKeys::default()
     };
     let err = TimedOutPhala
-        .deploy("compose", &keys, "test-node-secret-1234", None, 0)
+        .deploy(
+            "registry-selected-contract",
+            "compose",
+            &keys,
+            "test-node-secret-1234",
+            None,
+            0,
+        )
         .expect_err("timed-out deploy must produce an error");
     let msg = err.to_string();
     assert!(
