@@ -666,7 +666,6 @@ fn direct_routes_preserve_native_paths_and_tls_pins() {
             "generativelanguage.googleapis.com",
             "/v1beta/models/gemini:generateContent",
         ),
-        ("kubetee", "llm.kubetee.ai", "/v1/images/generations"),
         ("engy", "api.engy.ai", "/v1/chat/completions"),
         ("moonmath", "zro.moonmath.ai", "/v1/chat/completions"),
     ] {
@@ -835,7 +834,7 @@ fn near_images_gate_admits_flux_klein_and_still_rejects_unknown_models() {
 }
 
 #[test]
-fn kubetee_chat_and_models_reach_only_the_measured_verifier() {
+fn kubetee_chat_image_and_models_reach_only_the_measured_verifier() {
     let (status, _, stderr, rendered) = render_envoy([("KUBETEE_API_KEY", "kt-key")]);
     assert!(status.success(), "render failed: {stderr}");
     let parsed = config(&rendered);
@@ -850,7 +849,7 @@ fn kubetee_chat_and_models_reach_only_the_measured_verifier() {
         assert!(selected["route"].get("host_rewrite_literal").is_none());
     }
     let images = route(&parsed, "kubetee", "/v1/images/generations");
-    assert_eq!(images["route"]["cluster"], "kubetee");
+    assert_eq!(images["route"]["cluster"], "kubetee_verify_proxy");
     assert!(images["route"].get("retry_policy").is_none());
     for path in [
         "/v1/completions",
@@ -877,6 +876,7 @@ fn kubetee_chat_and_models_reach_only_the_measured_verifier() {
 
 fn kubetee_request(rendered: &str, path: &str, selector: Option<&str>) -> Lua {
     let mut headers = vec![
+        (":method", "POST"),
         (":path", path),
         ("x-gm-provider", "kubetee"),
         ("x-gm-node-key", "test-node-secret-0001"),
@@ -901,57 +901,25 @@ fn forwarded(lua: &Lua) -> Option<mlua::Table> {
 }
 
 #[test]
-fn kubetee_chat_gate_admits_exactly_the_verifier_targets() {
+fn kubetee_chat_and_image_selectors_are_forwarded_to_the_measured_verifier() {
     let (status, _, stderr, rendered) = render_envoy([("KUBETEE_API_KEY", "kt-key")]);
     assert!(status.success(), "render failed: {stderr}");
-    for model in gm_miner_attestd::kubetee_verify::TARGETS {
-        let lua = kubetee_request(&rendered, "/v1/chat/completions", Some(model));
-        let headers = forwarded(&lua).expect("a target selector is forwarded");
+    for (path, selector) in [
+        ("/v1/chat/completions", "registry/model-added-later"),
+        ("/v1/images/generations", "registry/image-added-later"),
+    ] {
+        let lua = kubetee_request(&rendered, path, Some(selector));
+        let headers = forwarded(&lua).expect("selectors reach the measured verifier");
         assert_eq!(
             headers
                 .get::<Option<String>>("x-gm-upstream-model")
                 .expect("selector"),
-            Some(model.to_owned()),
-            "the validated selector must survive to the loopback verifier"
+            Some(selector.to_owned()),
+            "{path}"
         );
         assert_eq!(
             headers.get::<String>("authorization").expect("auth"),
             "Bearer kt-key"
-        );
-    }
-    for model in [
-        Some("minimax/h3"),
-        Some("mistralai/mistral-large-4"),
-        Some("ornith/ornith-1.5-397b"),
-        Some("black-forest-labs/flux.2-klein-4b"),
-        Some("z-ai/glm-5.3,z-ai/glm-5.2"),
-        Some(""),
-        None,
-    ] {
-        let lua = kubetee_request(&rendered, "/v1/chat/completions", model);
-        assert_eq!(
-            lua.globals()
-                .get::<Option<String>>("response_status")
-                .expect("status")
-                .as_deref(),
-            Some("400"),
-            "{model:?}"
-        );
-    }
-    for (path, selector) in [
-        ("/v1/images/generations", Some("z-ai/glm-5.3")),
-        ("/v1/models", Some("z-ai/glm-5.3")),
-        ("/v1/models", None),
-    ] {
-        let lua = kubetee_request(&rendered, path, selector);
-        let headers =
-            forwarded(&lua).expect("a selector off the chat path is dropped, not refused");
-        assert_eq!(
-            headers
-                .get::<Option<String>>("x-gm-upstream-model")
-                .expect("selector"),
-            None,
-            "{path}"
         );
     }
 }
@@ -987,6 +955,7 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
             let lua = run_request(
                 &rendered,
                 &[
+                    (":method", if path == "/v1/models" { "GET" } else { "POST" }),
                     (":path", path),
                     ("x-gm-provider", provider),
                     ("x-gm-node-key", "test-node-secret-0001"),

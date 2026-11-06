@@ -33,9 +33,11 @@ Docker after changing anything here.
 3. **Header strip.** Every upstream route gets the gm-internal headers
    (`x-gm-request-id`, `x-gm-gateway-sig`, `x-gm-product`, `x-gm-node-key`,
    `x-gm-provider`, `x-gm-upstream-slot`, `x-gm-session-id`) appended to its
-   `request_headers_to_remove`. The exact KubeTEE chat route keeps
-   `x-gm-session-id` for the loopback verifier; every other route removes it.
-   Lua also strips `x-gm-session-id` for every provider except KubeTEE. The
+   `request_headers_to_remove`. KubeTEE chat and image routes keep
+   `x-gm-upstream-model` for the loopback verifier, which authorizes the model
+   and endpoint against the registry snapshot. The exact KubeTEE chat route
+   also keeps `x-gm-session-id`; every other route removes it. Lua strips
+   `x-gm-session-id` for every provider except the KubeTEE chat route. The
    verifier maps one chat value of exactly 64 lowercase hexadecimal characters
    (`[0-9a-f]{64}`) to `x-litellm-session-id` after stripping all caller-supplied
    `x-litellm-*` headers. Upstream files list only the extra headers a route

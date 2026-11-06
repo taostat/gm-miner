@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use axum::{routing::get, Router};
 use dcap_qvl::policy::QuoteClaims;
 use dcap_qvl::quote::{EnclaveReport, Report, TDReport10};
 use dcap_qvl::tcb_info::TcbStatus;
@@ -34,6 +35,21 @@ use tokio_rustls::TlsAcceptor;
 use super::binding;
 use super::evidence::{verify_attestation, BindingGuard};
 use super::*;
+
+#[path = "model_snapshot_tests.rs"]
+mod model_snapshot_tests;
+
+const TEST_CHAT_MODELS: [&str; 8] = [
+    "z-ai/glm-5.2",
+    "z-ai/glm-5.3",
+    "z-ai/glm-5.3-flash",
+    "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-v4.1-flash-1017",
+    "moonshotai/kimi-k3",
+    "moonshotai/kimi-k3.1-pro",
+    "xiaomi/mimo-v2.6-pro",
+];
+const TEST_IMAGE_MODEL: &str = "black-forest-labs/flux.2-klein-4b";
 
 const FIXTURE_NOW: u64 = 1_793_789_636;
 /// Within the test leaf's validity, which ends in 2126.
@@ -92,6 +108,244 @@ fn standalone(payload: &AttestationPayload, nonce: &str, claims: &QuoteClaims) -
 
 fn failure(result: Result<()>) -> String {
     format!("{:#}", result.unwrap_err())
+}
+
+fn test_bindings() -> model_snapshot::KubeteeModelBindings {
+    let mut models = TEST_CHAT_MODELS
+        .iter()
+        .map(|model| serde_json::json!({"upstream_model": model, "endpoint": "chat_completions"}))
+        .chain(std::iter::once(serde_json::json!({
+            "upstream_model": TEST_IMAGE_MODEL,
+            "endpoint": "images_generations"
+        })))
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        left["upstream_model"]
+            .as_str()
+            .cmp(&right["upstream_model"].as_str())
+    });
+    model_snapshot::parse_model_snapshot(
+        &serde_json::json!({"schema_version": 1, "network": "mainnet", "models": models})
+            .to_string()
+            .into_bytes(),
+        "mainnet",
+    )
+    .unwrap()
+}
+
+#[test]
+fn model_binding_parser_rejects_invalid_envelopes_network_keys_duplicates_caps_and_ids() {
+    let valid = serde_json::json!({
+        "schema_version": 1,
+        "network": "mainnet",
+        "models": [{"upstream_model": "a/model", "endpoint": "chat_completions"}],
+    });
+    let invalid = [
+        serde_json::json!({"schema_version": 1, "models": []}),
+        serde_json::json!({"schema_version": 2, "network": "mainnet", "models": []}),
+        serde_json::json!({"schema_version": 1, "network": "testnet", "models": []}),
+        serde_json::json!({"schema_version": 1, "network": "mainnet", "models": [], "extra": true}),
+        serde_json::json!({
+            "schema_version": 1,
+            "network": "mainnet",
+            "models": [
+                {"upstream_model": "a/model", "endpoint": "chat_completions"},
+                {"upstream_model": "a/model", "endpoint": "chat_completions"},
+            ],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "network": "mainnet",
+            "models": [
+                {"upstream_model": "b/model", "endpoint": "chat_completions"},
+                {"upstream_model": "a/model", "endpoint": "chat_completions"},
+            ],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "network": "mainnet",
+            "models": (0..=256)
+                .map(|index| serde_json::json!({"upstream_model": format!("m{index:03}"), "endpoint": "chat_completions"}))
+                .collect::<Vec<_>>(),
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "network": "mainnet",
+            "models": [{"upstream_model": "../bad", "endpoint": "chat_completions"}],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "network": "mainnet",
+            "models": [{"upstream_model": format!("a{}", "x".repeat(256)), "endpoint": "chat_completions"}],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "network": "mainnet",
+            "models": [{"upstream_model": "a/model", "endpoint": "other"}],
+        }),
+        serde_json::json!({
+            "schema_version": 1,
+            "network": "mainnet",
+            "models": [{"upstream_model": "a/model", "endpoint": "chat_completions", "other": 1}],
+        }),
+    ];
+    assert!(
+        model_snapshot::parse_model_snapshot(&valid.to_string().into_bytes(), "mainnet").is_ok()
+    );
+    assert!(model_snapshot::parse_model_snapshot(
+        br#"{"schema_version":1,"network":"mainnet","models":[]}"#,
+        "mainnet"
+    )
+    .is_ok());
+    for payload in invalid {
+        assert!(
+            model_snapshot::parse_model_snapshot(&payload.to_string().into_bytes(), "mainnet")
+                .is_err()
+        );
+    }
+    assert!(model_snapshot::parse_model_snapshot(
+        br#"{"schema_version":1,"schema_version":1,"network":"mainnet","models":[]}"#,
+        "mainnet"
+    )
+    .is_err());
+}
+
+#[test]
+fn chat_and_image_requests_require_the_matching_endpoint_kind_and_selector() {
+    let bindings = test_bindings();
+    assert!(validate_request(&chat(TEST_CHAT_MODELS[0]), &bindings).is_ok());
+    assert!(validate_request(&chat(TEST_IMAGE_MODEL), &bindings).is_err());
+
+    let image = Request::builder()
+        .method(Method::POST)
+        .uri(IMAGES_GENERATIONS)
+        .header(SELECTOR_HEADER, TEST_IMAGE_MODEL)
+        .body(Body::from(
+            serde_json::json!({"model": TEST_IMAGE_MODEL}).to_string(),
+        ))
+        .unwrap();
+    assert!(validate_request(&image, &bindings).is_ok());
+    let wrong_kind = Request::builder()
+        .method(Method::POST)
+        .uri(IMAGES_GENERATIONS)
+        .header(SELECTOR_HEADER, TEST_CHAT_MODELS[0])
+        .body(Body::from(
+            serde_json::json!({"model": TEST_CHAT_MODELS[0]}).to_string(),
+        ))
+        .unwrap();
+    assert!(validate_request(&wrong_kind, &bindings).is_err());
+}
+
+#[tokio::test]
+async fn body_model_must_match_the_selected_registry_model() {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(CHAT_COMPLETIONS)
+        .body(Body::from(r#"{"model":"z-ai/glm-5.3"}"#))
+        .unwrap();
+    assert!(require_body_model(request, TEST_CHAT_MODELS[0])
+        .await
+        .is_err());
+}
+
+#[test]
+fn registry_model_discovery_filters_to_snapshot_ids() {
+    let list = serde_json::json!({"object": "list", "data": [
+        {"id": TEST_CHAT_MODELS[1], "object": "model"},
+        {"id": "minimax/h3", "object": "model"},
+        {"id": TEST_IMAGE_MODEL, "object": "model"},
+    ]});
+    let served = served_models(&list, &test_bindings());
+    assert_eq!(
+        served["data"],
+        serde_json::json!([
+            {"id": TEST_CHAT_MODELS[1], "object": "model"},
+            {"id": TEST_IMAGE_MODEL, "object": "model"},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn inference_without_a_snapshot_returns_a_clear_503_before_upstream_access() {
+    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    verifier
+        .model_snapshot
+        .cache_for_test()
+        .write()
+        .await
+        .clear();
+    let response = verifier.forward(chat(TEST_CHAT_MODELS[0])).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("KubeTEE model bindings are unavailable"));
+    assert_eq!(counts(&upstream), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_failed_registry_refresh_keeps_the_last_good_snapshot() {
+    let (mut verifier, _) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    let payload = Arc::new(tokio::sync::RwLock::new(
+        serde_json::json!({
+            "schema_version": 1,
+            "network": "mainnet",
+            "models": [{"upstream_model": "a/model", "endpoint": "chat_completions"}],
+        })
+        .to_string()
+        .into_bytes(),
+    ));
+    verifier.model_snapshot = verifier
+        .model_snapshot
+        .clone()
+        .with_url(&registry_server(payload.clone()).await);
+    verifier.refresh_bindings().await.unwrap();
+    let last_good = verifier
+        .model_snapshot
+        .cache_for_test()
+        .read()
+        .await
+        .current()
+        .unwrap();
+
+    *payload.write().await = serde_json::json!({
+        "schema_version": 1,
+        "network": "testnet",
+        "models": [],
+    })
+    .to_string()
+    .into_bytes();
+    assert!(verifier.refresh_bindings().await.is_err());
+    assert_eq!(
+        verifier
+            .model_snapshot
+            .cache_for_test()
+            .read()
+            .await
+            .current(),
+        Some(last_good)
+    );
+}
+
+async fn registry_server(body: Arc<tokio::sync::RwLock<Vec<u8>>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/model-bindings/kubetee",
+        get(move || {
+            let body = Arc::clone(&body);
+            async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body.read().await.clone(),
+                )
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{address}/model-bindings/kubetee")
 }
 
 #[test]
@@ -295,7 +549,7 @@ fn the_model_list_is_narrowed_to_the_chat_and_image_models() {
         {"id": "xiaomi/mimo-v2.6-pro", "object": "model"},
         {"object": "model"},
     ]});
-    let served = served_targets(&list);
+    let served = served_models(&list, &test_bindings());
     assert_eq!(
         served["data"],
         serde_json::json!([
@@ -305,7 +559,7 @@ fn the_model_list_is_narrowed_to_the_chat_and_image_models() {
         ])
     );
     assert_eq!(
-        served_targets(&serde_json::json!({}))["data"],
+        served_models(&serde_json::json!({}), &test_bindings())["data"],
         serde_json::json!([])
     );
 }
@@ -315,7 +569,7 @@ fn the_upstream_request_carries_no_supplier_or_selector_header() {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/v1/chat/completions")
-        .header(SELECTOR_HEADER, TARGETS[0])
+        .header(SELECTOR_HEADER, TEST_CHAT_MODELS[0])
         .header("x-kubetee-nonce", "buyer-chosen")
         .header("x-kubetee-anything", "buyer")
         .header("x-litellm-tags", "buyer")
@@ -680,7 +934,21 @@ async fn serve(evidence: Evidence, chat: Chat, limits: Limits) -> (KubeteeVerifi
         Arc::new(FixtureChain),
         fixture_nonce,
         limits,
+        RegistrySnapshot::new(
+            reqwest::Client::new(),
+            format!("http://127.0.0.1:0{}", model_snapshot::PATH),
+            "mainnet".to_owned(),
+            SnapshotCache::default(),
+            model_snapshot::parse_model_snapshot,
+            "KubeTEE",
+        ),
     );
+    verifier
+        .model_snapshot
+        .cache_for_test()
+        .write()
+        .await
+        .publish(test_bindings(), std::time::Instant::now());
     (verifier, upstream)
 }
 
@@ -736,7 +1004,7 @@ fn counts(upstream: &Upstream) -> (usize, usize, usize) {
 #[tokio::test]
 async fn a_chat_streams_through_unchanged_without_supplier_headers() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
-    let response = verifier.forward(chat(TARGETS[2])).await.unwrap();
+    let response = verifier.forward(chat(TEST_CHAT_MODELS[2])).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().keys().all(|name| {
         !name.as_str().starts_with("x-kubetee-") && !name.as_str().starts_with("x-litellm-")
@@ -779,7 +1047,7 @@ async fn chat_session_ids_are_validated_and_supplier_values_are_untrusted() {
 
     for (ids, supplier_id) in cases {
         let response = verifier
-            .forward(chat_with_session(TARGETS[0], &ids, supplier_id))
+            .forward(chat_with_session(TEST_CHAT_MODELS[0], &ids, supplier_id))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -809,7 +1077,10 @@ async fn retiring_an_expired_connection_attests_again_before_chat_or_models() {
     connection.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
     verifier.pool.give_back(connection);
     assert_eq!(verifier.idle_connections(), 0);
-    assert_eq!(round_trip(&verifier, TARGETS[0]).await.1, SSE.as_bytes());
+    assert_eq!(
+        round_trip(&verifier, TEST_CHAT_MODELS[0]).await.1,
+        SSE.as_bytes()
+    );
     assert_eq!(counts(&upstream), (2, 2, 1));
 
     let mut connection = verifier.pool.take().unwrap();
@@ -830,7 +1101,11 @@ async fn retiring_an_expired_connection_attests_again_before_chat_or_models() {
 #[tokio::test]
 async fn an_attested_connection_is_reused_without_attesting_again() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
-    for selector in [TARGETS[0], TARGETS[1], TARGETS[5]] {
+    for selector in [
+        TEST_CHAT_MODELS[0],
+        TEST_CHAT_MODELS[1],
+        TEST_CHAT_MODELS[5],
+    ] {
         assert_eq!(round_trip(&verifier, selector).await.1, SSE.as_bytes());
     }
     assert_eq!(counts(&upstream), (1, 1, 3));
@@ -840,7 +1115,7 @@ async fn an_attested_connection_is_reused_without_attesting_again() {
 #[tokio::test]
 async fn a_connection_returns_once_its_body_reports_its_end() {
     let (verifier, _) = serve(Evidence::Genuine, Chat::Served, limits()).await;
-    let response = verifier.forward(chat(TARGETS[0])).await.unwrap();
+    let response = verifier.forward(chat(TEST_CHAT_MODELS[0])).await.unwrap();
     let mut body = response.into_body();
     // A server writing the response stops polling once the body reports its end.
     while !hyper::body::Body::is_end_stream(&body) {
@@ -853,9 +1128,9 @@ async fn a_connection_returns_once_its_body_reports_its_end() {
 #[tokio::test]
 async fn a_body_dropped_early_retires_its_connection() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
-    drop(verifier.forward(chat(TARGETS[0])).await.unwrap());
+    drop(verifier.forward(chat(TEST_CHAT_MODELS[0])).await.unwrap());
     assert_eq!(verifier.idle_connections(), 0);
-    round_trip(&verifier, TARGETS[0]).await;
+    round_trip(&verifier, TEST_CHAT_MODELS[0]).await;
     assert_eq!(counts(&upstream), (2, 2, 2));
 }
 
@@ -866,10 +1141,10 @@ async fn a_connection_that_expires_while_idle_is_not_reused() {
         ..Limits::default()
     };
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, short).await;
-    round_trip(&verifier, TARGETS[0]).await;
+    round_trip(&verifier, TEST_CHAT_MODELS[0]).await;
     assert_eq!(verifier.idle_connections(), 1, "pooled while fresh");
     tokio::time::sleep(Duration::from_millis(400)).await;
-    round_trip(&verifier, TARGETS[0]).await;
+    round_trip(&verifier, TEST_CHAT_MODELS[0]).await;
     assert_eq!(counts(&upstream), (2, 2, 2));
 }
 
@@ -881,7 +1156,7 @@ async fn a_connection_is_renewed_after_its_request_limit() {
     };
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, two).await;
     for _ in 0..3 {
-        round_trip(&verifier, TARGETS[0]).await;
+        round_trip(&verifier, TEST_CHAT_MODELS[0]).await;
     }
     assert_eq!(counts(&upstream), (2, 2, 3));
 }
@@ -893,7 +1168,7 @@ async fn the_idle_pool_is_capped() {
     let burst = |verifier: Arc<KubeteeVerifier>| async move {
         let requests = (0..pool::MAX_IDLE + 2).map(|_| {
             let verifier = Arc::clone(&verifier);
-            tokio::spawn(async move { round_trip(&verifier, TARGETS[0]).await })
+            tokio::spawn(async move { round_trip(&verifier, TEST_CHAT_MODELS[0]).await })
         });
         for request in requests.collect::<Vec<_>>() {
             assert_eq!(request.await.unwrap().0, StatusCode::OK);
@@ -914,21 +1189,21 @@ async fn the_idle_pool_is_capped() {
 #[tokio::test]
 async fn off_list_requests_are_refused_before_any_connection() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
-    let mut wrong_path = chat(TARGETS[0]);
+    let mut wrong_path = chat(TEST_CHAT_MODELS[0]);
     *wrong_path.uri_mut() = Uri::from_static("/v1/completions");
-    let mut wrong_method = chat(TARGETS[0]);
+    let mut wrong_method = chat(TEST_CHAT_MODELS[0]);
     *wrong_method.method_mut() = Method::GET;
-    let mut no_selector = chat(TARGETS[0]);
+    let mut no_selector = chat(TEST_CHAT_MODELS[0]);
     no_selector.headers_mut().remove(SELECTOR_HEADER);
-    let mut two_selectors = chat(TARGETS[0]);
+    let mut two_selectors = chat(TEST_CHAT_MODELS[0]);
     two_selectors
         .headers_mut()
         .append(SELECTOR_HEADER, HeaderValue::from_static("z-ai/glm-5.3"));
-    let mut other_body_model = chat(TARGETS[1]);
+    let mut other_body_model = chat(TEST_CHAT_MODELS[1]);
     *other_body_model.body_mut() = Body::from(r#"{"model":"minimax/h3"}"#);
-    let mut no_body_model = chat(TARGETS[1]);
+    let mut no_body_model = chat(TEST_CHAT_MODELS[1]);
     *no_body_model.body_mut() = Body::from(r#"{"messages":[]}"#);
-    let mut not_json = chat(TARGETS[1]);
+    let mut not_json = chat(TEST_CHAT_MODELS[1]);
     *not_json.body_mut() = Body::from("model=z-ai/glm-5.3");
     for request in [
         other_body_model,
@@ -956,7 +1231,10 @@ async fn a_connection_that_fails_attestation_never_carries_a_chat() {
         (Evidence::Unbound, "no kubetee.attestation.v1 binding"),
     ] {
         let (verifier, upstream) = serve(evidence, Chat::Served, limits()).await;
-        let error = verifier.forward(chat(TARGETS[0])).await.unwrap_err();
+        let error = verifier
+            .forward(chat(TEST_CHAT_MODELS[0]))
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains(expected), "{error:#}");
         assert_eq!(
             counts(&upstream),
@@ -982,9 +1260,12 @@ fn quick_fetch() -> Limits {
 #[tokio::test]
 async fn an_attestation_body_that_stalls_times_out_and_is_retried() {
     let (verifier, upstream) = serve(Evidence::Stalled, Chat::Served, quick_fetch()).await;
-    let result = tokio::time::timeout(Duration::from_secs(10), verifier.forward(chat(TARGETS[0])))
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        verifier.forward(chat(TEST_CHAT_MODELS[0])),
+    )
+    .await
+    .unwrap();
     let error = result.unwrap_err();
     assert!(format!("{error:#}").contains("timed out"), "{error:#}");
     assert_eq!(counts(&upstream), (3, 3, 0), "three attempts, no chat");
@@ -1011,11 +1292,13 @@ async fn a_model_list_body_that_stalls_times_out_and_retires_its_connection() {
 #[tokio::test]
 async fn each_event_reaches_the_caller_as_it_arrives() {
     let (verifier, _) = serve(Evidence::Genuine, Chat::FirstEventOnly, limits()).await;
-    let response =
-        tokio::time::timeout(Duration::from_secs(10), verifier.forward(chat(TARGETS[0])))
-            .await
-            .unwrap()
-            .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        verifier.forward(chat(TEST_CHAT_MODELS[0])),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let mut body = response.into_body();
     let first = tokio::time::timeout(Duration::from_secs(10), body.frame())
         .await
@@ -1028,7 +1311,7 @@ async fn each_event_reaches_the_caller_as_it_arrives() {
 #[tokio::test]
 async fn supplier_trailers_are_removed_on_the_forwarding_path() {
     let (verifier, _) = serve(Evidence::Genuine, Chat::Trailed, limits()).await;
-    let mut request = chat(TARGETS[0]);
+    let mut request = chat(TEST_CHAT_MODELS[0]);
     request
         .headers_mut()
         .insert("te", HeaderValue::from_static("trailers"));
@@ -1048,7 +1331,7 @@ async fn a_chat_body_that_stalls_is_refused_before_any_connection() {
         ..Limits::default()
     };
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, slow_caller).await;
-    let mut request = chat(TARGETS[0]);
+    let mut request = chat(TEST_CHAT_MODELS[0]);
     *request.body_mut() = Body::new(Frames::stalling(Bytes::from_static(b"{\"model\":")));
     let result = tokio::time::timeout(Duration::from_secs(10), verifier.forward(request))
         .await
@@ -1060,7 +1343,7 @@ async fn a_chat_body_that_stalls_is_refused_before_any_connection() {
 #[tokio::test]
 async fn a_failed_chat_is_never_retried_and_its_connection_is_retired() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Dropped, limits()).await;
-    assert!(verifier.forward(chat(TARGETS[0])).await.is_err());
+    assert!(verifier.forward(chat(TEST_CHAT_MODELS[0])).await.is_err());
     assert_eq!(counts(&upstream), (1, 1, 1));
     assert_eq!(verifier.idle_connections(), 0);
 }
@@ -1068,7 +1351,7 @@ async fn a_failed_chat_is_never_retried_and_its_connection_is_retired() {
 #[tokio::test]
 async fn an_upstream_error_status_passes_through() {
     let (verifier, _) = serve(Evidence::Genuine, Chat::Unauthorized, limits()).await;
-    let (status, body) = round_trip(&verifier, TARGETS[1]).await;
+    let (status, body) = round_trip(&verifier, TEST_CHAT_MODELS[1]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body, "{\"error\":\"unauthorized\"}".as_bytes());
 }
@@ -1095,7 +1378,7 @@ async fn the_model_list_is_fetched_on_an_attested_connection_and_narrowed() {
     let keyless = Request::builder().uri(MODELS).body(Body::empty()).unwrap();
     let response = verifier.models(keyless).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    round_trip(&verifier, TARGETS[0]).await;
+    round_trip(&verifier, TEST_CHAT_MODELS[0]).await;
     assert_eq!(
         counts(&upstream),
         (1, 1, 1),

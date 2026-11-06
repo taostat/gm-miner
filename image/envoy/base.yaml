@@ -248,6 +248,13 @@ static_resources:
                             headers:remove("x-envoy-hedge-on-per-try-timeout")
                           end
 
+                          local function kubetee_inference_request(headers, provider, bare)
+                            return provider == "kubetee"
+                              and headers:get(":method") == "POST"
+                              and (bare == "/v1/chat/completions"
+                                or bare == "/v1/images/generations")
+                          end
+
                           local function strip_internal_headers(headers, provider, bare)
                             -- Envoy forbids header mutation during iteration. Keep the
                             -- route discriminator until route actions remove it,
@@ -270,10 +277,12 @@ static_resources:
                                   and name == "x-gm-execution-policy")
                                 and not (keep_execution_policy
                                   and name == "x-gm-model-binding-revision")
-                                and not ((provider == "near" or provider == "chutes"
-                                    or provider == "kubetee")
+                                and not ((provider == "near" or provider == "chutes")
                                   and name == "x-gm-upstream-model")
-                                and not (provider == "kubetee"
+                                and not (kubetee_inference_request(headers, provider, bare)
+                                  and name == "x-gm-upstream-model")
+                                and not (kubetee_inference_request(headers, provider, bare)
+                                  and bare == "/v1/chat/completions"
                                   and name == "x-gm-session-id")
                                 and not (provider == "chutes" and name == "x-gm-ordinary") then
                                 names[#names + 1] = name
@@ -446,33 +455,21 @@ static_resources:
                             return bare == "/v1/images/generations"
                           end
 
-                          -- These selectors must agree with each verifier's closed model list.
+                          -- NEAR retains its image-compiled model list. KubeTEE's measured
+                          -- verifier owns the registry snapshot and checks both endpoints.
                           local verified_models = {
-                            near = {
-                              ["Qwen/Qwen3.8-27B"] = true,
-                              ["z-ai/glm-5.3-flash"] = true,
-                              ["black-forest-labs/FLUX.2-klein-4B"] = true,
-                            },
-                            kubetee = {
-                              ["z-ai/glm-5.2"] = true,
-                              ["z-ai/glm-5.3"] = true,
-                              ["z-ai/glm-5.3-flash"] = true,
-                              ["deepseek/deepseek-v4.1-flash"] = true,
-                              ["deepseek/deepseek-v4.1-flash-1017"] = true,
-                              ["moonshotai/kimi-k3"] = true,
-                              ["moonshotai/kimi-k3.1-pro"] = true,
-                              ["xiaomi/mimo-v2.6-pro"] = true,
-                            },
+                            ["Qwen/Qwen3.8-27B"] = true,
+                            ["z-ai/glm-5.3-flash"] = true,
+                            ["black-forest-labs/FLUX.2-klein-4B"] = true,
                           }
 
-                          local function verified_selector_accepted(handle, headers, provider)
+                          local function verified_selector_accepted(handle, headers)
                             local model = headers:get("x-gm-upstream-model")
-                            if verified_models[provider][model] then
+                            if verified_models[model] then
                               return true
                             end
-                            local names = {near = "NEAR", kubetee = "KubeTEE"}
                             reject(handle, "400",
-                              "missing or unsupported " .. names[provider] .. " source model")
+                              "missing or unsupported NEAR source model")
                             return false
                           end
 
@@ -482,9 +479,11 @@ static_resources:
                             end
                             local needs_verified_selector = provider == "near"
                               and bare ~= "/v1/models"
-                              or provider == "kubetee" and bare == "/v1/chat/completions"
                             if needs_verified_selector then
-                              return verified_selector_accepted(handle, headers, provider)
+                              return verified_selector_accepted(handle, headers)
+                            end
+                            if kubetee_inference_request(headers, provider, bare) then
+                              return true
                             end
                             headers:remove("x-gm-upstream-model")
                             return true

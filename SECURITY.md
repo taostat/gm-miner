@@ -49,6 +49,11 @@ registry. Reports that concern the confidentiality or integrity guarantees
 of the TEE boundary — attestation verification, key handling, or enclave
 isolation — are treated as high severity.
 
+KubeTEE chat and image models are authorized by a strict network-specific
+snapshot from the registry. The measured verifier checks the endpoint kind and
+the exact upstream model on every request, filters model discovery to that
+snapshot, and fails closed when no fresh snapshot is available.
+
 The node secret (`GM_NODE_SECRET`) is generated per-worker by the CLI and
 embedded in the compose env; it is used by Envoy to authenticate inbound
 requests from the gateway. Reports involving node secret exposure or

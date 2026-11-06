@@ -317,10 +317,12 @@ fn report_empty_provider_coverage(target: &StreamingTarget, configured: &[Provid
 fn warn_unreadable_declarations(providers: &[Provider]) {
     for provider in sourcing_providers() {
         if providers.contains(&provider) {
-            println!(
-                "  [--] {provider}: could not read declared offers; \
-                 probing fallback only (offered-route coverage unknown)"
-            );
+            let clause = if fallback_model(&provider).is_none() {
+                "no registry-selected probe model is available"
+            } else {
+                "probing fallback only (offered-route coverage unknown)"
+            };
+            println!("  [--] {provider}: could not read declared offers; {clause}");
         }
     }
 }
@@ -345,6 +347,11 @@ async fn check_provider_streaming(
             println!(
                 "  [--] {provider}: selected worker's {backend} model binding is \
                  unavailable/unverified; no streaming probe sent"
+            );
+        } else if fallback_model(&provider).is_none() {
+            println!(
+                "  [--] {provider}: no declared route is available to probe; \
+                 supply probe is inconclusive"
             );
         } else {
             println!(
@@ -831,8 +838,8 @@ fn non_empty(value: Option<&str>) -> bool {
 
 struct ProbeModels {
     /// One or more models to probe per provider. Sourcing providers may
-    /// declare several routes (e.g. `z-ai/glm-5.2` and
-    /// `deepseek/deepseek-v4-flash-0731`); each gets its own check.
+    /// declare several routes; each gets its own check. `KubeTEE` has no
+    /// fallback because its current routes come from miner declarations.
     models: std::collections::HashMap<Provider, Vec<ProbeModel>>,
 }
 
@@ -840,12 +847,14 @@ impl ProbeModels {
     fn models_for(&self, provider: &Provider) -> Vec<ProbeModel> {
         match self.models.get(provider) {
             Some(models) if !models.is_empty() => models.clone(),
-            _ => vec![ProbeModel {
-                canonical: fallback_model(provider).to_owned(),
-                upstream: None,
-                fallback: true,
-                binding_revision: None,
-            }],
+            _ => fallback_model(provider).map_or_else(Vec::new, |model| {
+                vec![ProbeModel {
+                    canonical: model.to_owned(),
+                    upstream: None,
+                    fallback: true,
+                    binding_revision: None,
+                }]
+            }),
         }
     }
 }
@@ -857,8 +866,9 @@ impl ProbeModels {
 /// Sourcing providers report supply health for every **offered** model from
 /// `/miners/me` (e.g. GLM-5.2 and
 /// deepseek-v4-flash-0731), independent of buyer-catalog availability. If
-/// nothing is declared, [`fallback_model`] is used at print time. The check
-/// must never fail the deploy it advises on.
+/// nothing is declared, [`fallback_model`] is used except for `KubeTEE`, whose
+/// route list is registry supplied. The check must never fail the deploy it
+/// advises on.
 fn resolve_probe_models(
     providers: &[Provider],
     canonical: &std::collections::HashMap<Provider, Vec<String>>,
@@ -1033,8 +1043,8 @@ fn declared_models_for_provider(
         .collect()
 }
 
-fn fallback_model(provider: &Provider) -> &'static str {
-    match provider {
+fn fallback_model(provider: &Provider) -> Option<&'static str> {
+    Some(match provider {
         Provider::Anthropic => "claude-sonnet-4-6",
         Provider::OpenAI => "gpt-5.5",
         Provider::Gemini => "gemini-2.5-pro",
@@ -1043,12 +1053,10 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::Zai | Provider::Engy | Provider::Moonmath => "glm-5.2",
         Provider::Moonshot => "kimi-k3",
         Provider::DeepInfra => "zai-org/GLM-5.2",
-        // Last resort only when `/miners/me` has no kubetee offer. Prefer GLM
-        // over kimi; flash is probed once declared (see #185 / sources).
-        Provider::Kubetee => "z-ai/glm-5.2",
+        Provider::Kubetee => return None,
         Provider::Near => "Qwen/Qwen3.8-27B",
         Provider::Benchmark => "benchmark",
-    }
+    })
 }
 
 fn build_probe(provider: Provider, model: &ProbeModel, slot: Option<String>) -> ProviderProbe {
@@ -1880,7 +1888,9 @@ mod tests {
     #[test]
     fn zai_probe_uses_openai_compatible_route_and_model() {
         let model = ProbeModel {
-            canonical: fallback_model(&Provider::Zai).to_owned(),
+            canonical: fallback_model(&Provider::Zai)
+                .expect("Zai fallback")
+                .to_owned(),
             upstream: None,
             fallback: true,
             binding_revision: None,
@@ -1894,9 +1904,9 @@ mod tests {
     #[test]
     fn kubetee_probe_uses_openai_compatible_route_and_model() {
         let model = ProbeModel {
-            canonical: fallback_model(&Provider::Kubetee).to_owned(),
-            upstream: None,
-            fallback: true,
+            canonical: "zai/glm-5.2-tee".to_owned(),
+            upstream: Some("z-ai/glm-5.2".to_owned()),
+            fallback: false,
             binding_revision: None,
         };
         let probe = build_probe(Provider::Kubetee, &model, None);
@@ -1905,7 +1915,7 @@ mod tests {
             probe.body["model"],
             Value::String("z-ai/glm-5.2".to_owned())
         );
-        assert_eq!(probe.model, "z-ai/glm-5.2");
+        assert_eq!(probe.model, "zai/glm-5.2-tee");
     }
 
     fn catalog_row(provider: &str, model: &str, capabilities: Value) -> Product {
@@ -2129,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawn_kubetee_routes_degrade_to_the_fallback() {
+    fn withdrawn_kubetee_routes_do_not_probe_a_compiled_fallback() {
         let mut declared = std::collections::HashMap::new();
         declared.insert(
             (Provider::Kubetee, "moonshotai/kimi-k3".to_owned()),
@@ -2146,11 +2156,7 @@ mod tests {
             models: std::collections::HashMap::new(),
         };
         let models = catalog.models_for(&Provider::Kubetee);
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].canonical, "z-ai/glm-5.2");
-        assert!(models[0].fallback);
-        let probe = build_probe(Provider::Kubetee, &models[0], None);
-        assert_eq!(probe.model_label(), "z-ai/glm-5.2 [fallback]");
+        assert!(models.is_empty());
     }
 
     #[test]
@@ -2414,7 +2420,9 @@ mod tests {
     #[test]
     fn deepinfra_probe_uses_openai_compatible_route_and_model() {
         let model = ProbeModel {
-            canonical: fallback_model(&Provider::DeepInfra).to_owned(),
+            canonical: fallback_model(&Provider::DeepInfra)
+                .expect("DeepInfra fallback")
+                .to_owned(),
             upstream: None,
             fallback: true,
             binding_revision: None,
@@ -2431,7 +2439,9 @@ mod tests {
     #[test]
     fn moonmath_probe_uses_openai_compatible_route_and_model() {
         let model = ProbeModel {
-            canonical: fallback_model(&Provider::Moonmath).to_owned(),
+            canonical: fallback_model(&Provider::Moonmath)
+                .expect("Moonmath fallback")
+                .to_owned(),
             upstream: None,
             fallback: true,
             binding_revision: None,
