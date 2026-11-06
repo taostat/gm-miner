@@ -135,13 +135,18 @@ impl DerefMut for PhalaCommand {
 /// scoped onto it (via `.env`), never the global process environment — so the
 /// secret reaches only the `phala` CLI, not the `git`/`docker` subprocesses of
 /// the image build. The private, newly-created working directory keeps an
-/// ambient caller `phala.toml` out of every Phala invocation.
+/// ambient caller `phala.toml` out of every Phala invocation. A relative
+/// `PHALA_CLOUD_DIR` and relative PATH entries still resolve from the caller's
+/// directory.
 ///
 /// # Errors
-/// Returns an error if gmcli cannot create the isolated working directory.
+/// Returns an error if gmcli cannot create the isolated working directory or
+/// resolve the credential directory or executable search path.
 pub fn phala_command(api_key: Option<&str>) -> Result<PhalaCommand> {
     let working_dir = tempfile::tempdir().context("create isolated Phala CLI working directory")?;
     let mut cmd = std::process::Command::new("phala");
+    crate::dependency::scope_search_path(&mut cmd)?;
+    crate::phala::scope_credentials_dir(&mut cmd)?;
     cmd.current_dir(working_dir.path());
     if let Some(key) = api_key {
         cmd.env("PHALA_CLOUD_API_KEY", key);
@@ -149,6 +154,22 @@ pub fn phala_command(api_key: Option<&str>) -> Result<PhalaCommand> {
     Ok(PhalaCommand {
         command: cmd,
         _working_dir: working_dir,
+    })
+}
+
+/// Run a Phala CLI command and add the shared install hint if it cannot spawn.
+///
+/// # Errors
+/// Returns an error if the subprocess cannot be started.
+pub fn phala_output(
+    command: &mut std::process::Command,
+    invocation: &str,
+) -> Result<std::process::Output> {
+    command.output().with_context(|| {
+        format!(
+            "{invocation} — is the Phala CLI installed? ({})",
+            crate::dependency::PHALA.installer.display
+        )
     })
 }
 
@@ -574,16 +595,9 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
 /// Returns an error only if `phala` cannot be spawned, or it exits
 /// successfully but emits output that is not valid `cvms get --json` JSON.
 fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<DeployOutcome>> {
-    let out = phala_command(api_key)
-        .context("prepare isolated Phala CLI working directory")?
-        .args(["cvms", "get", cvm_id, "--json"])
-        .output()
-        .with_context(|| {
-            format!(
-                "run phala cvms get — is the Phala CLI installed? ({})",
-                crate::dependency::PHALA.installer.display
-            )
-        })?;
+    let mut command = phala_command(api_key)?;
+    command.args(["cvms", "get", cvm_id, "--json"]);
+    let out = phala_output(&mut command, "run phala cvms get")?;
 
     if !out.status.success() {
         tracing::info!(
@@ -622,16 +636,9 @@ fn read_phala_cvm_list_page(
     api_key: Option<&str>,
 ) -> Result<PhalaCvmListPage> {
     let args = build_phala_cvm_list_args(page);
-    let out = phala_command(api_key)
-        .context("prepare isolated Phala CLI working directory")?
-        .args(&args)
-        .output()
-        .with_context(|| {
-            format!(
-                "run phala cvms list — is the Phala CLI installed? ({})",
-                crate::dependency::PHALA.installer.display
-            )
-        })?;
+    let mut command = phala_command(api_key)?;
+    command.args(&args);
+    let out = phala_output(&mut command, "run phala cvms list")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!(
@@ -693,16 +700,9 @@ impl PhalaClient for RealPhalaClient {
             prelaunch_path: &prelaunch_arg,
         });
 
-        let out = phala_command(self.api_key.as_deref())
-            .context("prepare isolated Phala CLI working directory")?
-            .args(&args)
-            .output()
-            .with_context(|| {
-                format!(
-                    "run phala deploy — is the Phala CLI installed? ({})",
-                    crate::dependency::PHALA.installer.display
-                )
-            })?;
+        let mut command = phala_command(self.api_key.as_deref())?;
+        command.args(&args);
+        let out = phala_output(&mut command, "run phala deploy")?;
         if !out.status.success() {
             bail!(
                 "phala deploy exited with status {}: {}",

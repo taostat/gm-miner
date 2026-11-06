@@ -85,6 +85,7 @@ impl Fixture {
             "accepted_terms": {"version": CURRENT_TERMS_VERSION, "timestamp": "2026-01-01T00:00:00Z"},
         });
         std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config");
+        std::fs::write(dir.path().join("calls"), "").expect("initialize subprocess call log");
         std::fs::write(dir.path().join("phala.toml"), "id = 'existing-cvm'\n")
             .expect("write ambient caller project");
         for (name, script) in [
@@ -93,6 +94,9 @@ impl Fixture {
                 "#!/bin/sh\n\
                 printf '%s\\n' \"$*\" >> \"$TEST_CALLS\"\n\
                 [ ! -f phala.toml ] || exit 41\n\
+                if [ \"$TEST_REQUIRE_CREDENTIALS\" = 1 ]; then\n\
+                  [ -f \"$PHALA_CLOUD_DIR/credentials.json\" ] || exit 42\n\
+                fi\n\
                 case \"$1\" in\n\
                   --version) printf '1.1.19\\n';;\n\
                   whoami) exit 0;;\n\
@@ -146,7 +150,7 @@ impl Fixture {
         Self { dir, server, route }
     }
 
-    fn run(&self, requested: Option<&str>, build: bool) -> std::process::Output {
+    fn command(&self, requested: Option<&str>, build: bool) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_gmcli"));
         match self.route {
             Route::Add | Route::RetrySecondary => command.args(["worker", "add"]),
@@ -165,13 +169,70 @@ impl Fixture {
             .env("PATH", self.dir.path())
             .env("GMCLI_CONFIG_DIR", self.dir.path())
             .env("TEST_CALLS", self.dir.path().join("calls"))
-            .env("TEST_DEPLOY_ARGS", self.dir.path().join("deploy-args"))
+            .env("TEST_DEPLOY_ARGS", self.dir.path().join("deploy-args"));
+        command
+    }
+
+    fn run(&self, requested: Option<&str>, build: bool) -> std::process::Output {
+        self.command(requested, build)
             .output()
             .expect("run gmcli with isolated config and fake commands")
     }
 
     fn calls(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("calls")).expect("read subprocess calls")
+    }
+}
+
+#[tokio::test]
+async fn isolated_phala_calls_keep_relative_credential_directories() {
+    let fixture = Fixture::new(
+        Route::Deploy,
+        ResponseTemplate::new(200).set_body_json(allowed_roots()),
+    )
+    .await;
+    let credentials = fixture.dir.path().join("credentials");
+    std::fs::create_dir(&credentials).expect("create credential directory");
+    std::fs::write(credentials.join("credentials.json"), "{}").expect("write session marker");
+
+    let output = fixture
+        .command(None, false)
+        .env("PHALA_CLOUD_DIR", "credentials")
+        .env("TEST_REQUIRE_CREDENTIALS", "1")
+        .output()
+        .expect("run deploy with a relative Phala credential directory");
+
+    // The fake CLI checks credentials on every call and stops at creation.
+    // Reaching deploy proves the version, login and name checks all used the
+    // caller's credentials despite running outside its phala.toml directory.
+    assert!(
+        fixture.dir.path().join("deploy-args").exists(),
+        "Phala lost the caller's credential directory: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn isolated_phala_calls_keep_relative_executable_search_paths() {
+    // Both a relative component and an empty PATH component mean the
+    // caller's directory; neither may be rebound to the isolated directory.
+    for search_path in [".", ""] {
+        let fixture = Fixture::new(
+            Route::Deploy,
+            ResponseTemplate::new(200).set_body_json(allowed_roots()),
+        )
+        .await;
+        let output = fixture
+            .command(None, false)
+            .env("PATH", search_path)
+            .output()
+            .expect("run deploy with a relative executable search path");
+
+        assert!(
+            fixture.dir.path().join("deploy-args").exists(),
+            "Phala was lost from PATH {search_path:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -193,7 +254,11 @@ async fn kms_rejection_stops_real_creation_routes_before_image_build() {
             let fixture = Fixture::new(route, ResponseTemplate::new(200).set_body_json(body)).await;
             let output = fixture.run(*requested, true);
             assert!(!output.status.success(), "{route:?} accepted {requested:?}");
-            assert_eq!(fixture.calls(), "--version\nwhoami\n", "{route:?}");
+            assert_eq!(
+                fixture.calls(),
+                "",
+                "{route:?}: rejected KMS data must stop before the Phala version check or key preflight"
+            );
             let requests = fixture.server.received_requests().await.expect("requests");
             assert!(requests
                 .iter()
@@ -218,7 +283,11 @@ async fn missing_kms_endpoint_and_expiry_stop_real_creation_routes() {
                 !output.status.success(),
                 "{route:?} must reject invalid KMS data"
             );
-            assert_eq!(fixture.calls(), "--version\nwhoami\n", "{route:?}");
+            assert_eq!(
+                fixture.calls(),
+                "",
+                "{route:?}: rejected KMS data must stop before the Phala version check or key preflight"
+            );
             let requests = fixture.server.received_requests().await.expect("requests");
             assert!(!requests.iter().any(|r| r.url.path() == "/image-versions"));
         }

@@ -90,8 +90,8 @@ pub const PHALA: Dependency = Dependency {
 /// `tool --version`, the convention every CLI gmcli bridges to supports.
 ///
 /// # Errors
-/// Returns an error when the isolated working directory for the probe cannot
-/// be created.
+/// Returns an error if gmcli cannot create the isolated working directory
+/// used to keep ambient CLI configuration out of the probe.
 pub fn on_path(tool: &str) -> Result<bool> {
     Ok(version_command_output(tool)?.is_some_and(|output| output.status.success()))
 }
@@ -117,7 +117,8 @@ pub fn version_meets_minimum(version_output: &str, minimum: &str) -> bool {
 /// This check is non-interactive and never installs anything.
 ///
 /// # Errors
-/// Returns an actionable error when the executable is missing or outdated.
+/// Returns an actionable error when the executable is missing or outdated,
+/// or the isolated version-probe directory cannot be created.
 pub fn check_dependency(dep: &Dependency) -> Result<()> {
     match dependency_availability(dep)? {
         DependencyAvailability::Available => Ok(()),
@@ -135,10 +136,12 @@ pub fn check_dependency(dep: &Dependency) -> Result<()> {
                 dep.installer.display
             );
         }
-        DependencyAvailability::Unsupported => bail!(
-            "`{}` must be version {} or newer for this command.\n  install or upgrade it with: {}",
+        DependencyAvailability::Unsupported(observed) => bail!(
+            "`{}` must be version {} or newer for this command; `{} --version` reported: {}.\n  install or upgrade it with: {}",
             dep.name,
             dep.min_version.unwrap_or("a supported version"),
+            dep.name,
+            observed,
             dep.installer.display
         ),
     }
@@ -150,7 +153,8 @@ pub fn check_dependency(dep: &Dependency) -> Result<()> {
 ///
 /// # Errors
 /// Returns an actionable error when the executable is missing or fails its
-/// `--version` command.
+/// `--version` command, or the isolated version-probe directory cannot be
+/// created.
 pub fn check_dependency_presence(dep: &Dependency) -> Result<()> {
     if on_path(dep.name)? {
         Ok(())
@@ -163,10 +167,37 @@ pub fn check_dependency_presence(dep: &Dependency) -> Result<()> {
     }
 }
 
+/// Preserve PATH lookup from the caller's directory when a subprocess changes
+/// working directory. An empty component also means the caller's directory.
+pub(crate) fn scope_search_path(command: &mut Command) -> Result<()> {
+    let Some(search_path) = std::env::var_os("PATH") else {
+        return Ok(());
+    };
+    let mut paths: Vec<_> = std::env::split_paths(&search_path).collect();
+    if paths.iter().any(|path| path.is_relative()) {
+        let caller_dir = std::env::current_dir().context("resolve CLI search directory")?;
+        for path in &mut paths {
+            if path.is_relative() {
+                *path = caller_dir.join(&*path);
+            }
+        }
+        command.env(
+            "PATH",
+            std::env::join_paths(paths).context("resolve CLI search path")?,
+        );
+    }
+    Ok(())
+}
+
 fn version_command_output(tool: &str) -> Result<Option<Output>> {
     let working_dir = tempfile::tempdir()
-        .with_context(|| format!("create a temporary directory to run `{tool} --version`"))?;
-    Ok(Command::new(tool)
+        .with_context(|| format!("create isolated working directory to check {tool} version"))?;
+    let mut command = Command::new(tool);
+    scope_search_path(&mut command)?;
+    if tool == PHALA.name {
+        crate::phala::scope_credentials_dir(&mut command)?;
+    }
+    Ok(command
         .current_dir(working_dir.path())
         .arg("--version")
         .output()
@@ -177,7 +208,7 @@ fn version_command_output(tool: &str) -> Result<Option<Output>> {
 enum DependencyAvailability {
     Available,
     Missing,
-    Unsupported,
+    Unsupported(String),
 }
 
 fn dependency_availability(dep: &Dependency) -> Result<DependencyAvailability> {
@@ -199,7 +230,9 @@ fn dependency_availability(dep: &Dependency) -> Result<DependencyAvailability> {
     if version_meets_minimum(&version_output, minimum) {
         Ok(DependencyAvailability::Available)
     } else {
-        Ok(DependencyAvailability::Unsupported)
+        Ok(DependencyAvailability::Unsupported(
+            version_output.trim().to_owned(),
+        ))
     }
 }
 
@@ -240,25 +273,32 @@ pub fn confirm(question: &str, default_yes: bool, assume_yes: bool) -> Result<bo
 /// # Errors
 /// Returns an error when the tool is missing or outdated and cannot be brought
 /// up to date — no consent, no installer prerequisite, or the install command
-/// itself failing — always with the copy-paste command so the operator can
-/// finish by hand.
+/// itself failing — or when the isolated version-probe directory cannot be
+/// created. Dependency failures include the copy-paste command so the operator
+/// can finish by hand.
 pub fn ensure_dependency(dep: &Dependency, assume_yes: bool) -> Result<()> {
     let availability = dependency_availability(dep)?;
     if availability == DependencyAvailability::Available {
         return Ok(());
     }
 
-    match availability {
+    let observed_version = match &availability {
+        DependencyAvailability::Unsupported(observed) => Some(observed.as_str()),
+        _ => None,
+    };
+    match &availability {
         DependencyAvailability::Missing => {
             let minimum = dep.min_version.map_or_else(String::new, |version| {
                 format!(" (version {version} or newer required)")
             });
             println!("{} is not installed{minimum}.", dep.name);
         }
-        DependencyAvailability::Unsupported => println!(
-            "{} does not meet the required version {}.",
+        DependencyAvailability::Unsupported(observed) => println!(
+            "{} does not meet the required version {}; `{} --version` reported: {}.",
             dep.name,
-            dep.min_version.unwrap_or("a supported version")
+            dep.min_version.unwrap_or("a supported version"),
+            dep.name,
+            observed
         ),
         DependencyAvailability::Available => return Ok(()),
     }
@@ -275,8 +315,11 @@ pub fn ensure_dependency(dep: &Dependency, assume_yes: bool) -> Result<()> {
         let requirement = dep.min_version.map_or_else(String::new, |version| {
             format!(" version {version} or newer")
         });
+        let observed = observed_version.map_or_else(String::new, |version| {
+            format!("; `{} --version` reported: {version}", dep.name)
+        });
         bail!(
-            "`{}`{requirement} is required for this command.\n  {action} it with: {}",
+            "`{}`{requirement} is required for this command{observed}.\n  {action} it with: {}",
             dep.name,
             dep.installer.display
         );
@@ -295,16 +338,26 @@ pub fn ensure_dependency(dep: &Dependency, assume_yes: bool) -> Result<()> {
 
     run_installer(dep)?;
 
-    if dependency_availability(dep)? == DependencyAvailability::Available {
-        println!("{} installed.", dep.name);
-        Ok(())
-    } else {
-        bail!(
+    match dependency_availability(dep)? {
+        DependencyAvailability::Available => {
+            println!("{} installed.", dep.name);
+            Ok(())
+        }
+        DependencyAvailability::Missing => bail!(
             "ran `{}` but `{}` is still missing or does not meet the required version — \
              open a new shell or check the installer output above, then re-run.",
             dep.installer.display,
             dep.name
-        )
+        ),
+        DependencyAvailability::Unsupported(observed) => bail!(
+            "ran `{}` but `{}` still requires version {} or newer; `{} --version` reported: {} — \
+             open a new shell or check the installer output above, then re-run.",
+            dep.installer.display,
+            dep.name,
+            dep.min_version.unwrap_or("a supported version"),
+            dep.name,
+            observed
+        ),
     }
 }
 
@@ -358,8 +411,8 @@ mod tests {
 
     #[test]
     fn on_path_detects_cargo_and_rejects_nonsense() {
-        assert!(on_path("cargo").expect("probe cargo"));
-        assert!(!on_path("gm-miner-no-such-tool-xyz").expect("probe a missing tool"));
+        assert!(on_path("cargo").expect("check cargo on PATH"));
+        assert!(!on_path("gm-miner-no-such-tool-xyz").expect("check missing tool"));
     }
 
     #[test]

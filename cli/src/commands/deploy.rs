@@ -133,12 +133,16 @@ pub(crate) async fn cmd_deploy_subcommand(
     args: DeployArgs,
     registration: WorkerRegistration,
 ) -> Result<()> {
+    let mut client = RegistryClient::new(cfg.clone());
+    // Resolve the contract before Phala's interactive key prompt and credit
+    // check. A registry that cannot authorize a KMS root should fail without
+    // asking the operator to paste credentials or querying their balance.
+    let kms_contract_id = resolve_kms_contract_id(&client, args.kms_contract_id.as_deref()).await?;
     // Phala gate: ensure the CLI is installed and resolve+validate the API key
     // before building the client. The key is scoped onto the `phala`
     // subprocesses via the client (never the global env), so it never reaches
     // the `git`/`docker` children of the image build.
     let phala_api_key = phala_preflight(&args).await?;
-    let mut client = RegistryClient::new(cfg.clone());
     let phala = gm_miner_cli::deploy::RealPhalaClient::new(
         args.app_name.clone(),
         args.project_dir.clone(),
@@ -147,7 +151,15 @@ pub(crate) async fn cmd_deploy_subcommand(
         gm_miner_cli::deploy::DEFAULT_OS_IMAGE.to_owned(),
     )
     .with_api_key(phala_api_key);
-    cmd_deploy(&cfg, &mut client, &phala, &args, &registration).await
+    cmd_deploy_with_kms(
+        &cfg,
+        &mut client,
+        &phala,
+        &args,
+        &registration,
+        kms_contract_id,
+    )
+    .await
 }
 
 /// `gmcli worker add` — attach a new CVM to the existing hotkey.
@@ -633,6 +645,7 @@ fn resolve_and_render_target(
     )
 }
 
+#[cfg(test)]
 pub(crate) async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
@@ -641,6 +654,17 @@ pub(crate) async fn cmd_deploy(
     registration: &WorkerRegistration,
 ) -> Result<()> {
     let kms_contract_id = resolve_kms_contract_id(client, args.kms_contract_id.as_deref()).await?;
+    cmd_deploy_with_kms(cfg, client, phala, args, registration, kms_contract_id).await
+}
+
+async fn cmd_deploy_with_kms(
+    cfg: &Config,
+    client: &mut RegistryClient,
+    phala: &dyn PhalaClient,
+    args: &DeployArgs,
+    registration: &WorkerRegistration,
+    kms_contract_id: String,
+) -> Result<()> {
     let keys = deploy_preflight(cfg, client, phala, args, registration).await?;
     let worker_backends = keys.worker_backends();
     require_cloud_registration_capability_for_worker(
@@ -991,16 +1015,9 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
 }
 
 fn registered_cvm_detail(app_id: &str, phala_key: Option<&str>) -> Result<std::process::Output> {
-    let out = gm_miner_cli::deploy::phala_command(phala_key)
-        .context("prepare isolated Phala CLI working directory")?
-        .args(["cvms", "get", app_id, "--json"])
-        .output()
-        .with_context(|| {
-            format!(
-                "run phala cvms get — is the Phala CLI installed? ({})",
-                PHALA.installer.display
-            )
-        })?;
+    let mut command = gm_miner_cli::deploy::phala_command(phala_key)?;
+    command.args(["cvms", "get", app_id, "--json"]);
+    let out = gm_miner_cli::deploy::phala_output(&mut command, "run phala cvms get")?;
     if !out.status.success() {
         bail!(
             "phala cvms get {app_id} failed: {}",

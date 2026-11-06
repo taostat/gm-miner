@@ -42,7 +42,7 @@ pub async fn resolve_kms_contract_id(
     let status = response.status();
     if status == StatusCode::NOT_FOUND {
         bail!(
-            "registry returned 404 for {KMS_ROOTS_PATH}; this registry deployment does not yet provide the KMS root list required to create CVMs. Update the registry deployment and retry"
+            "GET {KMS_ROOTS_PATH} returned 404; this registry does not yet publish KMS roots. Ask the registry operator to configure the {KMS_ROOTS_PATH} endpoint before creating a CVM"
         );
     }
     if !status.is_success() {
@@ -302,6 +302,14 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("404"), "{message}");
         assert!(message.contains("/kms-roots"), "{message}");
-        assert!(message.contains("registry deployment"), "{message}");
+        assert!(
+            message.contains("does not yet publish KMS roots"),
+            "{message}"
+        );
+        assert!(message.contains("Ask the registry operator"), "{message}");
+        assert!(
+            !message.contains("update the registry deployment"),
+            "the action must be directed to the registry operator: {message}"
+        );
     }
 }

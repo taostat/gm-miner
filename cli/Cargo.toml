@@ -58,7 +58,7 @@ tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde        = { workspace = true }
 semver       = "=1.0.28"
-tempfile     = "3"
+tempfile     = "=3.27.0"
 # Keep YAML mapping order when rendering through serde_json::Value.
 serde_json   = { workspace = true, features = ["preserve_order"] }
 sha2         = { workspace = true }

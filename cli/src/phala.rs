@@ -32,6 +32,20 @@ pub const PHALA_API_KEY_HEADER: &str = "X-API-Key";
 /// Where a miner signs up for (and funds) a Phala Cloud account.
 pub const PHALA_SIGNUP_URL: &str = "https://cloud.phala.network";
 
+/// Keep a relative credential-directory override anchored to the caller when
+/// a Phala subprocess runs in an isolated working directory. Blank overrides
+/// are left alone because Phala treats them as unset.
+pub(crate) fn scope_credentials_dir(command: &mut std::process::Command) -> Result<()> {
+    if let Some(directory) = std::env::var_os("PHALA_CLOUD_DIR") {
+        if !directory.to_string_lossy().trim().is_empty() {
+            let path =
+                std::path::absolute(directory).context("resolve Phala credential directory")?;
+            command.env("PHALA_CLOUD_DIR", path);
+        }
+    }
+    Ok(())
+}
+
 /// `GET /auth/me` response — only the credit balance is consumed here.
 #[derive(Debug, Deserialize)]
 struct PhalaCurrentUser {
