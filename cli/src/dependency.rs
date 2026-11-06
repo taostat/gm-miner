@@ -88,9 +88,12 @@ pub const PHALA: Dependency = Dependency {
 
 /// Whether `tool` resolves to a runnable executable on PATH. Probed by
 /// `tool --version`, the convention every CLI gmcli bridges to supports.
-#[must_use]
-pub fn on_path(tool: &str) -> bool {
-    version_command_output(tool).is_some_and(|output| output.status.success())
+///
+/// # Errors
+/// Returns an error when the isolated working directory for the probe cannot
+/// be created.
+pub fn on_path(tool: &str) -> Result<bool> {
+    Ok(version_command_output(tool)?.is_some_and(|output| output.status.success()))
 }
 
 /// Whether a CLI's `--version` output is at least `minimum` under semver.
@@ -116,7 +119,7 @@ pub fn version_meets_minimum(version_output: &str, minimum: &str) -> bool {
 /// # Errors
 /// Returns an actionable error when the executable is missing or outdated.
 pub fn check_dependency(dep: &Dependency) -> Result<()> {
-    match dependency_availability(dep) {
+    match dependency_availability(dep)? {
         DependencyAvailability::Available => Ok(()),
         DependencyAvailability::Missing => {
             if let Some(minimum) = dep.min_version {
@@ -149,7 +152,7 @@ pub fn check_dependency(dep: &Dependency) -> Result<()> {
 /// Returns an actionable error when the executable is missing or fails its
 /// `--version` command.
 pub fn check_dependency_presence(dep: &Dependency) -> Result<()> {
-    if on_path(dep.name) {
+    if on_path(dep.name)? {
         Ok(())
     } else {
         bail!(
@@ -160,13 +163,14 @@ pub fn check_dependency_presence(dep: &Dependency) -> Result<()> {
     }
 }
 
-fn version_command_output(tool: &str) -> Option<Output> {
-    let working_dir = tempfile::tempdir().ok()?;
-    Command::new(tool)
+fn version_command_output(tool: &str) -> Result<Option<Output>> {
+    let working_dir = tempfile::tempdir()
+        .with_context(|| format!("create a temporary directory to run `{tool} --version`"))?;
+    Ok(Command::new(tool)
         .current_dir(working_dir.path())
         .arg("--version")
         .output()
-        .ok()
+        .ok())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -176,15 +180,15 @@ enum DependencyAvailability {
     Unsupported,
 }
 
-fn dependency_availability(dep: &Dependency) -> DependencyAvailability {
-    let Some(output) = version_command_output(dep.name) else {
-        return DependencyAvailability::Missing;
+fn dependency_availability(dep: &Dependency) -> Result<DependencyAvailability> {
+    let Some(output) = version_command_output(dep.name)? else {
+        return Ok(DependencyAvailability::Missing);
     };
     if !output.status.success() {
-        return DependencyAvailability::Missing;
+        return Ok(DependencyAvailability::Missing);
     }
     let Some(minimum) = dep.min_version else {
-        return DependencyAvailability::Available;
+        return Ok(DependencyAvailability::Available);
     };
     let version_bytes = if output.stdout.is_empty() {
         &output.stderr
@@ -193,9 +197,9 @@ fn dependency_availability(dep: &Dependency) -> DependencyAvailability {
     };
     let version_output = String::from_utf8_lossy(version_bytes);
     if version_meets_minimum(&version_output, minimum) {
-        DependencyAvailability::Available
+        Ok(DependencyAvailability::Available)
     } else {
-        DependencyAvailability::Unsupported
+        Ok(DependencyAvailability::Unsupported)
     }
 }
 
@@ -239,7 +243,7 @@ pub fn confirm(question: &str, default_yes: bool, assume_yes: bool) -> Result<bo
 /// itself failing — always with the copy-paste command so the operator can
 /// finish by hand.
 pub fn ensure_dependency(dep: &Dependency, assume_yes: bool) -> Result<()> {
-    let availability = dependency_availability(dep);
+    let availability = dependency_availability(dep)?;
     if availability == DependencyAvailability::Available {
         return Ok(());
     }
@@ -278,7 +282,7 @@ pub fn ensure_dependency(dep: &Dependency, assume_yes: bool) -> Result<()> {
         );
     }
 
-    if !on_path(dep.prereq.name) {
+    if !on_path(dep.prereq.name)? {
         bail!(
             "can't install `{}` automatically: its installer needs `{}`, \
              which is not on PATH.\n  {}\n  Or install it yourself with: {}",
@@ -291,7 +295,7 @@ pub fn ensure_dependency(dep: &Dependency, assume_yes: bool) -> Result<()> {
 
     run_installer(dep)?;
 
-    if dependency_availability(dep) == DependencyAvailability::Available {
+    if dependency_availability(dep)? == DependencyAvailability::Available {
         println!("{} installed.", dep.name);
         Ok(())
     } else {
@@ -354,8 +358,8 @@ mod tests {
 
     #[test]
     fn on_path_detects_cargo_and_rejects_nonsense() {
-        assert!(on_path("cargo"));
-        assert!(!on_path("gm-miner-no-such-tool-xyz"));
+        assert!(on_path("cargo").expect("probe cargo"));
+        assert!(!on_path("gm-miner-no-such-tool-xyz").expect("probe a missing tool"));
     }
 
     #[test]

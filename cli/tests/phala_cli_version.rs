@@ -42,3 +42,35 @@ fn outdated_phala_cli_stops_deploy_before_authentication() {
         "must use the dependency install hint: {stderr}"
     );
 }
+
+#[test]
+fn temp_directory_failure_is_not_reported_as_missing_phala() {
+    let dir = tempfile::tempdir().expect("isolated config and executable directory");
+    let executable = dir.path().join("phala");
+    std::fs::write(&executable, "#!/bin/sh\nprintf 'v1.1.19\\n'\n").expect("write stub phala");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+        .expect("make stub executable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gmcli"))
+        .args(["deploy"])
+        .env_clear()
+        .env("PATH", dir.path())
+        .env("GMCLI_CONFIG_DIR", dir.path())
+        .env("TMPDIR", dir.path().join("missing-tmp"))
+        .output()
+        .expect("run deploy without a usable temporary directory");
+
+    assert!(
+        !output.status.success(),
+        "deploy cannot check phala without a temp dir"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("temporary directory"),
+        "must name the temp-directory failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not found on PATH") && !stderr.contains("is not installed"),
+        "an installed phala must not be reported missing: {stderr}"
+    );
+}
