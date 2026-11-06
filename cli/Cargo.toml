@@ -57,6 +57,8 @@ tokio        = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde        = { workspace = true }
+semver       = "=1.0.28"
+tempfile     = "=3.27.0"
 # Keep YAML mapping order when rendering through serde_json::Value.
 serde_json   = { workspace = true, features = ["preserve_order"] }
 sha2         = { workspace = true }
@@ -89,7 +91,6 @@ gm-miner-attestd = { path = "../attestd" }
 regex         = "1.12"
 wiremock     = "0.6"
 tokio        = { workspace = true }
-tempfile     = "3"
 mlua         = { version = "0.12", features = ["lua51", "vendored"] }
 chrono       = { version = "0.4", features = ["serde"] }
 rcgen        = "0.14.8"

@@ -182,8 +182,7 @@ enum Command {
     /// measured hashes match the registry approval, then registers the
     /// image automatically.
     ///
-    /// Phala Cloud manages the confidential VM, the KMS, and `app_id`
-    /// authorization. Authentication uses a Phala Cloud API key — set
+    /// Authentication uses a Phala Cloud API key — set
     /// `PHALA_API_KEY` / `PHALA_CLOUD_API_KEY`, pass `--phala-api-key`, or
     /// run `phala auth login` before deploying.
     #[command(after_help = "Examples:\n  \
@@ -668,6 +667,15 @@ pub(crate) struct DeployFlags {
     #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
     pub(crate) disk_size: String,
 
+    /// Phala KMS contract ID for a new CVM. Defaults to the registry's
+    /// default allowed root; explicit IDs must name a non-expiring allowed root.
+    #[arg(
+        long,
+        value_name = "ID",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub(crate) kms_contract_id: Option<String>,
+
     /// Repository root used as the Docker build context. Defaults to
     /// the current directory.
     #[arg(long)]
@@ -1148,18 +1156,8 @@ mod tests {
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1204,18 +1202,8 @@ mod tests {
         // surface as a different error than the one asserted here.
         let args = DeployArgs {
             app_name: "gm-miner-1".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-1"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1270,18 +1258,8 @@ mod tests {
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1328,18 +1306,8 @@ mod tests {
         };
         let args = DeployArgs {
             app_name: "gm-miner-1".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-1"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1383,18 +1351,8 @@ mod tests {
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1497,6 +1455,17 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
+            .and(path("/kms-roots"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "roots": [{
+                    "kms_contract_id": "registry-default",
+                    "allowed_until": null,
+                    "is_default": true,
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/miners/me"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "hotkey": "5HK",
@@ -1573,6 +1542,7 @@ mod tests {
         impl PhalaClient for NoDeploy {
             fn deploy(
                 &self,
+                _kms_contract_id: &str,
                 _: &str,
                 _: &ProviderKeys,
                 _: &str,
@@ -1597,6 +1567,18 @@ mod tests {
         ] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
+                .and(path("/kms-roots"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "roots": [{
+                        "kms_contract_id": "registry-default",
+                        "allowed_until": null,
+                        "is_default": true,
+                    }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
                 .and(path("/image-versions"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "versions": [{
@@ -1616,18 +1598,10 @@ mod tests {
             });
             let args = DeployArgs {
                 app_name: "new-worker".to_owned(),
-                image_ref: None,
                 project_dir: std::path::PathBuf::from("unused"),
-                image_repo: None,
                 image_tag: "unused".to_owned(),
-                instance_type: "tdx.medium".to_owned(),
-                disk_size: "40G".to_owned(),
-                repo_root: None,
                 version: pin,
-                boot_timeout_secs: 300,
-                phala_api_key: None,
-                assume_yes: false,
-                accept_terms: false,
+                ..crate::commands::deploy::default_test_deploy_args()
             };
             let mut client = RegistryClient::new(cfg.clone());
             let error = cmd_deploy(
@@ -1665,6 +1639,7 @@ mod tests {
         impl PhalaClient for UnusedPhala {
             fn deploy(
                 &self,
+                _kms_contract_id: &str,
                 _compose: &str,
                 _keys: &ProviderKeys,
                 _node_secret: &str,
@@ -1695,18 +1670,8 @@ mod tests {
 
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let mut client = RegistryClient::new(cfg.clone());
@@ -2066,6 +2031,37 @@ mod tests {
         };
         assert_eq!(flags.app_name, "gm-miner-2");
         assert_eq!(flags.image_ref.as_deref(), Some("ghcr.io/o/m@sha256:abc"));
+    }
+
+    #[test]
+    fn clap_leaves_the_kms_contract_unset_by_default() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["gmcli", "deploy"]).unwrap();
+        let Command::Deploy { flags } = cli.command else {
+            unreachable!("expected deploy");
+        };
+        assert_eq!(flags.kms_contract_id, None);
+    }
+
+    #[test]
+    fn clap_parses_an_explicit_kms_contract_id() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "deploy",
+            "--kms-contract-id",
+            "registry-root-id",
+        ])
+        .unwrap();
+        let Command::Deploy { flags } = cli.command else {
+            unreachable!("expected deploy");
+        };
+        assert_eq!(flags.kms_contract_id.as_deref(), Some("registry-root-id"));
+    }
+
+    #[test]
+    fn clap_rejects_empty_kms_contract_overrides() {
+        let result =
+            <Cli as clap::Parser>::try_parse_from(["gmcli", "deploy", "--kms-contract-id", ""]);
+        assert!(result.is_err(), "deploy accepted an empty KMS contract");
     }
 
     #[test]

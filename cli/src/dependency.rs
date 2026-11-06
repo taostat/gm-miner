@@ -1,5 +1,5 @@
 //! Reusable external-tool preflight: detect a required CLI on PATH and, when
-//! it is missing, offer to install it.
+//! it is missing or outdated, offer to install or upgrade it.
 //!
 //! `gmcli` bridges to external tools rather than reimplementing them —
 //! `phala` for deploy, `btcli` for read-only wallet/metagraph checks during
@@ -8,7 +8,10 @@
 //! parameterised by a [`Dependency`] descriptor so a new tool slots in by value,
 //! not by a new copy of the detection-and-install dance.
 
-use std::io::{IsTerminal as _, Write as _};
+use std::{
+    io::{IsTerminal as _, Write as _},
+    process::{Command, Output},
+};
 
 use anyhow::{bail, Context, Result};
 
@@ -25,6 +28,8 @@ pub struct Dependency {
     pub purpose: &'static str,
     pub installer: InstallCommand,
     pub prereq: Prerequisite,
+    /// Minimum supported semantic version, when a CLI feature requires it.
+    pub min_version: Option<&'static str>,
 }
 
 /// The command that installs a [`Dependency`], split into program + args so it
@@ -57,13 +62,14 @@ pub const BTCLI: Dependency = Dependency {
     },
     prereq: Prerequisite {
         name: "pipx",
-        hint: "install Python and pipx first (https://pipx.pypa.io), \
-               then re-run — or install btcli yourself: pipx install bittensor-cli",
+        hint: "install Python and pipx first (https://pipx.pypa.io), then re-run",
     },
+    min_version: None,
 };
 
 /// `phala` (Phala Cloud CLI) — submits the compose stack to Phala Cloud and
 /// reports the CVM's measured hashes. The runtime dependency of `gmcli deploy`.
+/// Phala CLI 1.1.19 added the `--kms-contract-id` option used for new CVMs.
 pub const PHALA: Dependency = Dependency {
     name: "phala",
     purpose: "the phala CLI submits your miner to Phala Cloud and reports the \
@@ -75,21 +81,159 @@ pub const PHALA: Dependency = Dependency {
     },
     prereq: Prerequisite {
         name: "npm",
-        hint: "install Node.js and npm first (https://nodejs.org), \
-               then re-run — or install phala yourself: npm install -g phala",
+        hint: "install Node.js and npm first (https://nodejs.org), then re-run",
     },
+    min_version: Some("1.1.19"),
 };
 
 /// Whether `tool` resolves to a runnable executable on PATH. Probed by
 /// `tool --version`, the convention every CLI gmcli bridges to supports.
+///
+/// # Errors
+/// Returns an error if gmcli cannot create the isolated working directory
+/// used to keep ambient CLI configuration out of the probe.
+pub fn on_path(tool: &str) -> Result<bool> {
+    Ok(version_command_output(tool)?.is_some_and(|output| output.status.success()))
+}
+
+/// Whether a CLI's `--version` output is at least `minimum` under semver.
+///
+/// A leading `v` is accepted because several CLI tools print versions that
+/// way. Unparseable versions fail closed.
 #[must_use]
-pub fn on_path(tool: &str) -> bool {
-    std::process::Command::new(tool)
+pub fn version_meets_minimum(version_output: &str, minimum: &str) -> bool {
+    let trimmed = version_output.trim();
+    let output_version = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let Ok(output_version) = semver::Version::parse(output_version) else {
+        return false;
+    };
+    let Ok(minimum) = semver::Version::parse(minimum) else {
+        return false;
+    };
+    output_version >= minimum
+}
+
+/// Check that a dependency is present and meets its declared minimum version.
+/// This check is non-interactive and never installs anything.
+///
+/// # Errors
+/// Returns an actionable error when the executable is missing or outdated,
+/// or the isolated version-probe directory cannot be created.
+pub fn check_dependency(dep: &Dependency) -> Result<()> {
+    match dependency_availability(dep)? {
+        DependencyAvailability::Available => Ok(()),
+        DependencyAvailability::Missing => {
+            if let Some(minimum) = dep.min_version {
+                bail!(
+                    "`{}` version {minimum} or newer is required for this command but was not found on PATH.\n  install it with: {}",
+                    dep.name,
+                    dep.installer.display
+                );
+            }
+            bail!(
+                "`{}` is required for this command but was not found on PATH.\n  install it with: {}",
+                dep.name,
+                dep.installer.display
+            );
+        }
+        DependencyAvailability::Unsupported(observed) => bail!(
+            "`{}` must be version {} or newer for this command; `{} --version` reported: {}.\n  install or upgrade it with: {}",
+            dep.name,
+            dep.min_version.unwrap_or("a supported version"),
+            dep.name,
+            observed,
+            dep.installer.display
+        ),
+    }
+}
+
+/// Check only whether a dependency can run, ignoring its optional version
+/// floor. Recovery commands use this when they need the tool but do not create
+/// a new CVM.
+///
+/// # Errors
+/// Returns an actionable error when the executable is missing or fails its
+/// `--version` command, or the isolated version-probe directory cannot be
+/// created.
+pub fn check_dependency_presence(dep: &Dependency) -> Result<()> {
+    if on_path(dep.name)? {
+        Ok(())
+    } else {
+        bail!(
+            "`{}` is required for this command but was not found on PATH.\n  install it with: {}",
+            dep.name,
+            dep.installer.display
+        )
+    }
+}
+
+/// Preserve PATH lookup from the caller's directory when a subprocess changes
+/// working directory. An empty component also means the caller's directory.
+pub(crate) fn scope_search_path(command: &mut Command) -> Result<()> {
+    let Some(search_path) = std::env::var_os("PATH") else {
+        return Ok(());
+    };
+    let mut paths: Vec<_> = std::env::split_paths(&search_path).collect();
+    if paths.iter().any(|path| path.is_relative()) {
+        let caller_dir = std::env::current_dir().context("resolve CLI search directory")?;
+        for path in &mut paths {
+            if path.is_relative() {
+                *path = caller_dir.join(&*path);
+            }
+        }
+        command.env(
+            "PATH",
+            std::env::join_paths(paths).context("resolve CLI search path")?,
+        );
+    }
+    Ok(())
+}
+
+fn version_command_output(tool: &str) -> Result<Option<Output>> {
+    let working_dir = tempfile::tempdir()
+        .with_context(|| format!("create isolated working directory to check {tool} version"))?;
+    let mut command = Command::new(tool);
+    scope_search_path(&mut command)?;
+    if tool == PHALA.name {
+        crate::phala::scope_credentials_dir(&mut command)?;
+    }
+    Ok(command
+        .current_dir(working_dir.path())
         .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .ok())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DependencyAvailability {
+    Available,
+    Missing,
+    Unsupported(String),
+}
+
+fn dependency_availability(dep: &Dependency) -> Result<DependencyAvailability> {
+    let Some(output) = version_command_output(dep.name)? else {
+        return Ok(DependencyAvailability::Missing);
+    };
+    if !output.status.success() {
+        return Ok(DependencyAvailability::Missing);
+    }
+    let Some(minimum) = dep.min_version else {
+        return Ok(DependencyAvailability::Available);
+    };
+    let version_bytes = if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    };
+    let version_output = String::from_utf8_lossy(version_bytes);
+    if version_meets_minimum(&version_output, minimum) {
+        Ok(DependencyAvailability::Available)
+    } else {
+        Ok(DependencyAvailability::Unsupported(
+            version_output.trim().to_owned(),
+        ))
+    }
 }
 
 /// Prompt the operator with `question` and return their yes/no answer.
@@ -118,7 +262,8 @@ pub fn confirm(question: &str, default_yes: bool, assume_yes: bool) -> Result<bo
     Ok(answer == "y" || answer == "yes")
 }
 
-/// Ensure `dep` is installed, offering to install it when it is missing.
+/// Ensure `dep` is installed at a supported version, offering to install or
+/// upgrade it when it is missing or outdated.
 ///
 /// `assume_yes` (the command's `--yes`) and a non-TTY stdin both suppress the
 /// prompt: in those non-interactive contexts we never block on input. With
@@ -126,50 +271,93 @@ pub fn confirm(question: &str, default_yes: bool, assume_yes: bool) -> Result<bo
 /// we print guidance and fail rather than guess consent.
 ///
 /// # Errors
-/// Returns an error when the tool is missing and cannot be installed — no
-/// consent, no installer prerequisite, or the install command itself failing —
-/// always with the copy-paste command so the operator can finish by hand.
+/// Returns an error when the tool is missing or outdated and cannot be brought
+/// up to date — no consent, no installer prerequisite, or the install command
+/// itself failing — or when the isolated version-probe directory cannot be
+/// created. Dependency failures include the copy-paste command so the operator
+/// can finish by hand.
 pub fn ensure_dependency(dep: &Dependency, assume_yes: bool) -> Result<()> {
-    if on_path(dep.name) {
+    let availability = dependency_availability(dep)?;
+    if availability == DependencyAvailability::Available {
         return Ok(());
     }
 
-    println!("{} is not installed.", dep.name);
+    let observed_version = match &availability {
+        DependencyAvailability::Unsupported(observed) => Some(observed.as_str()),
+        _ => None,
+    };
+    match &availability {
+        DependencyAvailability::Missing => {
+            let minimum = dep.min_version.map_or_else(String::new, |version| {
+                format!(" (version {version} or newer required)")
+            });
+            println!("{} is not installed{minimum}.", dep.name);
+        }
+        DependencyAvailability::Unsupported(observed) => println!(
+            "{} does not meet the required version {}; `{} --version` reported: {}.",
+            dep.name,
+            dep.min_version.unwrap_or("a supported version"),
+            dep.name,
+            observed
+        ),
+        DependencyAvailability::Available => return Ok(()),
+    }
     println!("  {}", dep.purpose);
 
     // Default to no: a bare Enter or a non-interactive shell declines, so we
     // never install without an explicit yes (or `--yes`).
-    if !confirm(&format!("install {} now?", dep.name), false, assume_yes)? {
+    let action = if dep.min_version.is_some() {
+        "install or upgrade"
+    } else {
+        "install"
+    };
+    if !confirm(&format!("{action} {} now?", dep.name), false, assume_yes)? {
+        let requirement = dep.min_version.map_or_else(String::new, |version| {
+            format!(" version {version} or newer")
+        });
+        let observed = observed_version.map_or_else(String::new, |version| {
+            format!("; `{} --version` reported: {version}", dep.name)
+        });
         bail!(
-            "`{}` is required for this command but was not found on PATH.\n  \
-             install it with: {}",
+            "`{}`{requirement} is required for this command{observed}.\n  {action} it with: {}",
             dep.name,
             dep.installer.display
         );
     }
 
-    if !on_path(dep.prereq.name) {
+    if !on_path(dep.prereq.name)? {
         bail!(
             "can't install `{}` automatically: its installer needs `{}`, \
-             which is not on PATH.\n  {}",
+             which is not on PATH.\n  {}\n  Or install it yourself with: {}",
             dep.name,
             dep.prereq.name,
-            dep.prereq.hint
+            dep.prereq.hint,
+            dep.installer.display
         );
     }
 
     run_installer(dep)?;
 
-    if on_path(dep.name) {
-        println!("{} installed.", dep.name);
-        Ok(())
-    } else {
-        bail!(
-            "ran `{}` but `{}` is still not on PATH — open a new shell or check \
-             the installer output above, then re-run.",
+    match dependency_availability(dep)? {
+        DependencyAvailability::Available => {
+            println!("{} installed.", dep.name);
+            Ok(())
+        }
+        DependencyAvailability::Missing => bail!(
+            "ran `{}` but `{}` is still missing or does not meet the required version — \
+             open a new shell or check the installer output above, then re-run.",
             dep.installer.display,
             dep.name
-        )
+        ),
+        DependencyAvailability::Unsupported(observed) => bail!(
+            "ran `{}` but `{}` still requires version {} or newer; `{} --version` reported: {} — \
+             open a new shell or check the installer output above, then re-run.",
+            dep.installer.display,
+            dep.name,
+            dep.min_version.unwrap_or("a supported version"),
+            dep.name,
+            observed
+        ),
     }
 }
 
@@ -197,7 +385,7 @@ fn run_installer(dep: &Dependency) -> Result<()> {
     reason = "test assertions intentionally panic on unexpected values"
 )]
 mod tests {
-    use super::{confirm, ensure_dependency, on_path, BTCLI};
+    use super::{confirm, ensure_dependency, on_path, version_meets_minimum, BTCLI};
 
     #[test]
     fn missing_dep_without_consent_fails_with_install_hint() {
@@ -223,8 +411,26 @@ mod tests {
 
     #[test]
     fn on_path_detects_cargo_and_rejects_nonsense() {
-        assert!(on_path("cargo"));
-        assert!(!on_path("gm-miner-no-such-tool-xyz"));
+        assert!(on_path("cargo").expect("check cargo on PATH"));
+        assert!(!on_path("gm-miner-no-such-tool-xyz").expect("check missing tool"));
+    }
+
+    #[test]
+    fn version_comparison_observes_semver_minimum() {
+        for (output, expected) in [
+            ("v1.1.18", false),
+            ("1.1.19", true),
+            ("1.1.19+build", true),
+            ("1.1.19-rc.1", false),
+            ("2.0.0", true),
+            ("garbage", false),
+        ] {
+            assert_eq!(
+                version_meets_minimum(output, "1.1.19"),
+                expected,
+                "version output: {output}"
+            );
+        }
     }
 
     #[test]

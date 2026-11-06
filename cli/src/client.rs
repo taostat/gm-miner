@@ -251,6 +251,22 @@ impl RegistryClient {
         self.send(Method::GET, path, None).await
     }
 
+    /// Issue an unauthenticated GET request to a public registry endpoint.
+    ///
+    /// The request uses this client's configured registry URL and HTTP client,
+    /// but never attaches the miner JWT.
+    ///
+    /// # Errors
+    /// Returns an error if the request cannot be sent.
+    pub async fn get_public(&self, path: &str) -> Result<Response> {
+        let url = format!("{}{path}", self.api_url());
+        self.client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))
+    }
+
     /// Issue an authenticated POST request with a JSON body.
     ///
     /// # Errors

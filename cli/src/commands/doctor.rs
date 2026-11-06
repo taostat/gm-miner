@@ -473,19 +473,9 @@ fn azure_audit_check(audit: &AzureAudit) -> Check {
 }
 
 fn phala_cli_check() -> Check {
-    let on_path = std::process::Command::new("phala")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if on_path {
-        Check::pass("`phala` CLI on PATH", String::new())
-    } else {
-        Check::fail(
-            "`phala` CLI on PATH",
-            "not found — install with `npm i -g phala`",
-        )
+    match gm_miner_cli::dependency::check_dependency(&gm_miner_cli::dependency::PHALA) {
+        Ok(()) => Check::pass("`phala` CLI version", String::new()),
+        Err(error) => Check::fail("`phala` CLI version", error.to_string()),
     }
 }
 
