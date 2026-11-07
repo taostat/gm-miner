@@ -104,58 +104,138 @@ where
     let mut follows_stored_refresh = true;
 
     for attempt in 0..MAX_ATTEMPTS {
-        let needs_refresh = cfg
+        if !cfg
             .active_tokens()
-            .is_some_and(config::TokenEntry::is_expired_or_near);
-        if !needs_refresh {
+            .is_some_and(config::TokenEntry::is_expired_or_near)
+        {
             return Ok(cfg);
         }
 
-        let (token, from_refresh_grant) = obtain(&cfg).await?;
+        let wait_secs = with_auth_lock(async || {
+            // A different process may have consumed our refresh token while
+            // we waited for the lock or for an epoch boundary. Override device
+            // logins have a private chain that must never be replaced from disk.
+            if follows_stored_refresh {
+                reload_credentials(&mut cfg)?;
+            }
+            if !cfg
+                .active_tokens()
+                .is_some_and(config::TokenEntry::is_expired_or_near)
+            {
+                return Ok(None);
+            }
 
-        // A refresh response may omit `refresh_token` when the auth-gateway
-        // chooses not to rotate it — keep the previously stored value so the
-        // next refresh still has something to present.
-        let previous_refresh = cfg.active_tokens().and_then(|t| t.refresh_token.clone());
-        let entry = token.to_entry_keeping(previous_refresh);
-        let network = cfg.active_network().to_owned();
-        let override_active = cfg.api_url_override.is_some();
-        cfg.active_entry_mut().tokens = Some(entry.clone());
-        follows_stored_refresh &= from_refresh_grant;
-        persist_refreshed_tokens(network, entry, override_active, follows_stored_refresh)
-            .context("save refreshed token")?;
+            let (token, from_refresh_grant) = obtain(&cfg).await?;
+            // Only a refresh grant may retain a non-rotated refresh token.
+            // A device login starts a new chain, even when it returns none.
+            let previous_refresh = if from_refresh_grant {
+                cfg.active_tokens().and_then(|t| t.refresh_token.clone())
+            } else {
+                None
+            };
+            let entry = token.to_entry_keeping(previous_refresh);
+            let network = cfg.active_network().to_owned();
+            let override_active = cfg.api_url_override.is_some();
+            cfg.active_entry_mut().tokens = Some(entry.clone());
+            // Normal device logins are persisted and can be reloaded on retry.
+            // Only override device logins leave the shared refresh chain.
+            follows_stored_refresh &= from_refresh_grant || !override_active;
+            persist_refreshed_tokens(network, entry, override_active, follows_stored_refresh)
+                .context("save refreshed token")?;
 
-        let still_near_boundary = cfg
-            .active_tokens()
-            .is_some_and(config::TokenEntry::is_expired_or_near);
-        if !still_near_boundary {
+            if !cfg
+                .active_tokens()
+                .is_some_and(config::TokenEntry::is_expired_or_near)
+            {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                attempt + 1 < MAX_ATTEMPTS,
+                "access token still expires within {}s after waiting and refreshing again — \
+                 check the issuer's token lifetime/subnet tempo and the local clock; \
+                 retry once the issuer can provide a longer-lived token",
+                config::TOKEN_EXPIRY_MARGIN_SECS
+            );
+
+            Ok(Some(
+                cfg.active_tokens()
+                    .and_then(config::TokenEntry::seconds_until_expiry)
+                    .unwrap_or(0)
+                    .clamp(0, config::TOKEN_EXPIRY_MARGIN_SECS)
+                    .saturating_add(5),
+            ))
+        })
+        .await?;
+
+        let Some(wait_secs) = wait_secs else {
             return Ok(cfg);
-        }
-        anyhow::ensure!(
-            attempt + 1 < MAX_ATTEMPTS,
-            "access token still expires within {}s after waiting and refreshing again — \
-             check the issuer's token lifetime/subnet tempo and the local clock; \
-             retry once the issuer can provide a longer-lived token",
-            config::TOKEN_EXPIRY_MARGIN_SECS
-        );
-
-        let wait_secs = cfg
-            .active_tokens()
-            .and_then(config::TokenEntry::seconds_until_expiry)
-            .unwrap_or(0)
-            // Explicitly bound the wait even if the wall clock moves backwards
-            // between the margin check and reading the remaining lifetime.
-            .clamp(0, config::TOKEN_EXPIRY_MARGIN_SECS)
-            .saturating_add(5);
+        };
+        // Release the auth lock during the epoch wait. The next attempt
+        // re-acquires it and reloads before deciding whether to refresh.
         eprintln!(
             "Refreshed access token is still near expiry (possibly an epoch boundary) \
              — waiting {wait_secs}s before one more refresh."
         );
-        let wait_secs = u64::try_from(wait_secs).unwrap_or(0);
-        wait(std::time::Duration::from_secs(wait_secs)).await;
+        wait(std::time::Duration::from_secs(
+            u64::try_from(wait_secs).unwrap_or(0),
+        ))
+        .await;
     }
 
     Ok(cfg)
+}
+
+/// Serialize authentication across processes, independently of config writes.
+/// Never remove this lockfile: replacing its inode could admit two owners.
+/// Nonblocking attempts let the async runtime keep making progress; dropping
+/// the future or exiting the process releases the OS lock automatically.
+async fn with_auth_lock<T>(operation: impl AsyncFnOnce() -> Result<T>) -> Result<T> {
+    let mut lock = open_auth_lock()?;
+    loop {
+        match lock.try_write() {
+            Ok(_guard) => return operation().await,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error).context("acquire auth lock"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+fn open_auth_lock() -> Result<fd_lock::RwLock<std::fs::File>> {
+    let path = config::config_path().with_file_name(".auth.lock");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("create auth lock directory")?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .context("open auth lock")?;
+    Ok(fd_lock::RwLock::new(file))
+}
+
+/// Reload only the selected network's credentials, preserving this command's
+/// network selection and runtime settings. Called under the auth lock before
+/// using a shared refresh chain, including before any device-login fallback.
+fn reload_credentials(cfg: &mut Config) -> Result<()> {
+    let mut disk = config::load().context("reload credentials")?;
+    let stored = disk
+        .networks
+        .remove(cfg.active_network())
+        .unwrap_or_default();
+    if cfg.api_url_override.is_some() {
+        // Override access tokens belong to a different registry. Only the
+        // shared rotating refresh token may be adopted from disk.
+        if let Some(tokens) = cfg.active_entry_mut().tokens.as_mut() {
+            tokens.refresh_token = stored.tokens.and_then(|tokens| tokens.refresh_token);
+        }
+    } else {
+        let entry = cfg.active_entry_mut();
+        entry.api_url = stored.api_url;
+        entry.tokens = stored.tokens;
+    }
+    Ok(())
 }
 
 /// Persist the result of a token refresh.
@@ -263,15 +343,43 @@ pub(crate) fn persist_registered_hotkey(network: &str, record: config::HotkeyRec
 /// flow — a diagnostic like `doctor` must report state, not mutate auth by
 /// launching an interactive login.
 ///
-/// Returns the (possibly refreshed) config. Any failure — no refresh token,
-/// a rejected refresh, an unreachable auth-gateway — leaves the config
-/// untouched and returns it as-is, so the caller's checks report the real
-/// logged-out/expired state.
+/// Returns the latest stored credentials, refreshed when possible. A missing
+/// or rejected refresh token, or an unreachable auth-gateway, leaves those
+/// credentials unchanged so the caller can report the logged-out/expired state.
+/// If another authentication owns the lock, skip refreshing rather than wait
+/// for an interactive login to complete.
 pub(crate) async fn try_refresh_token(mut cfg: Config) -> Config {
     let needs_refresh = cfg
         .active_tokens()
         .is_some_and(config::TokenEntry::is_expired_or_near);
     if !needs_refresh {
+        return cfg;
+    }
+    let mut lock = match open_auth_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!("failed to open auth lock: {error}");
+            return cfg;
+        }
+    };
+    // Diagnostics must not wait for another command's interactive login.
+    // A busy lock means skip refreshing, never submit the shared token unlocked.
+    let _guard = match lock.try_write() {
+        Ok(guard) => guard,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return cfg,
+        Err(error) => {
+            tracing::warn!("failed to acquire auth lock: {error}");
+            return cfg;
+        }
+    };
+    if let Err(error) = reload_credentials(&mut cfg) {
+        tracing::warn!("failed to reload credentials: {error}");
+        return cfg;
+    }
+    if !cfg
+        .active_tokens()
+        .is_some_and(config::TokenEntry::is_expired_or_near)
+    {
         return cfg;
     }
     let Some(refresh) = cfg.active_tokens().and_then(|t| t.refresh_token.clone()) else {
@@ -297,6 +405,7 @@ pub(crate) async fn try_refresh_token(mut cfg: Config) -> Config {
     if let Err(e) = persist_refreshed_tokens(network, entry, override_active, true) {
         tracing::warn!("failed to persist refreshed tokens: {e}");
     }
+
     cfg
 }
 
@@ -362,42 +471,45 @@ pub(crate) async fn cmd_login(
     api_url_override: Option<String>,
     open_browser: bool,
 ) -> Result<()> {
-    // `config::load()` already returns Config::default() when the file
-    // is absent (first-time login). A failure here means the file
-    // exists but is unreadable or invalid JSON — surfacing that as a
-    // hard error matches the other commands' behaviour and prevents
-    // a normal re-login from silently wiping an operator's existing
-    // mainnet/testnet tokens.
-    let mut cfg =
-        config::load().context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
+    with_auth_lock(async || {
+        // `config::load()` already returns Config::default() when the file
+        // is absent (first-time login). A failure here means the file
+        // exists but is unreadable or invalid JSON — surfacing that as a
+        // hard error matches the other commands' behaviour and prevents
+        // a normal re-login from silently wiping an operator's existing
+        // mainnet/testnet tokens.
+        let mut cfg =
+            config::load().context("load gmcli config (delete ~/.gmcli/config.json if corrupted)")?;
 
-    // An explicit --network/--testnet selects (and sticks) the network this
-    // login targets; otherwise the stored sticky selection is kept so a
-    // re-login doesn't silently switch networks.
-    if let Some(network) = explicit_network {
-        cfg.set_network(network);
-    }
+        // An explicit --network/--testnet selects (and sticks) the network this
+        // login targets; otherwise the stored sticky selection is kept so a
+        // re-login doesn't silently switch networks.
+        if let Some(network) = explicit_network {
+            cfg.set_network(network);
+        }
 
-    let api_url = api_url_override.unwrap_or_else(|| cfg.api_url());
+        let api_url = api_url_override.unwrap_or_else(|| cfg.api_url());
 
-    // Fetch OAuth endpoints and client identity from the registry. Nothing
-    // auth-related is baked into the binary — it all comes from the registry
-    // at login time.
-    let auth_cfg = get_auth_config(&api_url)
-        .await
-        .with_context(|| format!("fetch auth config from {api_url}/auth/config"))?;
+        // Fetch OAuth endpoints and client identity from the registry. Nothing
+        // auth-related is baked into the binary — it all comes from the registry
+        // at login time.
+        let auth_cfg = get_auth_config(&api_url)
+            .await
+            .with_context(|| format!("fetch auth config from {api_url}/auth/config"))?;
 
-    let token = device_login_from(&auth_cfg, open_browser).await?;
+        let token = device_login_from(&auth_cfg, open_browser).await?;
 
-    let network = cfg.active_network().to_owned();
-    persist_login(&network, api_url, token.to_entry()).context("save config")?;
+        let network = cfg.active_network().to_owned();
+        persist_login(&network, api_url, token.to_entry()).context("save config")?;
 
-    println!("Login successful ({} network).", cfg.resolved_network());
-    println!("Credentials saved to {}", config::config_path().display());
-    println!(
-        "\nNext: gmcli set-api-keys --anthropic <key>  (and/or --openai / --google / --chutes / --zai / --moonshot / --deepinfra / --kubetee / --engy / --moonmath)"
-    );
-    Ok(())
+        println!("Login successful ({} network).", cfg.resolved_network());
+        println!("Credentials saved to {}", config::config_path().display());
+        println!(
+            "\nNext: gmcli set-api-keys --anthropic <key>  (and/or --openai / --google / --chutes / --zai / --moonshot / --deepinfra / --kubetee / --engy / --moonmath)"
+        );
+        Ok(())
+    })
+    .await
 }
 
 /// Upsert `record` into the active network's workers and save the config.
@@ -508,6 +620,352 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn concurrent_refreshes_reuse_the_saved_rotation() {
+        let _guard = ConfigDirGuard::new();
+        // Two commands, command + doctor, and two independent processes.
+        for mode in 0..3 {
+            let server = MockServer::start().await;
+            mount_auth_config(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("refresh_token=stored-refresh"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_millis(100))
+                        .set_body_json(serde_json::json!({
+                            "access_token": "fresh-access",
+                            "refresh_token": "rotated-refresh",
+                            "expires_in": 3600,
+                        })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/device/code"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let cfg = config_with_near_expiry(&server.uri(), 60);
+            config::save(&cfg).expect("seed credentials");
+            if mode == 2 {
+                let spawn = || {
+                    tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+                        .args([
+                            "--exact",
+                            "commands::persist::tests::refresh_process_child",
+                            "--ignored",
+                        ])
+                        .env(
+                            "GMCLI_TEST_REFRESH_CHILD",
+                            serde_json::to_string(&cfg).expect("fixture"),
+                        )
+                        .kill_on_drop(true)
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .expect("spawn CLI test process")
+                };
+                let first = spawn();
+                let second = spawn();
+                let (first, second) =
+                    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                        tokio::join!(first.wait_with_output(), second.wait_with_output())
+                    })
+                    .await
+                    .expect("processes must not deadlock");
+                for result in [first, second] {
+                    let output = result.expect("child output");
+                    assert!(
+                        output.status.success(),
+                        "{} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                continue;
+            }
+            let (first, second) = tokio::join!(ensure_fresh_token(cfg.clone()), async {
+                if mode == 1 {
+                    Ok(try_refresh_token(cfg).await)
+                } else {
+                    ensure_fresh_token(cfg).await
+                }
+            });
+            for (index, result) in [first, second].into_iter().enumerate() {
+                let cfg = result.expect("refresh without login");
+                if mode == 1
+                    && index == 1
+                    && cfg.active_tokens().expect("tokens").is_expired_or_near()
+                {
+                    continue;
+                }
+                assert_eq!(
+                    cfg.active_tokens()
+                        .expect("tokens")
+                        .refresh_token
+                        .as_deref(),
+                    Some("rotated-refresh")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper invoked by concurrent_refreshes_reuse_the_saved_rotation"]
+    async fn refresh_process_child() {
+        let cfg = serde_json::from_str(
+            &std::env::var("GMCLI_TEST_REFRESH_CHILD").expect("child fixture"),
+        )
+        .expect("fixture config");
+        let cfg = ensure_fresh_token(cfg)
+            .await
+            .expect("refresh without device login");
+        assert_eq!(
+            cfg.active_tokens()
+                .expect("tokens")
+                .refresh_token
+                .as_deref(),
+            Some("rotated-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn boundary_retry_reloads_credentials_saved_during_wait() {
+        let _guard = ConfigDirGuard::new();
+        let cfg = config_with_near_expiry("https://unused.invalid", 60);
+        config::save(&cfg).expect("seed credentials");
+        let mut attempts = 0;
+        let cfg = ensure_fresh_token_with(
+            cfg,
+            async |_| {
+                attempts += 1;
+                Ok((
+                    auth::TokenResponse {
+                        access_token: "boundary-access".to_owned(),
+                        refresh_token: Some("boundary-refresh".to_owned()),
+                        expires_in: Some(2),
+                        token_type: None,
+                    },
+                    true,
+                ))
+            },
+            |_| {
+                let mut disk = config::load().expect("load boundary token");
+                disk.active_entry_mut().tokens = Some(
+                    auth::TokenResponse {
+                        access_token: "other-command-access".to_owned(),
+                        refresh_token: Some("other-command-refresh".to_owned()),
+                        expires_in: Some(3600),
+                        token_type: None,
+                    }
+                    .to_entry(),
+                );
+                config::save(&disk).expect("another command refreshed during wait");
+                std::future::ready(())
+            },
+        )
+        .await
+        .expect("reuse fresh credentials");
+        assert_eq!(
+            attempts, 1,
+            "must not replay the consumed boundary refresh token"
+        );
+        assert_eq!(
+            cfg.active_tokens().expect("tokens").access_token.as_deref(),
+            Some("other-command-access")
+        );
+    }
+
+    #[tokio::test]
+    async fn device_login_without_refresh_token_does_not_keep_rejected_token() {
+        let _guard = ConfigDirGuard::new();
+        for override_active in [false, true] {
+            let mut cfg = config_with_near_expiry("https://stored.invalid", 60);
+            config::save(&cfg).expect("seed credentials");
+            if override_active {
+                cfg.api_url_override = Some("https://override.invalid".to_owned());
+            }
+            let cfg = ensure_fresh_token_with(
+                cfg,
+                async |_| {
+                    Ok((
+                        auth::TokenResponse {
+                            access_token: "device-access".to_owned(),
+                            refresh_token: None,
+                            expires_in: Some(3600),
+                            token_type: None,
+                        },
+                        false,
+                    ))
+                },
+                |_| std::future::ready(()),
+            )
+            .await
+            .expect("device login succeeded");
+            assert_eq!(
+                cfg.active_tokens().expect("tokens").refresh_token,
+                None,
+                "a new login must not inherit the rejected refresh token"
+            );
+            let disk = config::load().expect("saved credentials");
+            assert_eq!(
+                disk.active_tokens()
+                    .expect("tokens")
+                    .refresh_token
+                    .as_deref(),
+                if override_active {
+                    Some("stored-refresh")
+                } else {
+                    None
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_command_reuses_login_without_changing_selected_network() {
+        let _guard = ConfigDirGuard::new();
+        let mut stale = config_with_near_expiry("https://old.invalid", 60);
+        stale
+            .active_entry_mut()
+            .tokens
+            .as_mut()
+            .expect("tokens")
+            .refresh_token = None;
+        let mut disk = config_with_near_expiry("https://new.invalid", 3600);
+        disk.set_network(Network::Mainnet);
+        config::save(&disk).expect("concurrent login and network selection");
+        let cfg = ensure_fresh_token(stale)
+            .await
+            .expect("reuse login without HTTP");
+        assert_eq!(cfg.active_network(), "testnet");
+        assert_eq!(cfg.api_url(), "https://new.invalid");
+        assert!(!cfg.active_tokens().expect("tokens").is_expired_or_near());
+        assert_eq!(config::load().expect("disk").active_network(), "mainnet");
+    }
+
+    #[tokio::test]
+    async fn override_retry_adopts_only_the_shared_refresh_rotation() {
+        let _guard = ConfigDirGuard::new();
+        let mut cfg = config_with_near_expiry("https://stored.invalid", 60);
+        config::save(&cfg).expect("seed credentials");
+        cfg.api_url_override = Some("https://override.invalid".to_owned());
+        let mut attempts = 0;
+        let cfg = ensure_fresh_token_with(
+            cfg,
+            async |cfg| {
+                attempts += 1;
+                assert_eq!(cfg.api_url(), "https://override.invalid");
+                if attempts == 2 {
+                    let token = cfg.active_tokens().expect("tokens");
+                    assert_eq!(token.access_token.as_deref(), Some("override-access"));
+                    assert_eq!(
+                        token.refresh_token.as_deref(),
+                        Some("other-command-refresh")
+                    );
+                }
+                Ok((
+                    auth::TokenResponse {
+                        access_token: "override-access".to_owned(),
+                        refresh_token: Some("override-rotation".to_owned()),
+                        expires_in: Some(if attempts == 1 { 2 } else { 3600 }),
+                        token_type: None,
+                    },
+                    true,
+                ))
+            },
+            |_| {
+                // Taking the auth lock here also proves the boundary wait released it.
+                async {
+                    with_auth_lock(async || {
+                        let mut disk = config_with_near_expiry("https://stored.invalid", 3600);
+                        disk.active_entry_mut()
+                            .tokens
+                            .as_mut()
+                            .expect("tokens")
+                            .refresh_token = Some("other-command-refresh".to_owned());
+                        config::with_config_lock(|| config::save(&disk))
+                    })
+                    .await
+                    .expect("other command refresh");
+                }
+            },
+        )
+        .await
+        .expect("override refresh");
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            cfg.api_url_override.as_deref(),
+            Some("https://override.invalid")
+        );
+        let disk = config::load().expect("stored config");
+        assert_eq!(
+            disk.active_tokens()
+                .expect("tokens")
+                .access_token
+                .as_deref(),
+            Some("stale-access")
+        );
+        assert_eq!(
+            disk.active_tokens()
+                .expect("tokens")
+                .refresh_token
+                .as_deref(),
+            Some("override-rotation")
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_does_not_wait_for_an_interactive_login() {
+        let _guard = ConfigDirGuard::new();
+        let cfg = config_with_near_expiry("https://unused.invalid", 60);
+        config::save(&cfg).expect("seed credentials");
+        with_auth_lock(async || {
+            let cfg = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                try_refresh_token(cfg),
+            )
+            .await
+            .expect("doctor must skip refresh while login owns the lock");
+            assert_eq!(
+                cfg.active_tokens()
+                    .expect("tokens")
+                    .refresh_token
+                    .as_deref(),
+                Some("stored-refresh")
+            );
+            Ok(())
+        })
+        .await
+        .expect("hold login lock");
+    }
+
+    #[tokio::test]
+    async fn cancelling_auth_releases_lock_and_config_writes_remain_available() {
+        let _guard = ConfigDirGuard::new();
+        let (entered, receiver) = tokio::sync::oneshot::channel();
+        let mut operation = Box::pin(with_auth_lock(async || {
+            config::with_config_lock(|| config::save(&Config::default()))?;
+            entered.send(()).expect("notify holder entered");
+            std::future::pending::<Result<()>>().await
+        }));
+        tokio::select! {
+            result = &mut operation => { result.expect("holder"); }
+            result = receiver => { result.expect("holder acquired lock"); }
+        }
+        drop(operation);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            with_auth_lock(async || Ok(())),
+        )
+        .await
+        .expect("cancelled future releases lock")
+        .expect("acquire after cancellation");
+    }
+
     /// The auth-gateway mints `exp` at the next subnet epoch boundary, so a
     /// refresh taken near the end of an epoch can come back still inside the
     /// margin. `ensure_fresh_token` must wait out that boundary and refresh
@@ -605,6 +1063,7 @@ mod tests {
             .await;
 
         let cfg = config_with_near_expiry(&server.uri(), 60);
+        config::save(&cfg).expect("seed credentials");
         let mut waits = Vec::new();
         let cfg = ensure_fresh_token_with(
             cfg,
@@ -895,8 +1354,10 @@ mod tests {
         let _guard = ConfigDirGuard::new();
         let mut attempts = 0;
         let mut waits = 0;
+        let cfg = config_with_near_expiry("https://unused.invalid", 60);
+        config::save(&cfg).expect("seed credentials");
         let cfg = ensure_fresh_token_with(
-            config_with_near_expiry("https://unused.invalid", 60),
+            cfg,
             async |_| {
                 attempts += 1;
                 Ok((
