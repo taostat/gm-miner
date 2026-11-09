@@ -74,7 +74,7 @@ RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
 
 ## ── Stage 2: Runtime image ────────────────────────────────────────────
 ## Pin the base by digest so a mutable tag cannot change the attested runtime.
-FROM envoyproxy/envoy:v1.38-latest@sha256:b1f389c3a6148e85e9de364cb867aa2e5802153abb37ad80f1f2241d693da32a
+FROM envoyproxy/envoy:v1.40-latest@sha256:8de97e654644827d62afdbf7e1d3dc9fee01a8690d410dd1c63a30dc6b6cecbb
 
 ## Every Envoy upstream cluster validates against the system bundle
 ## /etc/ssl/certs/ca-certificates.crt. The base image ships
