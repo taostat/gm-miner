@@ -199,7 +199,8 @@ pub async fn resolve_key(flag: Option<&str>, assume_yes: bool) -> Result<Option<
 /// Whether the `phala` CLI already holds a login session. `phala whoami` exits
 /// non-zero when unauthenticated, so a zero exit means a usable session — the
 /// same probe `gmcli doctor`'s Phala check uses, kept consistent here.
-fn phala_cli_logged_in() -> bool {
+#[must_use]
+pub fn phala_cli_logged_in() -> bool {
     let Ok(mut command) = crate::deploy::phala_command(None) else {
         return false;
     };

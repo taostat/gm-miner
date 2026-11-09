@@ -229,12 +229,16 @@ pub(crate) async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> 
         // An empty-app_id provisional stub that belongs to `deploy` (a primary
         // attempt, flag unset) must not be retried through `worker add` — that
         // would reuse worker #1's in-flight secret as a secondary. Send it back
-        // to `deploy`. Only a provisional *secondary* stub retries here.
+        // to `deploy`. Only a provisional *secondary* stub retries here. The
+        // stub has no app_id, so `worker remove` cannot delete a CVM by ID:
+        // `--keep-cvm` discards it cleanly and names the CVM to look for.
         if !existing.provisional_secondary {
             bail!(
                 "'{}' is an in-flight worker #1 deploy, not a secondary worker; \
                  retry it with `gmcli deploy --app-name {}`, or \
-                 `gmcli worker remove {}` to discard the stub",
+                 `gmcli worker remove {} --keep-cvm` to discard the stub \
+                 (check `phala cvms list` for a CVM named '{}')",
+                args.app_name,
                 args.app_name,
                 args.app_name,
                 args.app_name
@@ -1362,7 +1366,9 @@ pub(crate) enum CvmTeardown {
 /// DELETE; this clears the dead-end that otherwise blocks re-running `worker
 /// add` for that name.
 ///
-/// The CVM is touched only after the registry DELETE succeeds. A CVM that
+/// When the CVM will be deleted, [`preflight_cvm_delete`] first checks for the
+/// `phala` CLI and a Phala credential, so a missing one fails before anything
+/// changes. The CVM is touched only after the registry DELETE succeeds. A CVM that
 /// cannot be deleted (or whose `app_id` is not tracked) is an error after the
 /// deregistration has been recorded, so the command exits non-zero with the
 /// `phala cvms delete` to run.
@@ -1373,6 +1379,11 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str, cvm: CvmTeardown) -
             .or_else(|| n.worker_by_app_id(id))
             .or_else(|| n.worker_by_app_name(id))
     });
+
+    let tracked_app_id = tracked.and_then(|w| non_empty_app_id(&w.app_id));
+    if let (CvmTeardown::Delete { phala_api_key }, Some(app_id)) = (&cvm, tracked_app_id) {
+        preflight_cvm_delete(app_id, phala_api_key.as_deref())?;
+    }
 
     if tracked.is_some_and(|w| w.worker_id.is_empty()) {
         let Some(record) = remove_provisional_worker(&network, id)? else {
@@ -1388,9 +1399,7 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str, cvm: CvmTeardown) -
         return tear_down_cvm(&cvm, app_id, &record.app_name, &done);
     }
 
-    let app_id = tracked
-        .and_then(|w| non_empty_app_id(&w.app_id))
-        .map(str::to_owned);
+    let app_id = tracked_app_id.map(str::to_owned);
     let worker_id = tracked.map_or_else(|| id.to_owned(), |w| w.worker_id.clone());
 
     let mut client = RegistryClient::new(cfg);
@@ -1425,6 +1434,23 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str, cvm: CvmTeardown) -
     tear_down_cvm(&cvm, app_id.as_deref(), "<app_id>", &done)
 }
 
+/// Fail before anything changes when the CVM delete could not run: no `phala`
+/// CLI, or no Phala credential (no resolved key and no `phala` CLI login).
+fn preflight_cvm_delete(app_id: &str, phala_api_key: Option<&str>) -> Result<()> {
+    let skip = "Nothing was changed. Pass --keep-cvm to remove the worker without \
+                deleting its CVM.";
+    check_dependency_presence(&PHALA)
+        .with_context(|| format!("cannot delete Phala CVM {app_id}. {skip}"))?;
+    if phala_api_key.is_none() && !gm_miner_cli::phala::phala_cli_logged_in() {
+        bail!(
+            "cannot delete Phala CVM {app_id}: no Phala credential found.\n  \
+             pass --phala-api-key <key>, set PHALA_API_KEY, or run `phala auth login`.\n  \
+             {skip}"
+        );
+    }
+    Ok(())
+}
+
 fn non_empty_app_id(app_id: &str) -> Option<&str> {
     Some(app_id).filter(|id| !id.trim().is_empty())
 }
@@ -1450,8 +1476,9 @@ fn tear_down_cvm(
         }
         (CvmTeardown::Keep, None) => {
             println!(
-                "Kept its Phala CVM (--keep-cvm). Its app_id is not tracked locally; \
-                 find it with `phala cvms list`, then:\n  phala cvms delete {fallback_id}"
+                "No CVM deleted (--keep-cvm). Its app_id is not tracked locally, so gmcli \
+                 cannot tell which CVM it ran on; if `phala cvms list` shows one, delete \
+                 it:\n  phala cvms delete {fallback_id}"
             );
             return Ok(());
         }

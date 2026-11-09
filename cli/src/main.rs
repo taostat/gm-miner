@@ -761,7 +761,9 @@ enum WorkerCommand {
     /// /miners/{hotkey}/workers/{worker_id}`), drop its local record, then
     /// delete its Phala CVM (`phala cvms delete <app_id>`).
     ///
-    /// The CVM is deleted only after the registry DELETE succeeds. If the CVM
+    /// Before anything changes, gmcli checks that the `phala` CLI is installed
+    /// and a Phala credential is available (skipped with `--keep-cvm`). The
+    /// CVM is deleted only after the registry DELETE succeeds. If the CVM
     /// cannot be deleted, or its `app_id` is not tracked locally, the command
     /// says so, prints the `phala cvms delete` to run, and exits non-zero.
     Remove {
@@ -1352,6 +1354,11 @@ mod tests {
         assert!(
             err.to_string().contains("in-flight worker #1"),
             "must redirect to deploy; got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("`gmcli worker remove gm-miner-1 --keep-cvm` to discard the stub"),
+            "the stub has no app_id, so the discard path must not end in an error: {err}"
         );
     }
 
