@@ -1,4 +1,4 @@
-//! Attested forwarding of `KubeTEE` chat completions.
+//! Attested forwarding of `KubeTEE` chat and image requests.
 //!
 //! Each upstream connection to `llm.kubetee.ai` is attested before use and
 //! renewed every 10 minutes. On a new TLS 1.3 connection the proxy fetches a
@@ -7,12 +7,13 @@
 //! equal to the v1 statement binding of that keyset and the nonce, Intel
 //! DCAP chain and an `UpToDate` TCB, a TDX report with debug off, the event
 //! log replaying to RTMR0-3, and the serving certificate's key signing the
-//! nonce. A response without the v1 binding fails closed. Chat requests are
-//! then sent on attested connections only, one at a time per connection,
-//! and never after the keyset's deadline.
+//! nonce. A response without the v1 binding fails closed. Requests are sent
+//! only on attested connections, one at a time per connection, and never
+//! after the keyset's deadline.
 
 pub mod binding;
 pub mod evidence;
+mod model_snapshot;
 pub mod pool;
 
 use std::fmt;
@@ -35,9 +36,11 @@ use serde_json::Value;
 use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
 
+use crate::model_bindings::{self, RegistrySnapshot, SnapshotCache};
 use crate::tee_evidence;
 use crate::upstream_proxy::{self, retry_attestation, strip_hop_by_hop, UpstreamConnection};
 use evidence::{AttestationPayload, Measurements};
+use model_snapshot::{EndpointKind, KubeteeModelBindings};
 use pool::{Lease, Limits, Pool};
 
 pub use crate::upstream_proxy::ATTESTATION_ATTEMPTS;
@@ -53,29 +56,13 @@ pub const SELECTOR_HEADER: &str = "x-gm-upstream-model";
 const SESSION_ID_HEADER: &str = "x-gm-session-id";
 const LITELLM_SESSION_ID_HEADER: &str = "x-litellm-session-id";
 pub const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+pub const IMAGES_GENERATIONS: &str = "/v1/images/generations";
 pub const MODELS: &str = "/v1/models";
-
-/// Every `KubeTEE` chat model gm sources, by the upstream id its route
-/// names (`kubetee/<id>` in `docs/sourcing.md`).
-pub const TARGETS: [&str; 8] = [
-    "z-ai/glm-5.2",
-    "z-ai/glm-5.3",
-    "z-ai/glm-5.3-flash",
-    "deepseek/deepseek-v4.1-flash",
-    "deepseek/deepseek-v4.1-flash-1017",
-    "moonshotai/kimi-k3",
-    "moonshotai/kimi-k3.1-pro",
-    "xiaomi/mimo-v2.6-pro",
-];
-
-/// Image models the direct `/v1/images/generations` route serves. They are
-/// listed in model discovery; chat for them is refused.
-pub const IMAGE_MODELS: [&str; 1] = ["black-forest-labs/flux.2-klein-4b"];
 
 /// Header families the supplier sets that are removed in both directions.
 const SUPPLIER_HEADER_PREFIXES: [&str; 2] = ["x-kubetee-", "x-litellm-"];
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
-/// The largest chat request body the proxy reads.
+/// The largest inference request body the proxy reads.
 const REQUEST_LIMIT: usize = 32 * 1024 * 1024;
 /// How long a pooled connection may take to accept its next request.
 const READY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -129,6 +116,7 @@ pub struct KubeteeVerifier {
     nonce: fn() -> [u8; 32],
     limits: Limits,
     pool: Arc<Pool>,
+    model_snapshot: RegistrySnapshot<KubeteeModelBindings>,
 }
 
 impl fmt::Debug for KubeteeVerifier {
@@ -147,14 +135,28 @@ impl KubeteeVerifier {
     ///
     /// Returns an error when the collateral client cannot be built.
     pub fn new() -> Result<Self> {
+        let network = std::env::var("GM_NETWORK").context("missing measured GM_NETWORK")?;
+        let registry_origin = model_bindings::registry_url_for_network(&network)
+            .ok_or_else(|| anyhow::anyhow!("GM_NETWORK must be exactly mainnet or testnet"))?;
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let model_snapshot = RegistrySnapshot::new(
+            model_bindings::registry_http_client()
+                .map_err(anyhow::Error::msg)
+                .context("build fixed KubeTEE registry client")?,
+            format!("{registry_origin}{}", model_snapshot::PATH),
+            network,
+            SnapshotCache::default(),
+            model_snapshot::parse_model_snapshot,
+            "KubeTEE",
+        );
         Ok(Self::with_parts(
             roots,
             None,
             Arc::new(Pccs(tee_evidence::collateral_client()?)),
             tee_evidence::random_nonce,
             Limits::default(),
+            model_snapshot,
         ))
     }
 
@@ -164,6 +166,7 @@ impl KubeteeVerifier {
         quote_chain: Arc<dyn QuoteChain>,
         nonce: fn() -> [u8; 32],
         limits: Limits,
+        model_snapshot: RegistrySnapshot<KubeteeModelBindings>,
     ) -> Self {
         let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_root_certificates(roots)
@@ -176,7 +179,53 @@ impl KubeteeVerifier {
             nonce,
             limits,
             pool: Arc::new(Pool::new(limits.pool_limits())),
+            model_snapshot,
         }
+    }
+
+    /// Refresh the registry snapshot and require `model` to be listed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot provide a valid current
+    /// snapshot or the model is not present in it.
+    pub async fn check_model_binding(&self, model: &str) -> Result<(), &'static str> {
+        self.model_snapshot.refresh().await?;
+        let snapshot = self
+            .model_snapshot
+            .current()
+            .await
+            .ok_or("KubeTEE model bindings are unavailable or stale")?;
+        snapshot
+            .models
+            .contains_key(model)
+            .then_some(())
+            .ok_or("model is not in the current KubeTEE model bindings")
+    }
+
+    pub fn start_model_bindings_refresh(&self) {
+        self.model_snapshot.start();
+    }
+
+    #[cfg(test)]
+    async fn refresh_bindings(&self) -> Result<(), &'static str> {
+        self.model_snapshot.refresh().await
+    }
+
+    async fn current_snapshot_for_request(
+        &self,
+        request: RequestDescriptor,
+    ) -> Result<Option<String>> {
+        let Some(snapshot) = self.model_snapshot.fresh().await else {
+            return Ok(None);
+        };
+        validate_request_parts(
+            &request.method,
+            &request.path,
+            &request.selectors,
+            &snapshot,
+        )
+        .map(Some)
     }
 
     /// Attest one new connection, sending no inference, and close it.
@@ -196,19 +245,44 @@ impl KubeteeVerifier {
     ///
     /// # Errors
     ///
-    /// Returns an error for a request outside the target list, or for any
-    /// attestation or upstream failure. A request is never sent on a
-    /// connection whose attestation failed, and never sent twice.
+    /// Returns an error for a request outside the current registry snapshot,
+    /// or for any attestation or upstream failure. A request is never sent on
+    /// a connection whose attestation failed, and never sent twice.
     pub async fn forward(&self, request: Request<Body>) -> Result<Response<Body>> {
-        let selector = validate_request(&request)?;
+        let Some(selector) = self
+            .current_snapshot_for_request(request_descriptor(&request))
+            .await?
+        else {
+            return Ok(bindings_unavailable_response());
+        };
         let request = timeout(
             self.limits.request_read_timeout,
-            require_body_model(request, selector),
+            require_body_model(request, &selector),
         )
         .await
-        .context("reading the KubeTEE chat request timed out")??;
-        let upstream = upstream_request(request)?;
+        .context("reading the KubeTEE request timed out")??;
+        // Reading the body and attesting a connection can outlive the snapshot
+        // that admitted the request. Recheck after each wait.
+        if self
+            .current_snapshot_for_request(request_descriptor(&request))
+            .await?
+            .is_none()
+        {
+            return Ok(bindings_unavailable_response());
+        }
         let mut connection = self.checkout().await?;
+        if self
+            .current_snapshot_for_request(request_descriptor(&request))
+            .await?
+            .is_none()
+        {
+            return Ok(bindings_unavailable_response());
+        }
+        ensure!(
+            self.pool.usable(&connection),
+            "KubeTEE connection expired or closed before inference"
+        );
+        let upstream = upstream_request(request)?;
         connection.requests += 1;
         let response =
             match timeout(INFERENCE_TIMEOUT, connection.sender.send_request(upstream)).await {
@@ -233,7 +307,7 @@ impl KubeteeVerifier {
         Ok(Response::from_parts(parts, Body::new(body)))
     }
 
-    /// The upstream model list, narrowed to [`TARGETS`] and [`IMAGE_MODELS`],
+    /// The upstream model list, narrowed to the current registry snapshot,
     /// fetched on an attested connection.
     ///
     /// # Errors
@@ -241,6 +315,9 @@ impl KubeteeVerifier {
     /// Returns an error when no attested connection is available or the list
     /// cannot be read.
     pub async fn models(&self, request: Request<Body>) -> Result<Response<Body>> {
+        if !self.model_snapshot.is_fresh().await {
+            return Ok(bindings_unavailable_response());
+        }
         let mut upstream = Request::builder()
             .method(Method::GET)
             .uri(MODELS)
@@ -253,10 +330,25 @@ impl KubeteeVerifier {
             .context("build KubeTEE model list request")?;
         let mut connection = self.checkout().await?;
         connection.requests += 1;
-        let result = timeout(
-            self.limits.fetch_timeout,
-            read_models(&mut connection.sender, upstream),
-        )
+        let result = timeout(self.limits.fetch_timeout, async {
+            let response = connection
+                .sender
+                .send_request(upstream)
+                .await
+                .context("send KubeTEE model list request")?;
+            let (mut parts, body) = response.into_parts();
+            let body = read_body(body).await?;
+            strip_supplier_headers(&mut parts.headers);
+            strip_hop_by_hop(&mut parts.headers);
+            if parts.status != StatusCode::OK {
+                return Ok(Response::from_parts(parts, Body::from(body)));
+            }
+            let list: Value = serde_json::from_slice(&body).context("decode KubeTEE model list")?;
+            let Some(snapshot) = self.model_snapshot.fresh().await else {
+                return Ok(bindings_unavailable_response());
+            };
+            read_models(parts, &list, &snapshot)
+        })
         .await
         .context("KubeTEE model list fetch timed out")
         .and_then(|result| result);
@@ -388,6 +480,16 @@ impl KubeteeVerifier {
     }
 }
 
+fn bindings_unavailable_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"error":"KubeTEE model bindings are unavailable or stale"}"#,
+        ))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
 async fn read_body(body: Incoming) -> Result<Bytes> {
     Ok(Limited::new(body, BODY_LIMIT)
         .collect()
@@ -396,31 +498,18 @@ async fn read_body(body: Incoming) -> Result<Bytes> {
         .to_bytes())
 }
 
-async fn read_models(
-    sender: &mut hyper::client::conn::http1::SendRequest<Body>,
-    request: Request<Body>,
+fn read_models(
+    mut parts: axum::http::response::Parts,
+    list: &Value,
+    snapshot: &KubeteeModelBindings,
 ) -> Result<Response<Body>> {
-    let response = sender
-        .send_request(request)
-        .await
-        .context("send KubeTEE model list request")?;
-    let (mut parts, body) = response.into_parts();
-    let body = read_body(body).await?;
-    strip_supplier_headers(&mut parts.headers);
-    strip_hop_by_hop(&mut parts.headers);
-    if parts.status != StatusCode::OK {
-        return Ok(Response::from_parts(parts, Body::from(body)));
-    }
-    let list: Value = serde_json::from_slice(&body).context("decode KubeTEE model list")?;
-    let served = serde_json::to_vec(&served_targets(&list)).context("encode model list")?;
+    let served = serde_json::to_vec(&served_models(list, snapshot)).context("encode model list")?;
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     Ok(Response::from_parts(parts, Body::from(served)))
 }
 
-/// The upstream model list with every entry outside [`TARGETS`] and
-/// [`IMAGE_MODELS`] removed.
-#[must_use]
-pub fn served_targets(list: &Value) -> Value {
+/// The upstream model list narrowed to ids in the current registry snapshot.
+fn served_models(list: &Value, bindings: &KubeteeModelBindings) -> Value {
     let data = list
         .get("data")
         .and_then(Value::as_array)
@@ -431,7 +520,7 @@ pub fn served_targets(list: &Value) -> Value {
                     model
                         .get("id")
                         .and_then(Value::as_str)
-                        .is_some_and(|id| TARGETS.contains(&id) || IMAGE_MODELS.contains(&id))
+                        .is_some_and(|id| bindings.models.contains_key(id))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -440,31 +529,61 @@ pub fn served_targets(list: &Value) -> Value {
     serde_json::json!({"object": "list", "data": data})
 }
 
-/// Refuse anything but a chat completion for a target model. Runs before
-/// any connection is used or opened.
-fn validate_request(request: &Request<Body>) -> Result<&'static str> {
+/// Validate the method, endpoint, selector count, and endpoint-kind binding.
+#[cfg(test)]
+fn validate_request(request: &Request<Body>, bindings: &KubeteeModelBindings) -> Result<String> {
+    let request = request_descriptor(request);
+    validate_request_parts(&request.method, &request.path, &request.selectors, bindings)
+}
+
+struct RequestDescriptor {
+    method: Method,
+    path: String,
+    selectors: Vec<HeaderValue>,
+}
+
+fn request_descriptor(request: &Request<Body>) -> RequestDescriptor {
+    RequestDescriptor {
+        method: request.method().clone(),
+        path: request.uri().path().to_owned(),
+        selectors: request
+            .headers()
+            .get_all(SELECTOR_HEADER)
+            .iter()
+            .cloned()
+            .collect(),
+    }
+}
+
+fn validate_request_parts(
+    method: &Method,
+    path: &str,
+    selectors: &[HeaderValue],
+    bindings: &KubeteeModelBindings,
+) -> Result<String> {
+    let endpoint = EndpointKind::for_path(path).context("KubeTEE route is not supported")?;
     ensure!(
-        request.method() == Method::POST && request.uri().path() == CHAT_COMPLETIONS,
-        "KubeTEE is served only at POST {CHAT_COMPLETIONS}, not {} {}",
-        request.method(),
-        request.uri().path()
+        method == Method::POST,
+        "KubeTEE inference requires POST, not {method} {path}"
     );
-    let mut selectors = request.headers().get_all(SELECTOR_HEADER).iter();
-    let (Some(selector), None) = (selectors.next(), selectors.next()) else {
+    let [selector] = selectors else {
         bail!("KubeTEE request needs exactly one model selector");
     };
     let selector = selector
         .to_str()
         .context("KubeTEE model selector is not ASCII")?;
-    TARGETS
-        .into_iter()
-        .find(|target| *target == selector)
-        .context("unsupported KubeTEE model selector")
+    let bound_endpoint = bindings
+        .models
+        .get(selector)
+        .context("unsupported KubeTEE model selector")?;
+    ensure!(
+        *bound_endpoint == endpoint,
+        "KubeTEE model selector is not admitted for this endpoint"
+    );
+    Ok(selector.to_owned())
 }
 
-/// Read the chat body and require its `model` to be the selected target, so
-/// the model sent upstream is the one the allowlist admitted. Runs before
-/// any connection is used or opened.
+/// Read the request body and require its model to match the selected route.
 async fn require_body_model(request: Request<Body>, selector: &str) -> Result<Request<Body>> {
     #[derive(serde::Deserialize)]
     struct ChatModel {
@@ -474,19 +593,25 @@ async fn require_body_model(request: Request<Body>, selector: &str) -> Result<Re
     let body = Limited::new(body, REQUEST_LIMIT)
         .collect()
         .await
-        .map_err(|error| anyhow::anyhow!("read KubeTEE chat request: {error}"))?
+        .map_err(|error| anyhow::anyhow!("read KubeTEE request: {error}"))?
         .to_bytes();
-    let chat: ChatModel =
-        serde_json::from_slice(&body).context("KubeTEE chat request has no model")?;
+    // Serde's derived struct deserializer also accepts positional arrays.
+    ensure!(
+        body.trim_ascii_start().starts_with(b"{"),
+        "KubeTEE request must be a JSON object"
+    );
+    let chat: ChatModel = serde_json::from_slice(&body).context("KubeTEE request has no model")?;
     ensure!(
         chat.model == selector,
-        "KubeTEE chat request names a model other than its selector"
+        "KubeTEE request names a model other than its selector"
     );
     Ok(Request::from_parts(parts, Body::from(body)))
 }
 
 fn upstream_request(mut request: Request<Body>) -> Result<Request<Body>> {
-    let session_id = request_session_id(&request);
+    let session_id = (request.uri().path() == CHAT_COMPLETIONS)
+        .then(|| request_session_id(&request))
+        .flatten();
     let headers = request.headers_mut();
     headers.remove(SELECTOR_HEADER);
     strip_supplier_headers(headers);

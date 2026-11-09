@@ -83,10 +83,11 @@ pub struct AdminImageVersionRequest {
 /// container check, which reads the CVM's public guest-agent page. It is a
 /// registry feature, unrelated to the `app_compose` `features` that
 /// [`crate::compose_hash`] measures.
-pub const IMAGE_FEATURES: [&str; 10] = [
+pub const IMAGE_FEATURES: [&str; 11] = [
     "upstream-key-slots",
     "upstream-model-hop",
     BEDROCK_MANTLE_IMAGE_FEATURE,
+    "kubetee-model-bindings-v1",
     "deepinfra-native-images",
     "chutes-verified-chat",
     "kubetee-attested-chat",
@@ -453,6 +454,7 @@ mod tests {
                 "upstream-key-slots",
                 "upstream-model-hop",
                 BEDROCK_MANTLE_IMAGE_FEATURE,
+                "kubetee-model-bindings-v1",
                 "deepinfra-native-images",
                 "chutes-verified-chat",
                 "kubetee-attested-chat",
