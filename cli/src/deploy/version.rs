@@ -15,6 +15,10 @@ pub struct ImageVersion {
     pub compose_hash: String,
     pub os_image_hash: String,
     pub status: String,
+    /// Last epoch a `deprecated` image may still route; `None` for other
+    /// statuses and for a deprecated row published without a grace window.
+    #[serde(default)]
+    pub deprecation_end_epoch: Option<u64>,
     pub notes: Option<String>,
     pub created_at: String,
     /// Digest-pinned, directly-pullable reference of the gm-published miner
@@ -74,6 +78,8 @@ pub struct ImageVersionOut {
     pub compose_hash: String,
     pub os_image_hash: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecation_end_epoch: Option<u64>,
     pub notes: Option<String>,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,11 +96,27 @@ pub struct ImageVersionOut {
 /// Returns an error if the registry returns 404 (endpoint not yet deployed),
 /// any other non-2xx status, or the response body cannot be parsed.
 pub async fn fetch_supported_versions(registry_url: &str) -> Result<Vec<ImageVersion>> {
+    fetch_versions(registry_url, "supported").await
+}
+
+/// Fetch every image version the registry knows — supported, deprecated and
+/// revoked — so a worker's measured compose hash can be named whatever its
+/// standing.
+///
+/// Returns the full list sorted newest-first by `created_at`.
+///
+/// # Errors
+/// As [`fetch_supported_versions`].
+pub async fn fetch_all_versions(registry_url: &str) -> Result<Vec<ImageVersion>> {
+    fetch_versions(registry_url, "all").await
+}
+
+async fn fetch_versions(registry_url: &str, status_filter: &str) -> Result<Vec<ImageVersion>> {
     // A one-shot client (30 s timeout, gmcli user-agent) — same shape as
     // RegistryClient — rather than bare `reqwest::get()` which has no timeout.
     let client = crate::client::build_http_client()?;
 
-    let url = format!("{registry_url}/image-versions?status=supported");
+    let url = format!("{registry_url}/image-versions?status={status_filter}");
     let resp = client
         .get(&url)
         .send()
@@ -256,6 +278,7 @@ mod tests {
             compose_hash: compose.to_owned(),
             os_image_hash: os.to_owned(),
             status: "supported".to_owned(),
+            deprecation_end_epoch: None,
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: None,

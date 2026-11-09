@@ -1,10 +1,11 @@
 //! The hotkey's workers as the registry sees them: which of them is worker #1,
-//! and the health view for the rest (suspension recovery state and upstream key
-//! slots the registry could not verify).
+//! the image each one runs, and the health view for the rest (suspension
+//! recovery state and upstream key slots the registry could not verify).
 
 use chrono::{DateTime, Utc};
 
 use crate::config::WorkerRecord;
+use crate::deploy::{normalize_hash, ImageVersion};
 use crate::types::WorkerEntry;
 
 /// The miner's worker #1: the oldest worker the registry still lists as live.
@@ -52,10 +53,66 @@ pub fn is_secondary_live(tracked: &WorkerRecord, live: &[WorkerEntry]) -> bool {
     first_live_worker_id(live) != Some(tracked.worker_id.as_str())
 }
 
-/// The recovery view for a worker that is suspended or carrying a dead key.
-/// A healthy worker renders nothing, so the common case stays a clean table.
+/// One worker's block beneath the `worker list` table: its header, the image
+/// it runs, then the recovery view when it is suspended, failing attestation or
+/// carrying a dead key.
+///
+/// `versions` is the registry's full image-version roster, or `None` when it
+/// could not be fetched.
 #[must_use]
-pub fn worker_health_lines(
+pub fn worker_detail_lines(
+    worker: &WorkerEntry,
+    versions: Option<&[ImageVersion]>,
+    consecutive_ok_required: u32,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        format!("{} ({})", worker.worker_id, worker.status),
+        format!("  image           : {}", image_label(worker, versions)),
+    ];
+    lines.extend(worker_health_lines(worker, consecutive_ok_required, now));
+    lines
+}
+
+/// Name the image a worker runs by matching its measured compose hash against
+/// the registry's image-version roster, with that version's standing.
+#[must_use]
+pub fn image_label(worker: &WorkerEntry, versions: Option<&[ImageVersion]>) -> String {
+    let Some(compose) = worker
+        .image_compose_hash
+        .as_deref()
+        .map(normalize_hash)
+        .filter(|hash| !hash.is_empty())
+    else {
+        return "not reported yet".to_owned();
+    };
+    let short: String = compose.chars().take(12).collect();
+    let Some(versions) = versions else {
+        return format!("compose {short} (version lookup failed)");
+    };
+    // The roster is newest-first, so a compose hash published twice (once per
+    // OS image) names its latest row.
+    let Some(version) = versions
+        .iter()
+        .find(|v| normalize_hash(&v.compose_hash) == compose)
+    else {
+        return format!("unknown image (compose {short})");
+    };
+    let name = version
+        .git_tag
+        .clone()
+        .unwrap_or_else(|| format!("compose {short}"));
+    match (version.status.as_str(), version.deprecation_end_epoch) {
+        ("deprecated", Some(epoch)) => format!("{name} (deprecated — grace ends epoch {epoch})"),
+        ("deprecated", None) => format!("{name} (deprecated — no grace window)"),
+        (status, _) => format!("{name} ({status})"),
+    }
+}
+
+/// The recovery view for a worker that is suspended, failing attestation or
+/// carrying a dead key. A healthy worker renders nothing.
+fn worker_health_lines(
     worker: &WorkerEntry,
     consecutive_ok_required: u32,
     now: DateTime<Utc>,
@@ -77,10 +134,7 @@ pub fn worker_health_lines(
         return Vec::new();
     }
 
-    let mut lines = vec![
-        String::new(),
-        format!("{} ({})", worker.worker_id, worker.status),
-    ];
+    let mut lines = Vec::new();
     // Verbatim, not translated. The registry owns this vocabulary; a second
     // copy here would drift from it exactly as `ineligible_reasons`' docstring
     // warns, and an unrecognised cause must still reach the operator.
@@ -168,8 +222,8 @@ pub fn relative_suffix(timestamp: &str, now: DateTime<Utc>) -> String {
 )]
 mod tests {
     use super::{
-        first_live_worker_id, is_secondary_live, worker_health_lines, DateTime, Utc, WorkerEntry,
-        WorkerRecord,
+        first_live_worker_id, image_label, is_secondary_live, worker_detail_lines,
+        worker_health_lines, DateTime, ImageVersion, Utc, WorkerEntry, WorkerRecord,
     };
 
     fn worker_entry(status: &str) -> WorkerEntry {
@@ -314,7 +368,7 @@ mod tests {
         worker.consecutive_ok = 1;
         worker.suspended_reprobe_attempt = 3;
 
-        let rendered = worker_health_lines(&worker, 2, now()).join("\n");
+        let rendered = worker_detail_lines(&worker, None, 2, now()).join("\n");
         assert!(rendered.contains("01J0A (suspended)"));
         assert!(rendered.contains("suspended since : 2026-07-11T08:30:00+00:00"));
         assert!(rendered.contains("next re-probe   : 2026-07-11T09:02:00+00:00 (in 2m)"));
@@ -331,7 +385,7 @@ mod tests {
         let mut worker = worker_entry("failed_attestation");
         worker.attestation_error = Some("tcb status OutOfDate".to_owned());
 
-        let rendered = worker_health_lines(&worker, 2, now()).join("\n");
+        let rendered = worker_detail_lines(&worker, None, 2, now()).join("\n");
         assert!(rendered.contains("01J0A (failed_attestation)"));
         assert!(rendered.contains("cause           : tcb status OutOfDate"));
     }
@@ -400,7 +454,7 @@ mod tests {
         }))
         .expect("decode slot status");
 
-        let rendered = worker_health_lines(&worker, 2, now()).join("\n");
+        let rendered = worker_detail_lines(&worker, None, 2, now()).join("\n");
         assert!(rendered.contains("01J0A (active)"));
         assert!(rendered.contains("unverified key  : openai slot BBBBBBBBBBBB"));
         assert!(!rendered.contains("AAAAAAAAAAAA"));
@@ -415,11 +469,101 @@ mod tests {
         }))
         .expect("decode slot status");
 
-        let lines = worker_health_lines(&worker, 2, now());
+        let lines = worker_detail_lines(&worker, None, 2, now());
         assert_eq!(
             lines.iter().filter(|l| l.contains("01J0A (")).count(),
             1,
             "one header, not one per block: {lines:?}"
         );
+    }
+
+    #[test]
+    fn a_healthy_worker_renders_its_header_and_image_only() {
+        let mut worker = worker_entry("active");
+        worker.image_compose_hash = Some("a".repeat(64));
+        let versions = [version(&"a".repeat(64), Some("v0.5.22"), "supported", None)];
+
+        assert_eq!(
+            worker_detail_lines(&worker, Some(&versions), 2, now()),
+            vec![
+                String::new(),
+                "01J0A (active)".to_owned(),
+                "  image           : v0.5.22 (supported)".to_owned(),
+            ]
+        );
+    }
+
+    fn version(compose: &str, tag: Option<&str>, status: &str, grace: Option<u64>) -> ImageVersion {
+        ImageVersion {
+            git_tag: tag.map(str::to_owned),
+            compose_hash: compose.to_owned(),
+            os_image_hash: "b".repeat(64),
+            status: status.to_owned(),
+            deprecation_end_epoch: grace,
+            notes: None,
+            created_at: "2026-11-01T00:00:00Z".to_owned(),
+            image_ref: None,
+            features: Vec::new(),
+        }
+    }
+
+    fn running(compose: Option<&str>) -> WorkerEntry {
+        let mut worker = worker_entry("active");
+        worker.image_compose_hash = compose.map(str::to_owned);
+        worker
+    }
+
+    #[test]
+    fn image_label_names_the_version_and_its_standing() {
+        let supported = "a".repeat(64);
+        let deprecated = "c".repeat(64);
+        let revoked = "d".repeat(64);
+        let no_window = "e".repeat(64);
+        let untagged = "f".repeat(64);
+        let versions = [
+            version(&supported, Some("v0.5.22"), "supported", None),
+            version(&deprecated, Some("v0.5.21"), "deprecated", Some(26_273)),
+            version(&revoked, Some("v0.5.11"), "revoked", None),
+            version(&no_window, Some("v0.5.10"), "deprecated", None),
+            version(&untagged, None, "supported", None),
+        ];
+        let label = |hash: &str| image_label(&running(Some(hash)), Some(&versions));
+
+        assert_eq!(label(&supported), "v0.5.22 (supported)");
+        assert_eq!(
+            label(&deprecated),
+            "v0.5.21 (deprecated — grace ends epoch 26273)"
+        );
+        assert_eq!(label(&revoked), "v0.5.11 (revoked)");
+        assert_eq!(label(&no_window), "v0.5.10 (deprecated — no grace window)");
+        assert_eq!(label(&untagged), "compose ffffffffffff (supported)");
+    }
+
+    #[test]
+    fn image_label_matches_a_prefixed_or_uppercase_compose_hash() {
+        let versions = [version(&"a".repeat(64), Some("v0.5.22"), "supported", None)];
+        let worker = running(Some(&format!("sha256:{}", "A".repeat(64))));
+
+        assert_eq!(image_label(&worker, Some(&versions)), "v0.5.22 (supported)");
+    }
+
+    #[test]
+    fn image_label_without_a_match_lookup_or_hash() {
+        let versions = [version(&"a".repeat(64), Some("v0.5.22"), "supported", None)];
+        let other = format!("0123456789ab{}", "9".repeat(52));
+
+        assert_eq!(
+            image_label(&running(Some(&other)), Some(&versions)),
+            "unknown image (compose 0123456789ab)"
+        );
+        assert_eq!(
+            image_label(&running(Some(&other)), None),
+            "compose 0123456789ab (version lookup failed)"
+        );
+        assert_eq!(
+            image_label(&running(None), Some(&versions)),
+            "not reported yet"
+        );
+        assert_eq!(image_label(&running(Some("")), None), "not reported yet");
     }
 }

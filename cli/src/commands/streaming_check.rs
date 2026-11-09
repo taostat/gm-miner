@@ -1504,6 +1504,7 @@ mod tests {
             compose_hash: compose_hash.to_owned(),
             os_image_hash: "os-hash".to_owned(),
             status: "supported".to_owned(),
+            deprecation_end_epoch: None,
             notes: None,
             created_at: "2026-10-21T00:00:00Z".to_owned(),
             image_ref: None,

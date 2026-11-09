@@ -113,6 +113,7 @@ mod tests {
             compose_hash: compose.to_owned(),
             os_image_hash: os.to_owned(),
             status: "supported".to_owned(),
+            deprecation_end_epoch: None,
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: None,
