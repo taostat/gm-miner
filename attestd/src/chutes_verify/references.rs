@@ -2,7 +2,7 @@
 //!
 //! The file is the verbatim body of `GET api.chutes.ai/servers/tee/measurements`
 //! and must hash to [`PUBLISHED_SHA256`]; a Chutes VM release is admitted only
-//! after gm commits the newer file.
+//! after gm commits the newer file. The current file was fetched 2026-11-09T15:50:10Z.
 
 use std::sync::OnceLock;
 
@@ -10,9 +10,9 @@ use anyhow::{bail, Context, Result};
 use dcap_qvl::quote::TDReport10;
 use serde::Deserialize;
 
-const PUBLISHED: &[u8] = include_bytes!("../../references/chutes/measurements-2026-09-23.json");
+const PUBLISHED: &[u8] = include_bytes!("../../references/chutes/measurements-2026-11-09.json");
 pub const PUBLISHED_SHA256: &str =
-    "9c18b5103c9e156a8663074cd70d7007e07ed6bc8fd4b890a868ba4a61c1f509";
+    "08609318828cea9d2091d28060530b2ca84c112d6023a0b34d32cbd13e2a61bd";
 
 /// One measured Chutes VM release on one hardware class.
 #[derive(Clone, Debug)]
@@ -158,7 +158,7 @@ mod tests {
     fn compiled_file_is_the_published_payload() {
         assert_eq!(hex::encode(Sha256::digest(PUBLISHED)), PUBLISHED_SHA256);
         let references = published().unwrap();
-        assert_eq!(references.len(), 38);
+        assert_eq!(references.len(), 61);
         assert!(references
             .iter()
             .all(|reference| reference.gpu_arch.is_some()));
@@ -172,6 +172,63 @@ mod tests {
         assert_eq!(
             (&matched.version, &matched.name),
             (&expected.version, &expected.name)
+        );
+    }
+
+    fn td_with(mrtd: &str, rtmrs: [&str; 4]) -> TDReport10 {
+        let reference = Reference {
+            version: String::new(),
+            name: String::new(),
+            mrtd: register(mrtd).unwrap(),
+            rtmrs: rtmrs.map(|value| register(value).unwrap()),
+            gpu_arch: None,
+            gpu_count: 0,
+        };
+        td_for(&reference)
+    }
+
+    #[test]
+    fn a_vm_1_5_0_pro_6000_quote_is_admitted() {
+        let td = td_with(
+            "261CE538B435E2D0E85FC97E254BC99154C507B7A8E13D59B69F8532384F1D0B\
+             FAADFDDF3FCCC6E0A411203840BBEE8D",
+            [
+                "BACB4ABF7B19ABA4A8307EBC7244706745DE4FA627E669E7F06FD35C3303EEA1\
+                 903F58DC143D27B557DA1A986E0E95F6",
+                "D3A862FF47357F374FC72C7F02A480A13790D1805E24AAA8DE1F03994256625C\
+                 E0F593AE35EA8F0C24D09F7DF36CB0ED",
+                "E1DE99043052F3E1AB5A4463D3310B5680E851631ADF10E071B15CBD8B4D664E\
+                 A435B0EC33E7F18E908DDA60734056F7",
+                "9617BE835BEAC8C62093A9DB424F015F3E12651235D0101C112729E7225B7A70\
+                 836A184DEE0B45F28CD190F1871AFE6E",
+            ],
+        );
+        let matched = match_td(published().unwrap(), &td).unwrap();
+        assert_eq!(matched.version, "1.5.0");
+        assert!(matched.name.starts_with("8xpro_6000"), "{}", matched.name);
+        assert_eq!(matched.gpu_arch, Some("BLACKWELL"));
+    }
+
+    #[test]
+    fn a_vm_release_chutes_withdrew_is_rejected() {
+        let td = td_with(
+            "DDC6EFCDD2309E10837F8A7F64B71272B7EF003B129460410FE715BDFFFEC38C\
+             7C0C1686DDDB2A23D4FD623D145E8455",
+            [
+                "2864B11878E8129095D62A5DD7C3E3AAE178D3A077606A825617324768F189AD\
+                 05AED08376947DF92D6C75865D915CBF",
+                "F858ED2AECBA4ECD29084352C6B5C6E403C0BEC89B8C852F90FA5A8CEE796FFA\
+                 095518C5CD8B92C25C1856E932A95877",
+                "7719F4FDE518994A5DD6767A8B8B87A38168CC0F3480E7498D4ACE99E49319BE\
+                 6A7FED26C21AD43310D2D488FC68AB1C",
+                "BFAC8BBE97148D00C0BC5DEA273CCD926E2415511F08F5DEDAA96D3C19E824D2\
+                 BF01FAE86E8987FF509FD3AD31374A60",
+            ],
+        );
+        let error = match_td(published().unwrap(), &td).unwrap_err();
+        assert!(
+            error.to_string().contains("not in the published"),
+            "{error:#}"
         );
     }
 
