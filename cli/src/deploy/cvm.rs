@@ -1,4 +1,5 @@
-//! Phala Cloud CVM orchestration: `phala deploy` + `phala cvms get` wiring.
+//! Phala Cloud CVM orchestration: `phala deploy`, `phala cvms get` and
+//! `phala cvms delete` wiring.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -625,6 +626,71 @@ fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<
         endpoint,
         app_id,
     }))
+}
+
+/// What `phala cvms delete` did to a CVM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CvmDeletion {
+    /// Phala Cloud deleted the CVM.
+    Deleted,
+    /// Phala Cloud has no such CVM in the workspace the credential can see:
+    /// it was already deleted, or it lives under a different Phala account.
+    NotFound,
+}
+
+/// The `{"success": false, "error": "..."}` envelope `phala ... --json` prints
+/// on stdout when a command fails.
+#[derive(Debug, Deserialize)]
+struct PhalaFailure {
+    error: Option<String>,
+}
+
+/// Delete the CVM `app_id` with `phala cvms delete <app_id> --force --json`,
+/// using the same isolated `phala` subprocess and API-key scoping as deploy.
+///
+/// # Errors
+/// Returns an error if `phala` cannot be spawned or Phala Cloud refuses the
+/// delete for any reason other than the CVM not existing.
+pub fn delete_phala_cvm(app_id: &str, api_key: Option<&str>) -> Result<CvmDeletion> {
+    let mut command = phala_command(api_key)?;
+    command.args(["cvms", "delete", app_id, "--force", "--json"]);
+    let out = phala_output(&mut command, "run phala cvms delete")?;
+    parse_phala_cvm_delete(out.status.success(), &out.stdout, &out.stderr)
+}
+
+/// Classify a `phala cvms delete --json` run. A zero exit is a deletion. A
+/// failure whose error says the CVM was not found (`The requested CVM was not
+/// found` from the API, `CVM not found` from the CLI) is [`CvmDeletion::NotFound`].
+/// Any other failure is an error carrying Phala's own message.
+///
+/// # Errors
+/// Returns an error for every non-zero exit that is not a not-found.
+pub fn parse_phala_cvm_delete(
+    succeeded: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<CvmDeletion> {
+    if succeeded {
+        return Ok(CvmDeletion::Deleted);
+    }
+    let reported = serde_json::from_slice::<PhalaFailure>(stdout)
+        .ok()
+        .and_then(|failure| failure.error)
+        .filter(|error| !error.trim().is_empty());
+    if let Some(error) = &reported {
+        if error.to_ascii_lowercase().contains("not found") {
+            return Ok(CvmDeletion::NotFound);
+        }
+    }
+    let detail = reported.unwrap_or_else(|| {
+        let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+        if stderr.is_empty() {
+            String::from_utf8_lossy(stdout).trim().to_owned()
+        } else {
+            stderr
+        }
+    });
+    bail!("phala cvms delete failed: {detail}")
 }
 
 /// Run one paginated `phala cvms list --json` request and parse its collision
@@ -1317,5 +1383,42 @@ mod tests {
         assert_eq!(PHALA_COMPOSE_HASH_FIELD, "compose_hash");
         assert_eq!(PHALA_OS_IMAGE_HASH_FIELD, "os.os_image_hash");
         assert_eq!(PHALA_ENDPOINT_FIELD, "endpoints[0].app");
+    }
+
+    // ── phala cvms delete classification ──────────────────────────────────────
+
+    #[test]
+    fn a_zero_exit_delete_is_a_deletion() {
+        let stdout = br#"{"success":true,"data":{"deleted":true,"cvm":"gm-miner-2"}}"#;
+        assert_eq!(
+            parse_phala_cvm_delete(true, stdout, b"").expect("deleted"),
+            CvmDeletion::Deleted
+        );
+    }
+
+    /// Both not-found wordings: the API's (verified against `phala` 1.1.19)
+    /// and the CLI's own when the lookup returns nothing.
+    #[test]
+    fn a_not_found_failure_is_not_an_error() {
+        for stdout in [
+            br#"{"success":false,"error":"The requested CVM was not found"}"#.as_slice(),
+            br#"{"success":false,"error":"CVM not found"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                parse_phala_cvm_delete(false, stdout, b"").expect("not found is classified"),
+                CvmDeletion::NotFound
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_failure_is_an_error_carrying_phalas_message() {
+        let stdout = br#"{"success":false,"error":"Invalid API key"}"#;
+        let err = parse_phala_cvm_delete(false, stdout, b"").expect_err("must fail");
+        assert!(err.to_string().contains("Invalid API key"), "{err}");
+
+        let err = parse_phala_cvm_delete(false, b"", b"network unreachable\n")
+            .expect_err("a failure without JSON must still fail");
+        assert!(err.to_string().contains("network unreachable"), "{err}");
     }
 }

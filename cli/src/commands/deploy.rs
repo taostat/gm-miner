@@ -15,11 +15,12 @@ use gm_miner_cli::{
     config::{self, Config, WorkerRecord},
     dependency::{check_dependency_presence, ensure_dependency, PHALA},
     deploy::{
-        fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
-        parse_phala_cvm_endpoint, parse_phala_cvm_name, prepare_deploy_target,
-        resolve_image_source, resolve_kms_contract_id, resolve_registry_credentials,
-        select_version, to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner,
-        ImageSource, ImageVersion, PhalaClient, PHALA_ENDPOINT_FIELD,
+        delete_phala_cvm, fetch_supported_versions, format_created_at, normalize_hash,
+        parse_phala_cvm_detail, parse_phala_cvm_endpoint, parse_phala_cvm_name,
+        prepare_deploy_target, resolve_image_source, resolve_kms_contract_id,
+        resolve_registry_credentials, select_version, to_ratls_passthrough_endpoint, verify_hashes,
+        CvmDeletion, ImageProvisioner, ImageSource, ImageVersion, PhalaClient,
+        PHALA_ENDPOINT_FIELD,
     },
     node_secret, slots, terms,
     types::{
@@ -210,14 +211,14 @@ pub(crate) async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> 
         // A provisional record with a real app_id is a CVM that launched but
         // whose registry POST never landed. Re-running `worker add` would
         // deploy a *second* CVM and orphan the first. Point the operator at
-        // `worker remove`, which clears the local record (and names the CVM to
-        // tear down), so the retry starts clean.
+        // `worker remove`, which clears the local record and deletes that CVM,
+        // so the retry starts clean.
         if !existing.app_id.is_empty() {
             bail!(
                 "worker '{}' has a CVM ({}) that was deployed but never \
                  registered. `worker add` would launch a second CVM and orphan \
                  it. Clear the stale record first:\n  gmcli worker remove {}\n\
-                 (it prints the `phala cvms delete` to run), then re-run \
+                 (which also deletes that CVM), then re-run \
                  `gmcli worker add --app-name {}`.",
                 args.app_name,
                 existing.app_id,
@@ -412,8 +413,9 @@ async fn fetch_live_workers(client: &mut RegistryClient) -> Result<Vec<WorkerEnt
 /// build and the provider keys have been staged. Catching it up front turns
 /// that into one actionable instruction.
 ///
-/// gmcli never deletes the CVM itself: the delete destroys a running worker and
-/// its encrypted env, so it stays the operator's explicit act.
+/// The preflight never deletes the colliding CVM: it may be a running worker,
+/// and the delete destroys it and its encrypted env, so it stays the
+/// operator's explicit act.
 pub(crate) fn reject_existing_cvm(app_name: &str, existing_app_id: Option<&str>) -> Result<()> {
     let Some(app_id) = existing_app_id else {
         return Ok(());
@@ -1341,8 +1343,17 @@ pub(crate) async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
     Ok(())
 }
 
-/// `gmcli worker remove <id>` — deregister a worker and remind the
-/// operator to tear down its Phala CVM separately.
+/// What `worker remove` does with the worker's Phala CVM.
+pub(crate) enum CvmTeardown {
+    /// `--keep-cvm`: leave the CVM running and print the delete command.
+    Keep,
+    /// Delete the CVM with `phala cvms delete`, scoping this key onto the
+    /// subprocess (`None` uses the `phala` CLI login session).
+    Delete { phala_api_key: Option<String> },
+}
+
+/// `gmcli worker remove <id>` — deregister a worker, drop its local record,
+/// then delete its Phala CVM (unless `--keep-cvm`).
 ///
 /// `id` is the registry `worker_id` for a registered worker. It also accepts
 /// the local `app_id` or `app_name` of a *provisional* record — a deploy that
@@ -1350,7 +1361,12 @@ pub(crate) async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
 /// provisional record is only local state, so it is dropped without a registry
 /// DELETE; this clears the dead-end that otherwise blocks re-running `worker
 /// add` for that name.
-pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
+///
+/// The CVM is touched only after the registry DELETE succeeds. A CVM that
+/// cannot be deleted (or whose `app_id` is not tracked) is an error after the
+/// deregistration has been recorded, so the command exits non-zero with the
+/// `phala cvms delete` to run.
+pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str, cvm: CvmTeardown) -> Result<()> {
     let network = cfg.active_network().to_owned();
     let tracked = cfg.active_network_entry().and_then(|n| {
         n.worker_by_id(id)
@@ -1359,10 +1375,22 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
     });
 
     if tracked.is_some_and(|w| w.worker_id.is_empty()) {
-        return remove_provisional_worker(&network, id);
+        let Some(record) = remove_provisional_worker(&network, id)? else {
+            println!("No provisional worker matched '{id}'.");
+            return Ok(());
+        };
+        println!(
+            "Dropped the unregistered worker record for '{}'.",
+            record.app_name
+        );
+        let done = format!("the record for '{}' is dropped", record.app_name);
+        let app_id = non_empty_app_id(&record.app_id);
+        return tear_down_cvm(&cvm, app_id, &record.app_name, &done);
     }
 
-    let app_id = tracked.map(|w| w.app_id.clone());
+    let app_id = tracked
+        .and_then(|w| non_empty_app_id(&w.app_id))
+        .map(str::to_owned);
     let worker_id = tracked.map_or_else(|| id.to_owned(), |w| w.worker_id.clone());
 
     let mut client = RegistryClient::new(cfg);
@@ -1381,23 +1409,71 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
 
     // Drop the local record so `worker list`/re-deploy don't reference a
     // deregistered worker. Locked so a concurrent deploy save can't resurrect it.
-    config::with_config_lock(|| {
+    let dropped = config::with_config_lock(|| {
         let mut cfg = config::load().context("load gmcli config")?;
         cfg.active_network = Some(network);
-        cfg.active_entry_mut().remove_worker_by_id(&worker_id);
-        config::save(&cfg).context("persist worker removal to gmcli config")
+        let dropped = cfg.active_entry_mut().remove_worker_by_id(&worker_id);
+        config::save(&cfg).context("persist worker removal to gmcli config")?;
+        Ok(dropped.is_some())
     })?;
 
     println!("Worker {worker_id} deregistered from the registry.");
-    let reminder = match app_id {
-        Some(app_id) => {
-            format!("Now tear down the Phala CVM separately:\n  phala cvms delete {app_id}")
+    if dropped {
+        println!("Dropped its local worker record.");
+    }
+    let done = format!("worker {worker_id} is deregistered");
+    tear_down_cvm(&cvm, app_id.as_deref(), "<app_id>", &done)
+}
+
+fn non_empty_app_id(app_id: &str) -> Option<&str> {
+    Some(app_id).filter(|id| !id.trim().is_empty())
+}
+
+/// Delete (or, with `--keep-cvm`, keep) the worker's CVM. `done` names what
+/// already succeeded, so a failure says exactly what did and did not happen.
+/// `fallback_id` is what to tell the operator to delete when no `app_id` is
+/// tracked: `<app_id>`, or a provisional record's CVM name (`phala cvms
+/// delete` accepts either).
+fn tear_down_cvm(
+    cvm: &CvmTeardown,
+    app_id: Option<&str>,
+    fallback_id: &str,
+    done: &str,
+) -> Result<()> {
+    let (phala_api_key, app_id) = match (cvm, app_id) {
+        (CvmTeardown::Keep, Some(app_id)) => {
+            println!(
+                "Kept its Phala CVM (--keep-cvm). Delete it when ready:\n  \
+                 phala cvms delete {app_id}"
+            );
+            return Ok(());
         }
-        None => "Now tear down the corresponding Phala CVM separately with \
-             `phala cvms delete <app_id>` (its app_id was not tracked locally)."
-            .to_owned(),
+        (CvmTeardown::Keep, None) => {
+            println!(
+                "Kept its Phala CVM (--keep-cvm). Its app_id is not tracked locally; \
+                 find it with `phala cvms list`, then:\n  phala cvms delete {fallback_id}"
+            );
+            return Ok(());
+        }
+        (CvmTeardown::Delete { .. }, None) => bail!(
+            "{done}, but its Phala CVM was NOT deleted: its app_id is not tracked locally.\n  \
+             find it with `phala cvms list`, then delete it:\n  \
+             phala cvms delete {fallback_id}"
+        ),
+        (CvmTeardown::Delete { phala_api_key }, Some(app_id)) => (phala_api_key.as_deref(), app_id),
     };
-    println!("{reminder}");
+    match delete_phala_cvm(app_id, phala_api_key) {
+        Ok(CvmDeletion::Deleted) => println!("Deleted Phala CVM {app_id}."),
+        Ok(CvmDeletion::NotFound) => println!(
+            "Phala CVM {app_id} is already gone: Phala Cloud has no such CVM in this account. \
+             Nothing to delete (if it runs under another Phala account, delete it there)."
+        ),
+        Err(err) => bail!(
+            "{done}, but its Phala CVM {app_id} was NOT deleted: {err:#}\n  \
+             delete it yourself:\n  \
+             phala cvms delete {app_id}"
+        ),
+    }
     Ok(())
 }
 
@@ -1886,7 +1962,7 @@ mod tests {
     /// `phala deploy` with `A CVM with name '<name>' already exists in this
     /// workspace` — after the image build, with no hint about what to do. The
     /// preflight must catch the collision and name the exact teardown command
-    /// (gmcli never deletes the CVM itself: that destroys a running worker).
+    /// (the preflight never deletes the CVM itself: that destroys a running worker).
     #[test]
     fn an_existing_cvm_name_is_rejected_with_the_delete_command() {
         let err = preflight_cvm_name(&CollidingPhala, "gm-testnet-zai-a")

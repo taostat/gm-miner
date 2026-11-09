@@ -401,12 +401,23 @@ List all workers:
 gmcli worker list
 ```
 
-Deregister a worker (does not tear down the Phala CVM — run `phala cvms delete <app_id>`
-separately):
+Remove a worker. This deregisters it from the registry, drops its local record, and then
+deletes its Phala CVM with `phala cvms delete <app_id>`, using the same Phala credentials as
+`deploy` (`--phala-api-key`, `PHALA_API_KEY` / `PHALA_CLOUD_API_KEY`, the saved key, or your
+`phala` CLI login):
 
 ```sh
 gmcli worker remove <worker_id>
 ```
+
+Pass `--keep-cvm` to deregister only and leave the CVM running; the command prints the
+`phala cvms delete` to run later. The CVM is never touched if the registry refuses the
+deregistration. A CVM Phala Cloud no longer has counts as deleted. If the delete fails, or
+gmcli has no `app_id` recorded for the worker, the worker stays deregistered, the command
+prints the `phala cvms delete` to run yourself, and exits non-zero.
+
+`<worker_id>` can also be the `app_id` or `--app-name` of a deploy that launched a CVM but
+never registered; that record is dropped locally and its CVM deleted the same way.
 
 ## Command reference
 
@@ -435,7 +446,7 @@ gmcli worker remove <worker_id>
 | `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
 | `gmcli worker list` | List workers with per-worker status and last attestation |
-| `gmcli worker remove` | Deregister a worker from the registry |
+| `gmcli worker remove` | Deregister a worker and delete its Phala CVM (`--keep-cvm` keeps it) |
 
 All commands accept `--network testnet|mainnet` (default: mainnet). The selection is sticky:
 pass it once and every later command targets it until you pass a different one. `--testnet` is

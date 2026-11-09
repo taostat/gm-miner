@@ -138,6 +138,16 @@ pub fn stored_key(config_key: Option<&str>) -> Option<String> {
     key_from_env().or_else(|| non_empty(config_key).map(str::to_owned))
 }
 
+/// The Phala API key for a `phala` call outside deploy (`worker remove`'s CVM
+/// delete): deploy's precedence — `--phala-api-key` flag, then env, then the
+/// saved config key — without the paste prompt or the credit-balance check,
+/// since deleting a CVM needs no funds. `None` leaves the subprocess on the
+/// `phala` CLI login session.
+#[must_use]
+pub fn non_interactive_key(flag: Option<&str>, config_key: Option<&str>) -> Option<String> {
+    pick_key_source(flag, key_from_env().as_deref(), config_key).map(|source| source.key)
+}
+
 /// Read the Phala API key from the environment, preferring `PHALA_API_KEY`
 /// and falling back to `PHALA_CLOUD_API_KEY` (the var the `phala` CLI itself
 /// honours). Whitespace-only values are ignored.
