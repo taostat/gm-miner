@@ -61,8 +61,8 @@ pub use registry_auth::{
     RegistryCredentials, Visibility, GHCR_PULL_TOKEN_VAR, GHCR_PULL_USERNAME_VAR,
 };
 pub use version::{
-    fetch_supported_versions, format_created_at, resolve_image_source, select_version, ImageSource,
-    ImageVersion, ImageVersionOut, ImageVersionsResponse,
+    fetch_all_versions, fetch_supported_versions, format_created_at, resolve_image_source,
+    select_version, ImageSource, ImageVersion, ImageVersionOut, ImageVersionsResponse,
 };
 
 /// Default maximum time to wait for hashes to appear after deploy (seconds).

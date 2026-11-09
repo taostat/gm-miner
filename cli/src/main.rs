@@ -19,7 +19,7 @@
 //!   sources          — list sourcing routes with capability vs admission status
 //!   update           — upgrade gmcli in place to the latest release
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
-//!   worker list      — list the hotkey's live workers
+//!   worker list      — list the hotkey's live workers and the image version each runs
 //!   worker remove    — deregister a worker and delete its Phala CVM (`--keep-cvm` keeps it)
 //!
 //! Every command resolves a [`Network`] profile (testnet/mainnet) carrying the
@@ -751,6 +751,11 @@ enum WorkerCommand {
 
     /// List the hotkey's live workers with per-worker status and last
     /// attestation (`GET /miners/{hotkey}/workers`).
+    ///
+    /// Each worker's image is named by matching its compose hash against
+    /// `GET /image-versions`: the release tag and whether it is supported,
+    /// deprecated (with the epoch its grace ends) or revoked. If that lookup
+    /// fails the list still prints, showing the short compose hash.
     ///
     /// A suspended worker also reports when it is re-probed next and how many
     /// consecutive successful probes restore it; a worker whose upstream key

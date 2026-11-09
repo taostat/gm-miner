@@ -15,8 +15,8 @@ use gm_miner_cli::{
     config::{self, Config, WorkerRecord},
     dependency::{check_dependency_presence, ensure_dependency, PHALA},
     deploy::{
-        delete_phala_cvm, fetch_supported_versions, format_created_at, normalize_hash,
-        parse_phala_cvm_detail, parse_phala_cvm_endpoint, parse_phala_cvm_name,
+        delete_phala_cvm, fetch_all_versions, fetch_supported_versions, format_created_at,
+        normalize_hash, parse_phala_cvm_detail, parse_phala_cvm_endpoint, parse_phala_cvm_name,
         prepare_deploy_target, resolve_image_source, resolve_kms_contract_id,
         resolve_registry_credentials, select_version, to_ratls_passthrough_endpoint, verify_hashes,
         CvmDeletion, ImageProvisioner, ImageSource, ImageVersion, PhalaClient,
@@ -26,7 +26,7 @@ use gm_miner_cli::{
     types::{
         MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerEntry, WorkerListResponse,
     },
-    workers::{is_secondary_live, worker_health_lines},
+    workers::{is_secondary_live, worker_detail_lines},
 };
 
 use crate::commands::persist::{
@@ -1338,9 +1338,17 @@ pub(crate) async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
     }
     println!("\n{} worker(s) total.", list.workers.len());
 
+    // A display aid: the list is still worth printing when the roster is not.
+    let versions = match fetch_all_versions(&client.config.api_url()).await {
+        Ok(versions) => Some(versions),
+        Err(err) => {
+            eprintln!("warning: could not look up image versions: {err:#}");
+            None
+        }
+    };
     let now = Utc::now();
     for w in &list.workers {
-        for line in worker_health_lines(w, list.consecutive_ok_required, now) {
+        for line in worker_detail_lines(w, versions.as_deref(), list.consecutive_ok_required, now) {
             println!("{line}");
         }
     }
@@ -1642,6 +1650,7 @@ mod tests {
             compose_hash: "a".repeat(64),
             os_image_hash: "b".repeat(64),
             status: "supported".to_owned(),
+            deprecation_end_epoch: None,
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
@@ -1734,6 +1743,7 @@ mod tests {
             compose_hash: "a".repeat(64),
             os_image_hash: "b".repeat(64),
             status: "supported".to_owned(),
+            deprecation_end_epoch: None,
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),

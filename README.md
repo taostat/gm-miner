@@ -395,11 +395,19 @@ use `gmcli worker add` with a distinct `--app-name`:
 gmcli worker add --app-name gm-miner-2
 ```
 
-List all workers:
+List all workers, with the image version each one runs and whether the registry still
+supports it:
 
 ```sh
 gmcli worker list
 ```
+
+Each worker gets an `image` line such as `v0.5.22 (supported)`,
+`v0.5.21 (deprecated — grace ends epoch 26273)` or `v0.5.11 (revoked)`. A deprecated image keeps
+serving until its grace epoch; a revoked one is not routed. `unknown image (compose <hash>)` means the registry has no record of that
+image; `not reported yet` means the worker has not reported its compose hash yet.
+`standing ambiguous` means the registry has published that compose hash under more than one OS
+image with different standings, and the worker list does not say which OS image the worker runs.
 
 Remove a worker. This deregisters it from the registry, drops its local record, and then
 deletes its Phala CVM with `phala cvms delete <app_id>`, using the same Phala credentials as
@@ -451,7 +459,7 @@ discard it with `--keep-cvm` and check `phala cvms list` for a CVM under that na
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |
 | `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
-| `gmcli worker list` | List workers with per-worker status and last attestation |
+| `gmcli worker list` | List workers with per-worker status, last attestation, and image version (supported, deprecated with its grace epoch, or revoked) |
 | `gmcli worker remove` | Deregister a worker and delete its Phala CVM (`--keep-cvm` keeps it) |
 
 All commands accept `--network testnet|mainnet` (default: mainnet). The selection is sticky:

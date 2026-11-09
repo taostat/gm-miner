@@ -441,7 +441,8 @@ and only one of them will be routed. In rough order of frequency:
   then `gmcli deploy`.
 - The worker has not been probed since it came up. Wait a cycle and re-check.
 - The worker is on an image version the registry no longer approves — `gmcli
-  worker list` shows each worker's status and last attestation. A route added in a
+  worker list` shows each worker's status, last attestation, and image version
+  with its standing (supported, deprecated, or revoked). A route added in a
   newer image cannot be served by a worker still running an older one.
 - The worker was just restored from suspension; its supported-model list is
   cleared and repopulates on the next probe.
