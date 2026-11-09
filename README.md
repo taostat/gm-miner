@@ -412,10 +412,13 @@ gmcli worker remove <worker_id>
 
 Pass `--keep-cvm` to deregister only and leave the CVM running; the command prints the
 `phala cvms delete` to run later. Without it, the command first checks that the `phala` CLI is
-installed and a Phala credential is available, and stops before changing anything if not. The
-CVM is never touched if the registry refuses the deregistration. A CVM Phala Cloud no longer has counts as deleted. If the delete fails, or
-gmcli has no `app_id` recorded for the worker, the worker stays deregistered, the command
-prints the `phala cvms delete` to run yourself, and exits non-zero.
+installed and that Phala Cloud accepts your credential (`phala whoami`), and stops before
+changing anything if not. The CVM is never touched if the registry refuses the deregistration.
+A CVM Phala Cloud reports as not found counts as deleted. If the delete fails, or gmcli has no
+`app_id` recorded for the worker, the worker stays deregistered, the command prints the
+`phala cvms delete` to run yourself, and exits non-zero. If the local record cannot be saved
+after deregistration, the CVM is still deleted and the command reports both outcomes and exits
+non-zero.
 
 `<worker_id>` can also be the `app_id` or `--app-name` of a deploy that launched a CVM but
 never registered; that record is dropped locally and its CVM deleted the same way. A deploy

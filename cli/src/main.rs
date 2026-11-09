@@ -762,7 +762,8 @@ enum WorkerCommand {
     /// delete its Phala CVM (`phala cvms delete <app_id>`).
     ///
     /// Before anything changes, gmcli checks that the `phala` CLI is installed
-    /// and a Phala credential is available (skipped with `--keep-cvm`). The
+    /// and Phala Cloud accepts the credential via `phala whoami` (skipped with
+    /// `--keep-cvm`). The
     /// CVM is deleted only after the registry DELETE succeeds. If the CVM
     /// cannot be deleted, or its `app_id` is not tracked locally, the command
     /// says so, prints the `phala cvms delete` to run, and exits non-zero.

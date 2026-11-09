@@ -658,10 +658,16 @@ pub fn delete_phala_cvm(app_id: &str, api_key: Option<&str>) -> Result<CvmDeleti
     parse_phala_cvm_delete(out.status.success(), &out.stdout, &out.stderr)
 }
 
+/// The exact errors `phala cvms delete --json` reports for a CVM that does not
+/// exist: the API's lookup answer, and the CLI's own when the lookup is empty.
+/// Compared whole (trimmed, case-insensitive) so an unrelated failure that
+/// merely mentions "not found" stays an error.
+const PHALA_CVM_NOT_FOUND_ERRORS: [&str; 2] = ["the requested cvm was not found", "cvm not found"];
+
 /// Classify a `phala cvms delete --json` run. A zero exit is a deletion. A
-/// failure whose error says the CVM was not found (`The requested CVM was not
-/// found` from the API, `CVM not found` from the CLI) is [`CvmDeletion::NotFound`].
-/// Any other failure is an error carrying Phala's own message.
+/// failure whose error is exactly one of [`PHALA_CVM_NOT_FOUND_ERRORS`] is
+/// [`CvmDeletion::NotFound`]. Any other failure is an error carrying Phala's
+/// own message.
 ///
 /// # Errors
 /// Returns an error for every non-zero exit that is not a not-found.
@@ -678,7 +684,7 @@ pub fn parse_phala_cvm_delete(
         .and_then(|failure| failure.error)
         .filter(|error| !error.trim().is_empty());
     if let Some(error) = &reported {
-        if error.to_ascii_lowercase().contains("not found") {
+        if PHALA_CVM_NOT_FOUND_ERRORS.contains(&error.trim().to_ascii_lowercase().as_str()) {
             return Ok(CvmDeletion::NotFound);
         }
     }
@@ -1416,6 +1422,11 @@ mod tests {
         let stdout = br#"{"success":false,"error":"Invalid API key"}"#;
         let err = parse_phala_cvm_delete(false, stdout, b"").expect_err("must fail");
         assert!(err.to_string().contains("Invalid API key"), "{err}");
+
+        let stdout = br#"{"success":false,"error":"Workspace not found"}"#;
+        let err = parse_phala_cvm_delete(false, stdout, b"")
+            .expect_err("an unrelated not-found must not read as an absent CVM");
+        assert!(err.to_string().contains("Workspace not found"), "{err}");
 
         let err = parse_phala_cvm_delete(false, b"", b"network unreachable\n")
             .expect_err("a failure without JSON must still fail");

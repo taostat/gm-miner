@@ -196,11 +196,33 @@ pub async fn resolve_key(flag: Option<&str>, assume_yes: bool) -> Result<Option<
     Ok(Some(source.key))
 }
 
+/// Prove a Phala credential works with `phala whoami`, an authenticated
+/// read-only call: with `api_key` scoped onto the subprocess (which takes
+/// precedence over any CLI session), or the CLI login session when `None`.
+///
+/// # Errors
+/// Returns an error carrying Phala's own message when `phala` cannot be run
+/// or rejects the credential.
+pub fn check_credential(api_key: Option<&str>) -> Result<()> {
+    let mut command = crate::deploy::phala_command(api_key)?;
+    command.arg("whoami");
+    let out = crate::deploy::phala_output(&mut command, "run phala whoami")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    let detail = if stderr.is_empty() {
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    } else {
+        stderr
+    };
+    bail!("`phala whoami` failed: {detail}")
+}
+
 /// Whether the `phala` CLI already holds a login session. `phala whoami` exits
 /// non-zero when unauthenticated, so a zero exit means a usable session — the
 /// same probe `gmcli doctor`'s Phala check uses, kept consistent here.
-#[must_use]
-pub fn phala_cli_logged_in() -> bool {
+fn phala_cli_logged_in() -> bool {
     let Ok(mut command) = crate::deploy::phala_command(None) else {
         return false;
     };

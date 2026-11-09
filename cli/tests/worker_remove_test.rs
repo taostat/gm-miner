@@ -20,13 +20,21 @@ const PROVISIONAL_NAME: &str = "gm-miner-3";
 const PROVISIONAL_APP_ID: &str = "app_prov456";
 
 /// The fake `phala`: answers the `--version` presence probe, and `whoami`
-/// as logged in only when `$TEST_PHALA_LOGIN=1`. Every `cvms` call is logged
+/// like Phala does: a scoped key wins over the CLI session and is accepted
+/// unless it is `rejected-key`; without one, only a `$TEST_PHALA_LOGIN=1`
+/// session is. Every `cvms` call is logged
 /// as `<args> key=<scoped key>` and answered as `$TEST_PHALA_DELETE` says,
 /// with the `--json` envelopes `phala` 1.1.19 prints.
 const FAKE_PHALA: &str = "#!/bin/sh\n\
     case \"$1\" in\n\
       --version) printf '1.1.19\\n'; exit 0;;\n\
-      whoami) [ \"$TEST_PHALA_LOGIN\" = 1 ]; exit $?;;\n\
+      whoami)\n\
+        if [ -n \"$PHALA_CLOUD_API_KEY\" ]; then\n\
+          [ \"$PHALA_CLOUD_API_KEY\" != rejected-key ] && exit 0\n\
+        elif [ \"$TEST_PHALA_LOGIN\" = 1 ]; then\n\
+          exit 0\n\
+        fi\n\
+        printf 'Invalid API key\\n' >&2; exit 1;;\n\
     esac\n\
     printf '%s key=%s\\n' \"$*\" \"$PHALA_CLOUD_API_KEY\" >> \"$TEST_CALLS\"\n\
     case \"$TEST_PHALA_DELETE\" in\n\
@@ -133,6 +141,13 @@ impl Fixture {
 
     fn without_phala_cli(&self) {
         std::fs::remove_file(self.dir.path().join("phala")).expect("remove fake phala");
+    }
+
+    /// Make the config's atomic save fail (its temp path is a directory)
+    /// while loading and locking still work.
+    fn with_unsaveable_config(&self) {
+        std::fs::create_dir(self.dir.path().join("config.json.tmp"))
+            .expect("block the config temp file");
     }
 
     fn without_saved_phala_key(&self) {
@@ -391,7 +406,7 @@ async fn a_missing_phala_credential_fails_before_deregistering() {
         let out = fixture.run(&[id], "ok");
         assert_refused_before_anything_changed(&fixture, &out);
         assert!(
-            text(&out.stderr).contains("no Phala credential found"),
+            text(&out.stderr).contains("did not accept the `phala` CLI login session"),
             "{}",
             text(&out.stderr)
         );
@@ -424,4 +439,66 @@ async fn keep_cvm_needs_neither_the_phala_cli_nor_a_key() {
 
     assert!(out.status.success(), "stderr: {}", text(&out.stderr));
     assert!(!fixture.tracked_app_ids().contains(&APP_ID.to_owned()));
+}
+
+#[tokio::test]
+async fn a_rejected_phala_key_fails_before_deregistering() {
+    let fixture = Fixture::new(Registry::Unused).await;
+    for id in [WORKER_ID, PROVISIONAL_NAME] {
+        let out = fixture.run(&[id, "--phala-api-key", "rejected-key"], "ok");
+        assert_refused_before_anything_changed(&fixture, &out);
+        let stderr = text(&out.stderr);
+        assert!(
+            stderr.contains("did not accept the resolved Phala API key")
+                && stderr.contains("Invalid API key"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("rejected-key"),
+            "the key must not be echoed: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_record_save_still_deletes_the_cvm_and_reports_it() {
+    let fixture = Fixture::new(Registry::Deletes).await;
+    fixture.with_unsaveable_config();
+    let out = fixture.run(&[WORKER_ID], "ok");
+    let stdout = text(&out.stdout);
+    let stderr = text(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "a stale local record must fail the run"
+    );
+    assert_eq!(
+        fixture.phala_calls(),
+        format!("cvms delete {APP_ID} --force --json key=saved-key\n")
+    );
+    assert!(
+        stdout.contains(&format!("Deleted Phala CVM {APP_ID}.")),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("worker {WORKER_ID} is deregistered"))
+            && stderr.contains("local record could not be dropped"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_record_save_and_cvm_delete_reports_both() {
+    let fixture = Fixture::new(Registry::Deletes).await;
+    fixture.with_unsaveable_config();
+    let out = fixture.run(&[WORKER_ID], "fail");
+    let stderr = text(&out.stderr);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains(&format!("Phala CVM {APP_ID} was NOT deleted"))
+            && stderr.contains(&format!("phala cvms delete {APP_ID}"))
+            && stderr.contains("local record could not be dropped"),
+        "{stderr}"
+    );
 }

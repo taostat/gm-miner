@@ -1424,31 +1424,51 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str, cvm: CvmTeardown) -
         let dropped = cfg.active_entry_mut().remove_worker_by_id(&worker_id);
         config::save(&cfg).context("persist worker removal to gmcli config")?;
         Ok(dropped.is_some())
-    })?;
+    });
 
     println!("Worker {worker_id} deregistered from the registry.");
-    if dropped {
-        println!("Dropped its local worker record.");
-    }
     let done = format!("worker {worker_id} is deregistered");
-    tear_down_cvm(&cvm, app_id.as_deref(), "<app_id>", &done)
+    match dropped {
+        Ok(dropped) => {
+            if dropped {
+                println!("Dropped its local worker record.");
+            }
+            tear_down_cvm(&cvm, app_id.as_deref(), "<app_id>", &done)
+        }
+        // The registry no longer has the worker, so its CVM must still be
+        // torn down; then report both outcomes.
+        Err(persist_err) => {
+            let stale = format!(
+                "its local record could not be dropped and stays in gmcli config: {persist_err:#}"
+            );
+            match tear_down_cvm(&cvm, app_id.as_deref(), "<app_id>", &done) {
+                Ok(()) => bail!("{done}, but {stale}"),
+                Err(teardown_err) => bail!("{teardown_err:#}\n  also, {stale}"),
+            }
+        }
+    }
 }
 
 /// Fail before anything changes when the CVM delete could not run: no `phala`
-/// CLI, or no Phala credential (no resolved key and no `phala` CLI login).
+/// CLI, or a credential Phala does not accept (`phala whoami` with the
+/// resolved key, or the CLI login session when there is none).
 fn preflight_cvm_delete(app_id: &str, phala_api_key: Option<&str>) -> Result<()> {
     let skip = "Nothing was changed. Pass --keep-cvm to remove the worker without \
                 deleting its CVM.";
     check_dependency_presence(&PHALA)
         .with_context(|| format!("cannot delete Phala CVM {app_id}. {skip}"))?;
-    if phala_api_key.is_none() && !gm_miner_cli::phala::phala_cli_logged_in() {
-        bail!(
-            "cannot delete Phala CVM {app_id}: no Phala credential found.\n  \
-             pass --phala-api-key <key>, set PHALA_API_KEY, or run `phala auth login`.\n  \
+    let source = if phala_api_key.is_some() {
+        "the resolved Phala API key"
+    } else {
+        "the `phala` CLI login session (no API key configured)"
+    };
+    gm_miner_cli::phala::check_credential(phala_api_key).with_context(|| {
+        format!(
+            "cannot delete Phala CVM {app_id}: Phala Cloud did not accept {source}.\n  \
+             pass a valid --phala-api-key <key>, set PHALA_API_KEY, or run `phala auth login`.\n  \
              {skip}"
-        );
-    }
-    Ok(())
+        )
+    })
 }
 
 fn non_empty_app_id(app_id: &str) -> Option<&str> {
