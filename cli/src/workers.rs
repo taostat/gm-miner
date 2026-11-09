@@ -91,18 +91,26 @@ pub fn image_label(worker: &WorkerEntry, versions: Option<&[ImageVersion]>) -> S
     let Some(versions) = versions else {
         return format!("compose {short} (version lookup failed)");
     };
-    // The roster is newest-first, so a compose hash published twice (once per
-    // OS image) names its latest row.
-    let Some(version) = versions
+    let matches: Vec<&ImageVersion> = versions
         .iter()
-        .find(|v| normalize_hash(&v.compose_hash) == compose)
-    else {
+        .filter(|v| normalize_hash(&v.compose_hash) == compose)
+        .collect();
+    let Some(version) = matches.first() else {
         return format!("unknown image (compose {short})");
     };
     let name = version
         .git_tag
         .clone()
         .unwrap_or_else(|| format!("compose {short}"));
+    // One compose hash can be published once per OS image, each row with its
+    // own standing, and the worker list does not report which OS image a
+    // worker runs. When those rows disagree, no single standing is true.
+    let standing_differs = matches.iter().any(|v| {
+        v.status != version.status || v.deprecation_end_epoch != version.deprecation_end_epoch
+    });
+    if standing_differs {
+        return format!("{name} (standing ambiguous — it differs by OS image)");
+    }
     match (version.status.as_str(), version.deprecation_end_epoch) {
         ("deprecated", Some(epoch)) => format!("{name} (deprecated — grace ends epoch {epoch})"),
         ("deprecated", None) => format!("{name} (deprecated — no grace window)"),
@@ -537,6 +545,40 @@ mod tests {
         assert_eq!(label(&revoked), "v0.5.11 (revoked)");
         assert_eq!(label(&no_window), "v0.5.10 (deprecated — no grace window)");
         assert_eq!(label(&untagged), "compose ffffffffffff (supported)");
+    }
+
+    /// Real on testnet: the dstack-0.6.0 migration published one compose hash
+    /// under two OS images with different standings.
+    #[test]
+    fn image_label_is_ambiguous_when_rows_for_one_compose_disagree() {
+        let compose = "a".repeat(64);
+        let mut other_os = version(&compose, Some("v0.5.22"), "supported", None);
+        other_os.os_image_hash = "c".repeat(64);
+        let worker = running(Some(&compose));
+
+        let disagree = [
+            version(&compose, Some("v0.5.22"), "revoked", None),
+            other_os,
+        ];
+        assert_eq!(
+            image_label(&worker, Some(&disagree)),
+            "v0.5.22 (standing ambiguous — it differs by OS image)"
+        );
+
+        let grace_differs = [
+            version(&compose, Some("v0.5.22"), "deprecated", Some(26_273)),
+            version(&compose, Some("v0.5.22"), "deprecated", Some(26_300)),
+        ];
+        assert_eq!(
+            image_label(&worker, Some(&grace_differs)),
+            "v0.5.22 (standing ambiguous — it differs by OS image)"
+        );
+
+        let agree = [
+            version(&compose, Some("v0.5.22"), "supported", None),
+            version(&compose, Some("v0.5.22"), "supported", None),
+        ];
+        assert_eq!(image_label(&worker, Some(&agree)), "v0.5.22 (supported)");
     }
 
     #[test]

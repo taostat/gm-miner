@@ -151,3 +151,20 @@ async fn a_failed_version_lookup_still_lists_the_workers() {
         "{stderr}"
     );
 }
+
+/// One compose hash published under two OS images with different standings:
+/// the worker list cannot tell which one the worker runs.
+#[tokio::test]
+async fn a_compose_published_twice_with_different_standings_is_ambiguous() {
+    let mut supported_os = version(&hash("a22"), "v0.5.22", "supported", None);
+    supported_os["os_image_hash"] = json!(hash("c"));
+    let versions = ResponseTemplate::new(200).set_body_json(json!({"versions": [
+        version(&hash("a22"), "v0.5.22", "revoked", None),
+        supported_os,
+    ]}));
+    let output = worker_list(Some(&hash("a22")), versions).await;
+    assert_image_line(
+        &output,
+        "v0.5.22 (standing ambiguous — it differs by OS image)",
+    );
+}

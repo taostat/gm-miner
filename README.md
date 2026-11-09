@@ -406,6 +406,8 @@ Each worker gets an `image` line such as `v0.5.22 (supported)`,
 `v0.5.21 (deprecated — grace ends epoch 26273)` or `v0.5.11 (revoked)`. A deprecated image keeps
 serving until its grace epoch; a revoked one is not routed. `unknown image (compose <hash>)` means the registry has no record of that
 image; `not reported yet` means the worker has not reported its compose hash yet.
+`standing ambiguous` means the registry has published that compose hash under more than one OS
+image with different standings, and the worker list does not say which OS image the worker runs.
 
 Remove a worker. This deregisters it from the registry, drops its local record, and then
 deletes its Phala CVM with `phala cvms delete <app_id>`, using the same Phala credentials as
