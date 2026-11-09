@@ -429,33 +429,16 @@ pub(crate) fn persist_accepted_terms() -> Result<()> {
 }
 
 /// Drop a provisional worker record (a deploy that never registered) from the
-/// local config. No registry DELETE: nothing was ever registered.
-pub(crate) fn remove_provisional_worker(network: &str, id: &str) -> Result<()> {
-    let removed = config::with_config_lock(|| {
+/// local config. No registry DELETE: nothing was ever registered. Returns the
+/// removed record, or `None` when nothing matched `id`.
+pub(crate) fn remove_provisional_worker(network: &str, id: &str) -> Result<Option<WorkerRecord>> {
+    config::with_config_lock(|| {
         let mut cfg = config::load().context("load gmcli config")?;
         cfg.active_network = Some(network.to_owned());
         let removed = cfg.active_entry_mut().remove_provisional_worker(id);
         config::save(&cfg).context("persist worker removal to gmcli config")?;
         Ok(removed)
-    })?;
-
-    match removed {
-        Some(w) if !w.app_id.is_empty() => {
-            println!(
-                "Dropped the unregistered worker record for '{}'.\n\
-                 Tear down its CVM separately:\n  phala cvms delete {}",
-                w.app_name, w.app_id
-            );
-        }
-        Some(w) => {
-            println!(
-                "Dropped the unregistered worker record for '{}'.",
-                w.app_name
-            );
-        }
-        None => println!("No provisional worker matched '{id}'."),
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]

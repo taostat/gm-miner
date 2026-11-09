@@ -138,6 +138,16 @@ pub fn stored_key(config_key: Option<&str>) -> Option<String> {
     key_from_env().or_else(|| non_empty(config_key).map(str::to_owned))
 }
 
+/// The Phala API key for a `phala` call outside deploy (`worker remove`'s CVM
+/// delete): deploy's precedence — `--phala-api-key` flag, then env, then the
+/// saved config key — without the paste prompt or the credit-balance check,
+/// since deleting a CVM needs no funds. `None` leaves the subprocess on the
+/// `phala` CLI login session.
+#[must_use]
+pub fn non_interactive_key(flag: Option<&str>, config_key: Option<&str>) -> Option<String> {
+    pick_key_source(flag, key_from_env().as_deref(), config_key).map(|source| source.key)
+}
+
 /// Read the Phala API key from the environment, preferring `PHALA_API_KEY`
 /// and falling back to `PHALA_CLOUD_API_KEY` (the var the `phala` CLI itself
 /// honours). Whitespace-only values are ignored.
@@ -184,6 +194,52 @@ pub async fn resolve_key(flag: Option<&str>, assume_yes: bool) -> Result<Option<
         println!("Saved the Phala Cloud API key to gmcli config for next time.");
     }
     Ok(Some(source.key))
+}
+
+/// Prove a Phala credential works with `phala whoami`, an authenticated
+/// read-only call: with `api_key` scoped onto the subprocess (which takes
+/// precedence over any CLI session), or the CLI login session when `None`.
+///
+/// # Errors
+/// Returns an error carrying Phala's own message when `phala` cannot be run
+/// or rejects the credential.
+pub fn check_credential(api_key: Option<&str>) -> Result<()> {
+    let mut command = crate::deploy::phala_command(api_key)?;
+    command.arg("whoami");
+    let out = crate::deploy::phala_output(&mut command, "run phala whoami")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    let detail = if stderr.is_empty() {
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    } else {
+        stderr
+    };
+    bail!(
+        "`phala whoami` failed: {}",
+        redact_credentials(&detail, api_key)
+    )
+}
+
+/// Subprocess diagnostics can echo the request's API key, including in debug
+/// headers. Session keys are unknown to gmcli, so suppress key headers too.
+pub(crate) fn redact_credentials(message: &str, api_key: Option<&str>) -> String {
+    let message = message
+        .lines()
+        .map(|line| {
+            if line.to_ascii_lowercase().contains("x-api-key") {
+                "[REDACTED API-key header]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    match api_key.filter(|key| !key.is_empty()) {
+        Some(key) => message.replace(key, "[REDACTED]"),
+        None => message,
+    }
 }
 
 /// Whether the `phala` CLI already holds a login session. `phala whoami` exits

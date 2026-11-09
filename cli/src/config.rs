@@ -154,7 +154,7 @@ pub struct WorkerRecord {
     /// `POST /miners/register` (worker #1) or `POST /miners/{hotkey}/workers`.
     pub worker_id: String,
     /// The Phala Cloud `app_id` of the deployed CVM. Stored so `worker
-    /// remove` can remind the operator which CVM to `phala cvms delete`.
+    /// remove` knows which CVM to `phala cvms delete`.
     pub app_id: String,
     /// The operator-chosen CVM name passed to `phala deploy --name`. The
     /// stable local handle for the worker — a re-deploy reuses the

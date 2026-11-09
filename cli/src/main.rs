@@ -20,7 +20,7 @@
 //!   update           — upgrade gmcli in place to the latest release
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
 //!   worker list      — list the hotkey's live workers
-//!   worker remove    — deregister a worker (CVM teardown is separate)
+//!   worker remove    — deregister a worker and delete its Phala CVM (`--keep-cvm` keeps it)
 //!
 //! Every command resolves a [`Network`] profile (testnet/mainnet) carrying the
 //! subnet `netuid`, chain websocket, and default registry URL. The selection
@@ -58,7 +58,8 @@ use gm_miner_cli::{
 
 use crate::commands::deploy::{
     cmd_deploy_subcommand, cmd_publish_image_version, cmd_register_image_subcommand,
-    cmd_worker_add, cmd_worker_list, cmd_worker_remove, deploy_args_from_flags, WorkerRegistration,
+    cmd_worker_add, cmd_worker_list, cmd_worker_remove, deploy_args_from_flags, CvmTeardown,
+    WorkerRegistration,
 };
 use crate::commands::doctor::cmd_doctor;
 use crate::commands::earnings::cmd_earnings;
@@ -757,11 +758,34 @@ enum WorkerCommand {
     List,
 
     /// Deregister a worker from the registry (`DELETE
-    /// /miners/{hotkey}/workers/{worker_id}`). This does NOT tear down the
-    /// Phala CVM — `phala cvms delete <app_id>` separately.
+    /// /miners/{hotkey}/workers/{worker_id}`), drop its local record, then
+    /// delete its Phala CVM (`phala cvms delete <app_id>`).
+    ///
+    /// Before anything changes, gmcli checks that the `phala` CLI is installed
+    /// and Phala Cloud accepts the credential via `phala whoami` (skipped with
+    /// `--keep-cvm`). The
+    /// CVM is deleted only after the registry DELETE succeeds. If the CVM
+    /// cannot be deleted, or its `app_id` is not tracked locally, the command
+    /// says so, prints the `phala cvms delete` to run, and exits non-zero.
     Remove {
-        /// The registry `worker_id` (ULID) of the worker to remove.
+        /// The registry `worker_id` (ULID) of the worker to remove, or the
+        /// `app_id` / `app_name` of a provisional (never registered) worker.
         worker_id: String,
+
+        /// Keep the worker's Phala CVM running; only deregister it.
+        #[arg(long)]
+        keep_cvm: bool,
+
+        /// Phala Cloud API key for the CVM delete (this run only, not
+        /// persisted). When omitted, gmcli uses `PHALA_API_KEY` /
+        /// `PHALA_CLOUD_API_KEY`, then the key saved in config, then the
+        /// `phala` CLI login session.
+        #[arg(
+            long = "phala-api-key",
+            value_name = "KEY",
+            conflicts_with = "keep_cvm"
+        )]
+        phala_api_key: Option<String>,
     },
 }
 
@@ -1033,7 +1057,22 @@ async fn dispatch_worker(
     match command {
         WorkerCommand::Add { flags } => cmd_worker_add(cfg, deploy_args_from_flags(*flags)).await,
         WorkerCommand::List => cmd_worker_list(&mut RegistryClient::new(cfg)).await,
-        WorkerCommand::Remove { worker_id } => cmd_worker_remove(cfg, &worker_id).await,
+        WorkerCommand::Remove {
+            worker_id,
+            keep_cvm,
+            phala_api_key,
+        } => {
+            let cvm = if keep_cvm {
+                CvmTeardown::Keep
+            } else {
+                let phala_api_key = gm_miner_cli::phala::non_interactive_key(
+                    phala_api_key.as_deref(),
+                    cfg.phala_api_key.as_deref(),
+                );
+                CvmTeardown::Delete { phala_api_key }
+            };
+            cmd_worker_remove(cfg, &worker_id, cvm).await
+        }
     }
 }
 
@@ -1317,6 +1356,11 @@ mod tests {
             err.to_string().contains("in-flight worker #1"),
             "must redirect to deploy; got: {err}"
         );
+        assert!(
+            err.to_string()
+                .contains("`gmcli worker remove gm-miner-1 --keep-cvm` to discard the stub"),
+            "the stub has no app_id, so the discard path must not end in an error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1360,7 +1404,9 @@ mod tests {
             .expect_err("a provisional CVM must block a re-deploy");
         let msg = err.to_string();
         assert!(
-            msg.contains("app_orphan") && msg.contains("phala cvms delete"),
+            msg.contains("app_orphan")
+                && msg.contains("gmcli worker remove")
+                && msg.contains("deletes that CVM"),
             "must name the orphaned CVM and how to tear it down; got: {msg}"
         );
     }
@@ -2080,12 +2126,55 @@ mod tests {
         let cli =
             <Cli as clap::Parser>::try_parse_from(["gmcli", "worker", "remove", "01J0C"]).unwrap();
         let Command::Worker {
-            command: WorkerCommand::Remove { worker_id },
+            command:
+                WorkerCommand::Remove {
+                    worker_id,
+                    keep_cvm,
+                    phala_api_key,
+                },
         } = cli.command
         else {
             unreachable!("expected worker remove");
         };
         assert_eq!(worker_id, "01J0C");
+        assert!(!keep_cvm, "the CVM is deleted unless --keep-cvm is passed");
+        assert_eq!(phala_api_key, None);
+    }
+
+    #[test]
+    fn clap_parses_worker_remove_keep_cvm() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "worker",
+            "remove",
+            "01J0C",
+            "--keep-cvm",
+        ])
+        .unwrap();
+        let Command::Worker {
+            command: WorkerCommand::Remove { keep_cvm, .. },
+        } = cli.command
+        else {
+            unreachable!("expected worker remove");
+        };
+        assert!(keep_cvm);
+    }
+
+    #[test]
+    fn clap_rejects_a_phala_key_alongside_keep_cvm() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "worker",
+            "remove",
+            "01J0C",
+            "--keep-cvm",
+            "--phala-api-key",
+            "k",
+        ]);
+        assert!(
+            result.is_err(),
+            "a key for a delete that will not run is a mistake"
+        );
     }
 
     #[test]

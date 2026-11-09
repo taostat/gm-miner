@@ -47,11 +47,11 @@ mod version;
 
 pub use compose::{render_compose, render_env_file, COMPOSE_TEMPLATE, PRELAUNCH_SCRIPT};
 pub use cvm::{
-    build_phala_deploy_args, parse_phala_cvm_app_id, parse_phala_cvm_detail,
-    parse_phala_cvm_endpoint, parse_phala_cvm_name, phala_command, phala_output,
-    to_ratls_passthrough_endpoint, PhalaClient, PhalaCommand, PhalaDeployArgs, RealPhalaClient,
-    PHALA_APP_ID_FIELD, PHALA_COMPOSE_HASH_FIELD, PHALA_ENDPOINT_FIELD, PHALA_OS_IMAGE_HASH_FIELD,
-    POLL_INTERVAL_SECS,
+    build_phala_deploy_args, delete_phala_cvm, parse_phala_cvm_app_id, parse_phala_cvm_delete,
+    parse_phala_cvm_detail, parse_phala_cvm_endpoint, parse_phala_cvm_name, phala_command,
+    phala_output, to_ratls_passthrough_endpoint, CvmDeletion, PhalaClient, PhalaCommand,
+    PhalaDeployArgs, RealPhalaClient, PHALA_APP_ID_FIELD, PHALA_COMPOSE_HASH_FIELD,
+    PHALA_ENDPOINT_FIELD, PHALA_OS_IMAGE_HASH_FIELD, POLL_INTERVAL_SECS,
 };
 pub use hashes::{normalize_hash, verify_hashes, DeployOutcome, DstackDeployResult};
 pub use kms_roots::resolve_kms_contract_id;
