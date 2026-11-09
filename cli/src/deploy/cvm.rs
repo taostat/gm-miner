@@ -656,6 +656,7 @@ pub fn delete_phala_cvm(app_id: &str, api_key: Option<&str>) -> Result<CvmDeleti
     command.args(["cvms", "delete", app_id, "--force", "--json"]);
     let out = phala_output(&mut command, "run phala cvms delete")?;
     parse_phala_cvm_delete(out.status.success(), &out.stdout, &out.stderr)
+        .map_err(|err| anyhow::anyhow!(crate::phala::redact_credentials(&err.to_string(), api_key)))
 }
 
 /// The exact errors `phala cvms delete --json` reports for a CVM that does not

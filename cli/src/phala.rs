@@ -216,7 +216,30 @@ pub fn check_credential(api_key: Option<&str>) -> Result<()> {
     } else {
         stderr
     };
-    bail!("`phala whoami` failed: {detail}")
+    bail!(
+        "`phala whoami` failed: {}",
+        redact_credentials(&detail, api_key)
+    )
+}
+
+/// Subprocess diagnostics can echo the request's API key, including in debug
+/// headers. Session keys are unknown to gmcli, so suppress key headers too.
+pub(crate) fn redact_credentials(message: &str, api_key: Option<&str>) -> String {
+    let message = message
+        .lines()
+        .map(|line| {
+            if line.to_ascii_lowercase().contains("x-api-key") {
+                "[REDACTED API-key header]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    match api_key.filter(|key| !key.is_empty()) {
+        Some(key) => message.replace(key, "[REDACTED]"),
+        None => message,
+    }
 }
 
 /// Whether the `phala` CLI already holds a login session. `phala whoami` exits

@@ -29,6 +29,12 @@ const FAKE_PHALA: &str = "#!/bin/sh\n\
     case \"$1\" in\n\
       --version) printf '1.1.19\\n'; exit 0;;\n\
       whoami)\n\
+        if [ -n \"$TEST_UPDATED_CONFIG\" ]; then\n\
+          /bin/cp \"$TEST_UPDATED_CONFIG\" \"$GMCLI_CONFIG_DIR/config.json\" || exit 1\n\
+        fi\n\
+        if [ \"$TEST_PHALA_ECHO_KEY\" = 1 ]; then\n\
+          printf 'X-API-Key: %s\\nInvalid API key\\n' \"${PHALA_CLOUD_API_KEY:-session-key}\" >&2; exit 1\n\
+        fi\n\
         if [ -n \"$PHALA_CLOUD_API_KEY\" ]; then\n\
           [ \"$PHALA_CLOUD_API_KEY\" != rejected-key ] && exit 0\n\
         elif [ \"$TEST_PHALA_LOGIN\" = 1 ]; then\n\
@@ -41,6 +47,9 @@ const FAKE_PHALA: &str = "#!/bin/sh\n\
       ok) printf '{\"success\":true,\"data\":{\"deleted\":true,\"cvm\":\"x\"}}\\n';;\n\
       gone) printf '{\"success\":false,\"error\":\"The requested CVM was not found\"}\\n'\n\
         exit 1;;\n\
+      echo-json) printf '{\"success\":false,\"error\":\"Invalid API key: %s\"}\\n' \"$PHALA_CLOUD_API_KEY\"; exit 1;;\n\
+      echo-stderr) printf 'X-API-Key: %s\\n' \"${PHALA_CLOUD_API_KEY:-session-key}\" >&2; exit 1;;\n\
+      echo-stdout) printf 'X-API-Key: %s\\n' \"${PHALA_CLOUD_API_KEY:-session-key}\"; exit 1;;\n\
       *) printf '{\"success\":false,\"error\":\"Insufficient permissions\"}\\n'; exit 1;;\n\
     esac\n";
 
@@ -54,7 +63,7 @@ enum Registry {
 
 struct Fixture {
     dir: tempfile::TempDir,
-    _server: MockServer,
+    server: MockServer,
 }
 
 fn worker(worker_id: &str, app_id: &str, app_name: &str) -> Value {
@@ -113,10 +122,7 @@ impl Fixture {
             .respond_with(ResponseTemplate::new(204))
             .mount(&server)
             .await;
-        Self {
-            dir,
-            _server: server,
-        }
+        Self { dir, server }
     }
 
     fn run(&self, args: &[&str], phala_delete: &str) -> std::process::Output {
@@ -159,6 +165,17 @@ impl Fixture {
             .expect("config object")
             .remove("phala_api_key");
         std::fs::write(file, config.to_string()).expect("rewrite config");
+    }
+
+    async fn assert_no_registry_calls(&self) {
+        assert!(
+            self.server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty(),
+            "no registry request may run"
+        );
     }
 
     fn phala_calls(&self) -> String {
@@ -313,6 +330,7 @@ async fn a_provisional_record_deletes_its_cvm_without_a_registry_call() {
     let out = fixture.run(&[PROVISIONAL_NAME], "ok");
     let stdout = text(&out.stdout);
 
+    fixture.assert_no_registry_calls().await;
     assert!(out.status.success(), "stderr: {}", text(&out.stderr));
     assert!(
         stdout.contains(&format!("record for '{PROVISIONAL_NAME}'")),
@@ -460,6 +478,88 @@ async fn a_rejected_phala_key_fails_before_deregistering() {
     }
 }
 
+// These paths must not reach the registry. An invalid URL makes accidental
+// registry work fail without using a socket.
+fn offline_removal(provisional: bool) -> (tempfile::TempDir, Command) {
+    let dir = tempfile::tempdir().expect("isolated removal");
+    let worker_id = if provisional { "" } else { WORKER_ID };
+    let config = json!({
+        "active_network": "testnet",
+        "networks": {"testnet": {
+            "api_url": "invalid-registry-url",
+            "tokens": {"access_token": "test-token"},
+            "workers": [worker(worker_id, APP_ID, PROVISIONAL_NAME)],
+        }},
+        "phala_api_key": "saved-key",
+    });
+    std::fs::write(dir.path().join("config.json"), config.to_string()).expect("write config");
+    let phala = dir.path().join("phala");
+    std::fs::write(&phala, FAKE_PHALA).expect("write fake phala");
+    std::fs::set_permissions(phala, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake phala executable");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gmcli"));
+    command
+        .args([
+            "worker",
+            "remove",
+            if provisional {
+                PROVISIONAL_NAME
+            } else {
+                WORKER_ID
+            },
+        ])
+        .env_clear()
+        .env("PATH", dir.path())
+        .env("GMCLI_CONFIG_DIR", dir.path())
+        .env("TEST_CALLS", dir.path().join("calls"))
+        .env("TEST_PHALA_DELETE", "ok");
+    (dir, command)
+}
+
+#[test]
+fn offline_phala_preflight_errors_do_not_echo_the_key() {
+    let (_dir, mut command) = offline_removal(false);
+    let out = command
+        .env("TEST_PHALA_ECHO_KEY", "1")
+        .output()
+        .expect("run gmcli");
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("Nothing was changed"));
+    assert!(
+        !text(&out.stderr).contains("saved-key"),
+        "key leaked in stderr"
+    );
+    assert!(
+        !text(&out.stdout).contains("saved-key"),
+        "key leaked in stdout"
+    );
+}
+
+#[test]
+fn offline_phala_delete_errors_do_not_echo_the_key() {
+    for response in ["echo-json", "echo-stderr", "echo-stdout"] {
+        let (dir, mut command) = offline_removal(true);
+        let out = command
+            .env("TEST_PHALA_DELETE", response)
+            .output()
+            .expect("run gmcli");
+        assert!(!out.status.success());
+        assert!(text(&out.stderr).contains("was NOT deleted"));
+        assert!(
+            !text(&out.stderr).contains("saved-key"),
+            "key leaked in stderr"
+        );
+        assert!(
+            !text(&out.stdout).contains("saved-key"),
+            "key leaked in stdout"
+        );
+        let config: gm_miner_cli::config::Config =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).expect("config"))
+                .expect("config JSON");
+        assert_eq!(config.active_network_entry().expect("network").workers, []);
+    }
+}
+
 #[tokio::test]
 async fn a_failed_record_save_still_deletes_the_cvm_and_reports_it() {
     let fixture = Fixture::new(Registry::Deletes).await;
@@ -500,5 +600,74 @@ async fn a_failed_record_save_and_cvm_delete_reports_both() {
             && stderr.contains(&format!("phala cvms delete {APP_ID}"))
             && stderr.contains("local record could not be dropped"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn offline_phala_session_headers_are_not_echoed() {
+    for response in ["whoami", "echo-stderr", "echo-stdout"] {
+        let (dir, mut command) = offline_removal(true);
+        let file = dir.path().join("config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("config")).expect("config JSON");
+        config["phala_api_key"] = Value::Null;
+        std::fs::write(file, config.to_string()).expect("config");
+        command
+            .env("TEST_PHALA_LOGIN", "1")
+            .env("TEST_PHALA_DELETE", response);
+        if response == "whoami" {
+            command.env("TEST_PHALA_ECHO_KEY", "1");
+        }
+        let out = command.output().expect("run gmcli");
+        assert!(!out.status.success());
+        let expected = if response == "whoami" {
+            "Invalid API key"
+        } else {
+            "was NOT deleted"
+        };
+        assert!(
+            text(&out.stderr).contains(expected),
+            "{}",
+            text(&out.stderr)
+        );
+        assert!(
+            !text(&out.stderr).contains("session-key"),
+            "session key leaked"
+        );
+        assert!(
+            !text(&out.stdout).contains("session-key"),
+            "session key leaked"
+        );
+    }
+}
+
+#[test]
+fn offline_registration_during_preflight_must_not_report_removal_success() {
+    let (dir, mut command) = offline_removal(true);
+    let file = dir.path().join("config.json");
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("config")).expect("config JSON");
+    config["networks"]["testnet"]["workers"][0]["worker_id"] = json!(WORKER_ID);
+    let update = dir.path().join("registered.json");
+    std::fs::write(&update, config.to_string()).expect("concurrently registered config");
+    let out = command
+        .env("TEST_UPDATED_CONFIG", update)
+        .output()
+        .expect("run gmcli");
+    assert!(
+        !out.status.success(),
+        "the worker and CVM are still live: {}",
+        text(&out.stdout)
+    );
+    assert!(text(&out.stderr).contains("changed"));
+    assert!(
+        !dir.path().join("calls").exists(),
+        "a registered CVM must not be deleted without deregistering"
+    );
+    let actual: Value =
+        serde_json::from_slice(&std::fs::read(file).expect("config")).expect("config JSON");
+    assert_eq!(
+        actual["networks"]["testnet"]["workers"],
+        config["networks"]["testnet"]["workers"]
     );
 }

@@ -1387,8 +1387,10 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str, cvm: CvmTeardown) -
 
     if tracked.is_some_and(|w| w.worker_id.is_empty()) {
         let Some(record) = remove_provisional_worker(&network, id)? else {
-            println!("No provisional worker matched '{id}'.");
-            return Ok(());
+            bail!(
+                "worker record '{id}' changed during removal; its CVM was NOT deleted. \
+                 Check `gmcli worker list` and retry removal."
+            );
         };
         println!(
             "Dropped the unregistered worker record for '{}'.",
