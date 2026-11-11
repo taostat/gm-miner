@@ -82,7 +82,10 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
     Duration::from_secs(secs).min(MAX_RETRY_AFTER)
 }
 
-/// Build an HTTP client with no idle connection pooling.
+/// Build an HTTP client with no redirects or idle connection pooling.
+///
+/// OAuth requests must use the configured endpoint directly: following a
+/// 307/308 redirect can forward refresh tokens or device codes in the body.
 ///
 /// `pool_max_idle_per_host(0)` ensures every request opens a fresh TCP
 /// connection. Without this the keep-alive connection used for the device-code
@@ -91,6 +94,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
 /// automatically.
 fn no_pool_client() -> Result<Client> {
     Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(0)
         .build()
@@ -230,6 +234,13 @@ async fn poll_for_token(
             eprintln!();
             let token: TokenResponse = resp.json().await.context("parse token response")?;
             return Ok(token);
+        }
+
+        // Redirects are terminal even if their body contains a retryable
+        // OAuth error such as authorization_pending or slow_down.
+        if status.is_redirection() {
+            eprintln!();
+            bail!("unexpected status from token endpoint: {status}");
         }
 
         // A rate-limited poll says nothing about the device code, which is
