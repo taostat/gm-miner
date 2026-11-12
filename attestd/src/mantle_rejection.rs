@@ -9,7 +9,7 @@
 
 use serde_json::Value;
 
-use crate::gateway_contract::signals_drain;
+use crate::gateway_contract::{signals_context_window, signals_drain};
 
 const PROMPT_TOO_LONG: &str = "prompt is too long";
 const BETA_PREFIX: &str = "Unexpected value(s) ";
@@ -126,6 +126,14 @@ impl MantleRejection {
     /// The public error for this rejection. `upstream_type` is Mantle's
     /// `error.type`, repeated only when it is a known Anthropic error type.
     pub(crate) fn public(&self, upstream_type: Option<&str>) -> PublicRejection {
+        if *self == Self::PromptTooLong {
+            return PublicRejection {
+                error_type: DEFAULT_ERROR_TYPE,
+                message: PROMPT_TOO_LONG_MESSAGE.to_owned(),
+                code: None,
+                param: None,
+            };
+        }
         let classified = self.classified(upstream_type);
         let generic = || PublicRejection {
             error_type: DEFAULT_ERROR_TYPE,
@@ -134,7 +142,7 @@ impl MantleRejection {
             param: None,
         };
         match classified {
-            Some(public) if !public_signals_drain(&public) => public,
+            Some(public) if !misreads_at_gateway(&public) => public,
             Some(_) | None => generic(),
         }
     }
@@ -151,13 +159,7 @@ impl MantleRejection {
             param,
         };
         Some(match self {
-            Self::Unclassified => return None,
-            Self::PromptTooLong => PublicRejection {
-                error_type: DEFAULT_ERROR_TYPE,
-                message: PROMPT_TOO_LONG_MESSAGE.to_owned(),
-                code: None,
-                param: None,
-            },
+            Self::Unclassified | Self::PromptTooLong => return None,
             Self::BetaValues(values) => {
                 let quoted: Vec<String> = values.iter().map(|value| format!("`{value}`")).collect();
                 public(
@@ -192,8 +194,11 @@ impl MantleRejection {
     }
 }
 
-fn public_signals_drain(public: &PublicRejection) -> bool {
-    signals_drain(&public.message) || public.param.as_deref().is_some_and(signals_drain)
+/// Whether a classified body would read to the gateway as an account drain
+/// or a context-window refusal.
+fn misreads_at_gateway(public: &PublicRejection) -> bool {
+    let misreads = |text: &str| signals_drain(text) || signals_context_window(text);
+    misreads(&public.message) || public.param.as_deref().is_some_and(misreads)
 }
 
 fn error_message(body: &[u8]) -> Option<String> {
@@ -632,19 +637,26 @@ mod tests {
     }
 
     #[test]
-    fn a_classification_that_reads_as_an_account_drain_is_not_relayed() {
+    fn a_classification_the_gateway_would_misread_is_not_relayed() {
         for message in [
             "invalid_api_key: Extra inputs are not permitted",
             "tools.0.insufficient_quota: Field required",
+            "context_length_exceeded: Extra inputs are not permitted",
+            "tools.0: Input tag 'context_length_exceeded' found using 'type' does not match \
+             any of the expected tags",
         ] {
             assert_eq!(public_for(message), generic(), "{message}");
         }
-        let drain_param = MantleRejection::BetaValues(vec!["x".to_owned()]);
-        let public = drain_param.public(None);
-        assert!(!public_signals_drain(&public));
-        assert!(public_signals_drain(&PublicRejection {
-            param: Some("invalid_api_key".to_owned()),
-            ..public
-        }));
+        let public = MantleRejection::BetaValues(vec!["x".to_owned()]).public(None);
+        assert!(!misreads_at_gateway(&public));
+        for param in ["invalid_api_key", "context_length_exceeded"] {
+            assert!(
+                misreads_at_gateway(&PublicRejection {
+                    param: Some(param.to_owned()),
+                    ..public.clone()
+                }),
+                "{param}"
+            );
+        }
     }
 }
