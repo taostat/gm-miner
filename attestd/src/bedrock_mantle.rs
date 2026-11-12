@@ -37,6 +37,7 @@ use tokio::{
 };
 use tracing::info;
 
+use crate::mantle_rejection::{self, MantleRejection, PublicRejection};
 use crate::strict_json::parse_unique_json;
 
 pub const BEDROCK_MANTLE_FEATURE: &str = "bedrock-mantle-model-bindings-v1";
@@ -60,7 +61,6 @@ const MAX_STREAM_FRAME: usize = 4 * 1024 * 1024;
 const MAX_BINDINGS_BODY: usize = 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const ERROR_BODY_WAIT: Duration = Duration::from_secs(5);
-const PROMPT_TOO_LONG: &[u8] = b"prompt is too long";
 const MAX_MODEL_BINDINGS: usize = 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -797,7 +797,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Reject {
     Method,
     Path,
@@ -813,7 +813,7 @@ enum Reject {
     UpstreamThrottled { retry_after_secs: Option<u32> },
     UpstreamUnauthorized,
     UpstreamForbidden,
-    UpstreamInvalidRequest { prompt_too_long: bool },
+    UpstreamInvalidRequest(Box<PublicRejection>),
     UpstreamTooLarge,
     ModelIdentityMismatch,
 }
@@ -821,15 +821,15 @@ enum Reject {
 impl Reject {
     // Fixed categories only: never log provider bodies, model strings, headers,
     // credentials, or request content.
-    fn upstream_diagnostic(self) -> Option<(&'static str, Option<u16>)> {
+    fn upstream_diagnostic(&self) -> Option<(&'static str, Option<u16>)> {
         match self {
             Self::Upstream => Some(("upstream_response_invalid", None)),
             Self::UpstreamTransport => Some(("upstream_transport_failed", None)),
-            Self::UpstreamHttp(status) => Some(("upstream_http_rejected", Some(status))),
+            Self::UpstreamHttp(status) => Some(("upstream_http_rejected", Some(*status))),
             Self::UpstreamThrottled { .. } => Some(("upstream_http_rejected", Some(429))),
             Self::UpstreamUnauthorized => Some(("upstream_http_rejected", Some(401))),
             Self::UpstreamForbidden => Some(("upstream_http_rejected", Some(403))),
-            Self::UpstreamInvalidRequest { .. } => Some(("upstream_http_rejected", Some(400))),
+            Self::UpstreamInvalidRequest(_) => Some(("upstream_http_rejected", Some(400))),
             Self::UpstreamTooLarge => Some(("upstream_http_rejected", Some(413))),
             Self::ModelIdentityMismatch => Some(("model_identity_mismatch", None)),
             _ => None,
@@ -837,10 +837,11 @@ impl Reject {
     }
 
     // Public bodies are fixed strings, never provider text: an AWS error can
-    // name the account, role or ARN behind the worker's credential. The gm
+    // name the account, role or ARN behind the worker's credential. A 400's
+    // body is rebuilt from the bounded tokens in `mantle_rejection`. The gm
     // gateway reads the 401/403 bodies' `invalid_api_key` as a provider-account
     // failure on any status; no other body here may carry a drain phrase.
-    fn public_error(self) -> (StatusCode, &'static str, &'static str) {
+    fn public_error(&self) -> (StatusCode, &'static str, &'static str) {
         match self {
             Self::Method => (
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -897,18 +898,9 @@ impl Reject {
                 "permission_error",
                 "Bedrock Mantle denied the worker credential access (invalid_api_key)",
             ),
-            Self::UpstreamInvalidRequest {
-                prompt_too_long: true,
-            } => (
+            Self::UpstreamInvalidRequest(rejection) => (
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Bedrock Mantle rejected the request: prompt is too long",
-            ),
-            Self::UpstreamInvalidRequest {
-                prompt_too_long: false,
-            } => (
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                rejection.error_type,
                 "Bedrock Mantle rejected the request as invalid",
             ),
             Self::UpstreamTooLarge => (
@@ -932,7 +924,10 @@ impl Reject {
             tracing::warn!(reason, upstream_status, "Bedrock Mantle request rejected");
         }
         let (status, error_type, message) = self.public_error();
-        let body = format!("{{\"error\":{{\"type\":\"{error_type}\",\"message\":\"{message}\"}}}}");
+        let body = match &self {
+            Self::UpstreamInvalidRequest(rejection) => rejection_body(rejection),
+            _ => format!("{{\"error\":{{\"type\":\"{error_type}\",\"message\":\"{message}\"}}}}"),
+        };
         let mut response = response(status, "application/json", Body::from(body));
         if let Self::UpstreamThrottled {
             retry_after_secs: Some(seconds),
@@ -1011,8 +1006,8 @@ async fn forward_request(
         .header("anthropic-version", ANTHROPIC_VERSION)
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, accept);
-    if let Some(value) = anthropic_beta {
-        upstream_request = upstream_request.header("anthropic-beta", value);
+    if let Some(value) = &anthropic_beta {
+        upstream_request = upstream_request.header("anthropic-beta", value.clone());
     }
     let upstream_request = upstream_request
         .body(upstream_body)
@@ -1025,16 +1020,17 @@ async fn forward_request(
         .await
         .map_err(|_| Reject::UpstreamTransport)?;
 
-    finish_upstream_response(upstream, &binding, stream_response).await
+    finish_upstream_response(upstream, &binding, stream_response, anthropic_beta.as_ref()).await
 }
 
 async fn finish_upstream_response(
     upstream: reqwest::Response,
     binding: &ModelBinding,
     stream_response: bool,
+    forwarded_beta: Option<&HeaderValue>,
 ) -> Result<Response<Body>, Reject> {
     if upstream.status() != StatusCode::OK {
-        return Err(upstream_rejection(upstream).await);
+        return Err(upstream_rejection(upstream, forwarded_beta).await);
     }
     if stream_response {
         let content_type = upstream
@@ -1094,21 +1090,44 @@ async fn finish_upstream_response(
     }
 }
 
-async fn upstream_rejection(upstream: reqwest::Response) -> Reject {
+fn rejection_body(rejection: &PublicRejection) -> String {
+    let mut error = serde_json::Map::new();
+    error.insert("type".to_owned(), Value::from(rejection.error_type));
+    error.insert(
+        "message".to_owned(),
+        Value::from(rejection.message.as_str()),
+    );
+    if let Some(code) = rejection.code {
+        error.insert("code".to_owned(), Value::from(code));
+    }
+    if let Some(param) = &rejection.param {
+        error.insert("param".to_owned(), Value::from(param.as_str()));
+    }
+    serde_json::json!({ "error": error }).to_string()
+}
+
+async fn upstream_rejection(
+    upstream: reqwest::Response,
+    forwarded_beta: Option<&HeaderValue>,
+) -> Reject {
     match upstream.status() {
         StatusCode::TOO_MANY_REQUESTS => Reject::UpstreamThrottled {
             retry_after_secs: retry_after_secs(upstream.headers()),
         },
         StatusCode::UNAUTHORIZED => Reject::UpstreamUnauthorized,
         StatusCode::FORBIDDEN => Reject::UpstreamForbidden,
-        StatusCode::BAD_REQUEST => Reject::UpstreamInvalidRequest {
-            prompt_too_long: tokio::time::timeout(
-                ERROR_BODY_WAIT,
-                read_bounded_body(upstream, MAX_ERROR_BODY),
-            )
-            .await
-            .is_ok_and(|body| body.is_ok_and(|body| signals_prompt_too_long(&body))),
-        },
+        StatusCode::BAD_REQUEST => {
+            let body =
+                tokio::time::timeout(ERROR_BODY_WAIT, read_bounded_body(upstream, MAX_ERROR_BODY))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+            let forwarded_beta = forwarded_beta.and_then(|value| value.to_str().ok());
+            let rejection = MantleRejection::classify(&body, forwarded_beta);
+            let upstream_type = mantle_rejection::error_type(&body);
+            Reject::UpstreamInvalidRequest(Box::new(rejection.public(upstream_type.as_deref())))
+        }
         StatusCode::PAYLOAD_TOO_LARGE => Reject::UpstreamTooLarge,
         status => Reject::UpstreamHttp(status.as_u16()),
     }
@@ -1122,14 +1141,6 @@ fn retry_after_secs(headers: &HeaderMap) -> Option<u32> {
         return None;
     }
     value.parse().ok()
-}
-
-// Anthropic's context-window refusal; the gm gateway reroutes a 400 carrying
-// this phrase to a wider-window route when its capability retry is enabled.
-fn signals_prompt_too_long(body: &[u8]) -> bool {
-    body.to_ascii_lowercase()
-        .windows(PROMPT_TOO_LONG.len())
-        .any(|window| window == PROMPT_TOO_LONG)
 }
 
 fn validate_inbound_headers(headers: &HeaderMap) -> Result<(u64, Option<HeaderValue>), Reject> {
@@ -2076,7 +2087,7 @@ mod tests {
                 .body("private provider error details")
                 .expect("HTTP response"),
         );
-        let failure = finish_upstream_response(upstream, &binding, false)
+        let failure = finish_upstream_response(upstream, &binding, false, None)
             .await
             .expect_err("upstream rejection");
         assert_eq!(failure, Reject::UpstreamHttp(503));
@@ -2094,6 +2105,16 @@ mod tests {
         headers: &[(&'static str, &'static str)],
         body: &'static str,
         streaming: bool,
+    ) -> Relayed {
+        relay_upstream_error_for(status, headers, body, streaming, None).await
+    }
+
+    async fn relay_upstream_error_for(
+        status: u16,
+        headers: &[(&'static str, &'static str)],
+        body: &'static str,
+        streaming: bool,
+        anthropic_beta: Option<&'static str>,
     ) -> Relayed {
         let headers = headers.to_vec();
         let upstream_app = Router::new().route(
@@ -2122,11 +2143,13 @@ mod tests {
         } else {
             VALID_BODY.to_owned()
         };
-        let response = handle_request(
-            State(AppState(state)),
-            request("/v1/messages", &request_body),
-        )
-        .await;
+        let mut buyer_request = request("/v1/messages", &request_body);
+        if let Some(beta) = anthropic_beta {
+            buyer_request
+                .headers_mut()
+                .insert("anthropic-beta", HeaderValue::from_static(beta));
+        }
+        let response = handle_request(State(AppState(state)), buyer_request).await;
         upstream_task.abort();
         let status = response.status();
         let retry_after = response
@@ -2216,6 +2239,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_400_relays_only_the_adapter_written_classification() {
+        let beta_body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Unexpected value(s) `inline-tools-2026-09-15` for the `anthropic-beta` header. Please consult our documentation at docs.anthropic.com or try again without the header."}}"#;
+        for streaming in [false, true] {
+            let relayed = relay_upstream_error_for(
+                400,
+                &[],
+                beta_body,
+                streaming,
+                Some("interleaved-thinking-2025-05-14,inline-tools-2026-09-15"),
+            )
+            .await;
+            assert_eq!(relayed.status, StatusCode::BAD_REQUEST);
+            let value: Value = serde_json::from_str(&relayed.body).expect("JSON body");
+            assert_eq!(
+                value,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "message": "Unexpected value(s) `inline-tools-2026-09-15` for the `anthropic-beta` header.",
+                    "code": "mantle_beta_rejected",
+                    "param": "inline-tools-2026-09-15",
+                }})
+            );
+        }
+
+        let unsent = relay_upstream_error_for(400, &[], beta_body, false, None).await;
+        assert!(!unsent.body.contains("inline-tools"), "{}", unsent.body);
+        assert!(unsent
+            .body
+            .contains("Bedrock Mantle rejected the request as invalid"));
+
+        let echo = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content.0.text: Input should be shorter, got 'PRIVATE_PROMPT_7f3a'"}}"#;
+        let relayed = relay_upstream_error(400, &[], echo, false).await;
+        assert!(
+            !relayed.body.contains("PRIVATE_PROMPT_7f3a"),
+            "{}",
+            relayed.body
+        );
+        assert!(relayed.body.contains("/messages/0/content/0/text"));
+    }
+
+    #[tokio::test]
     async fn upstream_server_and_worker_side_failures_stay_502() {
         for status in [404, 408, 424, 500, 503, 529] {
             let relayed = relay_upstream_error(
@@ -2250,12 +2314,8 @@ mod tests {
             Reject::UpstreamThrottled {
                 retry_after_secs: Some(7),
             },
-            Reject::UpstreamInvalidRequest {
-                prompt_too_long: true,
-            },
-            Reject::UpstreamInvalidRequest {
-                prompt_too_long: false,
-            },
+            Reject::UpstreamInvalidRequest(Box::new(MantleRejection::PromptTooLong.public(None))),
+            Reject::UpstreamInvalidRequest(Box::new(MantleRejection::Unclassified.public(None))),
             Reject::UpstreamTooLarge,
             Reject::ModelIdentityMismatch,
         ];
@@ -2266,11 +2326,11 @@ mod tests {
             String::from_utf8(raw.to_vec()).expect("UTF-8 body")
         };
         for failure in credential {
-            let text = body(failure).await;
+            let text = body(failure.clone()).await;
             assert!(signals_drain(&text), "{failure:?}");
         }
         for failure in every_other {
-            let text = body(failure).await;
+            let text = body(failure.clone()).await;
             assert!(!signals_drain(&text), "{failure:?}");
             assert!(!text.contains("miner saturated"), "{failure:?}");
         }

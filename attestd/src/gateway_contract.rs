@@ -1,4 +1,5 @@
-//! Test-only mirror of the gm gateway's error-body classifiers.
+//! Mirror of the gm gateway's error-body classifiers, so adapter-written
+//! bodies never read as a provider-account failure by accident.
 
 /// Mirrors `is_provider_account_drain` in the gm repo's
 /// `gateway/src/pipeline/retry.rs`, which matches these on any status.
