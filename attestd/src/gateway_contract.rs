@@ -2,8 +2,9 @@
 //! bodies never read as a provider-account failure or a context-window
 //! refusal by accident.
 
-/// Mirrors `is_provider_account_drain` in the gm repo's
-/// `gateway/src/pipeline/retry.rs`, which matches these on any status.
+/// Phrases of `is_provider_account_drain` in the gm repo's
+/// `gateway/src/pipeline/retry.rs`, matched here on any status and anywhere in
+/// the body; the gateway's own check is narrower, so this one errs strict.
 pub(crate) const DRAIN_SIGNALS: &[&str] = &[
     "insufficient_quota",
     "exceeded your current quota",

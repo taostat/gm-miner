@@ -567,6 +567,7 @@ mod tests {
                 }
             );
         }
+        assert!(signals_context_window(PROMPT_TOO_LONG_MESSAGE));
     }
 
     #[test]
