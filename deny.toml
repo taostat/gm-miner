@@ -24,6 +24,11 @@ ignore = [
     # version has no enforced per-advisory expiry/parent restrictions.
     # This does not assess crypto inside the separately deployed guest agent.
     { id = "RUSTSEC-2026-0387", reason = "The locked crypto-bigint 0.5.5 -> elliptic-curve 0.13.8 chain is only used by dstack-sdk's unused Ethereum helper; reassess before using it or changing this dependency graph" },
+    # chrono is unmaintained but carries no known vulnerability. gmcli and
+    # attestd use it directly, and dcap-qvl depends on it. Remove when both
+    # crates move to jiff or time and a dcap-qvl without chrono is adopted;
+    # the gm repo carries the same ignore.
+    "RUSTSEC-2026-0543",  # chrono unmaintained (direct, and via dcap-qvl)
 ]
 
 [licenses]
