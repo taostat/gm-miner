@@ -89,6 +89,13 @@ futures-util = { workspace = true }
 ml-kem = { workspace = true }
 ring = { workspace = true }
 webpki-roots = { workspace = true }
+# Unmodified crates.io AMD library: stock OpenSSL parses and verifies the
+# whole AMD ARK/ASK/VCEK chain and SNP report. No CoCo source is patched.
+# SNP only; legacy SEV/SEV-ES and the pure-Rust alternate backend are disabled.
+sev = { version = "=7.1.0", default-features = false, features = ["snp", "serde", "openssl"] }
+openssl = "0.10"
+asn1-rs = "0.7"
+url = "2.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
