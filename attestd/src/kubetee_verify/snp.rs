@@ -338,7 +338,7 @@ mod tests {
             &self,
             url: url::Url,
         ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send {
-            std::future::ready(anyhow::bail!("unexpected AMD request {url}"))
+            std::future::ready(Err(anyhow::anyhow!("unexpected AMD request {url}")))
         }
     }
 
