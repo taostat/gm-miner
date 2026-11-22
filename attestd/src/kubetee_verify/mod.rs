@@ -10,10 +10,20 @@
 //! nonce. A response without the v1 binding fails closed. Chat requests are
 //! then sent on attested connections only, one at a time per connection,
 //! and never after the keyset's deadline.
+//!
+//! For AMD, the unmodified `sev` crate verifies ARK/ASK/VCEK and the report;
+//! the VCEK must match the report's full chip identity and measured TCB.
+//! `KubeTEE` then separately requires its signed release launch measurement,
+//! uncompressed-InitData `HOST_DATA`, VMPL 0, migration/debug off, SMT on,
+//! supported Family 19h/1Ah TCB floors, and the v1 keyset/TLS possession.
+//! No firmware TCB is guessed from an OVMF recipe, and no `CoCo` fallback
+//! bypasses these checks. Recognized non-release hardware fails closed.
 
 pub mod binding;
 pub mod evidence;
+pub mod policy;
 pub mod pool;
+pub mod snp;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -31,6 +41,7 @@ use dcap_qvl::policy::QuoteClaims;
 use http_body_util::{BodyExt as _, Limited};
 use hyper::body::Incoming;
 use rustls::{ClientConfig, RootCertStore};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
@@ -121,10 +132,35 @@ pub struct Attestation {
     pub keyset_not_after: DateTime<Utc>,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Platform {
+    /// Backwards-compatible default for existing TDX-only proxy deployments.
+    #[default]
+    Tdx,
+    #[serde(alias = "snp")]
+    SevSnp,
+}
+
+impl Platform {
+    fn from_environment() -> Result<Self> {
+        match std::env::var("KUBETEE_TEE").as_deref() {
+            Ok("snp" | "sev-snp") => Ok(Self::SevSnp),
+            // Never accept legacy SEV or SEV-ES as an AMD SNP fallback.
+            Ok(other) => bail!("unsupported KUBETEE_TEE {other:?}; use snp or sev-snp"),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => bail!("KUBETEE_TEE is not UTF-8"),
+        }
+    }
+}
+
+/// Live verification uses the canonical HTTPS endpoint, including its DNS
+/// selection and certificate hostname. Offline fixture tests inject peers.
 #[derive(Clone)]
 pub struct KubeteeVerifier {
     tls: TlsConnector,
     address: Option<SocketAddr>,
+    platform: Platform,
     quote_chain: Arc<dyn QuoteChain>,
     nonce: fn() -> [u8; 32],
     limits: Limits,
@@ -152,6 +188,7 @@ impl KubeteeVerifier {
         Ok(Self::with_parts(
             roots,
             None,
+            Platform::from_environment()?,
             Arc::new(Pccs(tee_evidence::collateral_client()?)),
             tee_evidence::random_nonce,
             Limits::default(),
@@ -161,6 +198,7 @@ impl KubeteeVerifier {
     fn with_parts(
         roots: RootCertStore,
         address: Option<SocketAddr>,
+        platform: Platform,
         quote_chain: Arc<dyn QuoteChain>,
         nonce: fn() -> [u8; 32],
         limits: Limits,
@@ -172,6 +210,7 @@ impl KubeteeVerifier {
         Self {
             tls: TlsConnector::from(Arc::new(config)),
             address,
+            platform,
             quote_chain,
             nonce,
             limits,
@@ -362,18 +401,42 @@ impl KubeteeVerifier {
                 .context("kubetee.attestation.v1 binding")?;
         let payload: AttestationPayload =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
-        let quote =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.quote)
-                .context("decode KubeTEE quote")?;
-        let (claims, now) = self.quote_chain.verify(&quote).await?;
-        let measurements = evidence::verify_attestation(
-            &payload,
-            &nonce,
-            connection.leaf.as_ref(),
-            &claims,
-            now,
-            &binding.report_data,
-        )?;
+        payload.ensure_platform(self.platform)?;
+        let measurements = if self.platform == Platform::SevSnp {
+            let snp = payload
+                .snp_evidence()?
+                .context("SNP native evidence is missing")?;
+            let report = snp::verify(snp, &binding.report_data).await?;
+            policy::accept(&report)?;
+            evidence::verify_tls_possession(
+                payload
+                    .tls_possession
+                    .as_ref()
+                    .context("KubeTEE attestation has no tls_possession")?,
+                &nonce,
+                connection.leaf.as_ref(),
+            )?;
+            ensure!(payload.nonce == nonce, "KubeTEE echoed a different nonce");
+            Measurements::of_snp(&report)
+        } else {
+            let quote = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                payload
+                    .quote
+                    .as_deref()
+                    .context("TDX attestation has no quote")?,
+            )
+            .context("decode KubeTEE quote")?;
+            let (claims, now) = self.quote_chain.verify(&quote).await?;
+            evidence::verify_attestation(
+                &payload,
+                &nonce,
+                connection.leaf.as_ref(),
+                &claims,
+                now,
+                &binding.report_data,
+            )?
+        };
         binding.ensure_current(Utc::now())?;
         evidence::log_attested(&payload.pod, &measurements);
         Ok((

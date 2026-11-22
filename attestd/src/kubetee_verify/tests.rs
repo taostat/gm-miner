@@ -60,7 +60,11 @@ fn collateral() -> dcap_qvl::QuoteCollateralV3 {
 }
 
 fn quote() -> Vec<u8> {
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload().quote).unwrap()
+    base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        payload().quote.as_deref().unwrap(),
+    )
+    .unwrap()
 }
 
 fn claims() -> QuoteClaims {
@@ -677,6 +681,7 @@ async fn serve(evidence: Evidence, chat: Chat, limits: Limits) -> (KubeteeVerifi
     let verifier = KubeteeVerifier::with_parts(
         roots,
         Some(address),
+        Platform::Tdx,
         Arc::new(FixtureChain),
         fixture_nonce,
         limits,
