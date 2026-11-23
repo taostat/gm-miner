@@ -1,38 +1,10 @@
-//! `gmcli publish-image-version` — publish a release's `ImageVersion` to a
-//! network's registry, computing both hashes offline from source.
+//! `gmcli publish-image-version` computes release measurements from source and
+//! publishes one row for each non-expiring KMS root on the selected network.
 //!
-//! ## Why this exists
-//!
-//! The registry's attestation enforcement compares a miner CVM's measured
-//! `compose_hash` / `os_image_hash` against an allow-list of approved
-//! `ImageVersion` rows. That allow-list used to be hand-published. The CLI's
-//! rendered compose changes between releases — the digest-pinned image ref
-//! and the `GM_NETWORK` literal both feed the compose, and the compose feeds
-//! the hash — so a hand-published hash drifts from what the released CLI
-//! actually deploys, surfacing as a "HASH MISMATCH" at deploy time. This
-//! command closes that gap: the release pipeline runs it so the approved hash
-//! is always the one the released CLI produces.
-//!
-//! ## Why it computes offline (not deploy-and-read)
-//!
-//! dstack's `compose_hash` is `sha256` over the canonical serialization of
-//! the CVM's `app_compose` object — re-derivable offline by design (see
-//! [`crate::compose_hash`]). The `os_image_hash` is the pinned dstack OS
-//! image's published reproducible measurement. Both are computed from the
-//! release's source with no Phala Cloud deploy and no spend — so the publish
-//! needs only a registry admin key, never a `PHALA_API_KEY`.
-//!
-//! ## Flow
-//!
-//! 1. Render the compose for the target network around the digest-pinned
-//!    `image_ref`, build the `app_compose` object, and `sha256` its canonical
-//!    serialization to get `compose_hash`; read `os_image_hash` from the
-//!    pinned OS image.
-//! 2. POST the pair to that network's registry admin endpoint
-//!    (`POST /admin/image-versions`, `X-API-Key`). The endpoint is an upsert
-//!    keyed on `(compose_hash, os_image_hash)`, so re-publishing the same
-//!    release is a no-op update — the publish step is idempotent by
-//!    construction.
+//! Each compose hash includes the rendered Docker Compose file, pre-launch
+//! script, declared environment names, and the selected root's CA public key.
+//! The OS image hash is the pinned measurement for `dstack-0.6.5`. See
+//! [`crate::compose_hash`] for the normalized manifest v3 serialization.
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;

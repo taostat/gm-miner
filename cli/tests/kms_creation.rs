@@ -34,7 +34,12 @@ const ROUTES: [Route; 5] = [
 ];
 
 fn root(id: &str, default: bool, expiry: Option<&str>) -> Value {
-    json!({"kms_contract_id": id, "is_default": default, "allowed_until": expiry})
+    json!({
+        "ca_pubkey": format!("ca-{id}"),
+        "kms_contract_id": id,
+        "is_default": default,
+        "allowed_until": expiry
+    })
 }
 
 fn allowed_roots() -> Value {
@@ -42,6 +47,33 @@ fn allowed_roots() -> Value {
         root("other-allowed", false, None),
         root("registry-default", true, None),
         root("expiring", false, Some("2099-01-01T00:00:00Z")),
+    ]})
+}
+
+fn image_versions(image_ref: &str) -> Value {
+    let default_compose = compute_compose_hash(image_ref, Network::Testnet, "ca-registry-default")
+        .expect("default-root compose hash");
+    let other_compose = compute_compose_hash(image_ref, Network::Testnet, "ca-other-allowed")
+        .expect("additional-root compose hash");
+    json!({"versions": [
+        {
+            "git_tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+            "compose_hash": default_compose,
+            "os_image_hash": PINNED_OS_IMAGE_HASH,
+            "image_ref": image_ref,
+            "status": "supported",
+            "created_at": "2026-01-02T00:00:00Z",
+            "features": ["upstream-key-slots", "bedrock-mantle-model-bindings-v1"],
+        },
+        {
+            "git_tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+            "compose_hash": other_compose,
+            "os_image_hash": PINNED_OS_IMAGE_HASH,
+            "image_ref": image_ref,
+            "status": "supported",
+            "created_at": "2026-01-01T00:00:00Z",
+            "features": ["upstream-model-hop"],
+        }
     ]})
 }
 
@@ -98,10 +130,15 @@ impl Fixture {
                   [ -f \"$PHALA_CLOUD_DIR/credentials.json\" ] || exit 42\n\
                 fi\n\
                 case \"$1\" in\n\
-                  --version) printf '1.1.19\\n';;\n\
+                  --version) printf '1.2.1\\n';;\n\
                   whoami) exit 0;;\n\
-                  cvms) printf '{\"items\":[],\"page\":1,\"totalPages\":0}\\n';;\n\
-                  deploy) printf '%s\\n' \"$@\" > \"$TEST_DEPLOY_ARGS\"; exit 57;;\n\
+                  cvms)\n\
+                    case \"$2\" in\n\
+                      list) printf '{\"items\":[],\"page\":1,\"totalPages\":0}\\n';;\n\
+                      get) printf '{\"app_id\":\"app-created\",\"compose_hash\":\"%s\",\"os\":{\"os_image_hash\":\"%s\"},\"endpoints\":[{\"app\":\"%s\"}]}\\n' \"$TEST_COMPOSE_HASH\" \"$TEST_OS_IMAGE_HASH\" \"$TEST_ENDPOINT\";;\n\
+                      *) exit 58;;\n\
+                    esac;;\n\
+                  deploy) printf '%s\\n' \"$@\" > \"$TEST_DEPLOY_ARGS\"; exit \"${TEST_DEPLOY_EXIT:-57}\";;\n\
                   *) exit 58;;\n\
                 esac\n",
             ),
@@ -132,19 +169,19 @@ impl Fixture {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/miners/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "worker_id": "worker-created"
+            })))
+            .mount(&server)
+            .await;
         // Docker Hub refs bypass the anonymous manifest probe. No external
         // network or real image/CVM commands are needed to reach creation.
         let image = format!("docker.io/library/test@sha256:{}", "a".repeat(64));
         Mock::given(method("GET"))
             .and(path("/image-versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"versions": [{
-                "git_tag": format!("v{}", env!("CARGO_PKG_VERSION")),
-                "compose_hash": compute_compose_hash(&image, Network::Testnet).expect("compose hash"),
-                "os_image_hash": PINNED_OS_IMAGE_HASH,
-                "image_ref": image,
-                "status": "supported",
-                "created_at": "2026-01-01T00:00:00Z",
-            }]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(image_versions(&image)))
             .mount(&server)
             .await;
         Self { dir, server, route }
@@ -169,7 +206,11 @@ impl Fixture {
             .env("PATH", self.dir.path())
             .env("GMCLI_CONFIG_DIR", self.dir.path())
             .env("TEST_CALLS", self.dir.path().join("calls"))
-            .env("TEST_DEPLOY_ARGS", self.dir.path().join("deploy-args"));
+            .env("TEST_DEPLOY_ARGS", self.dir.path().join("deploy-args"))
+            .env("HTTP_PROXY", self.server.uri())
+            .env("http_proxy", self.server.uri())
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost");
         command
     }
 
@@ -325,6 +366,7 @@ async fn registry_selection_reaches_phala_on_every_creation_route() {
                 1
             );
             assert!(args.windows(2).any(|pair| pair == ["--kms", "phala"]));
+            assert!(args.contains(&"--ephemeral-data-disk"));
             assert!(
                 args.windows(2)
                     .any(|pair| pair
@@ -356,4 +398,89 @@ async fn registry_selection_reaches_phala_on_every_creation_route() {
             assert!(!requests[kms].headers.contains_key("authorization"));
         }
     }
+}
+
+#[tokio::test]
+async fn selected_root_hashes_allow_creation_and_registration() {
+    let fixture = Fixture::new(
+        Route::Deploy,
+        ResponseTemplate::new(200).set_body_json(allowed_roots()),
+    )
+    .await;
+    let image_ref = format!("docker.io/library/test@sha256:{}", "a".repeat(64));
+    let selected_compose = compute_compose_hash(&image_ref, Network::Testnet, "ca-other-allowed")
+        .expect("selected-root compose hash");
+    let output = fixture
+        .command(Some("other-allowed"), false)
+        .env("TEST_DEPLOY_EXIT", "0")
+        .env("TEST_COMPOSE_HASH", selected_compose.clone())
+        .env("TEST_OS_IMAGE_HASH", PINNED_OS_IMAGE_HASH)
+        .env("TEST_ENDPOINT", "http://app-8080.invalid")
+        .output()
+        .expect("run selected-root deploy");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = fixture.server.received_requests().await.expect("requests");
+    let registration = requests
+        .iter()
+        .find(|request| request.url.path() == "/miners/register")
+        .expect("verified CVM is registered");
+    let body: Value = serde_json::from_slice(&registration.body).expect("registration body");
+    assert_eq!(
+        body["compose_hash"].as_str(),
+        Some(selected_compose.as_str())
+    );
+    assert_eq!(body["os_image_hash"].as_str(), Some(PINNED_OS_IMAGE_HASH));
+    assert!(body.get("provider_slots").is_none());
+}
+
+#[tokio::test]
+async fn another_roots_approved_hashes_are_rejected_after_creation() {
+    let fixture = Fixture::new(
+        Route::Deploy,
+        ResponseTemplate::new(200).set_body_json(allowed_roots()),
+    )
+    .await;
+    let image_ref = format!("docker.io/library/test@sha256:{}", "a".repeat(64));
+    let other_compose = compute_compose_hash(&image_ref, Network::Testnet, "ca-registry-default")
+        .expect("other-root compose hash");
+    let selected_compose = compute_compose_hash(&image_ref, Network::Testnet, "ca-other-allowed")
+        .expect("selected-root compose hash");
+    assert_ne!(other_compose, selected_compose);
+    let versions = image_versions(&image_ref);
+    assert_eq!(
+        versions["versions"][0]["compose_hash"].as_str(),
+        Some(other_compose.as_str())
+    );
+    let output = fixture
+        .command(Some("other-allowed"), false)
+        .env("TEST_DEPLOY_EXIT", "0")
+        .env("TEST_COMPOSE_HASH", other_compose)
+        .env("TEST_OS_IMAGE_HASH", PINNED_OS_IMAGE_HASH)
+        .env("TEST_ENDPOINT", "http://app-8080.invalid")
+        .output()
+        .expect("run selected-root deploy with another root's measurements");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("HASH MISMATCH"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fixture.calls();
+    assert!(calls
+        .lines()
+        .any(|call| call.split_whitespace().next() == Some("deploy")));
+    assert!(calls.lines().any(|call| call.starts_with("cvms get ")));
+    let requests = fixture.server.received_requests().await.expect("requests");
+    assert!(requests
+        .iter()
+        .any(|request| request.url.path() == "/kms-roots"));
+    assert!(!requests
+        .iter()
+        .any(|request| request.url.path() == "/miners/register"));
 }

@@ -139,9 +139,8 @@ fn versions_body(compose_hash: &str, os_image_hash: &str) -> serde_json::Value {
 
 // ── Core verification tests ───────────────────────────────────────────────────
 
-/// The central trust guarantee: if Phala Cloud returns hashes that do NOT
-/// match the registry-approved version, `verify_hashes` must return an
-/// `Err`. This causes `cmd_deploy` to refuse to register and exit non-zero.
+/// When Phala Cloud returns hashes that differ from the selected image
+/// version, `verify_hashes` returns an error.
 #[test]
 fn mismatched_hashes_produce_error() {
     let approved = ImageVersion {
@@ -156,10 +155,10 @@ fn mismatched_hashes_produce_error() {
         features: vec![],
     };
 
-    // Phala Cloud returns DIFFERENT hashes (simulates a tampered deploy).
+    // Phala Cloud reports hashes for a different image version.
     let actual = DstackDeployResult {
-        compose_sha256: "TAMPERED-compose-hash".to_owned(),
-        os_image_hash: "TAMPERED-os-hash".to_owned(),
+        compose_sha256: "different-compose-hash".to_owned(),
+        os_image_hash: "different-os-hash".to_owned(),
     };
 
     let err =
@@ -179,7 +178,7 @@ fn mismatched_hashes_produce_error() {
         "error must mention os_image_hash; got: {msg}"
     );
     assert!(msg.contains("approved-compose-hash"));
-    assert!(msg.contains("TAMPERED-compose-hash"));
+    assert!(msg.contains("different-compose-hash"));
 }
 
 /// When only the compose hash is wrong, the error must call that out precisely.
@@ -304,8 +303,8 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
     assert!(verify_hashes(&actual.hashes, approved).is_ok());
 }
 
-/// Mismatch path: Phala Cloud returns different hashes → verify fails →
-/// deploy refuses to register.
+/// Mismatch path: Phala Cloud returns hashes for a different image version,
+/// and deploy verification returns an error.
 #[tokio::test]
 async fn deploy_flow_mismatched_hashes_causes_verify_error() {
     let server = MockServer::start().await;
@@ -323,7 +322,7 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
     let versions = fetch_supported_versions(&server.uri()).await.unwrap();
     let approved = select_version(&versions, None).unwrap();
 
-    // Phala Cloud returns DIFFERENT hashes — simulates a tampered build.
+    // Phala Cloud reports hashes for a different image version.
     let stub = StubPhala::matching("different-compose", "different-os");
     let keys = ProviderKeys {
         anthropic: Some("key".to_owned()),
@@ -650,7 +649,7 @@ fn dist_dir_used_verbatim_when_provided() {
         explicit_dir.clone(),
         "tdx.medium",
         "40G",
-        "dstack-0.5.7",
+        "dstack-0.6.5",
     );
     assert_eq!(client.project_dir, explicit_dir);
     assert!(

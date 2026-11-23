@@ -1,88 +1,58 @@
-# Auto-publishing the release `ImageVersion`
+# Publishing release `ImageVersion` rows
 
-The registry enforces miner attestation against an allow-list of approved
-`ImageVersion` rows: a CVM whose measured `compose_hash` / `os_image_hash`
-is absent from the list is rejected. That allow-list used to be
-hand-published, so it drifted from what the released CLI actually deploys —
-surfacing at deploy time as a `HASH MISMATCH`. The release pipeline now
-publishes the matching version automatically, computing both hashes offline
-from source.
+The release workflow publishes an image measurement for each non-expiring KMS
+root returned by `GET /kms-roots`. Each row contains the compose hash for that
+root's CA public key and the pinned OS image hash. The registry upsert key is
+`(compose_hash, os_image_hash)`.
 
-## How the hashes are computed offline
+## Measured compose shape
 
-A dstack CVM's `compose_hash` is `sha256` over the canonical serialization of
-its `app_compose` object — the wrapper dstack measures into RTMR3 and exposes
-in the attestation TCB info. The VMM hashes the exact UTF-8 bytes of the
-submitted `app-compose.json` string and the guest re-hashes the same file, so
-the value is **re-derivable offline** — that re-derivability is the whole
-point of dstack attestation.
+New deployments use OS image `dstack-0.6.5` and the Phala manifest v3 shape.
+The measured `app_compose` includes:
 
-- **The serialization** mirrors dstack's `get_compose_hash`: JSON with
-  **lexicographically sorted keys** and **compact separators** (`,` and `:`,
-  no spaces), non-ASCII left as UTF-8, lowercase-hex digest. In Rust a
-  `BTreeMap` plus `serde_json::to_string` reproduces it.
-- **The hashed object is the wrapper**, not the raw `docker-compose.yaml`. Its
-  `docker_compose_file` field carries the rendered compose YAML as one JSON
-  string and `pre_launch_script` carries the bundled pre-launch script. The
-  rest are the Phala-Cloud-set security/runtime flags (`kms_enabled`,
-  `gateway_enabled`, `tproxy_enabled`, `public_logs`, `public_sysinfo`,
-  `public_tcbinfo`, `local_key_provider_enabled`, …), `allowed_envs` (the
-  env-var names the deploy declares), and the runner/storage fields. The
-  earlier deploy-and-read approach searched only the serialization space and
-  missed these flag fields — the gap was content, not formatting.
-- **`os_image_hash`** is the pinned dstack OS image's published reproducible
-  measurement (`PINNED_OS_IMAGE_HASH`, tied to `DEFAULT_OS_IMAGE`).
+- `manifest_version: "3"` and `init_script: []`;
+- `key_provider: "kms"` and `key_provider_id` set to the selected root's
+  `ca_pubkey` from `GET /kms-roots`;
+- `requirements: {"ephemeral_data_disk": true}`;
+- `secure_time: false` and `storage_fs: "zfs"`;
+- the rendered Docker Compose bytes, pre-launch script bytes, declared
+  environment names, and the remaining Phala runtime fields.
 
-`cli/src/compose_hash.rs` implements this. Its gate test reproduces a real,
-registry-approved testnet `compose_hash` byte-for-byte, anchoring the field
-set, the flag values, and the serialization to ground truth so any drift is
-caught in CI rather than at a miner's deploy.
+The compose hash serializes the normalized object as compact UTF-8 JSON with
+lexicographically sorted keys, then computes lowercase SHA-256. Phala removes
+the runner-inapplicable script field and omits its null and empty optional
+fields before hashing. `cli/src/compose_hash.rs` implements the same
+normalization and serialization.
 
-### The canonical `allowed_envs`
+The live v3 fixture records the exact Docker Compose and pre-launch script
+bytes from a 0.6.5 deployment. Its test reproduces compose hash
+`0d75dcd1311506ec717f9bac9628e4edfed8023115ea7e78aa0a1086a8b67a79`. A
+separate frozen v2 JSON fixture preserves the historical hash check. The
+candidate test uses the current bundled template and does not change that
+historical fixture.
 
-`allowed_envs` is the list of env-var names the deploy declares. The `phala`
-CLI derives it from the `.env` line keys, keeping a name whenever its line is
-non-blank regardless of the value. `gmcli deploy` therefore writes every
-provider key name on its own line unconditionally — a configured key as
-`NAME=<value>`, an unset key as a bare `NAME=` — so the measured `allowed_envs`
-is the same fixed set for every miner no matter which providers they
-configured. That set is `compose_hash::CANONICAL_ALLOWED_ENVS`: the direct
-provider keys, the Anthropic/OpenAI cloud upstream selectors and cloud
-settings, plus the node secret (`ANTHROPIC_API_KEY`, `ANTHROPIC_UPSTREAM`,
-`BEDROCK_REGION`, `BEDROCK_API_KEY`, `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_API_KEY`,
-`AZURE_FOUNDRY_TENANT_ID`, `AZURE_FOUNDRY_SUBSCRIPTION_ID`,
-`AZURE_FOUNDRY_RESOURCE_GROUP`, `AZURE_FOUNDRY_CLIENT_ID`, `AZURE_FOUNDRY_CLIENT_SECRET`,
-`OPENAI_API_KEY`, `OPENAI_UPSTREAM`,
-`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_TENANT_ID`,
-`AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`, `AZURE_CLIENT_ID`,
-`AZURE_CLIENT_SECRET`, `GOOGLE_API_KEY`, `CHUTES_API_KEY`, `ZAI_API_KEY`,
-`MOONSHOT_API_KEY`, `DEEPINFRA_API_KEY`, `KUBETEE_API_KEY`, `ENGY_API_KEY`,
-`MOONMATH_API_KEY`, `GM_NODE_SECRET`), with no private-registry
-pull credentials. Multi-key slots use semicolon-separated values inside those
-same direct key names, so changing key count or key order does not change the
-allowed-env set. The registry's approved baseline is keyed on it.
+`PINNED_OS_IMAGE_HASH` is
+`4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623`, paired
+with `DEFAULT_OS_IMAGE = "dstack-0.6.5"`.
 
-## Interface
+## Publishing
 
-`gmcli publish-image-version`:
+`gmcli publish-image-version` accepts:
 
-- `--network testnet|mainnet` — the network whose registry to publish to.
-  The `GM_NETWORK` literal in the rendered compose makes the `compose_hash`
-  network-specific, so each network gets its own row.
-- `--image-ref <repo@sha256:…>` — the digest-pinned released image.
-- `--registry-admin-key <key>` / `REGISTRY_ADMIN_KEY` — the registry admin
-  `X-API-Key`. This is the only secret the publish needs — no `PHALA_API_KEY`.
-- `--api-url <url>` overrides the network's default registry URL.
-- `--git-tag`, `--git-commit`, `--git-repo` — provenance stamped onto the
-  row; the auto-generated notes reference the tag + commit.
+- `--network testnet|mainnet` to select the registry;
+- `--image-ref <repo@sha256:…>` for the released image;
+- `--registry-admin-key <key>` or `REGISTRY_ADMIN_KEY` for the registry
+  admin API;
+- `--api-url <url>` to override the network's registry URL;
+- `--git-tag`, `--git-commit`, and `--git-repo` for release metadata.
 
-The registry endpoint (`POST /admin/image-versions`) is an upsert keyed on
-`(compose_hash, os_image_hash)`, so re-publishing the same release is a no-op
-update — the command is idempotent by construction.
+The command reads the approved KMS roots from the selected network, computes
+one root-specific compose hash per root, and upserts the corresponding rows.
+It does not create a Phala CVM.
 
 ## Release CI
 
-`.github/workflows/publish-image-version.yml` builds and pushes the miner
-image at the release commit (digest-pinned), then runs
-`publish-image-version` once per target network. Each network's registry admin
-key is the only secret; there is no Phala account or CVM in the loop.
+`.github/workflows/publish-image-version.yml` builds and pushes the miner image
+at the release commit, then runs `publish-image-version` once for each target
+network. Each network's registry admin key is used only for its publication
+step.

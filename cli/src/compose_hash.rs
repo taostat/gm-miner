@@ -1,36 +1,8 @@
-//! Offline `compose_hash` derivation for the release `ImageVersion`.
+//! Offline compose-hash derivation for release image versions.
 //!
-//! ## What `compose_hash` is
-//!
-//! A dstack CVM's `compose_hash` is `sha256` over the canonical
-//! serialization of its `app_compose` object — the wrapper dstack measures
-//! into RTMR3 and exposes in the attestation TCB info. The VMM hashes the
-//! exact UTF-8 bytes of the submitted `app-compose.json` string, and the
-//! guest re-hashes the same file, so the value is **re-derivable offline**:
-//! that re-derivability is the whole point of dstack attestation. We mirror
-//! the canonical serialization here instead of deploying a CVM to read the
-//! hash back.
-//!
-//! ## The serialization (mirrors dstack's `get_compose_hash`)
-//!
-//! `app_compose` is serialized as JSON with **lexicographically sorted keys**
-//! and **compact separators** (`,` and `:`, no spaces), non-ASCII left as
-//! UTF-8 (`ensure_ascii=false`), and the digest is lowercase hex. In Rust a
-//! [`BTreeMap`] gives the sorted keys and `serde_json::to_string` gives the
-//! compact, UTF-8 form — together they reproduce a real gm-deployed hash
-//! byte-for-byte (see the `reproduces_*` gate tests).
-//!
-//! ## The `app_compose` field set
-//!
-//! The hashed object is the WRAPPER, not the raw `docker-compose.yaml`. The
-//! `docker_compose_file` field carries the rendered compose YAML as one JSON
-//! string; `pre_launch_script` carries the bundled pre-launch script. The
-//! remaining fields are the Phala-Cloud-set security/runtime flags
-//! (`kms_enabled`, `gateway_enabled`, `public_logs`, …) plus `allowed_envs`,
-//! the list of env-var names the deploy declares. Every field's value is
-//! pinned here to the values a gm release deploy produces; the gate tests
-//! anchor that pinning to a real registry-approved hash so a drift in any
-//! field is caught in CI rather than at a miner's deploy.
+//! Phala normalizes optional app-compose fields, sorts object keys, and
+//! serializes compact UTF-8 JSON before hashing. The v3 builder mirrors that
+//! shape and includes the selected KMS root identity in the measured object.
 
 use std::collections::BTreeMap;
 
@@ -40,31 +12,13 @@ use sha2::{Digest as _, Sha256};
 use crate::deploy::{render_compose, COMPOSE_TEMPLATE, PRELAUNCH_SCRIPT};
 use crate::network::Network;
 
-/// The `manifest_version` of the `app_compose` format dstack currently emits.
-const MANIFEST_VERSION: u64 = 2;
-
-/// The `runner` a docker-compose miner CVM uses.
+const MANIFEST_VERSION: &str = "3";
 const RUNNER: &str = "docker-compose";
-
-/// The `storage_fs` the Phala node provisions for the pinned OS image. Tied
-/// to the dstack OS image version ([`crate::deploy::DEFAULT_OS_IMAGE`]); a
-/// node on a different image would report a different value and move the
-/// hash, which the gate tests would catch.
 const STORAGE_FS: &str = "zfs";
-
-/// The `features` array Phala Cloud sets for a KMS-backed, gateway-fronted
-/// CVM. A literal in the measured object, so it is pinned here.
+const KEY_PROVIDER: &str = "kms";
 const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 
-/// The env-var names a gm release deploy declares, in deploy order. Lists
-/// every supported provider key name plus the node secret, regardless of
-/// which keys an individual miner has configured. Hash covers names only,
-/// not values, so every miner produces the same `compose_hash`. The order
-/// matches `render_env_file`: Anthropic direct/Bedrock/Foundry, `OpenAI`
-/// direct/Azure, Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, Engy,
-/// Moonmath, NEAR and the node secret.
-/// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
-/// gm image is public and those vars do not appear in `allowed_envs`.
+/// The env-var names a release declares, in deploy order.
 const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
@@ -98,24 +52,6 @@ const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
     "GM_NODE_SECRET",
 ];
 
-/// The pinned dstack OS image's published reproducible `os_image_hash`.
-///
-/// This is the measurement of [`crate::deploy::DEFAULT_OS_IMAGE`]
-/// (`dstack-0.5.15`), published by dstack's reproducible OS image build and
-/// reported in every CVM's attestation TCB info (`os.os_image_hash`). It is
-/// verifiable against any live gm CVM on that image and against the
-/// release's approved `ImageVersion` rows; the gate test
-/// [`tests::os_image_hash_matches_published_measurement`] anchors it. Bump this
-/// in lockstep with `DEFAULT_OS_IMAGE`.
-pub const PINNED_OS_IMAGE_HASH: &str =
-    "4597735f1a38ad8ec9f781356b88737fc052062deb7c9aaa4be89bf1b35643ca";
-
-/// The pinned `app_compose` security and runtime flag fields a gm release
-/// deploy produces, as `(field, value)` pairs. `gateway_enabled` and
-/// `tproxy_enabled` are both present and true (dstack accepts either name;
-/// the Phala backend emits both); the local key provider is off because the
-/// CVM uses Phala's KMS. Each field is measured into the hash, so a drift in
-/// any of them is caught by the gate tests.
 const RELEASE_FLAGS: [(&str, bool); 9] = [
     ("kms_enabled", true),
     ("gateway_enabled", true),
@@ -128,95 +64,158 @@ const RELEASE_FLAGS: [(&str, bool); 9] = [
     ("no_instance_id", false),
 ];
 
-/// Build the `app_compose` object a gm release deploy produces for `network`
-/// around the digest-pinned `image_ref`.
-///
-/// The compose template and pre-launch script are bundled from the repo
-/// (`crate::deploy::COMPOSE_TEMPLATE` / `PRELAUNCH_SCRIPT`), so the embedded
-/// `docker_compose_file` is byte-identical to what `gmcli deploy` submits.
-///
-/// Returns a `BTreeMap` so the keys are already in the lexicographic order
-/// the canonical serialization requires.
-///
-/// # Errors
-/// Returns an error if the compose template cannot be rendered (a missing
-/// placeholder — a template bug).
-fn build_app_compose(image_ref: &str, network: Network) -> anyhow::Result<BTreeMap<String, Value>> {
-    build_app_compose_from(
-        image_ref,
-        network,
-        COMPOSE_TEMPLATE,
-        &CANONICAL_ALLOWED_ENVS,
-    )
-}
+const NULLABLE_FIELDS: [&str; 8] = [
+    "event_log_version",
+    "key_provider",
+    "port_policy",
+    "requirements",
+    "snapshotter",
+    "storage_discard",
+    "swap_size",
+    "verity_volumes",
+];
 
-fn build_app_compose_from(
+const EMPTY_FIELDS: [&str; 4] = [
+    "default_gateway_domain",
+    "key_provider_id",
+    "pre_launch_script",
+    "salt",
+];
+
+/// The reproducible `os_image_hash` for `DEFAULT_OS_IMAGE`.
+pub const PINNED_OS_IMAGE_HASH: &str =
+    "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623";
+
+fn build_app_compose(
     image_ref: &str,
     network: Network,
-    compose_template: &str,
-    allowed_envs: &[&str],
+    key_provider_id: &str,
 ) -> anyhow::Result<BTreeMap<String, Value>> {
-    let docker_compose_file = render_compose(compose_template, image_ref, network.as_str())?;
+    let docker_compose_file = render_compose(COMPOSE_TEMPLATE, image_ref, network.as_str())?;
+    Ok(build_app_compose_from_parts(
+        &docker_compose_file,
+        PRELAUNCH_SCRIPT,
+        key_provider_id,
+    ))
+}
 
-    let mut compose: BTreeMap<String, Value> = BTreeMap::new();
+fn build_app_compose_from_parts(
+    docker_compose_file: &str,
+    pre_launch_script: &str,
+    key_provider_id: &str,
+) -> BTreeMap<String, Value> {
+    let mut compose = BTreeMap::new();
     compose.insert(
         "allowed_envs".to_owned(),
-        Value::from(allowed_envs.to_vec()),
+        Value::from(CANONICAL_ALLOWED_ENVS.to_vec()),
     );
+    compose.insert("bash_script".to_owned(), Value::Null);
+    compose.insert("default_gateway_domain".to_owned(), Value::Null);
     compose.insert(
         "docker_compose_file".to_owned(),
-        Value::String(docker_compose_file),
+        Value::String(docker_compose_file.to_owned()),
     );
+    compose.insert("event_log_version".to_owned(), Value::Null);
     compose.insert("features".to_owned(), Value::from(FEATURES.to_vec()));
+    compose.insert("gateway_enabled".to_owned(), Value::Bool(true));
+    compose.insert("init_script".to_owned(), Value::Array(Vec::new()));
+    compose.insert(
+        "key_provider".to_owned(),
+        Value::String(KEY_PROVIDER.to_owned()),
+    );
+    compose.insert(
+        "key_provider_id".to_owned(),
+        Value::String(key_provider_id.to_owned()),
+    );
     compose.insert(
         "manifest_version".to_owned(),
-        Value::Number(MANIFEST_VERSION.into()),
+        Value::String(MANIFEST_VERSION.to_owned()),
     );
     compose.insert("name".to_owned(), Value::String(String::new()));
+    compose.insert("port_policy".to_owned(), Value::Null);
     compose.insert(
         "pre_launch_script".to_owned(),
-        Value::String(PRELAUNCH_SCRIPT.to_owned()),
+        Value::String(pre_launch_script.to_owned()),
+    );
+    compose.insert(
+        "requirements".to_owned(),
+        serde_json::json!({"ephemeral_data_disk": true}),
     );
     compose.insert("runner".to_owned(), Value::String(RUNNER.to_owned()));
+    compose.insert("salt".to_owned(), Value::Null);
+    compose.insert("snapshotter".to_owned(), Value::Null);
+    compose.insert("storage_discard".to_owned(), Value::Null);
     compose.insert(
         "storage_fs".to_owned(),
         Value::String(STORAGE_FS.to_owned()),
     );
+    compose.insert("swap_size".to_owned(), Value::Null);
+    compose.insert("verity_volumes".to_owned(), Value::Null);
     for (field, value) in RELEASE_FLAGS {
         compose.insert(field.to_owned(), Value::Bool(value));
     }
-    Ok(compose)
+    compose
 }
 
-/// Serialize an `app_compose` object to its canonical bytes and return the
-/// lowercase-hex `sha256`.
-///
-/// The map is a [`BTreeMap`], so its keys serialize in lexicographic order;
-/// `serde_json::to_string` emits compact separators and UTF-8 (no ASCII
-/// escaping) — together the dstack canonical form. The digest is over those
-/// exact UTF-8 bytes.
-///
-/// # Errors
-/// Returns an error if serialization fails (it cannot for a `BTreeMap` of
-/// JSON values, but the result is propagated rather than unwrapped).
+/// Apply the field normalization used by the Phala compose-hash helper.
+fn normalize_app_compose(compose: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut normalized = compose.clone();
+
+    match normalized.get("runner").and_then(Value::as_str) {
+        Some("bash") => {
+            normalized.remove("docker_compose_file");
+        }
+        Some("docker-compose") => {
+            normalized.remove("bash_script");
+        }
+        _ => {}
+    }
+
+    if !normalized.contains_key("tproxy_enabled") {
+        let enabled = normalized
+            .get("gateway_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        normalized.insert("tproxy_enabled".to_owned(), Value::Bool(enabled));
+    }
+
+    for field in NULLABLE_FIELDS {
+        if normalized.get(field).is_some_and(Value::is_null) {
+            normalized.remove(field);
+        }
+    }
+
+    for field in EMPTY_FIELDS {
+        if normalized
+            .get(field)
+            .is_some_and(|value| value.is_null() || value.as_str().is_some_and(str::is_empty))
+        {
+            normalized.remove(field);
+        }
+    }
+
+    normalized
+}
+
+/// Serialize the normalized compose object and return its lowercase SHA-256.
 fn hash_app_compose(compose: &BTreeMap<String, Value>) -> anyhow::Result<String> {
-    let canonical = serde_json::to_string(compose)
-        .map_err(|e| anyhow::anyhow!("serialize app_compose: {e}"))?;
+    let canonical = serde_json::to_string(&normalize_app_compose(compose))
+        .map_err(|error| anyhow::anyhow!("serialize app_compose: {error}"))?;
     Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
 }
 
-/// Compute the `compose_hash` a gm release deploy produces for `network`
-/// around the digest-pinned `image_ref`, offline.
+/// Compute the compose hash for an image, network, and selected KMS root.
 ///
-/// Builds the `app_compose` object ([`build_app_compose`]) and hashes its
-/// canonical serialization ([`hash_app_compose`]). The result is bare
-/// lowercase 64-hex, the form the registry's `^[0-9a-f]{64}$` accepts.
+/// The root identity is the `ca_pubkey` value from GET /kms-roots.
 ///
 /// # Errors
 /// Returns an error if the compose template cannot be rendered.
-pub fn compute_compose_hash(image_ref: &str, network: Network) -> anyhow::Result<String> {
-    let compose = build_app_compose(image_ref, network)?;
-    hash_app_compose(&compose)
+pub fn compute_compose_hash(
+    image_ref: &str,
+    network: Network,
+    key_provider_id: &str,
+) -> anyhow::Result<String> {
+    hash_app_compose(&build_app_compose(image_ref, network, key_provider_id)?)
 }
 
 #[cfg(test)]
@@ -228,161 +227,185 @@ pub fn compute_compose_hash(image_ref: &str, network: Network) -> anyhow::Result
 mod tests {
     use super::*;
 
-    /// Image reference for the historical registry-approved compose fixture.
-    /// Only a verified registry approval can replace this baseline.
     const TESTNET_IMAGE_REF: &str =
         "ghcr.io/taostat/gm-miner@sha256:11f99ebde0d1acb944669be8fd0215086e8857de4324ae3fbeab2fcb42c72299";
-
-    /// Registry-approved hash of `approved-compose.yaml`, `TESTNET_IMAGE_REF`
-    /// and `APPROVED_BASELINE_ALLOWED_ENVS`.
-    const REGISTRY_TESTNET_COMPOSE_HASH: &str =
+    const LIVE_KEY_PROVIDER_ID: &str = "3059301306072a8648ce3d020106082a8648ce3d03010703420004e8e325a477b0bf22800dc927a46c68638938d283fe73d1f9028eeac7028193f3470122193875f598b7addc503e534712ab437b4120776bbac32ddf8897f844ee";
+    const HISTORICAL_REGISTRY_HASH: &str =
         "81e5f2b7544840f5394dd76940a6cf75558a4e822e7992670972af9cca695377";
-    /// Keep the candidate pin separate: deterministic rendering does not confer
-    /// registry approval, and template changes must not move the approved anchor.
-    const CANDIDATE_TESTNET_COMPOSE_HASH: &str =
-        "6d41a82c6c49def6e6e84b182fe9d89e60621da21482c74543b2e1d8630210f2";
+    const LIVE_DSTACK_065_HASH: &str =
+        "0d75dcd1311506ec717f9bac9628e4edfed8023115ea7e78aa0a1086a8b67a79";
+    const CANDIDATE_TESTNET_HASH: &str =
+        "c87bf90acd02ea5ffff0e19d9207bfd6b48d07d6dbbb25836be49002bd0e7fc7";
 
-    const APPROVED_BASELINE_ALLOWED_ENVS: [&str; 30] = [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_UPSTREAM",
-        "BEDROCK_REGION",
-        "BEDROCK_API_KEY",
-        "AZURE_FOUNDRY_ENDPOINT",
-        "AZURE_FOUNDRY_API_KEY",
-        "AZURE_FOUNDRY_TENANT_ID",
-        "AZURE_FOUNDRY_SUBSCRIPTION_ID",
-        "AZURE_FOUNDRY_RESOURCE_GROUP",
-        "AZURE_FOUNDRY_CLIENT_ID",
-        "AZURE_FOUNDRY_CLIENT_SECRET",
-        "OPENAI_API_KEY",
-        "OPENAI_UPSTREAM",
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_TENANT_ID",
-        "AZURE_SUBSCRIPTION_ID",
-        "AZURE_RESOURCE_GROUP",
-        "AZURE_CLIENT_ID",
-        "AZURE_CLIENT_SECRET",
-        "GOOGLE_API_KEY",
-        "CHUTES_API_KEY",
-        "ZAI_API_KEY",
-        "MOONSHOT_API_KEY",
-        "DEEPINFRA_API_KEY",
-        "KUBETEE_API_KEY",
-        "ENGY_API_KEY",
-        "MOONMATH_API_KEY",
-        "NEAR_API_KEY",
-        "GM_NODE_SECRET",
-    ];
+    fn decode_fixture(encoded: &str) -> Vec<u8> {
+        hex::decode(encoded.trim()).expect("fixture bytes must decode")
+    }
 
     #[test]
-    fn reproduces_registry_approved_testnet_compose_hash() {
-        let compose = build_app_compose_from(
-            TESTNET_IMAGE_REF,
-            Network::Testnet,
-            include_str!("../tests/fixtures/approved-compose.yaml"),
-            &APPROVED_BASELINE_ALLOWED_ENVS,
-        )
-        .expect("approved baseline compose must compute");
-        let computed = hash_app_compose(&compose).expect("offline compose hash must compute");
+    fn historical_v2_bytes_match_the_registry_anchor() {
+        let bytes = decode_fixture(include_str!(
+            "../tests/fixtures/approved-app-compose-v2.json.hex"
+        ));
+        let compose: BTreeMap<String, Value> =
+            serde_json::from_slice(&bytes).expect("frozen compose fixture must parse");
+        let computed = hash_app_compose(&compose).expect("compose hash must compute");
+        assert_eq!(computed, HISTORICAL_REGISTRY_HASH);
+    }
+
+    #[test]
+    fn live_v3_compose_matches_its_fields_and_hash() {
+        let bytes = decode_fixture(include_str!(
+            "../tests/fixtures/live-dstack-065-app-compose.json.hex"
+        ));
+        let live: BTreeMap<String, Value> =
+            serde_json::from_slice(&bytes).expect("live compose fixture must parse");
+        let docker_compose_file = live
+            .get("docker_compose_file")
+            .and_then(Value::as_str)
+            .expect("live compose contains its docker compose bytes");
+        let pre_launch_script = live
+            .get("pre_launch_script")
+            .and_then(Value::as_str)
+            .expect("live compose contains its pre-launch bytes");
+        let key_provider_id = live
+            .get("key_provider_id")
+            .and_then(Value::as_str)
+            .expect("live compose contains its KMS root identity");
+        let built =
+            build_app_compose_from_parts(docker_compose_file, pre_launch_script, key_provider_id);
+
+        assert_eq!(built, live, "the v3 fields must match the live compose");
         assert_eq!(
-            computed, REGISTRY_TESTNET_COMPOSE_HASH,
-            "approved baseline fixture must remain byte-for-byte reproducible"
+            built.get("manifest_version").and_then(Value::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            built
+                .get("init_script")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            built.get("key_provider").and_then(Value::as_str),
+            Some("kms")
+        );
+        assert_eq!(
+            built
+                .get("requirements")
+                .and_then(Value::as_object)
+                .map(serde_json::Map::len),
+            Some(1)
+        );
+        assert_eq!(
+            built
+                .get("requirements")
+                .and_then(|value| value.get("ephemeral_data_disk"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            built.get("secure_time").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(built.get("storage_fs").and_then(Value::as_str), Some("zfs"));
+        assert_eq!(
+            hash_app_compose(&built).expect("live compose hash must compute"),
+            LIVE_DSTACK_065_HASH
         );
     }
 
     #[test]
-    fn candidate_compose_hash_fixture_is_deterministic() {
-        let first = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet)
+    fn candidate_compose_hash_is_deterministic() {
+        let first = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet, LIVE_KEY_PROVIDER_ID)
             .expect("candidate compose hash must compute");
-        let second = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet)
-            .expect("candidate compose hash must compute");
+        let second =
+            compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet, LIVE_KEY_PROVIDER_ID)
+                .expect("candidate compose hash must compute");
         assert_eq!(first, second);
-        assert_eq!(first, CANDIDATE_TESTNET_COMPOSE_HASH);
+        assert_eq!(first, CANDIDATE_TESTNET_HASH);
         assert_eq!(first.len(), 64);
     }
 
-    /// The canonical serialization is sorted-key + compact: the rendered
-    /// bytes must contain no `, ` or `": "` spacing and the keys must be in
-    /// lexicographic order.
     #[test]
-    fn canonical_serialization_is_sorted_and_compact() {
-        let compose =
-            build_app_compose(TESTNET_IMAGE_REF, Network::Testnet).expect("must build app_compose");
-        let canonical = serde_json::to_string(&compose).unwrap();
-        assert!(
-            canonical.starts_with(r#"{"allowed_envs":["#),
-            "keys must be sorted (allowed_envs first) and compact (no space after colon)"
-        );
-        assert!(
-            !canonical.contains(r#"", ""#),
-            "compact separators must have no space after a comma"
+    fn candidate_fixture_matches_the_bundled_compose_template() {
+        assert_eq!(
+            COMPOSE_TEMPLATE,
+            include_str!("../tests/fixtures/candidate-compose-v3.yaml")
         );
     }
 
-    /// Missing a Phala Cloud security flag changes the measured hash even when
-    /// the inner compose YAML is identical.
     #[test]
-    fn app_compose_carries_the_security_flags() {
-        let compose =
-            build_app_compose(TESTNET_IMAGE_REF, Network::Testnet).expect("must build app_compose");
-        for (key, expected) in [
-            ("kms_enabled", true),
-            ("gateway_enabled", true),
-            ("tproxy_enabled", true),
-            ("public_logs", true),
-            ("public_sysinfo", true),
-            ("local_key_provider_enabled", false),
-        ] {
-            assert_eq!(
-                compose.get(key).and_then(Value::as_bool),
-                Some(expected),
-                "{key} must be pinned to {expected}"
-            );
-        }
+    fn canonical_serialization_is_sorted_and_compact() {
+        let compose = build_app_compose(TESTNET_IMAGE_REF, Network::Testnet, LIVE_KEY_PROVIDER_ID)
+            .expect("app compose must build");
+        let canonical = serde_json::to_string(&normalize_app_compose(&compose)).unwrap();
+        assert!(canonical.starts_with(r#"{"allowed_envs":["#));
+        assert!(!canonical.contains(r#"", ""#));
+    }
+
+    #[test]
+    fn app_compose_carries_the_release_fields() {
+        let compose = build_app_compose(TESTNET_IMAGE_REF, Network::Testnet, LIVE_KEY_PROVIDER_ID)
+            .expect("app compose must build");
         assert_eq!(
             compose
                 .get("allowed_envs")
-                .and_then(|v| v.as_array())
+                .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(CANONICAL_ALLOWED_ENVS.len()),
-            "allowed_envs must be the canonical env-name set"
+            Some(CANONICAL_ALLOWED_ENVS.len())
         );
+        assert_eq!(
+            compose
+                .get("requirements")
+                .and_then(Value::as_object)
+                .map(|value| value.keys().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["ephemeral_data_disk"])
+        );
+        for (key, expected) in RELEASE_FLAGS {
+            assert_eq!(compose.get(key).and_then(Value::as_bool), Some(expected));
+        }
     }
 
-    /// The network literal feeds the rendered compose, so testnet and mainnet
-    /// must produce different hashes — each network gets its own row.
     #[test]
     fn hash_is_network_specific() {
-        let testnet = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet).unwrap();
-        let mainnet = compute_compose_hash(TESTNET_IMAGE_REF, Network::Mainnet).unwrap();
-        assert_ne!(
-            testnet, mainnet,
-            "the GM_NETWORK literal must make the compose_hash network-specific"
-        );
+        let testnet =
+            compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet, LIVE_KEY_PROVIDER_ID)
+                .unwrap();
+        let mainnet =
+            compute_compose_hash(TESTNET_IMAGE_REF, Network::Mainnet, LIVE_KEY_PROVIDER_ID)
+                .unwrap();
+        assert_ne!(testnet, mainnet);
     }
 
-    /// A different image digest must move the hash — the digest is embedded in
-    /// the rendered compose.
     #[test]
     fn hash_changes_with_image_ref() {
-        let a = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet).unwrap();
-        let b = compute_compose_hash(
+        let first = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet, LIVE_KEY_PROVIDER_ID)
+            .unwrap();
+        let second = compute_compose_hash(
             "ghcr.io/taostat/gm-miner@sha256:0000000000000000000000000000000000000000000000000000000000000000",
             Network::Testnet,
+            LIVE_KEY_PROVIDER_ID,
         )
         .unwrap();
-        assert_ne!(a, b, "a different image digest must move the compose_hash");
+        assert_ne!(first, second);
     }
 
-    /// The pinned OS image hash must match the `os_image_hash` Phala Cloud
-    /// publishes for `DEFAULT_OS_IMAGE` (`phala cvms list-nodes`) and the live
-    /// CVM's measured `os.os_image_hash`.
     #[test]
-    fn os_image_hash_matches_published_measurement() {
+    fn hash_changes_with_the_selected_kms_root_key() {
+        let first = compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet, LIVE_KEY_PROVIDER_ID)
+            .unwrap();
+        let second =
+            compute_compose_hash(TESTNET_IMAGE_REF, Network::Testnet, "another-kms-root-key")
+                .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn os_image_hash_matches_the_published_measurement() {
         assert_eq!(
             PINNED_OS_IMAGE_HASH,
-            "4597735f1a38ad8ec9f781356b88737fc052062deb7c9aaa4be89bf1b35643ca"
+            "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623"
         );
     }
 }

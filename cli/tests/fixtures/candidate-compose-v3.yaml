@@ -26,10 +26,8 @@
 ## header. It is declared here so it is part of the attestation-measured
 ## compose hash.
 ##
-## The runtime is two co-located processes inside one container: envoy
-## (the data plane on :8080) and gm-miner-attestd (the TEE attestation
-## server). The registry probes :8080 — `x-gm-provider` for capability,
-## and `GET /attestation/info` which envoy routes to attestd.
+## Envoy serves the data plane on :8080 and forwards /attestation/info to
+## gm-miner-attestd. Both run inside the TEE; attestd gates Azure serving.
 ##
 ## RA-TLS data plane (Mechanism 2 of attestation-and-identity.md): envoy
 ## terminates TLS on :8080 with a certificate minted by dstack's RA-TLS

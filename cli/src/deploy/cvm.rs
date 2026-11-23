@@ -566,6 +566,7 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
         "--image".to_owned(),
         args.os_image.to_owned(),
         "--no-dev-os".to_owned(),
+        "--ephemeral-data-disk".to_owned(),
         "--kms".to_owned(),
         "phala".to_owned(),
         "--kms-contract-id".to_owned(),
@@ -897,7 +898,7 @@ mod tests {
             app_name: "gm-miner-1",
             instance_type: "tdx.medium",
             disk_size: "40G",
-            os_image: "dstack-0.5.7",
+            os_image: "dstack-0.6.5",
             kms_contract_id: "registry-selected-contract",
             compose_path: "/tmp/dist/docker-compose.yaml",
             env_path: "/tmp/dist/.env",
@@ -918,7 +919,7 @@ mod tests {
             ("--name", "gm-miner-1"),
             ("--instance-type", "tdx.medium"),
             ("--disk-size", "40G"),
-            ("--image", "dstack-0.5.7"),
+            ("--image", "dstack-0.6.5"),
             ("--kms", "phala"),
             ("--kms-contract-id", "registry-selected-contract"),
             ("--compose", "/tmp/dist/docker-compose.yaml"),
@@ -942,6 +943,16 @@ mod tests {
         assert!(
             args.iter().any(|a| a == "--json"),
             "missing --json in {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--ephemeral-data-disk"),
+            "missing --ephemeral-data-disk in {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--event-log-version" || arg == "--init-script"),
+            "unexpected optional deploy flag in {args:?}"
         );
     }
 
