@@ -69,7 +69,8 @@ pub const BTCLI: Dependency = Dependency {
 
 /// `phala` (Phala Cloud CLI) — submits the compose stack to Phala Cloud and
 /// reports the CVM's measured hashes. The runtime dependency of `gmcli deploy`.
-/// Phala CLI 1.1.19 added the `--kms-contract-id` option used for new CVMs.
+/// Phala CLI 1.2.1 is the first version with `--ephemeral-data-disk`; 1.2.0
+/// lacks it.
 pub const PHALA: Dependency = Dependency {
     name: "phala",
     purpose: "the phala CLI submits your miner to Phala Cloud and reports the \
@@ -83,7 +84,7 @@ pub const PHALA: Dependency = Dependency {
         name: "npm",
         hint: "install Node.js and npm first (https://nodejs.org), then re-run",
     },
-    min_version: Some("1.1.19"),
+    min_version: Some("1.2.1"),
 };
 
 /// Whether `tool` resolves to a runnable executable on PATH. Probed by
@@ -418,15 +419,15 @@ mod tests {
     #[test]
     fn version_comparison_observes_semver_minimum() {
         for (output, expected) in [
-            ("v1.1.18", false),
-            ("1.1.19", true),
-            ("1.1.19+build", true),
-            ("1.1.19-rc.1", false),
+            ("v1.2.0", false),
+            ("1.2.1", true),
+            ("1.2.1+build", true),
+            ("1.2.1-rc.1", false),
             ("2.0.0", true),
             ("garbage", false),
         ] {
             assert_eq!(
-                version_meets_minimum(output, "1.1.19"),
+                version_meets_minimum(output, "1.2.1"),
                 expected,
                 "version output: {output}"
             );

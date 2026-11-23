@@ -37,7 +37,7 @@ handles the full operator lifecycle from your laptop.
 
 Three steps to a running miner.
 
-1. **Install Phala CLI 1.1.19 or newer** (the miner deploys to Phala Cloud) and have a funded account:
+1. **Install Phala CLI 1.2.1 or newer** (the miner deploys to Phala Cloud) and have a funded account:
 
    ```sh
    npm i -g phala
@@ -46,6 +46,8 @@ Three steps to a running miner.
 
    A new miner needs a funded Phala Cloud account — sign up at <https://cloud.phala.network> and
    create an API key (Dashboard → API Keys).
+
+   New CVMs use the `dstack-0.6.5` OS image, manifest v3, and an ephemeral data disk.
 
 2. **Install gmcli:**
 

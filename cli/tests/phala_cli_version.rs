@@ -16,6 +16,7 @@ async fn registry_server() -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "roots": [{
                 "kms_contract_id": "registry-default",
+                "ca_pubkey": "registry-ca-key",
                 "is_default": true,
                 "allowed_until": null
             }]
@@ -55,7 +56,7 @@ async fn outdated_phala_cli_stops_deploy_before_authentication() {
     assert_eq!(calls.lines().collect::<Vec<_>>(), ["--version"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("1.1.19"),
+        stderr.contains("1.2.1"),
         "must explain the minimum: {stderr}"
     );
     assert!(

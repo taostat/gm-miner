@@ -1498,6 +1498,41 @@ mod tests {
         }
     }
 
+    fn registry_default_kms_roots() -> serde_json::Value {
+        serde_json::json!({
+            "roots": [{
+                "ca_pubkey": "registry-default-ca",
+                "kms_contract_id": "registry-default",
+                "allowed_until": null,
+                "is_default": true,
+            }]
+        })
+    }
+
+    fn assert_release_failure(error: &anyhow::Error, template_mismatch: bool) {
+        let message = format!("{error:#}");
+        if template_mismatch {
+            assert!(
+                message.contains(
+                    "the local gmcli compose template does not match any approved release for the chosen KMS root"
+                ),
+                "{message}"
+            );
+            assert!(message.contains("Update gmcli"), "{message}");
+            assert!(
+                message.contains("choose a supported --version"),
+                "{message}"
+            );
+            assert!(message.contains("No CVM was created"), "{message}");
+        } else {
+            assert!(message.contains("no supported image"), "{message}");
+            assert!(
+                !message.contains("local gmcli compose template"),
+                "unknown release should keep its distinct error: {message}"
+            );
+        }
+    }
+
     /// Mount `GET /miners/me` + `GET /miners/{hotkey}/workers` returning
     /// exactly `live` — the workers the registry still knows about.
     async fn mock_registry_workers(live: &[(&str, &str)]) -> wiremock::MockServer {
@@ -1507,13 +1542,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/kms-roots"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "roots": [{
-                    "kms_contract_id": "registry-default",
-                    "allowed_until": null,
-                    "is_default": true,
-                }]
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_default_kms_roots()))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1586,10 +1615,13 @@ mod tests {
         use super::{cmd_deploy, DeployArgs, RegistryClient, WorkerRegistration};
         use gm_miner_cli::config::ProviderKeys;
         use gm_miner_cli::deploy::{DeployOutcome, PhalaClient, RegistryCredentials};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        struct NoDeploy;
+        struct NoDeploy {
+            deploy_calls: AtomicUsize,
+        }
         impl PhalaClient for NoDeploy {
             fn deploy(
                 &self,
@@ -1600,6 +1632,7 @@ mod tests {
                 _: Option<&RegistryCredentials>,
                 _: u64,
             ) -> anyhow::Result<DeployOutcome> {
+                self.deploy_calls.fetch_add(1, Ordering::Relaxed);
                 anyhow::bail!("unexpected CVM creation attempt");
             }
             fn existing_cvm_app_id(&self) -> anyhow::Result<Option<String>> {
@@ -1607,25 +1640,17 @@ mod tests {
             }
         }
 
-        for (tag, pin, expected) in [
-            ("v99.0.0", None, "no supported image"),
-            (
-                concat!("v", env!("CARGO_PKG_VERSION")),
-                None,
-                "no CVM was created",
-            ),
-            ("v99.0.0", Some(1), "no CVM was created"),
+        for (tag, pin, template_mismatch) in [
+            ("v99.0.0", None, false),
+            (concat!("v", env!("CARGO_PKG_VERSION")), None, true),
+            ("v99.0.0", Some(1), true),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/kms-roots"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "roots": [{
-                        "kms_contract_id": "registry-default",
-                        "allowed_until": null,
-                        "is_default": true,
-                    }]
-                })))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(registry_default_kms_roots()),
+                )
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -1655,10 +1680,13 @@ mod tests {
                 ..crate::commands::deploy::default_test_deploy_args()
             };
             let mut client = RegistryClient::new(cfg.clone());
+            let phala = NoDeploy {
+                deploy_calls: AtomicUsize::new(0),
+            };
             let error = cmd_deploy(
                 &cfg,
                 &mut client,
-                &NoDeploy,
+                &phala,
                 &args,
                 &WorkerRegistration::Add {
                     hotkey: "5HK".to_owned(),
@@ -1666,7 +1694,12 @@ mod tests {
             )
             .await
             .expect_err("must fail before creating a CVM");
-            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_release_failure(&error, template_mismatch);
+            assert_eq!(
+                phala.deploy_calls.load(Ordering::Relaxed),
+                0,
+                "the CLI must reject the release before asking Phala to create a CVM"
+            );
             assert!(server
                 .received_requests()
                 .await

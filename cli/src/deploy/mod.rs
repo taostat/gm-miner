@@ -54,7 +54,7 @@ pub use cvm::{
     PHALA_ENDPOINT_FIELD, PHALA_OS_IMAGE_HASH_FIELD, POLL_INTERVAL_SECS,
 };
 pub use hashes::{normalize_hash, verify_hashes, DeployOutcome, DstackDeployResult};
-pub use kms_roots::resolve_kms_contract_id;
+pub use kms_roots::{fetch_approved_kms_roots, resolve_kms_contract_id, resolve_kms_root, KmsRoot};
 pub use registry_auth::{
     fetch_anonymous_token, image_is_public, non_empty_env, parse_bearer_challenge, registry_host,
     resolve_registry_credentials, split_repo_reference, visibility_from_status, BearerChallenge,
@@ -70,12 +70,8 @@ pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
 
 /// Default OS image passed to `phala deploy --image`.
 ///
-/// The OS image version must match the dstack version of the Phala node
-/// the CVM lands on. Confirmed via `phala cvms list-nodes` (2026-11-19):
-/// prod5/prod9 dropped `dstack-0.5.12` and now offer `dstack-0.5.14`,
-/// `dstack-0.5.15`, `dstack-0.6.4` and `dstack-0.6.5`; `dstack-0.5.15` is the
-/// newest 0.5.x, so it's the working default.
-pub const DEFAULT_OS_IMAGE: &str = "dstack-0.5.15";
+/// New CVMs use the dstack 0.6.5 image and manifest v3 compose shape.
+pub const DEFAULT_OS_IMAGE: &str = "dstack-0.6.5";
 
 /// Abstraction over the image-build step, injectable so the deploy
 /// orchestration can be exercised without a real `docker` toolchain.
