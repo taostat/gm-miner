@@ -12,6 +12,11 @@ ignore = [
     # alloy-sol-macro proc-macro chain. No fix to adopt until alloy drops
     # the dependency upstream; the gm gateway repo carries the same ignore.
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained (transitive via dstack-sdk)
+    # sev 7.1.0's crypto_nossl verifier uses rsa only to parse public keys and
+    # verify AMD certificate signatures. This service performs no RSA private
+    # key operation, which is the scope of the Marvin timing advisory. Re-audit
+    # if the RSA use or selected sev feature changes.
+    { id = "RUSTSEC-2023-0071", reason = "sev crypto_nossl uses only RSA public-key certificate signature verification; the Marvin advisory concerns private-key operations" },
     # dstack-sdk 0.1.3 unconditionally pulls Alloy's Ethereum signer, but
     # this workspace only calls its guest-agent RPC client (get_key,
     # get_quote, info and get_tls_key). It never calls ethereum::to_account

@@ -65,6 +65,15 @@ async fn verify_with(
     evidence: &Value,
     report_data: &[u8; 64],
 ) -> Result<AttestationReport> {
+    verify_with_cache(endpoint, evidence, report_data, policy::shared_vcek_cache()).await
+}
+
+async fn verify_with_cache(
+    endpoint: &impl AmdEndpoint,
+    evidence: &Value,
+    report_data: &[u8; 64],
+    cache: &policy::VcekCache,
+) -> Result<AttestationReport> {
     let report = report(evidence)?;
     ensure!(
         report.report_data == *report_data,
@@ -85,7 +94,7 @@ async fn verify_with(
             "VLEK requires AMD hashstick validation and is not accepted by this consumer"
         );
     }
-    let vek = policy::verify_vek(&report, endpoint).await?;
+    let vek = policy::verify_vek_with_cache(&report, endpoint, cache).await?;
     if let Some(chain) = supplied_chain {
         // Treat the whole CoCo table as supplied *data*. CoCo verifies its
         // path; this comparison prevents it substituting an endorsement key.
@@ -114,6 +123,7 @@ mod tests {
     )]
     use super::*;
     use sev::certs::snp::{builtin::milan, Certificate, Verifiable};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const REPORT: &[u8] = include_bytes!("../../tests/fixtures/kubetee/snp/test-report.bin");
     const VCEK: &[u8] = include_bytes!("../../tests/fixtures/kubetee/snp/test-vcek.der");
@@ -211,19 +221,22 @@ mod tests {
     }
     #[test]
     fn native_kds_response_verify_report_and_pin_requested_cpu_tcb() {
-        struct PinCpuTcb;
+        struct PinCpuTcb {
+            report: AttestationReport,
+            vcek: Vec<u8>,
+        }
         impl AmdEndpoint for PinCpuTcb {
             fn fetch(
                 &self,
                 url: url::Url,
             ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send {
-                let report = AttestationReport::from_bytes(REPORT).unwrap();
+                let report = self.report;
                 let tcb = report.reported_tcb;
                 assert_eq!(url.scheme(), "https");
                 assert_eq!(url.host_str(), Some("kdsintf.amd.com"));
                 assert_eq!(
                     url.path(),
-                    format!("/vcek/v1/Milan/{}", hex::encode(report.chip_id))
+                    format!("/vcek/v1/Genoa/{}", hex::encode(report.chip_id))
                 );
                 let query: std::collections::HashMap<_, _> =
                     url.query_pairs().into_owned().collect();
@@ -232,22 +245,90 @@ mod tests {
                 assert_eq!(query["teeSPL"], tcb.tee.to_string());
                 assert_eq!(query["snpSPL"], tcb.snp.to_string());
                 assert_eq!(query["ucodeSPL"], tcb.microcode.to_string());
-                std::future::ready(Ok(VCEK.to_vec()))
+                std::future::ready(Ok(self.vcek.clone()))
             }
         }
+        let evidence: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/kubetee/coco-snp-evidence.json"
+        ))
+        .unwrap();
+        let report = report(&evidence).unwrap();
+        assert_eq!(report.version, 3);
+        let vcek = certificates(&evidence).unwrap().remove(0).data;
+        let endpoint = PinCpuTcb { report, vcek };
+        let cache = policy::VcekCache::default();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
             .unwrap();
+        let verified = runtime
+            .block_on(verify_with_cache(
+                &endpoint,
+                &evidence,
+                &report.report_data,
+                &cache,
+            ))
+            .unwrap();
+        assert_eq!(verified.version, 3);
+        assert_eq!(verified.reported_tcb, report.reported_tcb);
+    }
+
+    #[test]
+    fn a_cached_vcek_does_not_cache_report_signature_verification() {
+        struct CountedVcek {
+            calls: std::sync::Arc<AtomicUsize>,
+            certificate: Vec<u8>,
+        }
+        impl AmdEndpoint for CountedVcek {
+            fn fetch(
+                &self,
+                _url: url::Url,
+            ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(self.certificate.clone()))
+            }
+        }
+
+        let mut evidence: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/kubetee/coco-snp-evidence.json"
+        ))
+        .unwrap();
+        let original_report = report(&evidence).unwrap();
+        let certificate = certificates(&evidence).unwrap().remove(0).data;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let endpoint = CountedVcek {
+            calls: std::sync::Arc::clone(&calls),
+            certificate,
+        };
+        let cache = policy::VcekCache::default();
+        let runtime = runtime();
+        runtime
+            .block_on(verify_with_cache(
+                &endpoint,
+                &evidence,
+                &original_report.report_data,
+                &cache,
+            ))
+            .unwrap();
+
+        let byte = u8::try_from(
+            evidence["attestation_report"]["report_data"][0]
+                .as_u64()
+                .unwrap(),
+        )
+        .unwrap();
+        evidence["attestation_report"]["report_data"][0] = Value::from(byte ^ 1);
+        let tampered_report = report(&evidence).unwrap();
         let error = runtime
-            .block_on(verify_with(
-                &PinCpuTcb,
-                &evidence(),
-                &AttestationReport::from_bytes(REPORT).unwrap().report_data,
+            .block_on(verify_with_cache(
+                &endpoint,
+                &evidence,
+                &tampered_report.report_data,
+                &cache,
             ))
             .unwrap_err();
-        // The KDS URL and certificate are verified before report-version policy.
-        assert!(format!("{error:#}").contains("unsupported SNP report version 2"));
+        assert!(format!("{error:#}").contains("signature"), "{error:#}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn coco_v3_fixture_cryptographic_chain_result_is_tested_not_assumed() {
@@ -325,11 +406,11 @@ mod tests {
         let lookup = UnexpectedFetch {
             chip_id: hex::encode(report.chip_id),
         };
+        let cache = policy::VcekCache::default();
         let error = runtime()
-            .block_on(policy::verify_vek(&report, &lookup))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("test stops"), "{error}");
+            .block_on(policy::verify_vek_with_cache(&report, &lookup, &cache))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("test stops"), "{error:#}");
     }
 
     struct RejectAnyRequest;

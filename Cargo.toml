@@ -49,6 +49,7 @@ ring = "=0.17.14"
 # Mozilla's root set for the KubeTEE verifier's WebPKI TLS; already in the
 # lockfile through reqwest's rustls-tls feature.
 webpki-roots = "1.0.7"
+sev = { version = "=7.1.0", default-features = false, features = ["snp", "serde", "crypto_nossl"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
 # dstack-sdk's locked Alloy macros pull proc-macro-error2 2.0.1, which emits
 # future-incompatibility E0365 on proc_macro re-export. Keep this dependency

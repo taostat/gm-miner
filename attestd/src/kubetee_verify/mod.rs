@@ -11,13 +11,14 @@
 //! then sent on attested connections only, one at a time per connection,
 //! and never after the keyset's deadline.
 //!
-//! For AMD, the unmodified `sev` crate verifies ARK/ASK/VCEK and the report;
+//! For AMD, the upstream `sev` crate verifies ARK/ASK/VCEK and the report;
 //! the VCEK must match the report's full chip identity and measured TCB.
 //! `KubeTEE` then separately requires its signed release launch measurement,
-//! uncompressed-InitData `HOST_DATA`, VMPL 0, migration/debug off, SMT on,
-//! supported Family 19h/1Ah TCB floors, and the v1 keyset/TLS possession.
-//! No firmware TCB is guessed from an OVMF recipe, and no `CoCo` fallback
-//! bypasses these checks. Recognized non-release hardware fails closed.
+//! `HOST_DATA`, VMPL 0, migration/debug off, AMD-published SNP TCB floors,
+//! and the v1 keyset/TLS possession. TDX verification remains available for
+//! tests and a future provider return, while live verification is fixed to SNP.
+//! TCB floors come from AMD security bulletins. Recognized hardware outside
+//! the release policy fails closed.
 
 pub mod binding;
 pub mod evidence;
@@ -43,6 +44,7 @@ use hyper::body::Incoming;
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sev::firmware::guest::AttestationReport;
 use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
 
@@ -122,6 +124,21 @@ impl QuoteChain for Pccs {
     }
 }
 
+/// Verifies an AMD report and its endorsement chain for one SNP connection.
+#[async_trait]
+pub(crate) trait SnpReportVerifier: Send + Sync {
+    async fn verify(&self, evidence: &Value, report_data: &[u8; 64]) -> Result<AttestationReport>;
+}
+
+struct AmdSnpReportVerifier;
+
+#[async_trait]
+impl SnpReportVerifier for AmdSnpReportVerifier {
+    async fn verify(&self, evidence: &Value, report_data: &[u8; 64]) -> Result<AttestationReport> {
+        snp::verify(evidence, report_data).await
+    }
+}
+
 /// What a successful attestation of one connection found.
 #[derive(Clone, Debug)]
 pub struct Attestation {
@@ -135,23 +152,11 @@ pub struct Attestation {
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Platform {
-    /// Backwards-compatible default for existing TDX-only proxy deployments.
+    /// Live `KubeTEE` connections are verified as SNP.
     #[default]
-    Tdx,
-    #[serde(alias = "snp")]
     SevSnp,
-}
-
-impl Platform {
-    fn from_environment() -> Result<Self> {
-        match std::env::var("KUBETEE_TEE").as_deref() {
-            Ok("snp" | "sev-snp") => Ok(Self::SevSnp),
-            // Never accept legacy SEV or SEV-ES as an AMD SNP fallback.
-            Ok(other) => bail!("unsupported KUBETEE_TEE {other:?}; use snp or sev-snp"),
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(std::env::VarError::NotUnicode(_)) => bail!("KUBETEE_TEE is not UTF-8"),
-        }
-    }
+    /// Delete the TDX path if `KubeTEE` confirms TDX is retired.
+    Tdx,
 }
 
 /// Live verification uses the canonical HTTPS endpoint, including its DNS
@@ -162,6 +167,7 @@ pub struct KubeteeVerifier {
     address: Option<SocketAddr>,
     platform: Platform,
     quote_chain: Arc<dyn QuoteChain>,
+    snp_report_verifier: Arc<dyn SnpReportVerifier>,
     nonce: fn() -> [u8; 32],
     limits: Limits,
     pool: Arc<Pool>,
@@ -188,7 +194,7 @@ impl KubeteeVerifier {
         Ok(Self::with_parts(
             roots,
             None,
-            Platform::from_environment()?,
+            Platform::SevSnp,
             Arc::new(Pccs(tee_evidence::collateral_client()?)),
             tee_evidence::random_nonce,
             Limits::default(),
@@ -212,10 +218,17 @@ impl KubeteeVerifier {
             address,
             platform,
             quote_chain,
+            snp_report_verifier: Arc::new(AmdSnpReportVerifier),
             nonce,
             limits,
             pool: Arc::new(Pool::new(limits.pool_limits())),
         }
+    }
+
+    #[cfg(test)]
+    fn with_snp_report_verifier(mut self, verifier: Arc<dyn SnpReportVerifier>) -> Self {
+        self.snp_report_verifier = verifier;
+        self
     }
 
     /// Attest one new connection, sending no inference, and close it.
@@ -403,10 +416,11 @@ impl KubeteeVerifier {
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
         payload.ensure_platform(self.platform)?;
         let measurements = if self.platform == Platform::SevSnp {
-            let snp = payload
-                .snp_evidence()?
-                .context("SNP native evidence is missing")?;
-            let report = snp::verify(snp, &binding.report_data).await?;
+            let snp = payload.snp_evidence()?;
+            let report = self
+                .snp_report_verifier
+                .verify(snp, &binding.report_data)
+                .await?;
             policy::accept(&report)?;
             evidence::verify_tls_possession(
                 payload
