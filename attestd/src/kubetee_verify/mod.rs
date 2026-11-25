@@ -10,10 +10,21 @@
 //! nonce. A response without the v1 binding fails closed. Chat requests are
 //! then sent on attested connections only, one at a time per connection,
 //! and never after the keyset's deadline.
+//!
+//! For AMD, the upstream `sev` crate verifies ARK/ASK/VCEK and the report;
+//! the VCEK must match the report's full chip identity and measured TCB.
+//! `KubeTEE` then separately requires its signed release launch measurement,
+//! `HOST_DATA`, VMPL 0, migration/debug off, AMD-published SNP TCB floors,
+//! and the v1 keyset/TLS possession. TDX verification remains available for
+//! tests and a future provider return, while live verification is fixed to SNP.
+//! TCB floors come from AMD security bulletins. Recognized hardware outside
+//! the release policy fails closed.
 
 pub mod binding;
 pub mod evidence;
+pub mod policy;
 pub mod pool;
+pub mod snp;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -31,7 +42,9 @@ use dcap_qvl::policy::QuoteClaims;
 use http_body_util::{BodyExt as _, Limited};
 use hyper::body::Incoming;
 use rustls::{ClientConfig, RootCertStore};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sev::firmware::guest::AttestationReport;
 use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
 
@@ -111,6 +124,21 @@ impl QuoteChain for Pccs {
     }
 }
 
+/// Verifies an AMD report and its endorsement chain for one SNP connection.
+#[async_trait]
+pub(crate) trait SnpReportVerifier: Send + Sync {
+    async fn verify(&self, evidence: &Value, report_data: &[u8; 64]) -> Result<AttestationReport>;
+}
+
+struct AmdSnpReportVerifier;
+
+#[async_trait]
+impl SnpReportVerifier for AmdSnpReportVerifier {
+    async fn verify(&self, evidence: &Value, report_data: &[u8; 64]) -> Result<AttestationReport> {
+        snp::verify(evidence, report_data).await
+    }
+}
+
 /// What a successful attestation of one connection found.
 #[derive(Clone, Debug)]
 pub struct Attestation {
@@ -121,11 +149,25 @@ pub struct Attestation {
     pub keyset_not_after: DateTime<Utc>,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Platform {
+    /// Live `KubeTEE` connections are verified as SNP.
+    #[default]
+    SevSnp,
+    /// Delete the TDX path if `KubeTEE` confirms TDX is retired.
+    Tdx,
+}
+
+/// Live verification uses the canonical HTTPS endpoint, including its DNS
+/// selection and certificate hostname. Offline fixture tests inject peers.
 #[derive(Clone)]
 pub struct KubeteeVerifier {
     tls: TlsConnector,
     address: Option<SocketAddr>,
+    platform: Platform,
     quote_chain: Arc<dyn QuoteChain>,
+    snp_report_verifier: Arc<dyn SnpReportVerifier>,
     nonce: fn() -> [u8; 32],
     limits: Limits,
     pool: Arc<Pool>,
@@ -152,6 +194,7 @@ impl KubeteeVerifier {
         Ok(Self::with_parts(
             roots,
             None,
+            Platform::SevSnp,
             Arc::new(Pccs(tee_evidence::collateral_client()?)),
             tee_evidence::random_nonce,
             Limits::default(),
@@ -161,6 +204,7 @@ impl KubeteeVerifier {
     fn with_parts(
         roots: RootCertStore,
         address: Option<SocketAddr>,
+        platform: Platform,
         quote_chain: Arc<dyn QuoteChain>,
         nonce: fn() -> [u8; 32],
         limits: Limits,
@@ -172,11 +216,19 @@ impl KubeteeVerifier {
         Self {
             tls: TlsConnector::from(Arc::new(config)),
             address,
+            platform,
             quote_chain,
+            snp_report_verifier: Arc::new(AmdSnpReportVerifier),
             nonce,
             limits,
             pool: Arc::new(Pool::new(limits.pool_limits())),
         }
+    }
+
+    #[cfg(test)]
+    fn with_snp_report_verifier(mut self, verifier: Arc<dyn SnpReportVerifier>) -> Self {
+        self.snp_report_verifier = verifier;
+        self
     }
 
     /// Attest one new connection, sending no inference, and close it.
@@ -362,18 +414,43 @@ impl KubeteeVerifier {
                 .context("kubetee.attestation.v1 binding")?;
         let payload: AttestationPayload =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
-        let quote =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.quote)
-                .context("decode KubeTEE quote")?;
-        let (claims, now) = self.quote_chain.verify(&quote).await?;
-        let measurements = evidence::verify_attestation(
-            &payload,
-            &nonce,
-            connection.leaf.as_ref(),
-            &claims,
-            now,
-            &binding.report_data,
-        )?;
+        payload.ensure_platform(self.platform)?;
+        let measurements = if self.platform == Platform::SevSnp {
+            let snp = payload.snp_evidence()?;
+            let report = self
+                .snp_report_verifier
+                .verify(snp, &binding.report_data)
+                .await?;
+            policy::accept(&report)?;
+            evidence::verify_tls_possession(
+                payload
+                    .tls_possession
+                    .as_ref()
+                    .context("KubeTEE attestation has no tls_possession")?,
+                &nonce,
+                connection.leaf.as_ref(),
+            )?;
+            ensure!(payload.nonce == nonce, "KubeTEE echoed a different nonce");
+            Measurements::of_snp(&report)
+        } else {
+            let quote = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                payload
+                    .quote
+                    .as_deref()
+                    .context("TDX attestation has no quote")?,
+            )
+            .context("decode KubeTEE quote")?;
+            let (claims, now) = self.quote_chain.verify(&quote).await?;
+            evidence::verify_attestation(
+                &payload,
+                &nonce,
+                connection.leaf.as_ref(),
+                &claims,
+                now,
+                &binding.report_data,
+            )?
+        };
         binding.ensure_current(Utc::now())?;
         evidence::log_attested(&payload.pod, &measurements);
         Ok((

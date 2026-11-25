@@ -89,6 +89,9 @@ futures-util = { workspace = true }
 ml-kem = { workspace = true }
 ring = { workspace = true }
 webpki-roots = { workspace = true }
+sev = { workspace = true }
+asn1-rs = "0.7"
+url = "2.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

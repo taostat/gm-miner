@@ -27,6 +27,7 @@ use hyper::service::service_fn;
 use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use sev::firmware::guest::AttestationReport;
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -60,7 +61,11 @@ fn collateral() -> dcap_qvl::QuoteCollateralV3 {
 }
 
 fn quote() -> Vec<u8> {
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload().quote).unwrap()
+    base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        payload().quote.as_deref().unwrap(),
+    )
+    .unwrap()
 }
 
 fn claims() -> QuoteClaims {
@@ -361,6 +366,11 @@ enum Evidence {
     Unbound,
     /// Headers and half the body, then nothing.
     Stalled,
+    SnpGenuine,
+    SnpBadBinding,
+    SnpBadPossession,
+    SnpBadPolicy,
+    SnpExpired,
 }
 
 struct Upstream {
@@ -385,10 +395,14 @@ struct TestBinding {
 }
 
 fn test_binding() -> TestBinding {
+    test_binding_with_expiry(TEST_KEYSET_NOT_AFTER)
+}
+
+fn test_binding_with_expiry(not_after: &str) -> TestBinding {
     let (_, leaf) = x509_parser::parse_x509_certificate(TEST_LEAF).unwrap();
     let keyset = serde_json::json!({
         "subject": format!("{}/{HOST_NAME}", binding::PURPOSE),
-        "not_after": TEST_KEYSET_NOT_AFTER,
+        "not_after": not_after,
         "tls_public_keys": [{
             "domain": HOST_NAME,
             "spki_sha256": hex::encode(Sha256::digest(leaf.public_key().raw)),
@@ -423,6 +437,49 @@ impl QuoteChain for FixtureChain {
     }
 }
 
+struct SyntheticSnpVerifier {
+    report: AttestationReport,
+}
+
+impl SyntheticSnpVerifier {
+    fn new() -> Self {
+        let response: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/kubetee/snp/production-turin-evidence.json"
+        ))
+        .unwrap();
+        let mut report = snp::report(&response["evidence"]["snp"]).unwrap();
+        report.report_data = test_binding().report_data;
+        report.launch_tcb.snp = 0x08;
+        report.reported_tcb.snp = 0x08;
+        report.policy.set_smt_allowed(false);
+        report.launch_mit_vector = Some(1_u64 << 12);
+        report.current_mit_vector = Some(1_u64 << 12);
+        Self { report }
+    }
+}
+
+#[async_trait]
+impl SnpReportVerifier for SyntheticSnpVerifier {
+    async fn verify(&self, evidence: &Value, report_data: &[u8; 64]) -> Result<AttestationReport> {
+        ensure!(
+            evidence["schema"].as_str() == Some("kubetee.snp-evidence/1"),
+            "synthetic SNP evidence schema is missing"
+        );
+        let mut report = self.report;
+        if evidence["report_data_mismatch"] == true {
+            report.report_data[0] ^= 1;
+        }
+        ensure!(
+            report.report_data == *report_data,
+            "SNP signed report_data is not the v1 nonce/keyset binding"
+        );
+        if evidence["policy_reject"] == true {
+            report.measurement[0] ^= 1;
+        }
+        Ok(report)
+    }
+}
+
 fn sign(nonce: &str) -> String {
     let key = RsaKeyPair::from_pkcs8(TEST_KEY).unwrap();
     let mut signature = vec![0; key.public().modulus_len()];
@@ -439,7 +496,10 @@ fn sign(nonce: &str) -> String {
 fn attestation_body(evidence: Evidence) -> Vec<u8> {
     let mut payload: Value = serde_json::from_slice(ATTESTATION).unwrap();
     let nonce = payload["nonce"].as_str().unwrap().to_owned();
-    if !matches!(evidence, Evidence::OtherCertificate) {
+    if !matches!(
+        evidence,
+        Evidence::OtherCertificate | Evidence::SnpBadPossession
+    ) {
         payload["tls_possession"] = serde_json::json!({
             "tls_signature": sign(&nonce),
             "tls_signature_alg": "RS256",
@@ -447,7 +507,12 @@ fn attestation_body(evidence: Evidence) -> Vec<u8> {
             "tls_cert_sha256": hex::encode(Sha256::digest(TEST_LEAF)),
         });
     }
-    let served = test_binding();
+    let expires = if matches!(evidence, Evidence::SnpExpired) {
+        "2000-01-01T00:00:00Z"
+    } else {
+        TEST_KEYSET_NOT_AFTER
+    };
+    let served = test_binding_with_expiry(expires);
     payload["keyset"] = served.keyset;
     payload["bindings"] = serde_json::json!({
         "version": binding::PURPOSE,
@@ -460,6 +525,30 @@ fn attestation_body(evidence: Evidence) -> Vec<u8> {
             let fields = payload.as_object_mut().unwrap();
             fields.remove("keyset");
             fields.remove("bindings");
+        }
+        Evidence::SnpGenuine
+        | Evidence::SnpBadBinding
+        | Evidence::SnpBadPossession
+        | Evidence::SnpBadPolicy
+        | Evidence::SnpExpired => {
+            payload["tee"] = Value::from("snp");
+            payload["tee_type"] = Value::from("snp");
+            payload["runtime_class"] = Value::from("synthetic-unmeasured-class");
+            payload.as_object_mut().unwrap().remove("quote");
+            payload["evidence"] = serde_json::json!({
+                "snp": {
+                    "schema": "kubetee.snp-evidence/1",
+                    "report_data_mismatch": matches!(evidence, Evidence::SnpBadBinding),
+                    "policy_reject": matches!(evidence, Evidence::SnpBadPolicy),
+                }
+            });
+            if matches!(evidence, Evidence::SnpBadPossession) {
+                payload["tls_possession"] = serde_json::json!({
+                    "tls_signature": "AAAA",
+                    "tls_signature_alg": "RS256",
+                    "tls_cert_sha256": hex::encode(Sha256::digest(TEST_LEAF)),
+                });
+            }
         }
         Evidence::Genuine
         | Evidence::Unavailable
@@ -633,6 +722,31 @@ fn limits() -> Limits {
 }
 
 async fn serve(evidence: Evidence, chat: Chat, limits: Limits) -> (KubeteeVerifier, Arc<Upstream>) {
+    serve_with_platform(evidence, chat, limits, Platform::Tdx, None).await
+}
+
+async fn serve_snp(
+    evidence: Evidence,
+    chat: Chat,
+    limits: Limits,
+) -> (KubeteeVerifier, Arc<Upstream>) {
+    serve_with_platform(
+        evidence,
+        chat,
+        limits,
+        Platform::SevSnp,
+        Some(Arc::new(SyntheticSnpVerifier::new())),
+    )
+    .await
+}
+
+async fn serve_with_platform(
+    evidence: Evidence,
+    chat: Chat,
+    limits: Limits,
+    platform: Platform,
+    snp_verifier: Option<Arc<dyn SnpReportVerifier>>,
+) -> (KubeteeVerifier, Arc<Upstream>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let upstream = Arc::new(Upstream {
         evidence,
@@ -677,10 +791,16 @@ async fn serve(evidence: Evidence, chat: Chat, limits: Limits) -> (KubeteeVerifi
     let verifier = KubeteeVerifier::with_parts(
         roots,
         Some(address),
+        platform,
         Arc::new(FixtureChain),
         fixture_nonce,
         limits,
     );
+    let verifier = if let Some(snp_verifier) = snp_verifier {
+        verifier.with_snp_report_verifier(snp_verifier)
+    } else {
+        verifier
+    };
     (verifier, upstream)
 }
 
@@ -945,6 +1065,29 @@ async fn off_list_requests_are_refused_before_any_connection() {
     }
     tokio::task::yield_now().await;
     assert_eq!(counts(&upstream), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_synthetic_snp_connection_checks_binding_possession_policy_and_expiry() {
+    let (verifier, upstream) = serve_snp(Evidence::SnpGenuine, Chat::Served, limits()).await;
+    let (status, body) = round_trip(&verifier, TARGETS[0]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, SSE.as_bytes());
+    assert_eq!(counts(&upstream), (1, 1, 1));
+    assert_eq!(verifier.idle_connections(), 1);
+
+    for (evidence, expected) in [
+        (Evidence::SnpBadBinding, "report_data"),
+        (Evidence::SnpBadPossession, "does not verify"),
+        (Evidence::SnpBadPolicy, "measurements are outside"),
+        (Evidence::SnpExpired, "keyset is expired"),
+    ] {
+        let (verifier, upstream) = serve_snp(evidence, Chat::Served, limits()).await;
+        let error = verifier.forward(chat(TARGETS[0])).await.unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(counts(&upstream), (3, 3, 0));
+        assert_eq!(verifier.idle_connections(), 0);
+    }
 }
 
 #[tokio::test]
