@@ -43,7 +43,7 @@ const CERT_PATH: &str = "/tmp/gm-ratls/cert.pem";
 #[tokio::main]
 async fn main() -> Result<()> {
     // Log to stderr so the provisioner's lines interleave correctly
-    // with start.sh's `[start]` lines in `phala cvms logs`.
+    // with start.sh's `[start]` lines in `phala logs`.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

@@ -185,7 +185,7 @@ enum Command {
     ///
     /// Authentication uses a Phala Cloud API key — set
     /// `PHALA_API_KEY` / `PHALA_CLOUD_API_KEY`, pass `--phala-api-key`, or
-    /// run `phala auth login` before deploying.
+    /// run `phala login` before deploying.
     #[command(after_help = "Examples:\n  \
         gmcli deploy --image-repo ghcr.io/<owner>/gm-miner\n  \
         gmcli deploy --image-ref ghcr.io/<owner>/gm-miner@sha256:...")]

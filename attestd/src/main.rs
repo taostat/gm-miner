@@ -159,7 +159,7 @@ async fn run() -> Result<()> {
 fn init_logging() {
     // Log to stderr, not stdout: the container entrypoint (start.sh)
     // also logs to stderr, so a single stream keeps attestd's and the
-    // entrypoint's lines correctly interleaved in `phala cvms logs`,
+    // entrypoint's lines correctly interleaved in `phala logs`,
     // and an anyhow fatal-error printout (also stderr) lands in order.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
