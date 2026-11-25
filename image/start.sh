@@ -55,7 +55,7 @@
 # unless-stopped` policy recreates the stack — a miner missing Envoy,
 # attestd, or a configured NEAR or Chutes verifier cannot serve the registry, so crashing fast and recovering is
 # the correct behaviour. The exit log names which process died and its
-# status, so a genuine crash is diagnosable from `phala cvms logs`.
+# status, so a genuine crash is diagnosable from `phala logs`.
 
 set -euo pipefail
 
