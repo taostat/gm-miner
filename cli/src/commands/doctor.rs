@@ -487,7 +487,7 @@ fn phala_api_key_check(cfg: &Config) -> Check {
         Some(source) => Check::pass(format!("Phala Cloud credential ({source})"), String::new()),
         None => Check::fail(
             "Phala Cloud API key",
-            "no Phala credential — set PHALA_API_KEY, run `phala auth login`, \
+            "no Phala credential — set PHALA_API_KEY, run `phala login`, \
              or paste a key when `gmcli deploy` prompts (it is then saved)",
         ),
     }

@@ -1461,7 +1461,7 @@ fn preflight_cvm_delete(app_id: &str, phala_api_key: Option<&str>) -> Result<()>
     gm_miner_cli::phala::check_credential(phala_api_key).with_context(|| {
         format!(
             "cannot delete Phala CVM {app_id}: Phala Cloud did not accept {source}.\n  \
-             pass a valid --phala-api-key <key>, set PHALA_API_KEY, or run `phala auth login`.\n  \
+             pass a valid --phala-api-key <key>, set PHALA_API_KEY, or run `phala login`.\n  \
              {skip}"
         )
     })

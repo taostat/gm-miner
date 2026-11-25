@@ -41,7 +41,7 @@ Three steps to a running miner.
 
    ```sh
    npm i -g phala
-   phala auth login          # or set PHALA_API_KEY
+   phala login               # or set PHALA_API_KEY
    ```
 
    A new miner needs a funded Phala Cloud account — sign up at <https://cloud.phala.network> and
