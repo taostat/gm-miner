@@ -111,6 +111,14 @@ fn cert_entry(node: &serde_json::Value) -> Result<CertEntry> {
 
 /// Parse the `evidence.snp` node of a response into [`SnpEvidence`], failing
 /// closed on a missing or malformed `raw_report` / `cert_chain`.
+///
+/// # Errors
+///
+/// Returns an error when `raw_report` is missing, is not base64, is not
+/// exactly [`REPORT_LEN`] bytes, or when `cert_chain` is missing or any of its
+/// entries is not an array of bytes. Every one of those is a reject — this is
+/// the fail-closed parse boundary, so malformed evidence never reaches the
+/// cryptographic appraisal below it.
 pub fn parse_snp(node: &serde_json::Value) -> Result<SnpEvidence> {
     let raw_report = node
         .get("raw_report")
@@ -170,8 +178,7 @@ fn verify_anchored_chain(cert_chain: &[CertEntry]) -> Result<Chain> {
     let anchored = roots.iter().any(|(_, pem)| {
         Certificate::from_pem(pem)
             .and_then(|root| root.to_der())
-            .map(|root_der| root_der == served_ark_der)
-            .unwrap_or(false)
+            .is_ok_and(|root_der| root_der == served_ark_der)
     });
     ensure!(
         anchored,
@@ -192,6 +199,15 @@ fn verify_anchored_chain(cert_chain: &[CertEntry]) -> Result<Chain> {
 ///
 /// `quote_report_data` is the `evidence.quote_report_data` field (base64, 64
 /// bytes) — when present it must equal the report's `report_data` (anti-swap).
+///
+/// # Errors
+///
+/// Fails closed on every appraisal gate: an unparseable `raw_report`, a
+/// `cert_chain` that does not anchor to a known AMD root or does not verify
+/// ARK→ASK→VCEK, a report signature that does not verify against the VCEK over
+/// `to_bytes()[..0x2a0]`, the DEBUG policy bit set, a malformed policy field,
+/// or a `quote_report_data` that does not match the committed `report_data`.
+/// Any error means the evidence is untrusted and no measurements are returned.
 pub fn verify_snp(
     evidence: &SnpEvidence,
     quote_report_data: Option<&str>,
@@ -350,7 +366,7 @@ mod tests {
             "2c66167de055e8d6cd0e2073c4e959e242e544f9e0e124eeed18a1938191f118"
         );
         assert_eq!(m.policy, 0x30000, "debug bit clear (policy 0x30000)");
-        assert!(m.policy & POLICY_DEBUG_BIT == 0);
+        assert_eq!(m.policy & POLICY_DEBUG_BIT, 0);
     }
 
     #[test]
@@ -395,7 +411,7 @@ mod tests {
         // The hardware signature is checked first, so flipping the policy bit
         // invalidates it — the debug guest must be rejected either way.
         let mut snp = live_snp();
-        snp.raw_report[POLICY.start] |= POLICY_DEBUG_BIT as u8;
+        snp.raw_report[POLICY.start] |= u8::try_from(POLICY_DEBUG_BIT).unwrap();
         assert!(verify_snp(&snp, Some(&live_qrd())).is_err());
     }
 
