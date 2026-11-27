@@ -2,14 +2,17 @@
 //!
 //! Each upstream connection to `llm.kubetee.ai` is attested before use and
 //! renewed every 10 minutes. On a new TLS 1.3 connection the proxy fetches a
-//! quote bound to a fresh nonce and verifies it: a `kubetee.attestation.v1`
-//! keyset naming this connection's serving key and unexpired, `report_data`
-//! equal to the v1 statement binding of that keyset and the nonce, Intel
-//! DCAP chain and an `UpToDate` TCB, a TDX report with debug off, the event
-//! log replaying to RTMR0-3, and the serving certificate's key signing the
-//! nonce. A response without the v1 binding fails closed. Chat requests are
-//! then sent on attested connections only, one at a time per connection,
-//! and never after the keyset's deadline.
+//! quote bound to a fresh nonce and verifies it: a `kubetee.attestation.v2`
+//! quote-bound per-boot key binding (the quote's `report_data` is
+//! `SHA-384(tag ‖ framed(pkix) ‖ framed(nonce) ‖ framed(context)) ‖ 16 zero
+//! bytes` for the in-guest generated key the response names), a keyset naming
+//! this connection's serving key and unexpired, Intel DCAP chain and an
+//! `UpToDate` TCB, a TDX report with debug off, the event log replaying to
+//! RTMR0-3, and a `key_possession` signature over the quote-bound
+//! `report_data` under the very key the quote commits. A response without the
+//! v2 binding fails closed. Chat requests are then sent on attested
+//! connections only, one at a time per connection, and never after the
+//! keyset's deadline.
 
 pub mod binding;
 pub mod evidence;
@@ -359,21 +362,14 @@ impl KubeteeVerifier {
         // offline fixtures), not a clock for live connection reuse.
         let binding =
             evidence::BindingGuard::run(&body, &nonce, connection.leaf.as_ref(), Utc::now())
-                .context("kubetee.attestation.v1 binding")?;
+                .context("kubetee.attestation.v2 binding")?;
         let payload: AttestationPayload =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
         let quote =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.quote)
                 .context("decode KubeTEE quote")?;
         let (claims, now) = self.quote_chain.verify(&quote).await?;
-        let measurements = evidence::verify_attestation(
-            &payload,
-            &nonce,
-            connection.leaf.as_ref(),
-            &claims,
-            now,
-            &binding.report_data,
-        )?;
+        let measurements = evidence::verify_attestation(&payload, &nonce, &claims, now, &binding)?;
         binding.ensure_current(Utc::now())?;
         evidence::log_attested(&payload.pod, &measurements);
         Ok((

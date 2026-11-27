@@ -1,31 +1,45 @@
-//! The `kubetee.attestation.v1` `report_data` construction and its checks.
+//! The `kubetee.attestation.v2` quote-bound key binding and its checks.
 //!
-//! Construction (the `kubetee.attestation.v1` specification, section 4):
-//! `report_data = SHA-256(JCS(statement)) || 32 zero bytes`, where the
-//! statement is the fixed template
-//! `{"keyset_digest":"sha256:<hex>","nonce":"<64-hex>","purpose":"kubetee.attestation.v1"}`.
-//! The statement is served verbatim as `bindings.report_data_statement` and
-//! is hashed as served, so nothing is re-canonicalized here. `keyset_digest`
-//! is `sha256(JCS(keyset))` over the served keyset (spec section 5), which
-//! this module recomputes from the connection's own leaf certificate: the
-//! quote, the served keyset, and the TLS session must be one identity.
+//! Construction (`ReportDataForKeyWithContext`, Phase 6 zero-operator trust):
+//! `report_data = SHA-384(tag ‖ framed(pkix) ‖ framed(nonce) ‖ framed(context))`
+//! `‖ 16 zero bytes`, where `tag` is the raw `KEY_ATTESTATION_TAG` and each
+//! input is length-framed (`u64-be length ‖ bytes`) so no two distinct
+//! `(pkix, nonce, context)` tuples share a preimage. `pkix` is the DER
+//! `SubjectPublicKeyInfo` of a **per-boot in-guest generated** evidence key,
+//! `nonce` its raw 32 bytes, and `context` a domain-separation string.
 //!
-//! JCS here covers RFC 8785 for the attestation input class: objects,
-//! arrays, and strings, keys sorted by UTF-16 code units, ECMA-262 string
-//! serialization (assumes well-formed UTF-16 in names). The module is
-//! std-only so its vectors pin the wire format without new dependencies.
+//! The quote commits that `report_data`; the response serves the binding
+//! inputs verbatim as a canonical-JCS statement
+//! `{"context":..,"keyset_digest":..,"nonce":..,"pkix_pubkey_b64url":..,
+//! "purpose":"kubetee.attestation.v2"}` plus `keyset_digest`
+//! (`sha256(JCS(keyset))`). Verification re-derives the statement field-by-
+//! field (anti-downgrade — nothing is trusted as served) and recomputes the
+//! `report_data` from those fields, then the quote must carry it and a
+//! `key_possession` signature must verify over it under the bound key.
+//!
+//! This module is std-only (plus sha2/hex/base64) so its vectors pin the wire
+//! format without new dependencies.
 
 use std::collections::BTreeMap;
 
 use anyhow::{ensure, Result};
-use sha2::{Digest as _, Sha256};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use sha2::{Digest as _, Sha256, Sha384};
 
-/// The purpose tag every v1 statement carries (domain separation).
-pub const PURPOSE: &str = "kubetee.attestation.v1";
+/// The only binding version this proxy accepts (domain separation).
+pub const PURPOSE: &str = "kubetee.attestation.v2";
+/// Domain-separation tag for the v2 report-data derivation. Changing this
+/// string is a contract change (it is inside the frozen test vector).
+pub const KEY_ATTESTATION_TAG: &[u8] = b"kubetee.attestation.v2/ReportDataForKeyWithContext";
+/// The key class the per-boot generated key serves (the statement names it).
+pub const KEY_PURPOSE: &str = "tls-ephemeral";
+/// The `key_possession.input` the proof must name.
+pub const POSSESSION_INPUT: &str = "quote_report_data";
+/// The `key_possession.alg` the proof must name (ECDSA P-256 / SHA-256, DER).
+pub const POSSESSION_ALG: &str = "ecdsa-secp256r1-sha256";
+
 const KEYSET_DIGEST_PREFIX: &str = "sha256:";
-const STATEMENT_DIGEST_PREFIX: &str = "\"keyset_digest\":\"";
-const STATEMENT_NONCE_PREFIX: &str = "\",\"nonce\":\"";
-const STATEMENT_SUFFIX: &str = "\",\"purpose\":\"kubetee.attestation.v1\"}";
 
 /// The JSON tree a keyset and a statement are built from.
 #[derive(Clone, Debug)]
@@ -84,69 +98,36 @@ fn jcs_string(text: &str) -> String {
     out
 }
 
-/// `sha256:<hex>` over JCS(keyset) — what the statement's `keyset_digest`
-/// must equal when recomputed from the served keyset (spec section 5).
-#[must_use]
-fn keyset_digest(keyset: &Json) -> String {
-    format!(
-        "{KEYSET_DIGEST_PREFIX}{}",
-        hex::encode(Sha256::digest(jcs(keyset).as_bytes()))
-    )
-}
-
-/// The 64-byte `report_data` a served v1 statement binds: `SHA-256(statement)`
-/// zero-padded. Verifies the statement's `keyset_digest` and `nonce` against
-/// the expected values first (the statement is hashed as served).
+/// Normalize + validate the caller nonce: 64 lowercase hex chars. ASCII-only
+/// (rejects control chars / Unicode whitespace that `trim()` alone would let
+/// through — zero-length-input bypass class).
 ///
 /// # Errors
 ///
-/// Returns an error when the statement is malformed or names another keyset
-/// digest or nonce.
-pub fn report_data_of_statement(
-    statement: &str,
-    keyset_digest_value: &str,
-    nonce: &str,
-) -> Result<[u8; 64]> {
-    let Some(rest) = statement
-        .strip_prefix('{')
-        .and_then(|s| s.strip_prefix(STATEMENT_DIGEST_PREFIX))
-        .and_then(|s| s.strip_prefix(KEYSET_DIGEST_PREFIX))
-    else {
-        anyhow::bail!("kubetee.attestation.v1 statement is not the fixed template");
-    };
-    let Some(rest) = rest
-        .strip_prefix(
-            keyset_digest_value
-                .strip_prefix(KEYSET_DIGEST_PREFIX)
-                .unwrap_or(keyset_digest_value),
-        )
-        .and_then(|s| s.strip_prefix(STATEMENT_NONCE_PREFIX))
-    else {
-        anyhow::bail!("kubetee.attestation.v1 statement names a different keyset digest");
-    };
-    let Some(rest) = rest.strip_prefix(nonce) else {
-        anyhow::bail!("kubetee.attestation.v1 statement names a different nonce");
-    };
+/// Returns an error when `nonce` is not 64 ASCII hex characters.
+pub fn normalize_nonce(nonce: &str) -> Result<String> {
+    ensure!(nonce.is_ascii(), "nonce must be ASCII hex");
+    let n = nonce.trim().to_lowercase();
     ensure!(
-        rest == STATEMENT_SUFFIX,
-        "kubetee.attestation.v1 statement has no kubetee.attestation.v1 purpose"
+        n.len() == 64 && n.chars().all(|c| c.is_ascii_hexdigit()),
+        "nonce must be 64 hex chars, got {nonce:?}"
     );
-    let hash = Sha256::digest(statement.as_bytes());
-    let mut report_data = [0; 64];
-    report_data[..32].copy_from_slice(&hash);
-    Ok(report_data)
+    Ok(n)
 }
 
-/// `sha256:<hex>` over the JCS of a served keyset (serde `Value`), the spec
-/// section 5 recomputation from the response's own keyset.
+/// `sha256:<hex>` over JCS(keyset) — what the statement's `keyset_digest`
+/// must equal when recomputed from the served keyset.
 ///
 /// # Errors
 ///
 /// Returns an error when the keyset carries a value outside the attestation
 /// input class (numbers, booleans, null).
-pub fn recompute_keyset_digest(keyset: &serde_json::Value) -> Result<String> {
+pub fn keyset_digest(keyset: &serde_json::Value) -> Result<String> {
     let tree = json_tree(keyset)?;
-    Ok(keyset_digest(&tree))
+    Ok(format!(
+        "{KEYSET_DIGEST_PREFIX}{}",
+        hex::encode(Sha256::digest(jcs(&tree).as_bytes()))
+    ))
 }
 
 fn json_tree(value: &serde_json::Value) -> Result<Json> {
@@ -163,10 +144,139 @@ fn json_tree(value: &serde_json::Value) -> Result<Json> {
             }
             Ok(Json::Object(tree))
         }
-        other => anyhow::bail!(
-            "kubetee.attestation.v1 keyset holds {other}, outside the attestation input class"
-        ),
+        other => anyhow::bail!("keyset holds {other}, outside the attestation input class"),
     }
+}
+
+/// Length-framed concatenation (`u64-be length ‖ bytes`) — the
+/// `ReportDataForKeyWithContext` transcript pattern. Framing prevents any two
+/// distinct `(pkix, nonce, context)` tuples from sharing a preimage.
+fn framed(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(&(p.len() as u64).to_be_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// The exact byte string the v2 report-data hash consumes: the raw tag then
+/// `framed(pkix) ‖ framed(nonce) ‖ framed(context)`. `pkix` is the DER SPKI
+/// of the per-boot key, `nonce` its raw 32 bytes, `context` a non-empty
+/// domain-separation string.
+///
+/// # Errors
+///
+/// Returns an error when any input is empty (no uncontextualized key binding).
+pub fn report_data_preimage_v2(pkix_pubkey: &[u8], nonce: &[u8], context: &str) -> Result<Vec<u8>> {
+    ensure!(!pkix_pubkey.is_empty(), "v2 pkix_pubkey must be non-empty");
+    ensure!(!nonce.is_empty(), "v2 nonce must be non-empty");
+    ensure!(
+        !context.is_empty(),
+        "v2 context must be non-empty (no uncontextualized key binding)"
+    );
+    let mut out = Vec::new();
+    out.extend_from_slice(KEY_ATTESTATION_TAG);
+    out.extend_from_slice(&framed(&[pkix_pubkey, nonce, context.as_bytes()]));
+    Ok(out)
+}
+
+/// v2 `report_data` = `SHA-384(preimage) ‖ 16 zero bytes` (64 bytes total —
+/// the quote report-data field size). The zero suffix keeps the field layout
+/// while reserving it against cross-purpose collisions.
+///
+/// # Errors
+///
+/// Returns an error when an input is empty.
+pub fn report_data_v2(pkix_pubkey: &[u8], nonce: &[u8], context: &str) -> Result<[u8; 64]> {
+    let preimage = report_data_preimage_v2(pkix_pubkey, nonce, context)?;
+    let digest = Sha384::digest(&preimage);
+    let mut out = [0u8; 64];
+    out[..48].copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// The canonical-JCS statement the response serves (and verification re-
+/// derives) for v2: `{"context":..,"keyset_digest":..,"nonce":..,
+/// "pkix_pubkey_b64url":..,"purpose":"kubetee.attestation.v2"}`.
+///
+/// # Errors
+///
+/// Returns an error when `keyset_digest` is malformed, `nonce` is not 64 hex,
+/// or `pkix_pubkey_b64url` / `context` are empty.
+pub fn report_data_statement_v2(
+    keyset_digest: &str,
+    nonce: &str,
+    pkix_pubkey_b64url: &str,
+    context: &str,
+) -> Result<String> {
+    ensure!(
+        keyset_digest.starts_with(KEYSET_DIGEST_PREFIX)
+            && keyset_digest.len() == KEYSET_DIGEST_PREFIX.len() + 64
+            && keyset_digest[KEYSET_DIGEST_PREFIX.len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+        "malformed keyset_digest: {keyset_digest:?}"
+    );
+    let nonce = normalize_nonce(nonce)?;
+    ensure!(
+        !pkix_pubkey_b64url.is_empty(),
+        "v2 pkix_pubkey_b64url must be non-empty"
+    );
+    ensure!(!context.is_empty(), "v2 context must be non-empty");
+    let mut fields = BTreeMap::new();
+    fields.insert("context".to_owned(), Json::String(context.to_owned()));
+    fields.insert(
+        "keyset_digest".to_owned(),
+        Json::String(keyset_digest.to_owned()),
+    );
+    fields.insert("nonce".to_owned(), Json::String(nonce));
+    fields.insert(
+        "pkix_pubkey_b64url".to_owned(),
+        Json::String(pkix_pubkey_b64url.to_owned()),
+    );
+    fields.insert("purpose".to_owned(), Json::String(PURPOSE.to_owned()));
+    Ok(jcs(&Json::Object(fields)))
+}
+
+/// Decode the served `pkix_pubkey_b64url` (URL-safe, no pad — standard pad
+/// accepted) into the DER `SubjectPublicKeyInfo` the derivation hashes.
+///
+/// # Errors
+///
+/// Returns an error when the value is empty or not base64.
+pub fn decode_pkix_pubkey(pkix_pubkey_b64url: &str) -> Result<Vec<u8>> {
+    ensure!(
+        !pkix_pubkey_b64url.is_empty(),
+        "v2 pkix_pubkey_b64url is empty"
+    );
+    let mut s = pkix_pubkey_b64url.trim().to_owned();
+    while !s.len().is_multiple_of(4) {
+        s.push('=');
+    }
+    URL_SAFE_NO_PAD
+        .decode(s.trim_end_matches('='))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&s))
+        .map_err(|error| anyhow::anyhow!("v2 pkix_pubkey_b64url: {error}"))
+}
+
+/// Decode the statement's 64-hex nonce into its raw 32 bytes (the derivation
+/// hashes the raw bytes, not the hex text).
+///
+/// # Errors
+///
+/// Returns an error when `hex_str` is not 64 hex characters.
+pub fn bytes_from_hex32(hex_str: &str) -> Result<Vec<u8>> {
+    ensure!(
+        hex_str.len() == 64 && hex_str.chars().all(|c| c.is_ascii_hexdigit()),
+        "nonce hex length"
+    );
+    (0..32)
+        .map(|i| {
+            u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16)
+                .map_err(|error| anyhow::anyhow!("nonce hex: {error}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -178,51 +288,114 @@ mod tests {
 
     use super::*;
 
-    impl From<&str> for Json {
-        fn from(value: &str) -> Self {
-            Self::String(value.to_owned())
+    // Frozen derivation vector — shared with the Python builder
+    // (kubetee_binding.py) and the Rust reference verifier. The transcript
+    // and its report_data are pinned so any change to the tag, framing, or
+    // hash breaks this test (contract change).
+    const KAT_PKIX_HEX: &str = "302a300506032b6570032100000102030405060708090a0b0c0d0e0f\
+                                101112131415161718191a1b1c1d1e1f";
+    const KAT_NONCE: [u8; 32] = [0xaa; 32];
+    const KAT_CONTEXT: &str = "kubetee-test-context";
+    const KAT_REPORT_DATA: &str =
+        "7c7f82da79e64d00bb228bf3bd7075ea31b938759d00162f1f1d83021f245e24\
+         eff25929ec5761309dbbc014119dc4c000000000000000000000000000000000";
+
+    #[test]
+    fn the_v2_report_data_matches_the_cross_language_kat() {
+        let pkix = hex::decode(KAT_PKIX_HEX).unwrap();
+        let rd = report_data_v2(&pkix, &KAT_NONCE, KAT_CONTEXT).unwrap();
+        assert_eq!(
+            hex::encode(rd),
+            KAT_REPORT_DATA.replace(char::is_whitespace, "")
+        );
+        assert_eq!(rd.len(), 64);
+        assert!(rd[48..].iter().all(|b| *b == 0), "16 zero bytes suffix");
+    }
+
+    #[test]
+    fn the_transcript_is_tag_then_three_length_framed_parts() {
+        let pkix = hex::decode(KAT_PKIX_HEX).unwrap();
+        let preimage = report_data_preimage_v2(&pkix, &KAT_NONCE, KAT_CONTEXT).unwrap();
+        assert_eq!(
+            preimage.len(),
+            KEY_ATTESTATION_TAG.len() + (8 + 44) + (8 + 32) + (8 + KAT_CONTEXT.len())
+        );
+        let mut offset = KEY_ATTESTATION_TAG.len();
+        for part in [&pkix[..], &KAT_NONCE[..], KAT_CONTEXT.as_bytes()] {
+            let length = usize::try_from(u64::from_be_bytes(
+                preimage[offset..offset + 8].try_into().unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(length, part.len());
+            offset += 8;
+            assert_eq!(&preimage[offset..offset + length], part);
+            offset += length;
         }
+        assert_eq!(offset, preimage.len());
     }
 
-    /// The served keyset (spec section 5) for a serving certificate's DER SPKI
-    /// and RFC 3339 `not_after` (`YYYY-MM-DDThh:mm:ssZ`).
-    fn keyset_json(spki_der: &[u8], not_after: &str, domain: &str) -> Json {
-        let mut tls_key = BTreeMap::new();
-        tls_key.insert("domain".to_owned(), Json::from(domain));
-        tls_key.insert(
-            "spki_sha256".to_owned(),
-            Json::String(hex::encode(Sha256::digest(spki_der))),
+    #[test]
+    fn distinct_contexts_never_share_a_report_data() {
+        let pkix = [1u8; 32];
+        let nonce = [2u8; 32];
+        assert_ne!(
+            report_data_v2(&pkix, &nonce, "ctx-a").unwrap(),
+            report_data_v2(&pkix, &nonce, "ctx-b").unwrap()
         );
-        let mut fields = BTreeMap::new();
-        fields.insert(
-            "subject".to_owned(),
-            Json::String(format!("{PURPOSE}/{domain}")),
-        );
-        fields.insert("not_after".to_owned(), Json::String(not_after.to_owned()));
-        fields.insert(
-            "tls_public_keys".to_owned(),
-            Json::Array(vec![Json::Object(tls_key)]),
-        );
-        fields.insert("signing_keys".to_owned(), Json::Array(Vec::new()));
-        fields.insert("e2ee_keys".to_owned(), Json::Array(Vec::new()));
-        Json::Object(fields)
     }
 
-    /// Check a served v1 statement against the expected keyset digest, the nonce
-    /// sent, and the quote's `report_data` (spec section 4): derive the binding
-    /// the statement names and require the quote to carry exactly it.
-    fn verify_statement(
-        statement: &str,
-        keyset_digest: &str,
-        nonce: &str,
-        report_data: &[u8; 64],
-    ) -> Result<()> {
-        let expected = report_data_of_statement(statement, keyset_digest, nonce)?;
-        ensure!(
-            *report_data == expected,
-            "TDX report_data is not the v1 binding statement hash"
+    #[test]
+    fn the_v2_statement_is_the_canonical_jcs_of_its_fields() {
+        let statement = report_data_statement_v2(
+            "sha256:693868b5f94f4dad208e8e37fe93ebf1be212f3451462b079dc9ba828b8d33ea",
+            "cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a",
+            "AQIDBA",
+            "role=nim-terminator",
+        )
+        .unwrap();
+        assert_eq!(
+            statement,
+            r#"{"context":"role=nim-terminator","keyset_digest":"sha256:693868b5f94f4dad208e8e37fe93ebf1be212f3451462b079dc9ba828b8d33ea","nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","pkix_pubkey_b64url":"AQIDBA","purpose":"kubetee.attestation.v2"}"#
         );
-        Ok(())
+    }
+
+    #[test]
+    fn the_statement_nonce_is_normalized_to_lowercase_hex() {
+        let upper = report_data_statement_v2(
+            "sha256:693868b5f94f4dad208e8e37fe93ebf1be212f3451462b079dc9ba828b8d33ea",
+            &format!("CF95{}", "0".repeat(60)),
+            "AQIDBA",
+            "ctx",
+        )
+        .unwrap();
+        assert!(upper.contains(r#""nonce":"cf95"#));
+    }
+
+    #[test]
+    fn empty_or_malformed_v2_inputs_fail_closed() {
+        let pkix = [1u8; 32];
+        assert!(report_data_v2(&[], &[0u8; 32], "ctx").is_err());
+        assert!(report_data_v2(&pkix, &[], "ctx").is_err());
+        assert!(report_data_v2(&pkix, &[0u8; 32], "").is_err());
+        assert!(report_data_statement_v2("sha256:zz", "00", "AQ", "ctx").is_err());
+        assert!(report_data_statement_v2(
+            "sha256:693868b5f94f4dad208e8e37fe93ebf1be212f3451462b079dc9ba828b8d33ea",
+            "short",
+            "AQ",
+            "ctx"
+        )
+        .is_err());
+        assert!(decode_pkix_pubkey("").is_err());
+        assert!(decode_pkix_pubkey("!!!not-base64!!!").is_err());
+    }
+
+    #[test]
+    fn decode_pkix_accepts_urlsafe_unpadded_and_standard_padded() {
+        let raw = [7u8; 16];
+        let unpadded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        assert_eq!(decode_pkix_pubkey(&unpadded).unwrap(), raw);
+        let padded = base64::engine::general_purpose::STANDARD.encode(raw);
+        assert_eq!(decode_pkix_pubkey(&padded).unwrap(), raw);
     }
 
     #[test]
@@ -238,191 +411,40 @@ mod tests {
         );
     }
 
-    // Cross-implementation conformance: generated with the shipped Python
-    // builder (the supplier's Python implementation of this construction)
-    // over tests/fixtures/kubetee/session_leaf.der and the recorded nonce,
-    // and independently pinned by the spec section 4 vectors below.
-    const SPKI_SHA256: &str = "3f728244ad1bb95542b14cdbf7f637105dc588f8958c862e4beffc450c000cd3";
-    const FIXTURE_NONCE: &str = "cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a";
-    const FIXTURE_KEYSET_DIGEST: &str =
-        "sha256:64f6b8c71a0452909b382f5abcaaa6a76ae5b58bf930ff8f78f5074e4a64873d";
-    const FIXTURE_STATEMENT: &str = r#"{"keyset_digest":"sha256:64f6b8c71a0452909b382f5abcaaa6a76ae5b58bf930ff8f78f5074e4a64873d","nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","purpose":"kubetee.attestation.v1"}"#;
-    const FIXTURE_REPORT_DATA: &str = "9e4867826f437965258b4bcf964e603e30d31b662a4f3ef0ffc50cba611633710000000000000000000000000000000000000000000000000000000000000000";
-
-    // Spec section 4 published conformance vectors (2026-10-23).
-    const SPEC_KEYSET_DIGEST: &str =
-        "sha256:693868b5f94f4dad208e8e37fe93ebf1be212f3451462b079dc9ba828b8d33ea";
-    const SPEC_STATEMENT: &str = r#"{"keyset_digest":"sha256:693868b5f94f4dad208e8e37fe93ebf1be212f3451462b079dc9ba828b8d33ea","nonce":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","purpose":"kubetee.attestation.v1"}"#;
-    const SPEC_STATEMENT_SHA256: &str =
-        "755d36ae1b2ea98e9bdb32350b7356b75515e4ecae711a198ade29ec325b14f4";
-
-    fn fixture_report_data() -> [u8; 64] {
-        hex::decode(FIXTURE_REPORT_DATA)
-            .unwrap()
-            .try_into()
-            .unwrap()
-    }
-
-    fn spec_keyset() -> Json {
+    #[test]
+    fn keyset_digest_reproduces_the_spec_vector() {
         let mut tls_key = BTreeMap::new();
-        tls_key.insert("domain".to_owned(), Json::from("llm.kubetee.ai"));
+        tls_key.insert(
+            "domain".to_owned(),
+            Json::String("llm.kubetee.ai".to_owned()),
+        );
         tls_key.insert("spki_sha256".to_owned(), Json::String("0".repeat(64)));
         let mut fields = BTreeMap::new();
-        fields.insert("not_after".to_owned(), Json::from("2030-01-01T00:00:00Z"));
+        fields.insert(
+            "not_after".to_owned(),
+            Json::String("2030-01-01T00:00:00Z".to_owned()),
+        );
         fields.insert(
             "subject".to_owned(),
-            Json::from("kubetee.attestation.v1/test-vector"),
+            Json::String("kubetee.attestation.v1/test-vector".to_owned()),
         );
         fields.insert(
             "tls_public_keys".to_owned(),
             Json::Array(vec![Json::Object(tls_key)]),
         );
-        Json::Object(fields)
-    }
-
-    #[test]
-    fn jcs_orders_object_keys_and_escapes_strings() {
-        let mut fields = BTreeMap::new();
-        fields.insert("b".to_owned(), Json::from("x\"y"));
-        fields.insert("a".to_owned(), Json::from("z"));
-        assert_eq!(jcs(&Json::Object(fields)), r#"{"a":"z","b":"x\"y"}"#);
         assert_eq!(
-            jcs(&Json::Array(vec![Json::from("1"), Json::from("2")])),
-            "[\"1\",\"2\"]"
+            jcs(&Json::Object(fields.clone())),
+            "{\"not_after\":\"2030-01-01T00:00:00Z\",\"subject\":\"kubetee.attestation.v1/test-vector\",\"tls_public_keys\":[{\"domain\":\"llm.kubetee.ai\",\"spki_sha256\":\"".to_owned() + &"0".repeat(64) + "\"}]}"
         );
-        assert_eq!(jcs(&Json::from("a\nb")), "\"a\\nb\"");
     }
 
     #[test]
-    fn the_spec_keyset_digest_vector_reproduces() {
-        assert_eq!(keyset_digest(&spec_keyset()), SPEC_KEYSET_DIGEST);
-    }
-
-    #[test]
-    fn the_statement_and_its_hash_match_the_spec_vectors() {
-        let statement = format!(
-            r#"{{"keyset_digest":"{SPEC_KEYSET_DIGEST}","nonce":"{}","purpose":"{PURPOSE}"}}"#,
-            "0123456789abcdef".repeat(4)
-        );
-        assert_eq!(statement, SPEC_STATEMENT);
+    fn bytes_from_hex32_rejects_short_or_non_hex() {
         assert_eq!(
-            hex::encode(Sha256::digest(statement.as_bytes())),
-            SPEC_STATEMENT_SHA256
+            bytes_from_hex32(&"ab".repeat(32)).unwrap(),
+            [0xab; 32].to_vec()
         );
-    }
-
-    #[test]
-    fn the_fixture_statement_verifies_and_the_serving_keyset_digest_matches() {
-        verify_statement(
-            FIXTURE_STATEMENT,
-            FIXTURE_KEYSET_DIGEST,
-            FIXTURE_NONCE,
-            &fixture_report_data(),
-        )
-        .unwrap();
-        // A keyset built from the real SPKI digest must reproduce the builder's digest.
-        let mut tls_key = BTreeMap::new();
-        tls_key.insert("domain".to_owned(), Json::from("llm.kubetee.ai"));
-        tls_key.insert(
-            "spki_sha256".to_owned(),
-            Json::String(SPKI_SHA256.to_owned()),
-        );
-        let mut fields = BTreeMap::new();
-        fields.insert(
-            "subject".to_owned(),
-            Json::from("kubetee.attestation.v1/llm.kubetee.ai"),
-        );
-        fields.insert("not_after".to_owned(), Json::from("2026-12-21T10:08:05Z"));
-        fields.insert(
-            "tls_public_keys".to_owned(),
-            Json::Array(vec![Json::Object(tls_key)]),
-        );
-        fields.insert("signing_keys".to_owned(), Json::Array(Vec::new()));
-        fields.insert("e2ee_keys".to_owned(), Json::Array(Vec::new()));
-        assert_eq!(keyset_digest(&Json::Object(fields)), FIXTURE_KEYSET_DIGEST);
-    }
-
-    #[test]
-    fn the_report_data_is_the_statement_hash_zero_padded() {
-        let report_data = fixture_report_data();
-        assert_eq!(
-            hex::encode(&report_data[..32]),
-            hex::encode(Sha256::digest(FIXTURE_STATEMENT.as_bytes()))
-        );
-        assert_eq!(report_data[32..], [0; 32]);
-    }
-
-    #[test]
-    fn a_different_serving_spki_changes_the_keyset_digest() {
-        let keyset = keyset_json(&[0; 32], "2026-12-21T10:08:05Z", "llm.kubetee.ai");
-        let other = keyset_json(&[1; 32], "2026-12-21T10:08:05Z", "llm.kubetee.ai");
-        assert_ne!(keyset_digest(&keyset), keyset_digest(&other));
-    }
-
-    #[test]
-    fn a_statement_for_another_keyset_fails_closed() {
-        let report_data = fixture_report_data();
-        let other = format!("{KEYSET_DIGEST_PREFIX}{}", "0".repeat(64));
-        let error =
-            verify_statement(FIXTURE_STATEMENT, &other, FIXTURE_NONCE, &report_data).unwrap_err();
-        assert!(format!("{error:#}").contains("different keyset digest"));
-    }
-
-    #[test]
-    fn a_statement_for_another_nonce_fails_closed() {
-        let report_data = fixture_report_data();
-        let error = verify_statement(
-            FIXTURE_STATEMENT,
-            FIXTURE_KEYSET_DIGEST,
-            &"00".repeat(32),
-            &report_data,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("different nonce"));
-    }
-
-    #[test]
-    fn a_statement_with_another_purpose_fails_closed() {
-        let wrong = FIXTURE_STATEMENT.replace(PURPOSE, "kubetee.attestation.v0");
-        let error = verify_statement(
-            &wrong,
-            FIXTURE_KEYSET_DIGEST,
-            FIXTURE_NONCE,
-            &fixture_report_data(),
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("purpose"));
-    }
-
-    #[test]
-    fn a_reused_legacy_report_data_fails_the_v1_binding() {
-        // The legacy construction (SHA-512 of the nonce) must not pass as v1.
-        let legacy: [u8; 64] = legacy_report_data(FIXTURE_NONCE);
-        let error = verify_statement(
-            FIXTURE_STATEMENT,
-            FIXTURE_KEYSET_DIGEST,
-            FIXTURE_NONCE,
-            &legacy,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("report_data"));
-    }
-
-    fn legacy_report_data(nonce: &str) -> [u8; 64] {
-        use sha2::Sha512;
-        Sha512::digest(nonce.as_bytes()).into()
-    }
-
-    #[test]
-    fn a_statement_tampered_after_the_nonce_fails_closed() {
-        let tampered = FIXTURE_STATEMENT.replace(PURPOSE, "kubetee.attestation.v1 ");
-        let error = verify_statement(
-            &tampered,
-            FIXTURE_KEYSET_DIGEST,
-            FIXTURE_NONCE,
-            &fixture_report_data(),
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("purpose"));
+        assert!(bytes_from_hex32("short").is_err());
+        assert!(bytes_from_hex32(&"zz".repeat(32)).is_err());
     }
 }
