@@ -20,13 +20,16 @@ use x509_parser::x509::SubjectPublicKeyInfo;
 
 use crate::eventlog::{self, Register};
 use crate::kubetee_verify::binding;
+use crate::kubetee_verify::evidence_snp;
 use crate::tee_evidence;
 
 /// The `GET /v1/attestation` response body.
 #[derive(Clone, Debug, Deserialize)]
 pub struct AttestationPayload {
     pub nonce: String,
-    pub quote: String,
+    /// The Intel TDX quote (base64). `None` on an AMD SEV-SNP gateway, whose
+    /// hardware evidence lives in `evidence.snp` instead.
+    pub quote: Option<String>,
     pub cc_eventlog: Option<String>,
     pub key_possession: Option<KeyPossession>,
     #[serde(default)]
@@ -254,6 +257,15 @@ impl Measurements {
     }
 }
 
+/// The measured registers of an attested upstream, whichever TEE produced the
+/// hardware evidence: an Intel TDX TD ([`Measurements`]) or an AMD SEV-SNP guest
+/// ([`evidence_snp::SnpMeasurements`]).
+#[derive(Clone, Debug)]
+pub enum TeeMeasurements {
+    Tdx(Measurements),
+    Snp(evidence_snp::SnpMeasurements),
+}
+
 /// Check a verified attestation against the nonce this proxy sent, the
 /// `report_data` its v2 binding statement requires, the key-possession proof
 /// under the quote-bound key, and the certificate of the connection it
@@ -298,6 +310,47 @@ pub fn verify_attestation(
     Ok(measurements)
 }
 
+/// Check an AMD SEV-SNP attestation against the nonce this proxy sent, the
+/// `report_data` its v2 binding statement requires, the key-possession proof
+/// under the quote-bound key, and the connection's `evidence.snp` hardware
+/// evidence.
+///
+/// `binding` is from [`BindingGuard::run`] on the same response (which has
+/// already tied the served keyset to the connection's certificate). The SNP
+/// chain is root-anchored to AMD and the report signature checked in
+/// [`evidence_snp::verify_snp`].
+///
+/// # Errors
+///
+/// Returns an error naming the first check that fails: the echoed nonce, the
+/// SNP chain/report appraisal, the binding in `report_data`, or the
+/// key-possession proof.
+pub fn verify_attestation_snp(
+    payload: &AttestationPayload,
+    evidence_node: &serde_json::Value,
+    quote_report_data: Option<&str>,
+    nonce: &str,
+    binding: &Binding,
+) -> Result<TeeMeasurements> {
+    ensure!(
+        payload.nonce.as_bytes() == nonce.as_bytes(),
+        "KubeTEE echoed a different nonce"
+    );
+    let snp = evidence_snp::parse_snp(evidence_node)?;
+    let measurements = evidence_snp::verify_snp(&snp, quote_report_data)
+        .context("AMD SEV-SNP evidence appraisal")?;
+    ensure!(
+        measurements.report_data == binding.report_data,
+        "SNP report_data is not the kubetee.attestation.v2 binding for the nonce sent"
+    );
+    let possession = payload
+        .key_possession
+        .as_ref()
+        .context("KubeTEE attestation has no key_possession")?;
+    verify_key_possession(possession, &binding.report_data, &binding.bound_key)?;
+    Ok(TeeMeasurements::Snp(measurements))
+}
+
 fn verify_event_log(log: &str, quoted: &[Register; 4]) -> Result<()> {
     let log = STANDARD.decode(log).context("decode KubeTEE cc_eventlog")?;
     let replayed = eventlog::replay(&eventlog::parse(&log)?);
@@ -322,7 +375,7 @@ fn verify_event_log(log: &str, quoted: &[Register; 4]) -> Result<()> {
 /// both DER and raw `r||s` encodings are accepted). Any other spelling,
 /// a `report_data` of the wrong shape, or a signature under any other key
 /// fails closed.
-fn verify_key_possession(
+pub(crate) fn verify_key_possession(
     possession: &KeyPossession,
     report_data: &[u8; 64],
     bound_key: &[u8],
@@ -379,16 +432,29 @@ fn p256_point(pkix: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Log the replica and measured registers of a newly attested connection.
-pub fn log_attested(pod: &str, measurements: &Measurements) {
-    let [rtmr0, rtmr1, rtmr2, rtmr3] = measurements.rtmrs.map(hex::encode);
-    info!(
-        pod,
-        mrtd = hex::encode(measurements.mrtd),
-        mr_config_id = hex::encode(measurements.mr_config_id),
-        rtmr0,
-        rtmr1,
-        rtmr2,
-        rtmr3,
-        "KubeTEE connection attested"
-    );
+pub fn log_attested(pod: &str, measurements: &TeeMeasurements) {
+    match measurements {
+        TeeMeasurements::Tdx(m) => {
+            let [rtmr0, rtmr1, rtmr2, rtmr3] = m.rtmrs.map(hex::encode);
+            info!(
+                pod,
+                mrtd = hex::encode(m.mrtd),
+                mr_config_id = hex::encode(m.mr_config_id),
+                rtmr0,
+                rtmr1,
+                rtmr2,
+                rtmr3,
+                "KubeTEE connection attested"
+            );
+        }
+        TeeMeasurements::Snp(m) => {
+            info!(
+                pod,
+                measurement = hex::encode(m.measurement),
+                host_data = hex::encode(m.host_data),
+                policy = m.policy,
+                "KubeTEE connection attested"
+            );
+        }
+    }
 }

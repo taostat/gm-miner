@@ -34,6 +34,11 @@ ed25519-dalek = { version = "3.0", features = ["rand_core", "zeroize"] }
 sha2 = "0.11"
 hex = "0.4"
 dcap-qvl = { version = "0.6.1", default-features = false, features = ["std", "report", "ring", "default-x509"] }
+# AMD SEV-SNP evidence: the `sev` reference implementation for the report +
+# ARK->ASK->VCEK chain crypto (crypto_nossl = p384/sha2, no OpenSSL). Same
+# version + features as kubetee-attestation-verifier (the built-in AMD roots
+# are the shared anchor).
+sev = { version = "9.0.0", default-features = false, features = ["snp", "crypto_nossl"] }
 http-body-util = "0.1"
 hyper = { version = "1.6", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

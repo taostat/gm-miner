@@ -2,6 +2,10 @@
     clippy::unwrap_used,
     reason = "test fixtures intentionally fail hard on malformed local values"
 )]
+#![expect(
+    clippy::panic,
+    reason = "test helpers assert the recorded TDX fixture shape"
+)]
 
 //! The hardware evidence (quote, collateral, event log) is one live
 //! `kubetee.attestation` `GET /v1/attestation` response from `llm.kubetee.ai`
@@ -35,7 +39,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::binding;
-use super::evidence::{verify_attestation, Binding, BindingGuard, KeyPossession};
+use super::evidence::{verify_attestation, Binding, BindingGuard, KeyPossession, Measurements};
 use super::*;
 
 const FIXTURE_NOW: u64 = 1_793_789_636;
@@ -73,7 +77,7 @@ fn collateral() -> dcap_qvl::QuoteCollateralV3 {
 }
 
 fn quote() -> Vec<u8> {
-    STANDARD.decode(payload().quote).unwrap()
+    STANDARD.decode(payload().quote.unwrap()).unwrap()
 }
 
 fn claims() -> QuoteClaims {
@@ -226,6 +230,16 @@ fn verify_with_v2(
     let mut claims = claims();
     td_mut(&mut claims).report_data = v2.report_data;
     verify_attestation(payload, nonce, &claims, FIXTURE_NOW, &binding_of(v2))
+}
+
+/// The `Attestation.measurements` field is the TEE-dispatched enum; the
+/// fixtures are the recorded Intel TDX evidence, so every attested result is
+/// the `Tdx` arm. Panic if that ever changes.
+fn tdx(m: &TeeMeasurements) -> &Measurements {
+    match m {
+        TeeMeasurements::Tdx(t) => t,
+        TeeMeasurements::Snp(_) => panic!("expected TDX measurements"),
+    }
 }
 
 fn failure(result: Result<Measurements>) -> String {
@@ -1422,7 +1436,7 @@ async fn preflight_reports_the_attested_replica() {
     let (verifier, _) = serve(Evidence::Genuine, Chat::Served, limits()).await;
     let attested = verifier.preflight().await.unwrap();
     assert_eq!(attested.pod, "litellm-5dcbc54579-7rm6g");
-    assert_eq!(attested.measurements.rtmrs[3], [0; 48]);
+    assert_eq!(tdx(&attested.measurements).rtmrs[3], [0; 48]);
     assert_eq!(
         verifier.idle_connections(),
         0,

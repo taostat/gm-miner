@@ -16,6 +16,7 @@
 
 pub mod binding;
 pub mod evidence;
+pub mod evidence_snp;
 pub mod pool;
 
 use std::fmt;
@@ -40,7 +41,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::tee_evidence;
 use crate::upstream_proxy::{self, retry_attestation, strip_hop_by_hop, UpstreamConnection};
-use evidence::{AttestationPayload, Measurements};
+use evidence::{AttestationPayload, TeeMeasurements};
 use pool::{Lease, Limits, Pool};
 
 pub use crate::upstream_proxy::ATTESTATION_ATTEMPTS;
@@ -119,7 +120,7 @@ impl QuoteChain for Pccs {
 pub struct Attestation {
     pub pod: String,
     pub peer: SocketAddr,
-    pub measurements: Measurements,
+    pub measurements: TeeMeasurements,
     /// UTC deadline of the served keyset; the connection is not used after it.
     pub keyset_not_after: DateTime<Utc>,
 }
@@ -365,11 +366,46 @@ impl KubeteeVerifier {
                 .context("kubetee.attestation.v2 binding")?;
         let payload: AttestationPayload =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
-        let quote =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.quote)
-                .context("decode KubeTEE quote")?;
-        let (claims, now) = self.quote_chain.verify(&quote).await?;
-        let measurements = evidence::verify_attestation(&payload, &nonce, &claims, now, &binding)?;
+        let root: Value =
+            serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
+        let evidence_node = root.get("evidence");
+        let tee = root.get("tee").and_then(Value::as_str).unwrap_or("");
+        let snp_node = evidence_node
+            .and_then(|e| e.get("snp"))
+            .filter(|n| !n.is_null());
+        // Dispatch on the TEE that produced the hardware evidence: an AMD
+        // SEV-SNP gateway (tee: snp) serves evidence.snp; the Intel TDX path
+        // serves quote. Anything inconsistent fails closed.
+        let measurements = match (tee, &snp_node) {
+            ("snp", Some(snp_node)) => {
+                let quote_report_data = evidence_node
+                    .and_then(|e| e.get("quote_report_data"))
+                    .and_then(Value::as_str);
+                evidence::verify_attestation_snp(
+                    &payload,
+                    snp_node,
+                    quote_report_data,
+                    &nonce,
+                    &binding,
+                )
+                .context("kubetee.attestation.v2 SNP evidence")?
+            }
+            ("snp", None) => bail!("KubeTEE tee=snp but evidence.snp is absent"),
+            (_, Some(_)) => bail!("KubeTEE evidence.snp present but tee is not snp"),
+            (_, None) => {
+                let tdx_quote = payload
+                    .quote
+                    .as_deref()
+                    .context("KubeTEE attestation has no TDX quote or SNP evidence")?;
+                let tdx_quote =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, tdx_quote)
+                        .context("decode KubeTEE quote")?;
+                let (claims, now) = self.quote_chain.verify(&tdx_quote).await?;
+                TeeMeasurements::Tdx(evidence::verify_attestation(
+                    &payload, &nonce, &claims, now, &binding,
+                )?)
+            }
+        };
         binding.ensure_current(Utc::now())?;
         evidence::log_attested(&payload.pod, &measurements);
         Ok((
