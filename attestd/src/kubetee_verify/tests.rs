@@ -2,42 +2,51 @@
     clippy::unwrap_used,
     reason = "test fixtures intentionally fail hard on malformed local values"
 )]
+#![expect(
+    clippy::panic,
+    reason = "test helpers assert the recorded TDX fixture shape"
+)]
 
-//! The evidence is one live `kubetee.attestation.v1` `GET /v1/attestation`
-//! response from `llm.kubetee.ai` (2026-11-04, pod
-//! `litellm-5dcbc54579-7rm6g`), the leaf certificate it was served under,
-//! and the Intel collateral for its quote, verified offline at
-//! [`FIXTURE_NOW`].
-//!
-//! The end-to-end tests serve that quote from a local TLS server whose
-//! certificate chains to a test root, and which signs the TLS-possession
-//! proof with its own test key. Its v1 keyset names the test leaf, so the
-//! quote's signature chain is verified for real and its `report_data` is then
-//! set to that keyset's binding: [`FixtureChain`] is the only substitution.
+//! The hardware evidence (quote, collateral, event log) is one live
+//! `kubetee.attestation` `GET /v1/attestation` response from `llm.kubetee.ai`
+//! (2026-11-04, pod `litellm-5dcbc54579-7rm6g`) and the Intel collateral for
+//! its quote. The **binding** is rebuilt as `kubetee.attestation.v2` around a
+//! per-boot generated key (the quote's `report_data` is set to that key's
+//! binding), since v2 is the only contract this proxy accepts. The end-to-end
+//! tests serve that quote from a local TLS server whose certificate chains to
+//! a test root and which signs the v2 key-possession proof with its own
+//! per-boot key. [`FixtureChain`] is the only substitution on the hardware
+//! path.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine as _;
 use dcap_qvl::policy::QuoteClaims;
 use dcap_qvl::quote::{EnclaveReport, Report, TDReport10};
 use dcap_qvl::tcb_info::TcbStatus;
 use http_body_util::{Either, Full};
 use hyper::service::service_fn;
 use ring::rand::SystemRandom;
-use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+use ring::signature::{
+    EcdsaKeyPair, KeyPair as _, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P256_SHA256_FIXED_SIGNING,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::binding;
-use super::evidence::{verify_attestation, BindingGuard};
+use super::evidence::{verify_attestation, Binding, BindingGuard, KeyPossession, Measurements};
 use super::*;
 
 const FIXTURE_NOW: u64 = 1_793_789_636;
 /// Within the test leaf's validity, which ends in 2126.
 const TEST_KEYSET_NOT_AFTER: &str = "2126-01-01T00:00:00Z";
+/// The v2 binding context the gateway mints (`KUBETEE_V2_CONTEXT`).
+const CONTEXT: &str = "llm.kubetee.ai/tls-possession";
 const ATTESTATION: &[u8] = include_bytes!("../../tests/fixtures/kubetee/attestation.json");
 const SESSION_LEAF: &[u8] = include_bytes!("../../tests/fixtures/kubetee/session_leaf.der");
 const COLLATERAL: &[u8] = include_bytes!("../../tests/fixtures/kubetee/collateral.json");
@@ -46,6 +55,14 @@ const TEST_LEAF: &[u8] = include_bytes!("../../tests/fixtures/kubetee/test_leaf.
 const TEST_KEY: &[u8] = include_bytes!("../../tests/fixtures/kubetee/test_leaf_key.pk8");
 const FIRST_EVENT: &[u8] = b"data: {\"choices\":[]}\n\n";
 const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n";
+
+/// The fixed DER `SubjectPublicKeyInfo` header for an uncompressed P-256 key
+/// (RFC 5480 `id-ecPublicKey` + `prime256v1`), followed by the 65-byte SEC1
+/// point. Total DER is 91 bytes.
+const P256_SPKI_HEADER: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
 
 fn payload() -> AttestationPayload {
     serde_json::from_slice(ATTESTATION).unwrap()
@@ -60,7 +77,7 @@ fn collateral() -> dcap_qvl::QuoteCollateralV3 {
 }
 
 fn quote() -> Vec<u8> {
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload().quote).unwrap()
+    STANDARD.decode(payload().quote.unwrap()).unwrap()
 }
 
 fn claims() -> QuoteClaims {
@@ -79,111 +96,469 @@ fn fixture_time() -> DateTime<Utc> {
     DateTime::from_timestamp(i64::try_from(FIXTURE_NOW).unwrap(), 0).unwrap()
 }
 
-/// The `report_data` the recorded response's v1 statement binds.
-fn bound() -> [u8; 64] {
-    BindingGuard::run(ATTESTATION, &payload().nonce, SESSION_LEAF, fixture_time())
-        .unwrap()
-        .report_data
+/// A per-boot generated P-256 key, the DER SPKI the quote binds, and its raw
+/// uncompressed point.
+struct PerBootKey {
+    pair: EcdsaKeyPair,
+    pkix: Vec<u8>,
+    point: Vec<u8>,
 }
 
-fn standalone(payload: &AttestationPayload, nonce: &str, claims: &QuoteClaims) -> Result<()> {
-    verify_attestation(payload, nonce, SESSION_LEAF, claims, FIXTURE_NOW, &bound()).map(|_| ())
+impl PerBootKey {
+    fn generate(alg: &'static ring::signature::EcdsaSigningAlgorithm) -> Self {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap();
+        let point = pair.public_key().as_ref().to_vec();
+        let mut pkix = P256_SPKI_HEADER.to_vec();
+        pkix.extend_from_slice(&point);
+        Self { pair, pkix, point }
+    }
+
+    fn es256() -> Self {
+        Self::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+    }
+
+    /// Sign the quote-bound 64-byte `report_data` (DER encoding).
+    fn possession(&self, report_data: &[u8; 64]) -> KeyPossession {
+        let signature = self.pair.sign(&SystemRandom::new(), report_data).unwrap();
+        KeyPossession {
+            input: binding::POSSESSION_INPUT.to_owned(),
+            alg: binding::POSSESSION_ALG.to_owned(),
+            signature_b64: STANDARD.encode(signature.as_ref()),
+        }
+    }
 }
 
-fn failure(result: Result<()>) -> String {
+/// The v2 binding inputs and derived artifacts for a nonce and bound key.
+struct V2Binding {
+    keyset: Value,
+    digest: String,
+    statement: String,
+    report_data: [u8; 64],
+    bound_key: Vec<u8>,
+    not_after: DateTime<Utc>,
+}
+
+fn keyset_for(leaf: &[u8], not_after: &str) -> Value {
+    let (_, certificate) = x509_parser::parse_x509_certificate(leaf).unwrap();
+    serde_json::json!({
+        "subject": format!("{}/{HOST_NAME}", binding::PURPOSE),
+        "not_after": not_after,
+        "tls_public_keys": [{
+            "domain": HOST_NAME,
+            "spki_sha256": hex::encode(Sha256::digest(certificate.public_key().raw)),
+        }],
+        "signing_keys": [],
+        "e2ee_keys": [],
+    })
+}
+
+/// Build a self-consistent v2 binding around `key` for `nonce`, with the
+/// `report_data` the quote commits (or the derived one when `None`).
+fn v2_binding_with(
+    key: &PerBootKey,
+    nonce: &str,
+    leaf: &[u8],
+    not_after: &str,
+    report_data: Option<[u8; 64]>,
+) -> V2Binding {
+    let keyset = keyset_for(leaf, not_after);
+    let digest = binding::keyset_digest(&keyset).unwrap();
+    let pkix_b64url = URL_SAFE_NO_PAD.encode(&key.pkix);
+    let statement =
+        binding::report_data_statement_v2(&digest, nonce, &pkix_b64url, CONTEXT).unwrap();
+    let raw_nonce = binding::bytes_from_hex32(&binding::normalize_nonce(nonce).unwrap()).unwrap();
+    let report_data = match report_data {
+        Some(report_data) => report_data,
+        None => binding::report_data_v2(&key.pkix, &raw_nonce, CONTEXT).unwrap(),
+    };
+    V2Binding {
+        keyset,
+        digest,
+        statement,
+        report_data,
+        bound_key: key.point.clone(),
+        not_after: not_after.parse().unwrap(),
+    }
+}
+
+fn binding_of(v2: &V2Binding) -> Binding {
+    Binding {
+        report_data: v2.report_data,
+        bound_key: v2.bound_key.clone(),
+        not_after: v2.not_after,
+    }
+}
+
+/// The JSON body a v2 response serves for `v2`, with a `key_possession`
+/// proof signed by `key` over the quote-bound `report_data`.
+fn v2_body(v2: &V2Binding, nonce: &str, possession: Option<KeyPossession>) -> Vec<u8> {
+    let mut payload: Value = serde_json::from_slice(ATTESTATION).unwrap();
+    payload["nonce"] = Value::from(nonce.to_owned());
+    payload["keyset"] = v2.keyset.clone();
+    payload["bindings"] = serde_json::json!({
+        "version": binding::PURPOSE,
+        "report_data_statement": v2.statement,
+        "keyset_digest": v2.digest,
+    });
+    if let Some(possession) = possession {
+        payload["key_possession"] = serde_json::json!({
+            "input": possession.input,
+            "alg": possession.alg,
+            "signature_b64": possession.signature_b64,
+        });
+    } else {
+        payload["key_possession"] = Value::Null;
+    }
+    serde_json::to_vec(&payload).unwrap()
+}
+
+/// A v2 attestation payload with a `key_possession` proof under `key`.
+fn v2_payload(v2: &V2Binding, key: &PerBootKey, nonce: &str) -> AttestationPayload {
+    let body = v2_body(v2, nonce, Some(key.possession(&v2.report_data)));
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// Verify `payload` against `nonce` and the recorded quote's real chain, with
+/// the quote's `report_data` set to `v2`'s binding (the only substitution).
+fn verify_with_v2(
+    payload: &AttestationPayload,
+    nonce: &str,
+    v2: &V2Binding,
+) -> Result<Measurements> {
+    let mut claims = claims();
+    td_mut(&mut claims).report_data = v2.report_data;
+    verify_attestation(payload, nonce, &claims, FIXTURE_NOW, &binding_of(v2))
+}
+
+/// The `Attestation.measurements` field is the TEE-dispatched enum; the
+/// fixtures are the recorded Intel TDX evidence, so every attested result is
+/// the `Tdx` arm. Panic if that ever changes.
+fn tdx(m: &TeeMeasurements) -> &Measurements {
+    match m {
+        TeeMeasurements::Tdx(t) => t,
+        TeeMeasurements::Snp(_) => panic!("expected TDX measurements"),
+    }
+}
+
+fn failure(result: Result<Measurements>) -> String {
     format!("{:#}", result.unwrap_err())
 }
 
+/// The cross-language derivation KAT (shared with `kubetee_binding.py` and
+/// `kubetee-attestation-verifier`): the frozen `report_data` for a known
+/// `(pkix, nonce, context)` transcript.
 #[test]
-fn the_live_attestation_verifies_offline() {
-    let payload = payload();
-    let binding =
-        BindingGuard::run(ATTESTATION, &payload.nonce, SESSION_LEAF, fixture_time()).unwrap();
-    assert_eq!(
-        binding.not_after,
-        "2026-12-21T10:08:05Z".parse::<DateTime<Utc>>().unwrap()
-    );
-    let measurements = verify_attestation(
-        &payload,
-        &payload.nonce,
-        SESSION_LEAF,
-        &claims(),
-        FIXTURE_NOW,
-        &binding.report_data,
+fn the_v2_report_data_matches_the_cross_language_kat() {
+    let pkix = hex::decode(
+        "302a300506032b6570032100000102030405060708090a0b0c0d0e0f\
+         101112131415161718191a1b1c1d1e1f",
     )
     .unwrap();
+    let nonce = [0xaa_u8; 32];
+    let rd = binding::report_data_v2(&pkix, &nonce, "kubetee-test-context").unwrap();
+    assert_eq!(
+        hex::encode(rd),
+        "7c7f82da79e64d00bb228bf3bd7075ea31b938759d00162f1f1d83021f245e24\
+         eff25929ec5761309dbbc014119dc4c000000000000000000000000000000000"
+            .replace(char::is_whitespace, "")
+    );
+}
+
+/// The end-to-end shape: a v2 response binds the per-boot key and its
+/// `key_possession` verifies under that key.
+#[test]
+fn the_live_hardware_evidence_verifies_offline_under_a_v2_binding() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let payload = v2_payload(&v2, &key, &nonce);
+    let measurements = verify_with_v2(&payload, &nonce, &v2).unwrap();
     assert_eq!(measurements.rtmrs[3], [0; 48], "RTMR3 carries no events");
     assert_ne!(measurements.rtmrs[2], [0; 48]);
+    // The quote-bound report_data is the v2 derivation.
+    assert_eq!(
+        v2.report_data[..48],
+        binding::report_data_v2(
+            &key.pkix,
+            &binding::bytes_from_hex32(&nonce).unwrap(),
+            CONTEXT
+        )
+        .unwrap()[..48]
+    );
+    assert!(v2.report_data[48..].iter().all(|b| *b == 0));
 }
 
 #[test]
-fn the_live_response_without_its_v1_fields_fails_closed() {
-    let mut body: Value = serde_json::from_slice(ATTESTATION).unwrap();
+fn the_binding_binds_the_per_boot_key() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let bound = BindingGuard::run(
+        &v2_body(&v2, &nonce, Some(key.possession(&v2.report_data))),
+        &nonce,
+        TEST_LEAF,
+        fixture_time(),
+    )
+    .unwrap();
+    assert_eq!(bound.report_data, v2.report_data);
+    assert_eq!(bound.bound_key, key.point);
+    assert_eq!(bound.not_after, v2.not_after);
+}
+
+#[test]
+fn a_response_without_its_v2_fields_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let mut body: Value = serde_json::from_slice(&v2_body(&v2, &nonce, None)).unwrap();
     let fields = body.as_object_mut().unwrap();
     fields.remove("keyset");
     fields.remove("bindings");
-    let body = serde_json::to_vec(&body).unwrap();
-    let error =
-        BindingGuard::run(&body, &payload().nonce, SESSION_LEAF, fixture_time()).unwrap_err();
-    assert!(format!("{error:#}").contains("no kubetee.attestation.v1 binding"));
+    let error = BindingGuard::run(
+        &serde_json::to_vec(&body).unwrap(),
+        &nonce,
+        TEST_LEAF,
+        fixture_time(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("no kubetee.attestation.v2 binding"));
+}
+
+#[test]
+fn a_half_v2_response_fails_closed() {
+    let body = br#"{"nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","keyset":{}}"#;
+    let error = BindingGuard::run(body, &payload().nonce, TEST_LEAF, fixture_time()).unwrap_err();
+    assert!(format!("{error:#}").contains("half a v2 binding"));
+}
+
+#[test]
+fn a_non_v2_version_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let mut body: Value = serde_json::from_slice(&v2_body(&v2, &nonce, None)).unwrap();
+    body["bindings"]["version"] = Value::from("kubetee.attestation.v1");
+    let error = BindingGuard::run(
+        &serde_json::to_vec(&body).unwrap(),
+        &nonce,
+        TEST_LEAF,
+        fixture_time(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("version"));
+}
+
+/// Anti-downgrade: a statement re-serialized outside canonical JCS is not the
+/// derivation's fixed point and is rejected.
+#[test]
+fn a_non_canonical_v2_statement_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    // Shuffle key order + add whitespace: valid JSON, not canonical JCS.
+    let reordered = format!(
+        r#"{{"purpose":"{}","pkix_pubkey_b64url":"{pkix}","nonce":"{nonce}","keyset_digest":"{digest}","context":"{ctx}"}}"#,
+        binding::PURPOSE,
+        pkix = URL_SAFE_NO_PAD.encode(&key.pkix),
+        digest = v2.digest,
+        ctx = CONTEXT,
+    );
+    let mut body: Value = serde_json::from_slice(&v2_body(&v2, &nonce, None)).unwrap();
+    body["bindings"]["report_data_statement"] = Value::from(reordered);
+    let error = BindingGuard::run(
+        &serde_json::to_vec(&body).unwrap(),
+        &nonce,
+        TEST_LEAF,
+        fixture_time(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("canonical JCS"));
+}
+
+#[test]
+fn a_statement_bound_to_a_different_key_reproduces_a_different_report_data() {
+    let key = PerBootKey::es256();
+    let other = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let other_v2 = v2_binding_with(&other, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    assert_ne!(v2.report_data, other_v2.report_data);
+    // A possession proof under the other key must not verify against `v2`.
+    let payload = v2_payload(&v2, &key, &nonce);
+    let mut tampered = payload.clone();
+    tampered.key_possession = Some(other.possession(&v2.report_data));
+    assert!(failure(verify_with_v2(&tampered, &nonce, &v2)).contains("does not verify"));
+}
+
+#[test]
+fn a_key_possession_over_a_different_report_data_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let payload = v2_payload(&v2, &key, &nonce);
+    // Sign the wrong bytes (another key's report_data) under the right key.
+    let other = PerBootKey::es256();
+    let wrong = binding::report_data_v2(
+        &other.pkix,
+        &binding::bytes_from_hex32(&nonce).unwrap(),
+        CONTEXT,
+    )
+    .unwrap();
+    let mut tampered = payload.clone();
+    tampered.key_possession = Some(key.possession(&wrong));
+    assert!(failure(verify_with_v2(&tampered, &nonce, &v2)).contains("does not verify"));
+}
+
+#[test]
+fn a_missing_key_possession_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let mut payload = v2_payload(&v2, &key, &nonce);
+    payload.key_possession = None;
+    assert!(failure(verify_with_v2(&payload, &nonce, &v2)).contains("no key_possession"));
+}
+
+#[test]
+fn a_key_possession_naming_the_wrong_input_or_algorithm_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let payload = v2_payload(&v2, &key, &nonce);
+
+    let mut wrong_input = payload.clone();
+    let mut p = key.possession(&v2.report_data);
+    p.input = "nonce".to_owned();
+    wrong_input.key_possession = Some(p);
+    assert!(failure(verify_with_v2(&wrong_input, &nonce, &v2)).contains("input is"));
+
+    let mut wrong_alg = payload.clone();
+    let mut p = key.possession(&v2.report_data);
+    p.alg = "RS256".to_owned();
+    wrong_alg.key_possession = Some(p);
+    assert!(failure(verify_with_v2(&wrong_alg, &nonce, &v2)).contains("signature is"));
 }
 
 #[test]
 fn a_quote_carrying_the_sha512_nonce_construction_fails_the_binding() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let payload = v2_payload(&v2, &key, &nonce);
     let mut claims = claims();
-    let nonce = payload().nonce;
-    td_mut(&mut claims).report_data = sha2::Sha512::digest(nonce.as_bytes()).into();
-    assert!(failure(standalone(&payload(), &nonce, &claims)).contains("report_data"));
-}
-
-#[test]
-fn a_different_echoed_nonce_fails_closed() {
-    let mut payload = payload();
-    let nonce = payload.nonce.clone();
-    payload.nonce = hex::encode([7_u8; 32]);
-    assert!(failure(standalone(&payload, &nonce, &claims())).contains("echoed a different nonce"));
-}
-
-#[test]
-fn an_uppercased_echo_is_not_the_nonce_sent() {
-    let mut payload = payload();
-    let nonce = payload.nonce.clone();
-    payload.nonce = nonce.to_uppercase();
-    assert!(failure(standalone(&payload, &nonce, &claims())).contains("echoed a different nonce"));
-}
-
-#[test]
-fn a_replayed_response_under_a_new_nonce_fails_the_statement() {
-    let fresh = hex::encode([9_u8; 32]);
-    let error = BindingGuard::run(ATTESTATION, &fresh, SESSION_LEAF, fixture_time()).unwrap_err();
-    assert!(format!("{error:#}").contains("different nonce"));
-}
-
-#[test]
-fn a_replayed_quote_under_a_restated_nonce_fails_the_binding() {
-    let original: Value = serde_json::from_slice(ATTESTATION).unwrap();
-    let digest = original["bindings"]["keyset_digest"].as_str().unwrap();
-    let mut payload = payload();
-    let fresh = hex::encode([9_u8; 32]);
-    payload.nonce.clone_from(&fresh);
-    let restated = format!(
-        "{{\"keyset_digest\":\"{digest}\",\"nonce\":\"{fresh}\",\"purpose\":\"{}\"}}",
-        binding::PURPOSE
-    );
-    let report_data = binding::report_data_of_statement(&restated, digest, &fresh).unwrap();
-    let result = verify_attestation(
-        &payload,
-        &fresh,
-        SESSION_LEAF,
-        &claims(),
-        FIXTURE_NOW,
-        &report_data,
-    );
+    let mut legacy = [0_u8; 64];
+    legacy[..32].copy_from_slice(&Sha256::digest(nonce.as_bytes()));
+    td_mut(&mut claims).report_data = legacy;
+    let result = verify_attestation(&payload, &nonce, &claims, FIXTURE_NOW, &binding_of(&v2));
     assert!(format!("{:#}", result.unwrap_err()).contains("report_data"));
 }
 
 #[test]
+fn a_different_echoed_nonce_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let mut payload = v2_payload(&v2, &key, &nonce);
+    payload.nonce = hex::encode([7_u8; 32]);
+    assert!(failure(verify_with_v2(&payload, &nonce, &v2)).contains("echoed a different nonce"));
+}
+
+#[test]
+fn an_uppercased_echo_is_not_the_nonce_sent() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let mut payload = v2_payload(&v2, &key, &nonce);
+    payload.nonce = nonce.to_uppercase();
+    assert!(failure(verify_with_v2(&payload, &nonce, &v2)).contains("echoed a different nonce"));
+}
+
+#[test]
+fn a_replayed_response_under_a_new_nonce_fails_the_statement() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let body = v2_body(&v2, &nonce, None);
+    let fresh = hex::encode([9_u8; 32]);
+    let error = BindingGuard::run(&body, &fresh, TEST_LEAF, fixture_time()).unwrap_err();
+    assert!(format!("{error:#}").contains("names a different nonce"));
+}
+
+#[test]
+fn a_served_keyset_for_another_serving_key_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let mut v2 = v2_binding_with(&key, &nonce, SESSION_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    // Name a keyset built for a different leaf's key.
+    v2.keyset = keyset_for(TEST_LEAF, TEST_KEYSET_NOT_AFTER);
+    v2.digest = binding::keyset_digest(&v2.keyset).unwrap();
+    let error = BindingGuard::run(
+        &v2_body(&v2, &nonce, None),
+        &nonce,
+        SESSION_LEAF,
+        fixture_time(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("serving key"));
+}
+
+#[test]
+fn an_expired_keyset_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, "2000-01-01T00:00:00Z", None);
+    let error = BindingGuard::run(
+        &v2_body(&v2, &nonce, None),
+        &nonce,
+        TEST_LEAF,
+        fixture_time(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("expired"));
+}
+
+#[test]
+fn a_binding_expires_at_its_deadline_including_after_verification_work() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let deadline = "2026-12-01T00:00:00.123456789Z"
+        .parse::<DateTime<Utc>>()
+        .unwrap();
+    let v2 = v2_binding_with(
+        &key,
+        &nonce,
+        TEST_LEAF,
+        "2026-12-01T00:00:00.123456789Z",
+        None,
+    );
+    let before = deadline - chrono::Duration::nanoseconds(1);
+    let binding =
+        BindingGuard::run(&v2_body(&v2, &nonce, None), &nonce, TEST_LEAF, before).unwrap();
+    assert_eq!(binding.not_after, deadline);
+    binding.ensure_current(before).unwrap();
+    for now in [deadline, deadline + chrono::Duration::nanoseconds(1)] {
+        assert!(binding
+            .ensure_current(now)
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+        assert!(
+            BindingGuard::run(&v2_body(&v2, &nonce, None), &nonce, TEST_LEAF, now)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+    }
+}
+
+#[test]
 fn an_sgx_report_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let payload = v2_payload(&v2, &key, &nonce);
     let mut claims = claims();
     claims.report = Report::SgxEnclave(EnclaveReport {
         cpu_svn: [0; 16],
@@ -199,90 +574,72 @@ fn an_sgx_report_fails_closed() {
         reserved4: [0; 60],
         report_data: [0; 64],
     });
-    let payload = payload();
-    assert!(failure(standalone(&payload, &payload.nonce, &claims)).contains("SGX"));
+    let result = verify_attestation(&payload, &nonce, &claims, FIXTURE_NOW, &binding_of(&v2));
+    assert!(format!("{:#}", result.unwrap_err()).contains("SGX"));
 }
 
 #[test]
 fn a_tcb_below_up_to_date_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let payload = v2_payload(&v2, &key, &nonce);
     let mut claims = claims();
     claims.platform.tcb_level.tcb_status = TcbStatus::SWHardeningNeeded;
-    let payload = payload();
-    assert!(failure(standalone(&payload, &payload.nonce, &claims)).contains("TCB"));
+    td_mut(&mut claims).report_data = v2.report_data;
+    let result = verify_attestation(&payload, &nonce, &claims, FIXTURE_NOW, &binding_of(&v2));
+    assert!(format!("{:#}", result.unwrap_err()).contains("TCB"));
 }
 
 #[test]
 fn a_debug_td_fails_closed() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let payload = v2_payload(&v2, &key, &nonce);
     let mut claims = claims();
     td_mut(&mut claims).td_attributes[0] |= 1;
-    let payload = payload();
-    assert!(failure(standalone(&payload, &payload.nonce, &claims)).contains("debug"));
+    td_mut(&mut claims).report_data = v2.report_data;
+    let result = verify_attestation(&payload, &nonce, &claims, FIXTURE_NOW, &binding_of(&v2));
+    assert!(format!("{:#}", result.unwrap_err()).contains("debug"));
 }
 
 #[test]
 fn a_missing_event_log_fails_closed() {
-    let mut payload = payload();
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let mut payload = v2_payload(&v2, &key, &nonce);
     payload.cc_eventlog = None;
-    assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("cc_eventlog"));
+    assert!(failure(verify_with_v2(&payload, &nonce, &v2)).contains("cc_eventlog"));
 }
 
 #[test]
 fn a_tampered_event_log_does_not_replay() {
-    let mut payload = payload();
-    let engine = base64::engine::general_purpose::STANDARD;
-    let mut log = base64::Engine::decode(&engine, payload.cc_eventlog.as_deref().unwrap()).unwrap();
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let mut payload = v2_payload(&v2, &key, &nonce);
+    let mut log = STANDARD
+        .decode(payload.cc_eventlog.as_deref().unwrap())
+        .unwrap();
     let first_record = 32 + u32::from_le_bytes(log[28..32].try_into().unwrap()) as usize;
     log[first_record + 12 + 2] ^= 1;
-    payload.cc_eventlog = Some(base64::Engine::encode(&engine, log));
-    assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("RTMR0"));
+    payload.cc_eventlog = Some(STANDARD.encode(log));
+    assert!(failure(verify_with_v2(&payload, &nonce, &v2)).contains("RTMR0"));
 }
 
 #[test]
 fn an_rtmr3_extended_without_events_does_not_replay() {
+    let key = PerBootKey::es256();
+    let nonce = hex::encode(fixture_nonce());
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    let payload = v2_payload(&v2, &key, &nonce);
     let mut claims = claims();
     td_mut(&mut claims).rt_mr3[0] ^= 1;
-    let payload = payload();
-    assert!(failure(standalone(&payload, &payload.nonce, &claims)).contains("RTMR3"));
-}
-
-#[test]
-fn a_proof_for_another_certificate_fails_closed() {
-    let payload = payload();
-    let result = verify_attestation(
-        &payload,
-        &payload.nonce,
-        TEST_LEAF,
-        &claims(),
-        FIXTURE_NOW,
-        &bound(),
-    );
-    assert!(format!("{:#}", result.unwrap_err()).contains("other than this connection's"));
-}
-
-#[test]
-fn a_bad_tls_signature_fails_closed() {
-    let mut payload = payload();
-    let possession = payload.tls_possession.as_mut().unwrap();
-    let engine = base64::engine::general_purpose::STANDARD;
-    let mut signature = base64::Engine::decode(&engine, &possession.tls_signature).unwrap();
-    signature[10] ^= 1;
-    possession.tls_signature = base64::Engine::encode(&engine, signature);
-    assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("does not verify"));
-}
-
-#[test]
-fn an_unnamed_signature_algorithm_fails_closed() {
-    let mut payload = payload();
-    payload.tls_possession.as_mut().unwrap().tls_signature_alg = "PS256".to_owned();
-    assert!(failure(standalone(&payload, &payload.nonce, &claims()))
-        .contains("expected ES256 or RS256"));
-}
-
-#[test]
-fn an_es256_proof_over_the_rsa_session_key_fails_closed() {
-    let mut payload = payload();
-    payload.tls_possession.as_mut().unwrap().tls_signature_alg = "ES256".to_owned();
-    assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("not P-256"));
+    td_mut(&mut claims).report_data = v2.report_data;
+    let result = verify_attestation(&payload, &nonce, &claims, FIXTURE_NOW, &binding_of(&v2));
+    assert!(format!("{:#}", result.unwrap_err()).contains("RTMR3"));
 }
 
 #[test]
@@ -353,9 +710,9 @@ enum Chat {
 enum Evidence {
     Genuine,
     Unavailable,
-    /// The proof the recorded session carried, naming that session's certificate.
-    OtherCertificate,
-    /// The recorded quote, echoed under a nonce other than the one sent.
+    /// A `key_possession` proof under a per-boot key the quote does not bind.
+    OtherKey,
+    /// The recorded response echoed under a nonce other than the one sent.
     Replayed,
     /// The recorded response without its `keyset` and `bindings`.
     Unbound,
@@ -375,41 +732,27 @@ struct Upstream {
     attestation_requests: Mutex<Vec<(String, HeaderMap, usize)>>,
 }
 
-/// The v1 binding the local upstream serves for the test leaf and the
-/// fixture nonce.
+/// The per-boot key + v2 binding the local upstream serves for the test leaf
+/// and the fixture nonce: one pair for the whole test, since the quote's
+/// `report_data` and the possession signature must agree on it.
 struct TestBinding {
-    keyset: Value,
-    digest: String,
-    statement: String,
-    report_data: [u8; 64],
+    key: PerBootKey,
+    v2: V2Binding,
+    nonce: String,
 }
 
-fn test_binding() -> TestBinding {
-    let (_, leaf) = x509_parser::parse_x509_certificate(TEST_LEAF).unwrap();
-    let keyset = serde_json::json!({
-        "subject": format!("{}/{HOST_NAME}", binding::PURPOSE),
-        "not_after": TEST_KEYSET_NOT_AFTER,
-        "tls_public_keys": [{
-            "domain": HOST_NAME,
-            "spki_sha256": hex::encode(Sha256::digest(leaf.public_key().raw)),
-        }],
-        "signing_keys": [],
-        "e2ee_keys": [],
-    });
-    let digest = binding::recompute_keyset_digest(&keyset).unwrap();
-    let statement = format!(
-        "{{\"keyset_digest\":\"{digest}\",\"nonce\":\"{}\",\"purpose\":\"{}\"}}",
-        payload().nonce,
-        binding::PURPOSE
-    );
-    let report_data =
-        binding::report_data_of_statement(&statement, &digest, &payload().nonce).unwrap();
-    TestBinding {
-        keyset,
-        digest,
-        statement,
-        report_data,
-    }
+/// The recorded quote's `report_data` is replaced — the one substitution — by
+/// the value the served v2 statement derives, exactly as the hardware quote
+/// binds whatever `report_data` the guest minted its binding into.
+static TEST_BINDING: LazyLock<TestBinding> = LazyLock::new(|| {
+    let key = PerBootKey::generate(&ECDSA_P256_SHA256_FIXED_SIGNING);
+    let nonce = payload().nonce.clone();
+    let v2 = v2_binding_with(&key, &nonce, TEST_LEAF, TEST_KEYSET_NOT_AFTER, None);
+    TestBinding { key, v2, nonce }
+});
+
+fn test_binding() -> &'static TestBinding {
+    &TEST_BINDING
 }
 
 struct FixtureChain;
@@ -418,55 +761,32 @@ struct FixtureChain;
 impl QuoteChain for FixtureChain {
     async fn verify(&self, quote: &[u8]) -> Result<(QuoteClaims, u64)> {
         let mut claims = tee_evidence::verify_signature_chain(quote, collateral(), FIXTURE_NOW)?;
-        td_mut(&mut claims).report_data = test_binding().report_data;
+        td_mut(&mut claims).report_data = test_binding().v2.report_data;
         Ok((claims, FIXTURE_NOW))
     }
 }
 
-fn sign(nonce: &str) -> String {
-    let key = RsaKeyPair::from_pkcs8(TEST_KEY).unwrap();
-    let mut signature = vec![0; key.public().modulus_len()];
-    key.sign(
-        &RSA_PKCS1_SHA256,
-        &SystemRandom::new(),
-        nonce.as_bytes(),
-        &mut signature,
-    )
-    .unwrap();
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature)
-}
-
 fn attestation_body(evidence: Evidence) -> Vec<u8> {
-    let mut payload: Value = serde_json::from_slice(ATTESTATION).unwrap();
-    let nonce = payload["nonce"].as_str().unwrap().to_owned();
-    if !matches!(evidence, Evidence::OtherCertificate) {
-        payload["tls_possession"] = serde_json::json!({
-            "tls_signature": sign(&nonce),
-            "tls_signature_alg": "RS256",
-            "tls_signature_input": "sha256(nonce)",
-            "tls_cert_sha256": hex::encode(Sha256::digest(TEST_LEAF)),
-        });
-    }
     let served = test_binding();
-    payload["keyset"] = served.keyset;
-    payload["bindings"] = serde_json::json!({
-        "version": binding::PURPOSE,
-        "report_data_statement": served.statement,
-        "keyset_digest": served.digest,
-    });
-    match evidence {
-        Evidence::Replayed => payload["nonce"] = Value::from(hex::encode([5_u8; 32])),
-        Evidence::Unbound => {
-            let fields = payload.as_object_mut().unwrap();
-            fields.remove("keyset");
-            fields.remove("bindings");
-        }
-        Evidence::Genuine
-        | Evidence::Unavailable
-        | Evidence::OtherCertificate
-        | Evidence::Stalled => {}
+    let nonce = match evidence {
+        Evidence::Replayed => hex::encode([5_u8; 32]),
+        _ => served.nonce.clone(),
+    };
+    // The possession proof is over the served binding's report_data (the same
+    // one FixtureChain puts in the quote), so `Genuine` verifies end to end.
+    let possession = match evidence {
+        Evidence::OtherKey => Some(PerBootKey::es256().possession(&served.v2.report_data)),
+        _ => Some(served.key.possession(&served.v2.report_data)),
+    };
+    let mut body: Value =
+        serde_json::from_slice(&v2_body(&served.v2, &served.nonce, possession)).unwrap();
+    body["nonce"] = Value::from(nonce);
+    if matches!(evidence, Evidence::Unbound) {
+        let fields = body.as_object_mut().unwrap();
+        fields.remove("keyset");
+        fields.remove("bindings");
     }
-    serde_json::to_vec(&payload).unwrap()
+    serde_json::to_vec(&body).unwrap()
 }
 
 type Reply = Response<Either<Full<Bytes>, Frames>>;
@@ -842,7 +1162,6 @@ async fn a_connection_returns_once_its_body_reports_its_end() {
     let (verifier, _) = serve(Evidence::Genuine, Chat::Served, limits()).await;
     let response = verifier.forward(chat(TARGETS[0])).await.unwrap();
     let mut body = response.into_body();
-    // A server writing the response stops polling once the body reports its end.
     while !hyper::body::Body::is_end_stream(&body) {
         body.frame().await.unwrap().unwrap();
     }
@@ -951,9 +1270,9 @@ async fn off_list_requests_are_refused_before_any_connection() {
 async fn a_connection_that_fails_attestation_never_carries_a_chat() {
     for (evidence, expected) in [
         (Evidence::Unavailable, "502"),
-        (Evidence::OtherCertificate, "other than this connection's"),
+        (Evidence::OtherKey, "does not verify"),
         (Evidence::Replayed, "echoed a different nonce"),
-        (Evidence::Unbound, "no kubetee.attestation.v1 binding"),
+        (Evidence::Unbound, "no kubetee.attestation.v2 binding"),
     ] {
         let (verifier, upstream) = serve(evidence, Chat::Served, limits()).await;
         let error = verifier.forward(chat(TARGETS[0])).await.unwrap_err();
@@ -1105,7 +1424,7 @@ async fn the_model_list_is_fetched_on_an_attested_connection_and_narrowed() {
 
 #[tokio::test]
 async fn the_model_list_is_never_fetched_on_a_connection_that_failed_attestation() {
-    let (verifier, upstream) = serve(Evidence::OtherCertificate, Chat::Served, limits()).await;
+    let (verifier, upstream) = serve(Evidence::OtherKey, Chat::Served, limits()).await;
     let request = Request::builder().uri(MODELS).body(Body::empty()).unwrap();
     assert!(verifier.models(request).await.is_err());
     assert_eq!(counts(&upstream), (3, 3, 0));
@@ -1117,7 +1436,7 @@ async fn preflight_reports_the_attested_replica() {
     let (verifier, _) = serve(Evidence::Genuine, Chat::Served, limits()).await;
     let attested = verifier.preflight().await.unwrap();
     assert_eq!(attested.pod, "litellm-5dcbc54579-7rm6g");
-    assert_eq!(attested.measurements.rtmrs[3], [0; 48]);
+    assert_eq!(tdx(&attested.measurements).rtmrs[3], [0; 48]);
     assert_eq!(
         verifier.idle_connections(),
         0,

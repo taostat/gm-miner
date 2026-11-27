@@ -29,6 +29,24 @@ ignore = [
     # crates move to jiff or time and a dcap-qvl without chrono is adopted;
     # the gm repo carries the same ignore.
     "RUSTSEC-2026-0543",  # chrono unmaintained (direct, and via dcap-qvl)
+    # rsa 0.9 (Marvin Attack timing sidechannel) enters via `sev` 9.0.0's
+    # `crypto_nossl` feature. In `sev` the RSA code lives only under
+    # `certs::sev` — the legacy SEV/SEV-ES v1 certificate key type and its
+    # PKCS#1-PSS signing. `gm-miner-attestd` imports only
+    # `sev::certs::snp::{builtin, Certificate, Chain, Verifiable}`,
+    # `sev::firmware::guest::AttestationReport` and `sev::parser::ByteParser`;
+    # the SNP ARK -> ASK -> VCEK chain is ECDSA P-384 over `x509-cert`
+    # (p384 + sha2) and reaches no rsa code path. KubeTEE appraises SEV-SNP
+    # only and never calls the legacy SEV/SEV-ES cert module. Reviewed
+    # source-level non-reachability exception, not a dependency fix: no rsa
+    # code signs or decrypts anything in this workspace. `sev` also pins
+    # `rsa = "0.9"`, so a `[patch]` to the fixed 0.10 line is semver-inert.
+    # Resolution is upstream in virtee/sev (adopt rsa 0.10's constant-time
+    # draft-irtf-cfrg-rsa-guidance mitigations, or split the legacy SEV cert
+    # module out of `crypto_nossl`); drop this entry when a release does.
+    # Re-audit on any change to the sev import surface or its version, and
+    # review by 2027-02-27.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 is reachable only through sev::certs::sev (legacy SEV/SEV-ES v1 cert keys + PKCS#1-PSS signing), which gm-miner-attestd never calls; the SNP chain is ECDSA P-384/x509-cert. Non-reachability exception, not a fix — wait for virtee/sev to adopt rsa 0.10" },
 ]
 
 [licenses]
