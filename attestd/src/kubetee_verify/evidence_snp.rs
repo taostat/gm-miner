@@ -248,6 +248,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::kubetee_verify::binding;
 
     #[test]
     fn the_policy_debug_bit_is_the_abi_bit_3() {
@@ -276,5 +277,170 @@ mod tests {
         assert!(parse_snp(&empty).is_err());
         let short = serde_json::json!({"raw_report": STANDARD.encode([0u8; 10]), "cert_chain": []});
         assert!(parse_snp(&short).is_err(), "short raw_report must fail");
+    }
+
+    // ---- Golden v2 SNP evidence (captured live from llm.kubetee.ai) ----
+    //
+    // `v2-snp-live.json` is one complete `GET /v1/attestation` response from
+    // the AMD SEV-SNP gateway (pod `litellm-66ccfbc968-hfvk5`, 2026-11-27). It
+    // carries genuinely AMD-signed hardware evidence (VCEK/ASK/ARK + a 1184-byte
+    // report) bound to a `kubetee.attestation.v2` report_data. The tests below
+    // pin that the full appraisal PASSES and that every tamper FAILS CLOSED —
+    // this is the proof that the SNP path verifies real evidence, not synthetic
+    // bytes. (The report/signature are immutable hardware evidence, so the
+    // fixture is stable across boots; the v2 binding is re-derived below.)
+
+    const V2_SNP_LIVE: &str = include_str!("../../tests/fixtures/kubetee/snp/v2-snp-live.json");
+
+    fn live_root() -> serde_json::Value {
+        serde_json::from_str(V2_SNP_LIVE).unwrap()
+    }
+
+    fn live_snp() -> SnpEvidence {
+        parse_snp(&live_root()["evidence"]["snp"]).unwrap()
+    }
+
+    fn live_qrd() -> String {
+        live_root()["evidence"]["quote_report_data"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The report's `report_data` (bytes 0x50..0x90) is exactly the
+    /// `kubetee.attestation.v2` binding for the bound per-boot key + nonce +
+    /// context. This is the crux of "proving V2": the AMD-signed report commits
+    /// to the v2 key/context/nonce binding.
+    #[test]
+    fn the_report_data_is_the_v2_binding_of_the_served_key_nonce_and_context() {
+        let root = live_root();
+        let statement: serde_json::Value =
+            serde_json::from_str(root["bindings"]["report_data_statement"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(statement["purpose"], binding::PURPOSE);
+        let context = statement["context"].as_str().unwrap();
+        let pkix =
+            binding::decode_pkix_pubkey(statement["pkix_pubkey_b64url"].as_str().unwrap()).unwrap();
+        let nonce = binding::bytes_from_hex32(statement["nonce"].as_str().unwrap()).unwrap();
+        let expected = binding::report_data_v2(&pkix, &nonce, context).unwrap();
+        let snp = live_snp();
+        let m = verify_snp(&snp, Some(&live_qrd())).unwrap();
+        assert_eq!(
+            m.report_data, expected,
+            "AMD report_data must commit the v2 binding of the served key/nonce/context"
+        );
+        // And it must be the SHA-384(tag||framed(pkix)||framed(nonce)||framed(context)).
+        assert_ne!(
+            m.report_data,
+            binding::report_data_v2(&pkix, &nonce, "another-context").unwrap(),
+            "a different context must derive a different report_data"
+        );
+    }
+
+    #[test]
+    fn the_live_snp_evidence_appraises_to_the_pinned_measurements() {
+        let snp = live_snp();
+        let m = verify_snp(&snp, Some(&live_qrd())).unwrap();
+        assert_eq!(
+            hex::encode(m.measurement),
+            "20f0e183b7844cc835118d804699ab8b6cdab297414d8f54d70331378ff0d7fdd8a7548a0253ba561bec21e13a0dcc67"
+        );
+        assert_eq!(
+            hex::encode(m.host_data),
+            "2c66167de055e8d6cd0e2073c4e959e242e544f9e0e124eeed18a1938191f118"
+        );
+        assert_eq!(m.policy, 0x30000, "debug bit clear (policy 0x30000)");
+        assert!(m.policy & POLICY_DEBUG_BIT == 0);
+    }
+
+    #[test]
+    fn a_forged_self_signed_ark_is_rejected() {
+        let mut snp = live_snp();
+        let ask_der = snp
+            .cert_chain
+            .iter()
+            .find(|e| e.cert_type == "ASK")
+            .unwrap()
+            .der
+            .clone();
+        snp.cert_chain
+            .iter_mut()
+            .find(|e| e.cert_type == "ARK")
+            .unwrap()
+            .der = ask_der;
+        let error = verify_snp(&snp, Some(&live_qrd())).unwrap_err();
+        assert!(
+            error.to_string().contains("not a known AMD root"),
+            "forged ARK must be rejected as an untrusted root, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_generation_root_is_rejected() {
+        let mut snp = live_snp();
+        let milan_ark = Certificate::from_pem(builtin::milan::ARK).unwrap();
+        snp.cert_chain
+            .iter_mut()
+            .find(|e| e.cert_type == "ARK")
+            .unwrap()
+            .der = milan_ark.to_der().unwrap();
+        assert!(
+            verify_snp(&snp, Some(&live_qrd())).is_err(),
+            "a known but wrong-generation root must FAIL (this ASK does not chain to Milan)"
+        );
+    }
+
+    #[test]
+    fn a_debug_guest_is_rejected_despite_a_valid_signature() {
+        // The hardware signature is checked first, so flipping the policy bit
+        // invalidates it — the debug guest must be rejected either way.
+        let mut snp = live_snp();
+        snp.raw_report[POLICY.start] |= POLICY_DEBUG_BIT as u8;
+        assert!(verify_snp(&snp, Some(&live_qrd())).is_err());
+    }
+
+    #[test]
+    fn a_tampered_report_breaks_the_hardware_signature() {
+        // The VCEK signs `to_bytes()[..0x2a0]`; the `measurement` (0x90) is
+        // inside that signed region, so a single flipped byte must break the
+        // ECDSA verify. (Trailing bytes past 0x2a0 — the signature/reserved —
+        // are not signed, which is exactly why the check is on the signed
+        // body, not the whole 1184 bytes.)
+        let mut snp = live_snp();
+        snp.raw_report[MEASUREMENT.start] ^= 0x01;
+        assert!(
+            verify_snp(&snp, Some(&live_qrd())).is_err(),
+            "a single flipped signed byte must break the AMD signature"
+        );
+        // The unsigned tail is not covered by the signature; it holds the
+        // signature/reserved fields the appraiser never reads. Flipping a tail
+        // byte must not affect the appraised measurement (only the signed body
+        // is enforced).
+        let mut tail = live_snp();
+        let last = tail.raw_report.len() - 1;
+        tail.raw_report[last] ^= 0x01;
+        let tail_m = verify_snp(&tail, Some(&live_qrd())).unwrap();
+        let clean_m = verify_snp(&live_snp(), Some(&live_qrd())).unwrap();
+        assert_eq!(
+            tail_m.measurement, clean_m.measurement,
+            "the unsigned tail is inert: only the signed body is appraised"
+        );
+    }
+
+    #[test]
+    fn a_swapped_report_data_is_rejected_by_the_cross_check() {
+        // The signature covers the committed report_data, so a mismatching
+        // `quote_report_data` must be caught (and the report re-signing is
+        // impossible without the VCEK).
+        let snp = live_snp();
+        let other = STANDARD.encode([0u8; 64]);
+        assert!(verify_snp(&snp, Some(&other)).is_err());
+    }
+
+    #[test]
+    fn an_empty_cert_chain_fails_closed() {
+        let mut snp = live_snp();
+        snp.cert_chain.clear();
+        assert!(verify_snp(&snp, Some(&live_qrd())).is_err());
     }
 }

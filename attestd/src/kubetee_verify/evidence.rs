@@ -310,6 +310,62 @@ pub fn verify_attestation(
     Ok(measurements)
 }
 
+/// How a response's hardware evidence is shaped — which TEE produced it and
+/// where its signed evidence lives. The `kubetee.attestation.v2` SNP gateway
+/// serves `evidence.snp` with a null `quote`; the Intel TDX path serves a
+/// base64 `quote`. [`evidence_tee`] fails closed when the `tee` tag and the
+/// evidence nodes disagree.
+#[derive(Clone, Debug)]
+pub(crate) enum EvidenceTee {
+    /// AMD SEV-SNP: the signed report + chain live in `evidence.snp`.
+    Snp {
+        snp: Value,
+        quote_report_data: Option<String>,
+    },
+    /// Intel TDX: a base64 DCAP `quote`.
+    Tdx { quote: String },
+}
+
+/// Classify a response's hardware evidence from its `tee` / `evidence` /
+/// `quote` fields, failing closed on any inconsistency (a `tee` that claims
+/// SNP without `evidence.snp`, an `evidence.snp` on a non-SNP `tee`, or a
+/// response with neither). This is the only place the two TEE paths diverge.
+///
+/// # Errors
+///
+/// Returns an error when the shape is inconsistent or no evidence is present.
+pub(crate) fn evidence_tee(root: &Value) -> Result<EvidenceTee> {
+    let evidence_node = root.get("evidence");
+    let tee = root.get("tee").and_then(Value::as_str).unwrap_or("");
+    let snp_node = evidence_node
+        .and_then(|e| e.get("snp"))
+        .filter(|n| !n.is_null());
+    match (tee, snp_node) {
+        ("snp", Some(snp)) => {
+            let quote_report_data = evidence_node
+                .and_then(|e| e.get("quote_report_data"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            Ok(EvidenceTee::Snp {
+                snp: snp.clone(),
+                quote_report_data,
+            })
+        }
+        ("snp", None) => bail!("KubeTEE tee=snp but evidence.snp is absent"),
+        (_, Some(_)) => bail!("KubeTEE evidence.snp present but tee is not snp"),
+        (_, None) => {
+            let quote = root
+                .get("quote")
+                .and_then(Value::as_str)
+                .filter(|quote| !quote.is_empty())
+                .context("KubeTEE attestation has no TDX quote or SNP evidence")?;
+            Ok(EvidenceTee::Tdx {
+                quote: quote.to_owned(),
+            })
+        }
+    }
+}
+
 /// Check an AMD SEV-SNP attestation against the nonce this proxy sent, the
 /// `report_data` its v2 binding statement requires, the key-possession proof
 /// under the quote-bound key, and the connection's `evidence.snp` hardware
@@ -416,7 +472,7 @@ pub(crate) fn verify_key_possession(
 
 /// The raw uncompressed P-256 point from a DER `SubjectPublicKeyInfo` (the
 /// `ecdsa-secp256r1-sha256` key class the possession proof verifies under).
-fn p256_point(pkix: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn p256_point(pkix: &[u8]) -> Result<Vec<u8>> {
     let (_, spki) = SubjectPublicKeyInfo::from_der(pkix)
         .map_err(|error| anyhow!("parse v2 bound SubjectPublicKeyInfo: {error}"))?;
     match spki.parsed() {

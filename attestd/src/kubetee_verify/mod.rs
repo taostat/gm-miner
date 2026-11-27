@@ -368,44 +368,32 @@ impl KubeteeVerifier {
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
         let root: Value =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
-        let evidence_node = root.get("evidence");
-        let tee = root.get("tee").and_then(Value::as_str).unwrap_or("");
-        let snp_node = evidence_node
-            .and_then(|e| e.get("snp"))
-            .filter(|n| !n.is_null());
-        // Dispatch on the TEE that produced the hardware evidence: an AMD
-        // SEV-SNP gateway (tee: snp) serves evidence.snp; the Intel TDX path
-        // serves quote. Anything inconsistent fails closed.
-        let measurements = match (tee, &snp_node) {
-            ("snp", Some(snp_node)) => {
-                let quote_report_data = evidence_node
-                    .and_then(|e| e.get("quote_report_data"))
-                    .and_then(Value::as_str);
-                evidence::verify_attestation_snp(
-                    &payload,
-                    snp_node,
+        // Dispatch on the TEE that produced the hardware evidence (AMD SEV-SNP
+        // `evidence.snp` vs an Intel TDX `quote`); the classifier fails closed
+        // on any inconsistency.
+        let measurements =
+            match evidence::evidence_tee(&root).context("kubetee.attestation.v2 evidence shape")? {
+                evidence::EvidenceTee::Snp {
+                    snp,
                     quote_report_data,
+                } => evidence::verify_attestation_snp(
+                    &payload,
+                    &snp,
+                    quote_report_data.as_deref(),
                     &nonce,
                     &binding,
                 )
-                .context("kubetee.attestation.v2 SNP evidence")?
-            }
-            ("snp", None) => bail!("KubeTEE tee=snp but evidence.snp is absent"),
-            (_, Some(_)) => bail!("KubeTEE evidence.snp present but tee is not snp"),
-            (_, None) => {
-                let tdx_quote = payload
-                    .quote
-                    .as_deref()
-                    .context("KubeTEE attestation has no TDX quote or SNP evidence")?;
-                let tdx_quote =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, tdx_quote)
-                        .context("decode KubeTEE quote")?;
-                let (claims, now) = self.quote_chain.verify(&tdx_quote).await?;
-                TeeMeasurements::Tdx(evidence::verify_attestation(
-                    &payload, &nonce, &claims, now, &binding,
-                )?)
-            }
-        };
+                .context("kubetee.attestation.v2 SNP evidence")?,
+                evidence::EvidenceTee::Tdx { quote } => {
+                    let tdx_quote =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &quote)
+                            .context("decode KubeTEE quote")?;
+                    let (claims, now) = self.quote_chain.verify(&tdx_quote).await?;
+                    TeeMeasurements::Tdx(evidence::verify_attestation(
+                        &payload, &nonce, &claims, now, &binding,
+                    )?)
+                }
+            };
         binding.ensure_current(Utc::now())?;
         evidence::log_attested(&payload.pod, &measurements);
         Ok((
